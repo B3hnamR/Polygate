@@ -11,7 +11,7 @@ case "${1:-}" in
 Polygate Linux installer (systemd, Python 3.11+, x86_64 or arm64).
   sudo bash install.sh                    interactive install
   sudo bash install.sh --update           keep credentials, settings, certificates and data
-Environment: POLYGATE_REPO=owner/repo, POLYGATE_VERSION=latest|v0.1.0,
+Environment: POLYGATE_REPO=owner/repo, POLYGATE_VERSION=latest|v0.2.0,
 POLYGATE_SSL_MODE=ip|domain|custom|skip, POLYGATE_DOMAIN, POLYGATE_IP, POLYGATE_EMAIL,
 POLYGATE_CERT_FILE, POLYGATE_KEY_FILE, POLYGATE_PORT, POLYGATE_ADMIN_PASSWORD,
 Offline verification: POLYGATE_ARCHIVE=/path/release.tar.gz POLYGATE_CHECKSUM=/path/release.tar.gz.sha256
