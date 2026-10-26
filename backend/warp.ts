@@ -1,5 +1,5 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
+import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { generateKeyPairSync, createHash } from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
@@ -35,7 +35,11 @@ function which(name: string) { try { return (Bun.which(name) as string | null) |
 export function findWireproxy() {
   const name = isWin ? 'wireproxy.exe' : 'wireproxy';
   const candidates = [warpConfig().wireproxyPath, process.env.WIREPROXY_PATH || '', path.join(binDir, name), path.join(appDir, 'bin', name), path.join(path.dirname(process.execPath), name), which('wireproxy'), '/usr/local/bin/wireproxy', '/usr/bin/wireproxy'];
-  return candidates.find(c => c && existsSync(c)) || '';
+  return candidates.find(c => c && runnable(c)) || '';
+}
+// A directory or a file without the execute bit is not a helper: spawning it emits 'error', which used to end the whole gateway.
+function runnable(file: string) {
+  try { if (!statSync(file).isFile()) return false; if (!isWin) accessSync(file, fsConstants.X_OK); return true; } catch { return false; }
 }
 export const engineMode = (): WarpEngine => warpConfig().engine;
 // --- SOCKS probing ---
@@ -79,9 +83,16 @@ async function startTunnel(port: number, account: Account): Promise<Tunnel> {
     mkdirSync(warpDir, { recursive: true });
     const conf = path.join(warpDir, `wireproxy_${port}.conf`);
     writeFileSync(conf, `[Interface]\nPrivateKey = ${account.privateKey}\nAddress = ${account.addressV4}/32${account.addressV6 ? `, ${account.addressV6}/128` : ''}\nDNS = 1.1.1.1, 8.8.8.8\n\n[Peer]\nPublicKey = ${account.peerPublicKey}\nEndpoint = ${endpoint}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n\n[Socks5]\nBindAddress = 127.0.0.1:${port}\n`, { mode: 0o600 });
-    const proc = spawn(bin, ['-c', conf], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); let output = ''; let exited = false;
+    // A helper that cannot be run (wrong architecture, permissions changed after discovery) emits 'error'; without a listener that
+    // error ends the gateway. It is a problem with the helper, not the endpoint, so no other endpoint is tried.
+    let proc: ChildProcess, spawnError = '';
+    try { proc = spawn(bin, ['-c', conf], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
+    catch (e: any) { throw new GatewayError(`wireproxy could not be started (${bin}): ${e?.message || e}`, 503, 'warp_not_installed'); }
+    let output = ''; let exited = false;
+    proc.once('error', e => { spawnError = e.message || String(e); exited = true; });
     proc.stdout?.on('data', d => { output = (output + d).slice(-600); }); proc.stderr?.on('data', d => { output = (output + d).slice(-600); }); proc.once('exit', () => { exited = true; });
     let alive = false; for (let i = 0; i < 40 && !exited; i++) { await Bun.sleep(250); if (await socksAlive('127.0.0.1', port, 800)) { alive = true; break; } }
+    if (spawnError) throw new GatewayError(`wireproxy could not be started (${bin}): ${spawnError}`, 503, 'warp_not_installed');
     if (alive) {
       const egress = await traceVia('127.0.0.1', port, 7000);
       if (egress && ['on', 'plus'].includes(egress.warp)) {

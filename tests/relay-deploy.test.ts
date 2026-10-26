@@ -5,7 +5,7 @@ __timing.poll = 1; __timing.verify = 1;
 const realFetch = globalThis.fetch; afterEach(() => { globalThis.fetch = realFetch; });
 type Call = { url: string; method: string; headers: Headers; body: any };
 const API_TOKEN = 'platform-api-token-123456';
-const isApi = (url: string) => url.startsWith('https://api.vercel.com/') || url.startsWith('https://api.netlify.com/');
+const isApi = (url: string) => url.startsWith('https://api.vercel.com/') || url.startsWith('https://api.netlify.com/') || url.startsWith('https://api.cloudflare.com/');
 function platform(answer: (c: Call) => Response | undefined) {
   const calls: Call[] = [];
   globalThis.fetch = (async (url: any, init: any = {}) => {
@@ -79,4 +79,35 @@ test('Vercel: the Node runtime option leaves out bunVersion, marks the package a
   const bun = platform(c => c.method === 'POST' ? ok({ id: 'dpl_4', readyState: 'QUEUED' }) : ok({ id: 'dpl_4', readyState: 'READY', alias: ['my-bun-relay.vercel.app'], url: 'y.vercel.app' }));
   await deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-bun-relay' }); const b = JSON.parse(String(bun[0].body));
   expect(JSON.parse(b.files.find((f: any) => f.file === 'vercel.json').data).bunVersion).toBe('1.x'); expect(JSON.parse(b.files.find((f: any) => f.file === 'package.json').data).type).toBeUndefined();
+});
+
+const ACCOUNT = '0123456789abcdef0123456789abcdef'; const CF = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}`;
+const cfPlatform = (subdomain: string | null = 'acme', failEnable = false) => platform(c => {
+  if (c.url === `${CF}/workers/subdomain`) return ok({ success: true, result: subdomain ? { subdomain } : {} });
+  if (c.url.endsWith('/subdomain') && c.method === 'POST') return failEnable ? Response.json({ success: false, errors: [{ message: 'subdomain refused' }] }, { status: 400 }) : ok({ success: true, result: { enabled: true } });
+  if (c.method === 'PUT' || c.method === 'DELETE') return ok({ success: true, result: {} });
+});
+test('Cloudflare: uploads the Worker with the access token as a secret, turns on its workers.dev address and waits until it answers', async () => {
+  const calls = cfPlatform();
+  const r = await deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT, name: 'my-worker' });
+  expect(r.url).toBe('https://my-worker.acme.workers.dev'); expect(r.runtime).toBe('cloudflare-worker'); expect(r.only).toBe('kilo'); expect(r.buffered).toBe(false); expect(r.reachable).toBe(true);
+  const put = calls.find(c => c.method === 'PUT')!; expect(put.url).toBe(`${CF}/workers/scripts/my-worker`); expect(put.headers.get('authorization')).toBe('Bearer ' + API_TOKEN);
+  const form = put.body as FormData; const meta = JSON.parse(await (form.get('metadata') as Blob).text());
+  expect(meta.main_module).toBe('worker.js'); expect(meta.bindings).toEqual([{ type: 'secret_text', name: 'RELAY_TOKEN', text: r.accessToken }]);
+  const code = await (form.get('worker.js') as Blob).text(); expect(code).toContain("'api.kilo.ai'"); expect(code).not.toContain(r.accessToken);
+  expect(calls.find(c => c.url.endsWith('/workers/scripts/my-worker/subdomain'))!.method).toBe('POST');
+  expect(calls.filter(c => !isApi(c.url)).length).toBeGreaterThanOrEqual(4); // the status check has to pass several times in a row
+  expect(calls.some(c => c.url.includes(API_TOKEN))).toBe(false);
+});
+test('Cloudflare: the account ID is checked first and a missing workers.dev address is explained, not created', async () => {
+  const calls = cfPlatform(null);
+  await expect(deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: 'not-an-id' })).rejects.toThrow('Account ID'); expect(calls.length).toBe(0);
+  await expect(deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT })).rejects.toThrow('workers.dev address');
+  expect(calls.some(c => c.method === 'PUT')).toBe(false);
+});
+test('Cloudflare: a Worker whose address could not be turned on is removed again, and the token never appears in the error', async () => {
+  const calls = cfPlatform('acme', true);
+  const error: any = await deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT, name: 'half-made' }).catch(e => e);
+  expect(String(error.message)).toContain('subdomain refused'); expect(String(error.message)).not.toContain(API_TOKEN);
+  expect(calls.some(c => c.method === 'DELETE' && c.url === `${CF}/workers/scripts/half-made`)).toBe(true);
 });

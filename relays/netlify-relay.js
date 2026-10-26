@@ -1,7 +1,7 @@
 // Polygate relay for Netlify Functions (Node runtime). Deployed by the Relays page; also usable by hand.
 // OpenCode Free accepts a TLS client only if its ClientHello lists Bun's 17 cipher suites in Bun's order.
 // Node's default list is refused, so this relay calls node:https with that exact list instead of fetch. Nothing else in the handshake matters.
-// Needs the environment variable POLYGATE_RELAY_TOKEN. POLYGATE_ALLOWED_HOSTS (comma separated) defaults to the OpenCode hosts.
+// Needs the environment variable POLYGATE_RELAY_TOKEN. POLYGATE_ALLOWED_HOSTS (comma separated) defaults to the OpenCode and Kilo hosts.
 const crypto = require("node:crypto");
 const https = require("node:https");
 
@@ -28,7 +28,7 @@ exports.handler = async (event) => {
   const target = headers["x-relay-target"];
   const relayPath = headers["x-relay-path"] || "/";
   if (!target) return json(400, { error: "Missing x-relay-target header" });
-  const allowed = (process.env.POLYGATE_ALLOWED_HOSTS || "opencode.ai,models.opencode.ai").split(",").map((x) => x.trim());
+  const allowed = (process.env.POLYGATE_ALLOWED_HOSTS || "opencode.ai,models.opencode.ai,api.kilo.ai").split(",").map((x) => x.trim());
   let url;
   try {
     const origin = new URL(target);

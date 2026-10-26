@@ -1,6 +1,6 @@
 // Polygate relay for Vercel Functions. The OpenCode Free tier checks the TLS ClientHello of whoever connects: it accepts a client whose cipher-suite
 // list is Bun's, in Bun's order. On the Bun runtime (vercel.json: bunVersion) fetch already sends that list. On
-// Node the call is made with node:https and that list set explicitly, and the answer still streams. Only OpenCode hosts are allowed and
+// Node the call is made with node:https and that list set explicitly, and the answer still streams. Only OpenCode and Kilo hosts are allowed and
 // POLYGATE_RELAY_TOKEN is required, so this is not an open proxy.
 import crypto from 'node:crypto';
 import https from 'node:https';
@@ -18,7 +18,7 @@ const nodeSend = (url, { method, headers, body }) => new Promise((resolve, rejec
   if (body) Readable.fromWeb(body).on('error', e => out.destroy(e)).pipe(out); else out.end();
 });
 const send = (url, init) => isBun ? fetch(url, init) : nodeSend(url, init);
-const ALLOWED = (process.env.POLYGATE_ALLOWED_HOSTS || 'opencode.ai,models.opencode.ai').split(',').map(s => s.trim().toLowerCase());
+const ALLOWED = (process.env.POLYGATE_ALLOWED_HOSTS || 'opencode.ai,models.opencode.ai,api.kilo.ai').split(',').map(s => s.trim().toLowerCase());
 // Headers the platform adds about the caller; dropping them keeps the caller's address, location and account token away from the provider.
 const IDENTITY = /^(forwarded|x-forwarded-.*|x-real-ip|true-client-ip|client-ip|cf-.*|cdn-loop|x-vercel-.*|x-nf-.*|x-amzn-.*|x-middleware-subrequest|x-invocation-id|logs-url|via|x-envoy-.*|fly-.*|x-country|x-azure-.*|x-relay-.*|host|connection|content-length)$/i;
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -33,9 +33,12 @@ let egress;
 const egressIp = () => egress ||= fetch('https://opencode.ai/cdn-cgi/trace', { signal: AbortSignal.timeout(5000) }).then(r => r.text()).then(t => { const ip = (t.match(/^ip=(.+)$/m) || [])[1] || ''; if (!ip) egress = undefined; return ip; }).catch(() => { egress = undefined; return ''; });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // recycle ends this instance once the requests it is serving have finished (or after 15 s), so the next request starts a new instance with a new address.
-let inflight = 0, recycling = false;
+let inflight = 0, recycling = false, backstop, leaving;
+// One exit path: whichever fires first (idle or the 15 s backstop) cancels the other, so a stale timer never ends a later process.
+// recycling is cleared after the call: on a platform process.exit does not return, and where it does (a test) no later request exits.
+const leave = () => { clearTimeout(backstop); clearTimeout(leaving); backstop = leaving = undefined; process.exit(0); recycling = false; };
 const finish = () => { inflight = Math.max(0, inflight - 1); leaveIfIdle(); };
-const leaveIfIdle = () => { if (recycling && inflight === 0) setTimeout(() => process.exit(0), 150); };
+const leaveIfIdle = () => { if (recycling && inflight === 0 && !leaving) leaving = setTimeout(leave, 150); };
 export default {
   async fetch(req) {
     const required = process.env.POLYGATE_RELAY_TOKEN;
@@ -46,7 +49,7 @@ export default {
     if (control === 'ping' || control === 'hold' || control === 'recycle') {
       if (control === 'hold') await sleep(Math.min(Math.max(Number(req.headers.get('x-relay-hold')) || 3000, 0), 10000));
       const body = { instance, egress: await egressIp(), runtime: runtime(), control };
-      if (control === 'recycle') { recycling = true; setTimeout(() => process.exit(0), 15000); leaveIfIdle(); }
+      if (control === 'recycle') { if (!recycling) { recycling = true; backstop = setTimeout(leave, 15000); } leaveIfIdle(); }
       return json(200, body);
     }
     // Polygate lists the addresses it knows are used up; an instance on one of them answers at once, without calling OpenCode.

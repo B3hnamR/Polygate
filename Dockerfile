@@ -8,6 +8,7 @@ RUN npm run build:ui
 
 FROM oven/bun:1.4.4 AS gateway
 WORKDIR /src
+COPY package.json ./
 COPY backend ./backend
 COPY vendor/bridge ./vendor/bridge
 COPY vendor/protocols ./vendor/protocols

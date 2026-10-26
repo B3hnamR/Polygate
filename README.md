@@ -1,6 +1,6 @@
 # Polygate
 
-A Windows desktop and Linux/VPS model gateway with an adaptive OpenCode Free provider, Chat/Responses/Anthropic compatibility, built-in WARP tunnels, and a proxy pool that is checked with real requests.
+A Windows desktop and Linux/VPS model gateway with built-in OpenCode Free and Kilo free-model providers, Chat/Responses/Anthropic compatibility, built-in WARP tunnels, and a proxy pool that is checked with real requests.
 
 The gateway separates provider execution, protocol conversion, admission, model state and network routes. Direct, HTTP/SOCKS, WARP and header-contract relays are supported. Rotation is explicit and off by default. Xray and managed Tor are excluded.
 
@@ -8,6 +8,8 @@ The gateway separates provider execution, protocol conversion, admission, model 
 npm.cmd install
 bun run dev
 ```
+
+**Kilo free models.** Kilo is a built-in provider next to OpenCode Free: it lists Kilo Gateway's free chat models (those the catalog marks `isFree`), needs no account, and ranks behind OpenCode Free in `auto`. Kilo limits anonymous use per network address; when that limit is reached, Polygate rests all Kilo models for 30 minutes and answers with a clear message and `Retry-After`. A Kilo API key can be saved on the provider's row. A single busy model rests for a short time while the others keep working.
 
 Windows packaging: `bun run dist`. The packaged app includes the gateway bundle, the dashboard and the Bun runtime that runs the gateway. Copy the live URL/key from Overview into a compatible coding client, refresh the model catalog, and choose a model or `auto`.
 

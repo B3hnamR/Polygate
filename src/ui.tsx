@@ -17,7 +17,8 @@ export function Logs({rows,compact=false,onSelect,selected}:{rows:LogRow[];compa
 export const when=(t:number)=>{if(!t)return '—';const d=Date.now()-t;if(d<60000)return 'just now';if(d<3600000)return Math.round(d/60000)+' min ago';if(d<86400000)return Math.round(d/3600000)+' h ago';return new Date(t).toLocaleDateString();};
 export const compact=(n:number)=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(Math.round(n||0));
 // Runs `fn` now and every `every` ms, but only while the window is visible; it runs again at once when the window comes back.
-export function tickWhileVisible(fn:()=>void,every:number){const tick=()=>{if(!document.hidden)fn();};tick();const id=setInterval(tick,every);document.addEventListener('visibilitychange',tick);return()=>{clearInterval(id);document.removeEventListener('visibilitychange',tick);};}
+// A tick is skipped while the previous call is still running, so a slow gateway is not sent a growing pile of requests.
+export function tickWhileVisible(fn:()=>unknown,every:number){let busy=false;const tick=()=>{if(document.hidden||busy)return;busy=true;Promise.resolve().then(fn).catch(()=>{}).finally(()=>{busy=false;});};tick();const id=setInterval(tick,every);document.addEventListener('visibilitychange',tick);return()=>{clearInterval(id);document.removeEventListener('visibilitychange',tick);};}
 // Polls an admin endpoint while the component is mounted; `reload` refreshes immediately after an action.
 export function usePoll<T>(path:string,every:number,enabled=true){
   const [box,setBox]=useState<{path:string;value:T}|null>(null);const [error,setError]=useState('');const seq=useRef({path,sent:0,applied:0});

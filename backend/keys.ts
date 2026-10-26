@@ -9,7 +9,12 @@ import type { ApiKey } from './types';
 const reqWindow = new Map<string, number[]>();
 const tokenWindow = new Map<string, { t: number; n: number }[]>();
 let dirty: ReturnType<typeof setTimeout> | undefined;
-const saveSoon = () => { if (dirty) return; dirty = setTimeout(() => { dirty = undefined; persist(); }, 3000); dirty.unref?.(); };
+// Usage counters are saved a few seconds after a request. A failed write (disk full, a file held by antivirus) is logged and retried
+// with the next save instead of throwing from the timer, which ended the process.
+const savePending = () => { if (dirty) clearTimeout(dirty); dirty = undefined; try { persist(); } catch (e: any) { console.error('[state] Could not save usage:', e?.message || e); } };
+const saveSoon = () => { if (dirty) return; dirty = setTimeout(savePending, 3000); dirty.unref?.(); };
+// Called on shutdown so the last few seconds of usage are not lost.
+export const flushKeys = () => { if (dirty) savePending(); };
 const limited = (message: string, retryAfter: number, type = 'rate_limit_error') => new GatewayError(message, 429, type, retryAfter);
 export function tokenOf(req: IncomingMessage) {
   const auth = String(req.headers.authorization || '');
@@ -17,10 +22,10 @@ export function tokenOf(req: IncomingMessage) {
 }
 // Validates the caller's key. `count` is true for requests that consume capacity (inference), false for listing endpoints.
 export function authenticate(req: IncomingMessage, count = false): ApiKey {
-  const ip = clientIp(req); const wait = keyGate.retryAfter(ip);
-  if (wait) throw limited('Too many invalid API keys from this address. Try again later.', wait, 'rate_limited');
-  const value = tokenOf(req); const key = value ? settings.keys.find(k => equal(k.value, value)) : undefined;
-  if (!key) { keyGate.fail(ip); throw new GatewayError('Invalid gateway API key', 401, 'authentication_error'); }
+  // A valid key is accepted even from an address that is paused for bad keys: on a desktop, or behind a proxy without the trust flag,
+  // every client shares one address, and one misconfigured client must not lock out the others. Only failures are throttled.
+  const ip = clientIp(req); const value = tokenOf(req); const key = value ? settings.keys.find(k => equal(k.value, value)) : undefined;
+  if (!key) { const wait = keyGate.retryAfter(ip); if (wait) throw limited('Too many invalid API keys from this address. Try again later.', wait, 'rate_limited'); keyGate.fail(ip); throw new GatewayError('Invalid gateway API key', 401, 'authentication_error'); }
   keyGate.clear(ip);
   if (!key.enabled) throw new GatewayError('This API key is disabled', 403, 'permission_error');
   if (key.expiresAt && key.expiresAt < Date.now()) throw new GatewayError(`This API key expired on ${new Date(key.expiresAt).toISOString().slice(0, 10)}`, 403, 'key_expired');

@@ -15,7 +15,9 @@ out.mkdir(parents=True,exist_ok=True)
 asset='bun-'+target
 base=f'https://github.com/oven-sh/bun/releases/download/bun-v{version}'
 checks=urllib.request.urlopen(base+'/SHASUMS256.txt',timeout=60).read().decode()
-expected=next(line.split()[0] for line in checks.splitlines() if line.split()[-1].lstrip('*./')==asset+'.zip')
+matches=[line.split()[0] for line in checks.splitlines() if line.split() and line.split()[-1].lstrip('*./')==asset+'.zip']
+if len(matches)!=1: raise SystemExit(f'Expected one checksum for {asset}.zip in SHASUMS256.txt, found {len(matches)}')
+expected=matches[0]
 archive=out/'runtime.zip'
 if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest()!=expected:
     urllib.request.urlretrieve(base+'/'+asset+'.zip',archive)

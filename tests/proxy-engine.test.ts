@@ -1,12 +1,7 @@
-import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { expect, test } from 'bun:test';
 import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
-const dir = mkdtempSync(path.join(os.tmpdir(), 'polygate-engine-'));
-process.env.POLYGATE_STATE = dir; process.env.POLYGATE_NO_DISCOVERY = '1';
+// The state folder comes from tests/setup.ts (shared by every test file and removed after the run).
 const engine = await import('../backend/proxy-engine');
-afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* the state folder is in the temp directory */ } });
 // A target that answers like the OpenCode model list, and three tiny proxies in front of it.
 const target = Bun.serve({ port: 0, hostname: '127.0.0.2', fetch: req => new URL(req.url).pathname === '/models' ? Response.json({ data: [{ id: 'x' }] }) : new Response('nope', { status: 404 }) });
 const API = `http://127.0.0.2:${target.port}/models`;

@@ -1,22 +1,29 @@
 import { Database } from 'bun:sqlite';
 import { randomBytes, createCipheriv, createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { Settings, Model, LogRow } from './types';
+import type { Settings, Model, LogRow, Provider } from './types';
 
 // Windows keeps state under %LOCALAPPDATA%; Linux follows XDG (a service sets POLYGATE_STATE explicitly).
 export const stateDir = process.env.POLYGATE_STATE || (process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Polygate', 'state') : path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'polygate'));
-mkdirSync(stateDir, { recursive: true });
+// The folder holds the vault key, the encrypted settings and the activity database: owner-only where the platform supports it.
+mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 const masterPath = path.join(stateDir, 'vault.key');
 if (!existsSync(masterPath)) writeFileSync(masterPath, randomBytes(32), { mode: 0o600, flag: 'wx' });
 const master = readFileSync(masterPath);
 export const deriveKey = (label: string) => createHmac('sha256', master).update(label).digest();
 const configPath = path.join(stateDir, 'settings.vault');
+// Built-in providers: present in every install, switched off instead of deleted. Kilo's catalog is the same free tier the dashboard lists.
+export const KILO_ID = 'kilo';
+export const KILO_BASE = 'https://api.kilo.ai/api/gateway';
+const kiloProvider = (): Provider => ({ id: KILO_ID, name: 'Kilo Free', kind: 'kilo', enabled: true, baseUrl: KILO_BASE, apiKey: '', models: [], routeId: '' });
+// Settings saved before a built-in provider existed get it added (enabled, behind OpenCode in auto) without touching anything else.
+export const withBuiltIns = (s: Settings): Settings => s.providers.some(p => p.id === KILO_ID) ? s : { ...s, providers: [...s.providers, kiloProvider()] };
 export const initialSettings = (): Settings => ({
   enabled: true, maxConcurrent: 4, maxQueue: 32, timeoutMs: 120000, retries: 1, fallback: true,
   strategy: 'single', rotate: false, routeId: 'direct', refreshMinutes: 60, autoProbe: false, warpProxyPort: 40000,
-  providers: [{ id: 'opencode', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '' }],
+  providers: [{ id: 'opencode', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '' }, kiloProvider()],
   routes: [{ id: 'direct', name: 'Direct connection', kind: 'direct', url: '', enabled: true, models: [] }],
   keys: [{ id: crypto.randomUUID(), name: 'Local client', value: 'pg_' + randomBytes(24).toString('hex'), enabled: true, limit: 4 }]
 });
@@ -24,13 +31,17 @@ function load(): Settings {
   if (!existsSync(configPath)) return initialSettings();
   const raw = readFileSync(configPath); const iv = raw.subarray(0, 12); const tag = raw.subarray(12, 28);
   const d = createDecipheriv('aes-256-gcm', master, iv); d.setAuthTag(tag);
-  return { ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) };
+  return withBuiltIns({ ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) });
 }
 export let settings = load();
 export function persist() {
   const iv = randomBytes(12); const c = createCipheriv('aes-256-gcm', master, iv);
   const body = Buffer.concat([c.update(JSON.stringify(settings)), c.final()]);
-  writeFileSync(configPath + '.tmp', Buffer.concat([iv, c.getAuthTag(), body]), { mode: 0o600 }); renameSync(configPath + '.tmp', configPath);
+  // Written to a temporary file, flushed to disk, then renamed over the old one: a crash or power cut leaves either the old or the new
+  // vault, never a truncated one that fails decryption at the next start.
+  const tmp = configPath + '.tmp'; const fd = openSync(tmp, 'w', 0o600);
+  try { writeSync(fd, Buffer.concat([iv, c.getAuthTag(), body])); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, configPath);
 }
 if(process.env.POLYGATE_READ_ONLY_STATE!=='1')persist();
 export function equal(a: string, b: string) { const x = Buffer.from(a); const y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }

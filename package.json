@@ -2,7 +2,7 @@
   "name": "polygate",
   "version": "0.1.0",
   "private": true,
-  "description": "A Windows and Linux model gateway with WARP and an integrated proxy workspace",
+  "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
   "author": "Polygate",
   "main": "desktop/main.cjs",
   "scripts": {
@@ -58,8 +58,8 @@
         "to": "gateway.js"
       },
       {
-        "from": "build/bin",
-        "to": "bin"
+        "from": "build/bin/bun.exe",
+        "to": "bin/bun.exe"
       },
       {
         "from": "THIRD_PARTY_NOTICES.md",

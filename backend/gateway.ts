@@ -7,11 +7,12 @@ import { rankedModels, providerChat, sessionFor } from './providers';
 import { routeFor, failoverRoutes, networkFetch, exhaustedAlternative } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
+import { KILO_ID, KILO_LIMIT_PAUSE_MS, KILO_MODEL_PAUSE_MS, isAddressLimit, pauseKilo } from './kilo';
 import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
 import type { Model, ApiKey } from './types';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
-export async function readJson(req:IncomingMessage){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>8*1024*1024)throw new GatewayError('Request exceeds 8 MiB',413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
+export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
 export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
 export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
 const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
@@ -29,7 +30,7 @@ function chosenModels(requested:string,key?:ApiKey){
 export function classifyModel(m:Model,status:number,message:string,latency:number,retryAfter=0){m.checkedAt=Date.now();m.latency=latency;m.error=status<400?'':redactError(message);const wait=Number.isFinite(retryAfter)?retryAfter:0;
   if(status<400){m.state='available';m.failCount=0;m.cooldownUntil=0;}
   else if(settings.cooldowns===false&&(status===429||status>=500||/quota|capacity|rate.?limit/i.test(message)||status===403)){m.state='unchecked';m.cooldownUntil=0;}
-  else if(status===429||/quota|capacity|rate.?limit/i.test(message)){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+Math.max(wait, m.failCount<=1?15*60000:m.failCount<=3?3600000:21600000);}
+  else if(status===429||/quota|capacity|rate.?limit/i.test(message)){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+Math.max(wait, m.failCount<=1?(m.providerId===KILO_ID?KILO_MODEL_PAUSE_MS:15*60000):m.failCount<=3?3600000:21600000);}
   else if(status===404||status===410){m.state='unavailable';}
   else if(status>=500||status===403){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+60000;}
   saveModel(m);
@@ -46,17 +47,22 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   try{
     release=await queue.acquire(k.id,k.limit,controller.signal,settings.queueWaitMs||0);
     let upstream:Response|undefined;
-    for(const m of candidates){used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
-      let r=routeFor(m.id,p.routeId);route=r.name;
+    const limited=new Set<string>();
+    for(const m of candidates){if(limited.has(m.providerId))continue;used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
+      let r=routeFor(m.id,p.routeId,p.kind);route=r.name;
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
-        if(attempt>0&&settings.rotate){r=routeFor(m.id,p.routeId);route=r.name;}
+        if(attempt>0&&settings.rotate){r=routeFor(m.id,p.routeId,p.kind);route=r.name;}
         tried=true;t0=Date.now();
         try{
           upstream=await providerChat(p,m,chat,controller.signal,r.id,sessionFor(k.id,chat.messages,req.headers),requestId);status=upstream.status;
           if(upstream.ok)break;
           fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
+          // Kilo's anonymous limit covers every Kilo model at once: they all rest together and the rest of this request skips them.
+          if(p.kind==='kilo'&&isAddressLimit(status,message)){const until=pauseKilo(p.id,message);limited.add(p.id);fault=false;retryAfter=String(Math.ceil(KILO_LIMIT_PAUSE_MS/1000));
+            const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from this one. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
+            notify('Kilo free limit reached',plain,'warning','kilo-limit',3600000);message=plain;break;}
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
           const refused=takeRefused(requestId);if(refused)confirmedClean=true;const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
@@ -73,12 +79,12 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(blocked||final)classifyModel(m,status,message,Date.now()-t0,retryMs);
           if(blocked)throw new GatewayError(message,status,'upstream_error');
           if(final)break;
-          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;}}
+          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}
         }catch(e){
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
-          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&!settings.rotate&&attempt<attempts&&!controller.signal.aborted){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&!settings.rotate&&attempt<attempts&&!controller.signal.aborted){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;continue;}}
           if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
-          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;}}}
+          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}}
       }
       if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500)break;
     }
@@ -123,7 +129,7 @@ export function readiness(){
 export async function probeModel(id:string){
   const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);
   const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)throw new GatewayError('Provider is disabled',400);
-  const route=routeFor(id,p.routeId);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
+  const route=routeFor(id,p.routeId,p.kind);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
   try{
     release=await queue.acquire('availability-probe',1,c.signal);
     const r=await providerChat(p,m,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:16,stream:true},c.signal,route.id,'probe-'+crypto.randomUUID());

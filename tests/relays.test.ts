@@ -39,7 +39,11 @@ test('The Vercel Bun template needs the token, allows only OpenCode hosts, drops
   seen = undefined; const avoided = await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...RELAY, 'x-relay-key': 'secret', 'x-relay-avoid': '198.51.100.1, 203.0.113.7' }, body: '{}' }));
   expect(avoided.status).toBe(409); expect(avoided.headers.get('x-relay-rotate')).toBe('1'); expect(avoided.headers.get('x-relay-egress')).toBe('203.0.113.7'); expect(seen).toBeUndefined();
   const realExit = process.exit; let exited = 0; (process as any).exit = () => { exited++; };
-  try { expect(((await (await control('recycle')).json()) as any).control).toBe('recycle'); await new Promise(r => setTimeout(r, 250)); expect(exited).toBe(1); } finally { process.exit = realExit; }
+  try {
+    expect(((await (await control('recycle')).json()) as any).control).toBe('recycle'); await new Promise(r => setTimeout(r, 250)); expect(exited).toBe(1);
+    // The instance ends once: a later request must not schedule another exit, and the 15 s backstop is cancelled.
+    await control('ping'); await (await relay.fetch(request())).text(); await new Promise(r => setTimeout(r, 250)); expect(exited).toBe(1);
+  } finally { process.exit = realExit; }
 });
 test('The Netlify relay calls OpenCode over Node with Bun\'s cipher list, drops identity headers, keeps the answer intact and reports its runtime', async () => {
   process.env.POLYGATE_RELAY_TOKEN = 'secret';
@@ -102,4 +106,42 @@ test('The Netlify relay compares the access key as equal-length digests and neve
     for (const k of ['x-relay-avoid', 'x-relay-control', 'x-relay-hold']) expect(k in opts.headers).toBe(false);
     expect(opts.headers['x-relayed-by']).toBe('keep');
   } finally { https.request = real; }
+});
+test('Both templates forward to Kilo\'s gateway and still refuse every other host', async () => {
+  process.env.POLYGATE_RELAY_TOKEN = 'secret';
+  const kilo = { 'x-relay-target': 'https://api.kilo.ai', 'x-relay-path': '/api/gateway/chat/completions', 'x-relay-key': 'secret' };
+  const { default: relay } = await import('../relays/vercel-bun/api/relay.js');
+  globalThis.fetch = (async (url: any, init: any) => { seen = { url: String(url), headers: new Headers(init?.headers) }; return new Response('ok'); }) as any;
+  seen = undefined; expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: kilo, body: '{}' }))).status).toBe(200);
+  expect(seen!.url).toBe('https://api.kilo.ai/api/gateway/chat/completions');
+  for (const host of ['https://api.kilo.ai.evil.example', 'https://kilo.ai', 'https://example.com']) expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...kilo, 'x-relay-target': host }, body: '{}' }))).status).toBe(403);
+  const { handler } = (await import('node:module')).createRequire(import.meta.url)('../relays/netlify-relay.js?kilo');
+  const event = (target: string) => ({ httpMethod: 'POST', body: '{}', isBase64Encoded: false, headers: { ...kilo, 'x-relay-target': target } });
+  for (const host of ['https://api.kilo.ai.evil.example', 'https://kilo.ai', 'https://example.com']) expect((await handler(event(host))).statusCode).toBe(403);
+  const https = (await import('node:https')).default as any; const { EventEmitter } = await import('node:events'); const real = https.request; let opts: any;
+  https.request = (o: any, cb: any) => { opts = o; const req: any = new EventEmitter(); req.destroy = () => {}; req.end = () => { const res: any = new EventEmitter(); res.statusCode = 200; res.headers = { 'content-type': 'application/json' }; cb(res); res.emit('data', Buffer.from('{}')); res.emit('end'); }; return req; };
+  try { expect((await handler(event('https://api.kilo.ai'))).statusCode).toBe(200); expect(opts.host).toBe('api.kilo.ai'); expect(opts.path).toBe('/api/gateway/chat/completions'); } finally { https.request = real; }
+});
+
+test('The Cloudflare Worker needs the token, forwards to Kilo only, drops identity headers and streams the answer', async () => {
+  const { default: worker } = await import('../relays/cloudflare-worker.js');
+  const env = { RELAY_TOKEN: 'secret' }; const kilo = { 'x-relay-target': 'https://api.kilo.ai', 'x-relay-path': '/api/gateway/chat/completions?x=1', 'x-relay-key': 'secret' };
+  const call = (headers: Record<string, string>, e: any = env) => worker.fetch(new Request('https://relay.example/', { method: 'POST', headers, body: '{}' }), e);
+  let seen: { url: string; headers: Headers } | undefined;
+  globalThis.fetch = (async (url: any, init: any) => { seen = { url: String(url), headers: new Headers(init?.headers) }; return new Response('data: hi\n\n', { status: 200, headers: { 'content-type': 'text/event-stream', 'content-encoding': 'gzip', 'content-length': '999', 'x-up': '1' } }); }) as any;
+  expect((await call({ ...kilo, 'x-relay-key': 'wrong' })).status).toBe(401); expect((await call(kilo, {})).status).toBe(401); expect((await call({ ...kilo, 'x-relay-key': '' })).status).toBe(401);
+  for (const target of ['https://opencode.ai', 'https://api.kilo.ai.evil.example', 'https://kilo.ai', 'http://api.kilo.ai', 'https://user:pw@api.kilo.ai']) expect((await call({ ...kilo, 'x-relay-target': target })).status).toBe(403);
+  expect((await call({ ...kilo, 'x-relay-path': '//evil.example/x' })).status).toBe(403);
+  expect(seen).toBeUndefined(); // nothing was forwarded for any refused request
+  const other = { ...kilo, 'x-relay-target': 'https://example.com' };
+  expect((await call(other)).status).toBe(403); expect((await call(other, { ...env, POLYGATE_ALLOWED_HOSTS: 'api.kilo.ai, example.com' })).status).toBe(200);
+  seen = undefined;
+  const r = await call({ ...kilo, ...PLATFORM, 'content-type': 'application/json', 'x-session-id': 'ses_abc' });
+  expect(r.status).toBe(200); expect(await r.text()).toBe('data: hi\n\n'); expect(r.headers.get('x-relay-runtime')).toBe('cloudflare-worker'); expect(r.headers.get('x-up')).toBe('1'); expect(r.headers.has('content-encoding')).toBe(false); expect(r.headers.has('content-length')).toBe(false);
+  expect(seen!.url).toBe('https://api.kilo.ai/api/gateway/chat/completions?x=1'); expect(seen!.headers.get('content-type')).toBe('application/json'); expect(seen!.headers.get('x-session-id')).toBe('ses_abc');
+  for (const k of [...Object.keys(PLATFORM), 'x-relay-key', 'x-relay-target', 'x-relay-path']) expect(seen!.headers.has(k)).toBe(false);
+  globalThis.fetch = (async () => new Response('ip=203.0.113.9\nloc=DE\n')) as any;
+  const ping = await worker.fetch(new Request('https://relay.example/', { headers: { 'x-relay-key': 'secret', 'x-relay-control': 'ping' } }), env); expect(await ping.json()).toEqual({ egress: '203.0.113.9', runtime: 'cloudflare-worker' });
+  globalThis.fetch = (async () => { throw new Error('connect failed'); }) as any;
+  const down = await call(kilo); expect(down.status).toBe(502); expect(((await down.json()) as any).error).toContain('connect failed');
 });

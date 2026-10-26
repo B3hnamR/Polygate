@@ -32,8 +32,9 @@ app.whenReady().then(async()=>{
     win.webContents.on('render-process-gone',(_,d)=>{fs.writeSync(log,`[desktop] renderer gone: ${d.reason} (${d.exitCode})\n`);if(quitting||d.reason==='clean-exit')return;if(gone++){dialog.showErrorBox('Polygate window crashed',`The window crashed twice. Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}else win.loadURL(home);});
     await win.loadURL(home);if(process.env.POLYGATE_DESKTOP_SMOKE!=='1')win.show();
     if(process.env.POLYGATE_DESKTOP_SMOKE==='1'){
-      const authenticated=await win.webContents.executeJavaScript(`fetch('/admin/state',{headers:{authorization:'Bearer '+sessionStorage.getItem('polygate-token')}}).then(r=>r.ok)`);
-      const identity=await win.webContents.executeJavaScript(`fetch('/admin/whoami',{headers:{authorization:'Bearer '+sessionStorage.getItem('polygate-token')}}).then(r=>r.json())`);
+      // The dashboard exchanges the launch token for a session cookie and then forgets it; the smoke check uses that cookie, like the UI.
+      const authenticated=await win.webContents.executeJavaScript(`(async()=>{for(let i=0;i<50;i++){const w=await fetch('/admin/whoami').then(r=>r.json());if(w.authenticated)return (await fetch('/admin/state')).ok;await new Promise(r=>setTimeout(r,100));}return false;})()`);
+      const identity=await win.webContents.executeJavaScript(`fetch('/admin/whoami').then(r=>r.json())`);
       fs.writeFileSync(path.join(logDir,'desktop-smoke.json'),JSON.stringify({ok:authenticated&&identity.authenticated&&identity.mode==='desktop',mode:identity.mode,title:win.getTitle(),url:new URL(win.webContents.getURL()).pathname}));setTimeout(()=>app.quit(),1000);
     }
     child.on('exit',code=>{if(!quitting){dialog.showErrorBox('Polygate gateway stopped',`The gateway exited (${code}). Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}});

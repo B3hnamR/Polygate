@@ -7,6 +7,7 @@ import { admin } from './admin';
 import { GatewayError } from './queue';
 import { inference, clientKey, readJson, json, probeModel, queue, readiness } from './gateway';
 import { initBridge, discover, stopBridge } from './providers';
+import { KILO_ID } from './kilo';
 import { serve } from './serve';
 import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, signOutEverywhere, passwordManagedByEnv } from './auth';
 import { startWarp, stopWarp } from './warp';
@@ -15,6 +16,9 @@ import { startPoolMaintenance } from './pool';
 import { startExitRecheck } from './transport';
 import { prometheus } from './metrics';
 import { httpsRuntime, startHttps, stopHttps } from './https';
+import { flushKeys, modelAllowed } from './keys';
+import { version } from './version';
+import { closeSocksBridges } from './socks-bridge';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
   const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');
@@ -32,14 +36,16 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
       else if(req.headers.origin){let originHost='';try{originHost=new URL(String(req.headers.origin)).host;}catch{/* malformed origin is refused below */}
         if(originHost!==hostHeader&&!(process.env.POLYGATE_DEV==='1'&&req.headers.origin==='http://127.0.0.1:5173'))throw new GatewayError('Cross-origin request refused',403);}
       if(isHttps(req))res.setHeader('strict-transport-security','max-age=31536000');
-      if(p==='/health'||p==='/healthz')return json(res,200,{ok:true,app:'Polygate',version:'0.1.0',enabled:settings.enabled,uptime:Math.round(process.uptime())});
+      if(p==='/health'||p==='/healthz')return json(res,200,{ok:true,app:'Polygate',version,enabled:settings.enabled,uptime:Math.round(process.uptime())});
       if(p==='/readyz'){const r=readiness();return json(res,r.ready?200:503,{status:r.ready?'ready':'not_ready',...r});}
       if(p==='/metrics'&&req.method==='GET'){if(!authed(req))throw new GatewayError('Sign in required',401,'authentication_error');res.writeHead(200,{'content-type':'text/plain; version=0.0.4; charset=utf-8','cache-control':'no-store'});res.end(prometheus());return;}
       if(p==='/admin/whoami'&&req.method==='GET')return json(res,200,{authenticated:authed(req),mode:serverConfig().desktop?'desktop':'server',passwordManagedByEnv:passwordManagedByEnv()});
       if(p==='/admin/login'&&req.method==='POST'){
         if(!String(req.headers['content-type']||'').startsWith('application/json'))throw new GatewayError('JSON content type required',415);
         const ip=clientIp(req);const wait=loginGate.retryAfter(ip);if(wait){res.setHeader('retry-after',String(wait));throw new GatewayError(`Too many sign-in attempts. Try again in ${Math.ceil(wait/60)} minute(s).`,429,'rate_limited');}
-        const b=await readJson(req);if(!verifyPassword(String(b.password||''),token)){loginGate.fail(ip);throw new GatewayError('Incorrect password',401,'authentication_error');}
+        // The attempt is counted before the body is read: parallel slow-body requests used to all pass the check above before any failed.
+        loginGate.fail(ip);
+        const b=await readJson(req,4096);if(!verifyPassword(String(b.password||''),token))throw new GatewayError('Incorrect password',401,'authentication_error');
         loginGate.clear(ip);res.setHeader('set-cookie',sessionCookie(createSession(),isHttps(req)));return json(res,200,{ok:true});
       }
       if(p==='/admin/logout'&&req.method==='POST'){res.setHeader('set-cookie',sessionCookie('',isHttps(req),0));return json(res,200,{ok:true});}
@@ -52,7 +58,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
         if(p==='/admin/shutdown'&&req.method==='POST'){json(res,200,{ok:true});setTimeout(()=>close().then(()=>process.exit(0)),100);return;}
         return await admin(req,res,p);
       }
-      if(p==='/v1/models'&&req.method==='GET'){const k=clientKey(req);return json(res,200,{object:'list',data:[{id:'auto',object:'model',owned_by:'polygate'},...[...models.values()].filter(m=>settings.providers.some(x=>x.id===m.providerId&&x.enabled)&&m.state!=='unavailable'&&(!k.models?.length||k.models.includes(m.id))).map(m=>({id:m.id,object:'model',owned_by:m.providerId}))]});}
+      if(p==='/v1/models'&&req.method==='GET'){const k=clientKey(req);return json(res,200,{object:'list',data:[{id:'auto',object:'model',owned_by:'polygate'},...[...models.values()].filter(m=>settings.providers.some(x=>x.id===m.providerId&&x.enabled)&&m.state!=='unavailable'&&modelAllowed(k,m.id)).map(m=>({id:m.id,object:'model',owned_by:m.providerId}))]});}
       if(req.method==='POST'&&['/v1/chat/completions','/v1/responses','/v1/messages'].includes(p))return await inference(req,res,p.endsWith('/responses')?'responses':p.endsWith('/messages')?'anthropic':'chat');
       if(p==='/v1/messages/count_tokens'&&req.method==='POST'){clientKey(req);const b=await readJson(req);return json(res,200,{input_tokens:Math.ceil(JSON.stringify(b).length/4),estimated:true});}
       if(req.method==='GET'&&!p.startsWith('/v1/')){
@@ -65,30 +71,51 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
     }catch(e:any){if(!res.headersSent&&e.retryAfter&&!res.getHeader('retry-after'))res.setHeader('retry-after',String(e.retryAfter));if(!res.headersSent)json(res,e.status||500,{error:{type:e.type||'gateway_error',message:redactError(e.message||String(e))}});else res.end();}
   };
   // HTTPS (when configured) applies from the first request: the same handler is bound with a certificate, on the configured port.
-  const secure=httpsRuntime();
-  const recoveryOnly=!!settings.https&&settings.https.mode!=='off'&&!secure.tls;
-  let server=serve(handler,secure.port||port,secure.tls?'0.0.0.0':recoveryOnly?'127.0.0.1':host,secure.tls);
+  // The desktop app never serves HTTPS: a saved HTTPS setting (from a server install's state, or set through the API) is ignored there.
+  const desktop=serverConfig().desktop;
+  const secure:ReturnType<typeof httpsRuntime>=desktop?{}:httpsRuntime();
+  const recoveryOnly=!desktop&&!!settings.https&&settings.https.mode!=='off'&&!secure.tls;
+  const firstHost=secure.tls?'0.0.0.0':recoveryOnly?'127.0.0.1':host;
+  let server=serve(handler,secure.port||port,firstHost,secure.tls);
   if(recoveryOnly)console.error('[https] Configured certificate is unavailable; HTTP recovery is loopback-only until issuance succeeds.');
   let actual=server.port as number;
+  let current:{port:number;host:string;tls?:{cert:string;key:string}}={port:actual,host:firstHost,tls:secure.tls};
   // Swaps the listener (new certificate, new port, HTTPS on or off). The new socket is up before the old one stops accepting, so requests are not refused.
+  // Where the port cannot be shared (same port, no reusePort), the old socket closes first; if the new bind then fails too, the previous
+  // listener is bound again, so a failed swap never leaves the panel unreachable until a restart.
   const rebind=async(o:{port:number;host:string;tls?:{cert:string;key:string}})=>{
-    let next;try{next=serve(handler,o.port,o.host,o.tls,true);}catch{server.stop();next=serve(handler,o.port,o.host,o.tls);}
-    const old=server;server=next;actual=next.port as number;old.stop();return actual;
+    let next;
+    try{next=serve(handler,o.port,o.host,o.tls,true);}
+    catch{
+      server.stop();
+      try{next=serve(handler,o.port,o.host,o.tls);}
+      catch(e){
+        try{server=serve(handler,current.port,current.host,current.tls);actual=server.port as number;}
+        catch(restore){console.error('[https] Could not restore the previous listener:',redactError(String(restore)));}
+        throw e;
+      }
+      server=next;actual=next.port as number;current={...o,port:actual};return actual;
+    }
+    const old=server;server=next;actual=next.port as number;current={...o,port:actual};old.stop();return actual;
   };
-  const close=async()=>{server.stop(true);stopHttps();stopBridge();await stopWarp();};
+  const close=async()=>{flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();await stopWarp();};
   if(process.env.POLYGATE_NO_DISCOVERY!=='1')discover().catch(e=>console.error('[catalog]',redactError(String(e))));
   startWarp().catch(e=>console.error('[warp]',redactError(String(e))));
   const stopPool=startPoolMaintenance();
-  startHttps(rebind,{port:secure.tls?port:actual,host}).catch(e=>console.error('[https]',redactError(String(e))));
+  if(!desktop)startHttps(rebind,{port:secure.tls?port:actual,host}).catch(e=>console.error('[https]',redactError(String(e))));
   const stopNotifier=startNotifier();
   const stopRecheck=startExitRecheck();
   // Models whose probe never reached a verdict (full queue, no route) keep an old checkedAt, so attempts are tracked separately.
   let last=Date.now();let probing=false;const attempted=new Map<string,number>();const timer=setInterval(()=>{
     if(Date.now()-last>=settings.refreshMinutes*60000){last=Date.now();discover().catch(()=>{});}
-    if(settings.autoProbe&&settings.enabled&&!probing&&queue.active===0){const due=Date.now()-settings.refreshMinutes*60000;const candidate=[...models.values()].find(m=>m.state!=='unavailable'&&m.cooldownUntil<=Date.now()&&Math.max(m.checkedAt,attempted.get(m.id)||0)<due&&settings.providers.some(p=>p.id===m.providerId&&p.enabled));if(candidate){probing=true;attempted.set(candidate.id,Date.now());probeModel(candidate.id).catch(()=>{}).finally(()=>{probing=false;});}}
+    if(settings.autoProbe&&settings.enabled&&!probing&&queue.active===0){const due=Date.now()-settings.refreshMinutes*60000;const candidate=[...models.values()].find(m=>m.state!=='unavailable'&&m.providerId!==KILO_ID&&m.cooldownUntil<=Date.now()&&Math.max(m.checkedAt,attempted.get(m.id)||0)<due&&settings.providers.some(p=>p.id===m.providerId&&p.enabled));if(candidate){probing=true;attempted.set(candidate.id,Date.now());probeModel(candidate.id).catch(()=>{}).finally(()=>{probing=false;});}}
   },60000);timer.unref();
   if(password.generated)console.log(JSON.stringify({polygateDashboardPassword:{file:password.file}}));
   console.log(JSON.stringify({polygateReady:true,port:actual,host,https:!!secure.tls}));
   return {get server(){return server;},get port(){return actual;},token,close:async()=>{clearInterval(timer);stopNotifier();stopRecheck();stopPool();await close();}};
 }
-if(import.meta.main){const app=await startGateway();for(const signal of ['SIGINT','SIGTERM'] as const)process.on(signal,()=>app.close().then(()=>process.exit(0)));}
+if(import.meta.main){
+  // A forgotten promise (a cancelled body, a background check) must not end a gateway that is serving other requests: log it instead.
+  process.on('unhandledRejection',e=>console.error('[gateway] Unhandled rejection:',redactError(String((e as any)?.stack||e))));
+  const app=await startGateway();for(const signal of ['SIGINT','SIGTERM'] as const)process.on(signal,()=>app.close().then(()=>process.exit(0)));
+}

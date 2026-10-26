@@ -10,20 +10,29 @@ const loopbackHost = /^(127\.0\.0\.1|localhost|\[::1\])$/i;
 export function serverConfig() {
   const host = process.env.POLYGATE_HOST || '127.0.0.1';
   const list = (process.env.POLYGATE_ALLOWED_HOSTS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+  // POLYGATE_TRUST_PROXY=1 trusts one reverse proxy in front; a larger number trusts that many hops (for example a CDN plus a proxy).
+  const hops = /^\d+$/.test(process.env.POLYGATE_TRUST_PROXY || '') ? Math.min(10, Number(process.env.POLYGATE_TRUST_PROXY)) : 0;
   return {
     host, desktop: process.env.POLYGATE_DESKTOP === '1',
-    trustProxy: process.env.POLYGATE_TRUST_PROXY === '1',
+    trustProxy: hops > 0, proxyHops: hops,
     // Host-header pinning defends a loopback listener against DNS rebinding; a public listener is protected by login and API keys instead.
     allowAnyHost: list.includes('*') || !loopbackHost.test(host), allowedHosts: list,
     cookieSecure: process.env.POLYGATE_COOKIE_SECURE || 'auto',
   };
 }
+const bare = (h: string) => h.replace(/^\[|\]$/g, '').toLowerCase();
 export const hostAllowed = (hostHeader: string) => {
   const cfg = serverConfig(); const name = hostHeader.replace(/:\d+$/, '').toLowerCase();
-  return cfg.allowAnyHost || loopbackHost.test(name) || cfg.allowedHosts.includes(name);
+  if (cfg.allowAnyHost || loopbackHost.test(name) || cfg.allowedHosts.includes(name)) return true;
+  // The name the HTTPS certificate was issued for is this server's own name, even when POLYGATE_HOST was left at loopback.
+  const https = settings.https; if (!https || https.mode === 'off') return false;
+  return [https.domain, https.ip].some(h => !!h && bare(h) === bare(name));
 };
+// Each proxy appends the address it received the request from, so only the right-hand entries were written by trusted hops; everything
+// to the left of them came from the client and can be forged. The left-most entry used to be taken, which reset lockouts on every request.
 export function clientIp(req: IncomingMessage) {
-  if (serverConfig().trustProxy) { const f = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim(); if (f) return f; }
+  const cfg = serverConfig();
+  if (cfg.trustProxy) { const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean); const f = chain[Math.max(0, chain.length - cfg.proxyHops)]; if (f) return f; }
   return String((req as any).socket?.remoteAddress || 'unknown');
 }
 export const isHttps = (req: IncomingMessage) => {
@@ -32,13 +41,25 @@ export const isHttps = (req: IncomingMessage) => {
   return serverConfig().trustProxy && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
 };
 // Sliding-window failure counter used for login attempts and invalid API keys.
+// IPv6 clients are counted per /64 (one customer's allocation), so cycling through addresses in one network does not reset the count.
+export function gateKey(ip: string) {
+  const v4 = ip.match(/^(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)$/i); if (v4) return v4[1];
+  if (!ip.includes(':')) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('%')[0].split('::'); const left = head ? head.split(':') : []; const right = tail ? tail.split(':') : [];
+  const full = ip.includes('::') ? [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right] : left;
+  return full.slice(0, 4).map(x => x.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
 export class FailureGate {
   private hits = new Map<string, number[]>();
-  constructor(private max: number, private windowMs: number) {}
+  constructor(private max: number, private windowMs: number, private capacity = 5000) {}
   private recent(key: string) { const cutoff = Date.now() - this.windowMs; const list = (this.hits.get(key) || []).filter(t => t > cutoff); if (list.length) this.hits.set(key, list); else this.hits.delete(key); return list; }
-  retryAfter(key: string) { const list = this.recent(key); return list.length >= this.max ? Math.max(1, Math.ceil((list[0] + this.windowMs - Date.now()) / 1000)) : 0; }
-  fail(key: string) { if (this.hits.size > 5000) this.hits.clear(); this.hits.set(key, [...this.recent(key), Date.now()]); }
-  clear(key: string) { this.hits.delete(key); }
+  retryAfter(ip: string) { const list = this.recent(gateKey(ip)); return list.length >= this.max ? Math.max(1, Math.ceil((list[0] + this.windowMs - Date.now()) / 1000)) : 0; }
+  // At capacity the least recently failing addresses are dropped. The map used to be cleared, which reset every lockout at once.
+  fail(ip: string) {
+    const key = gateKey(ip); const list = [...this.recent(key), Date.now()]; this.hits.delete(key); this.hits.set(key, list);
+    for (const old of this.hits.keys()) { if (this.hits.size <= this.capacity) break; this.hits.delete(old); }
+  }
+  clear(ip: string) { this.hits.delete(gateKey(ip)); }
   reset() { this.hits.clear(); }
 }
 export const loginGate = new FailureGate(5, 10 * 60000);

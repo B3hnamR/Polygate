@@ -8,23 +8,25 @@ import { testRoute, describeRoutes, backupChain } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, ensureRoute as ensureWarpRoute } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
+import { KILO_ID, KILO_BASE } from './kilo';
 import { deployRelay, inspectVercel } from './relay-deploy';
 import { metrics } from './metrics';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig } from './auth';
 import { GatewayError } from './queue';
+import { version } from './version';
 import type { Provider, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
 export async function admin(req:IncomingMessage,res:ServerResponse,pathname:string){
   const method=req.method;
-  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version:'0.1.0',runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
+  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Request-shape records (no prompt or completion content) for working out why a request was refused.
   if(pathname==='/admin/request'&&method==='GET'){const id=new URL(req.url||'','http://x').searchParams.get('id')||'';const row=requestDetail(id);if(!row)throw new GatewayError('Request not found',404);return json(res,200,row);}
-  if(pathname==='/admin/diagnostics'&&method==='GET'){const q=new URL(req.url||'','http://x').searchParams;return json(res,200,{failures:recentFailureDetails(Math.min(100,Number(q.get('failures'))||20)),baseline:recentBaselineDetails(Math.min(20,Number(q.get('baseline'))||5))});}
+  if(pathname==='/admin/diagnostics'&&method==='GET'){const q=new URL(req.url||'','http://x').searchParams;return json(res,200,{failures:recentFailureDetails(Math.max(1,Math.min(100,Math.floor(Number(q.get('failures')))||20))),baseline:recentBaselineDetails(Math.max(1,Math.min(20,Math.floor(Number(q.get('baseline')))||5)))});}
   if(pathname==='/admin/settings'&&method==='POST'){
     const b=await readJson(req);const next:Partial<Settings>={};
     for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','exhaustedFailover','catalogDirect'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
@@ -45,13 +47,14 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/model'&&method==='POST'){const b=await readJson(req);const m=models.get(b.id);if(!m)throw new GatewayError('Model not found',404);const priority=b.priority!==undefined?bounded(b.priority,0,1000):m.priority;const score=b.score!==undefined?bounded(b.score,0,100):m.score;m.priority=priority;m.score=score;saveModel(m);return json(res,200,{ok:true});}
   if(pathname==='/admin/providers'&&method==='POST'){
     const b=await readJson(req);const old=settings.providers.find(p=>p.id===b.id);
-    if(!['free','openai','opencode'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
+    if(!['free','openai','opencode','kilo'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
     if(b.routeId&&!settings.routes.some(r=>r.id===b.routeId))throw new GatewayError('Provider route does not exist',400);
-    const p:Provider={id:old?.id||'p-'+randomBytes(4).toString('hex'),name:String(b.name||'New provider').slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:String(b.routeId||'')};
+    if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
+    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:'p-'+randomBytes(4).toString('hex')),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:String(b.routeId||'')};
     if(p.kind==='free'&&settings.providers.some(x=>x.kind==='free'&&x.id!==p.id))throw new GatewayError('Only one adaptive Free provider is supported',400);
     if(old)Object.assign(old,p);else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
   }
-  if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode')throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
+  if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode'||b.id===KILO_ID)throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
   if(pathname==='/admin/routes'&&method==='POST'){
     const b=await readJson(req);if(!['proxy','relay','warp'].includes(b.kind))throw new GatewayError('Choose proxy, relay, or WARP',400);
     const old=settings.routes.find(r=>r.id===b.id);if(old&&(old.id==='direct'||old.id==='proxy-pool'||old.managed))throw new GatewayError('This route is managed by Polygate and cannot be edited',409);
@@ -70,10 +73,11 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(String(b.token||''),b.teamId?String(b.teamId):undefined));}
   // One-click relay: deploys the bundled template with the platform's API token (used for this call only, never saved), then saves the relay as a route.
   if(pathname==='/admin/relays/deploy'&&method==='POST'){
-    const b=await readJson(req);const r=await deployRelay({platform:b.platform,token:String(b.token||''),name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined});
-    const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${r.platform==='netlify'?'Netlify':'Vercel'} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{})};
+    const b=await readJson(req);const r=await deployRelay({platform:b.platform,token:String(b.token||''),name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:b.accountId?String(b.accountId):undefined});
+    const label={netlify:'Netlify',cloudflare:'Cloudflare',vercel:'Vercel'}[r.platform];
+    const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${label} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{}),...(r.only?{only:r.only}:{})};
     settings.routes.push(route);persist();
-    return json(res,200,{ok:true,id:route.id,name:r.name,url:r.url,platform:r.platform,runtime:r.runtime,region:r.region,reachable:r.reachable,status:r.status,detail:r.detail});
+    return json(res,200,{ok:true,id:route.id,name:r.name,url:r.url,platform:r.platform,runtime:r.runtime,region:r.region,only:r.only,reachable:r.reachable,status:r.status,detail:r.detail});
   }
   // --- Cloudflare WARP ---
   if(pathname==='/admin/warp/status'&&method==='GET')return json(res,200,await warpStatus());
@@ -136,6 +140,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // Model-test the proxies already saved: OpenCode API check, speed gate, model test, then the working ones go into the pool.
   if(pathname==='/admin/pool/find'&&method==='POST'){const b=await readJson(req);return json(res,200,await testPool({deep:true,api:true,attach:{select:b.select===true}}));}
   // --- HTTPS ---
+  // The desktop app is pinned to a loopback HTTP listener; HTTPS would bind every interface on 443/80 at the next start.
+  if(pathname.startsWith('/admin/https')&&serverConfig().desktop)throw new GatewayError('HTTPS is configured on a server install, not in the desktop app',404);
   if(pathname==='/admin/https'&&method==='GET')return json(res,200,await httpsStatus());
   if(pathname==='/admin/https/apply'&&method==='POST'){const b=await readJson(req);return json(res,200,await httpsApply(b));}
   if(pathname==='/admin/https/renew'&&method==='POST')return json(res,200,await httpsRenew());

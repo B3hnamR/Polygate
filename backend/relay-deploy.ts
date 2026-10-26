@@ -2,17 +2,19 @@ import { randomBytes, createHash } from 'node:crypto';
 import { GatewayError } from './queue';
 import vercelModule from '../relays/vercel-bun/api/relay.js' with { type: 'text' };
 import netlifyModule from '../relays/netlify-relay.js' with { type: 'text' };
+import cloudflareModule from '../relays/cloudflare-worker.js' with { type: 'text' };
 // One-click relay deployment. The platform API token is used for this call only: it is never written to settings, logs or the saved route.
 // The relay's own access token is generated here, stored as a secret on the platform, and returned once to be saved in the Polygate route.
 // A relay is the TLS client OpenCode Free sees, and the Free tier accepts a client only if its handshake lists Bun's 17 cipher suites in Bun's order
 //. Vercel runs the relay on Bun. Netlify runs it on Node with that cipher list. Cloudflare Workers and Deno Deploy
-// give a function no control over the cipher list, and OpenCode Free refused a Cloudflare Worker, so they are not offered.
-const sources = { vercel: vercelModule as unknown as string, netlify: netlifyModule as unknown as string };
-export type Platform = 'vercel' | 'netlify';
+// give a function no control over the cipher list, and OpenCode Free refused a Cloudflare Worker, so a Worker relay forwards to Kilo only (Kilo does not check the handshake).
+const sources = { vercel: vercelModule as unknown as string, netlify: netlifyModule as unknown as string, cloudflare: cloudflareModule as unknown as string };
+export type Platform = 'vercel' | 'netlify' | 'cloudflare';
 // runtime (Vercel only): 'bun' (default) or 'node' (the same relay with Bun's cipher list set explicitly).
-export type DeployInput = { platform: Platform; token: string; name?: string; region?: string; teamId?: string; runtime?: 'bun' | 'node' };
-export type DeployResult = { platform: Platform; name: string; url: string; accessToken: string; buffered: boolean; runtime: 'bun' | 'node-bun-ciphers'; region?: string; reachable: boolean; status: number; detail: string };
-export const PLATFORMS: Platform[] = ['vercel', 'netlify'];
+// accountId (Cloudflare only): the account the Worker is created in.
+export type DeployInput = { platform: Platform; token: string; name?: string; region?: string; teamId?: string; runtime?: 'bun' | 'node'; accountId?: string };
+export type DeployResult = { platform: Platform; name: string; url: string; accessToken: string; buffered: boolean; runtime: 'bun' | 'node-bun-ciphers' | 'cloudflare-worker'; region?: string; only?: 'kilo'; reachable: boolean; status: number; detail: string };
+export const PLATFORMS: Platform[] = ['vercel', 'netlify', 'cloudflare'];
 const fail = (message: string, status = 502) => new GatewayError(message, status, 'deploy_failed');
 const slug = (value: string | undefined, fallback: string) => { const s = String(value || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40); return s || fallback + '-' + randomBytes(2).toString('hex'); };
 const accessToken = () => randomBytes(24).toString('base64url');
@@ -90,6 +92,23 @@ async function deployNetlify(i: DeployInput, access: string): Promise<{ name: st
   const host = String(site.default_domain || site.ssl_url?.replace(/^https:\/\//, '') || `${name}.netlify.app`);
   return { name, url: `https://${host}/.netlify/functions/relay`, buffered: true, runtime: 'node-bun-ciphers' };
 }
+// A Worker needs the account's workers.dev address to be reachable; creating that address would rename the whole account's subdomain, so it is only asked for.
+async function deployCloudflare(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'cloudflare-worker'; only: 'kilo' }> {
+  const account = String(i.accountId || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(account)) throw new GatewayError('Enter the Cloudflare Account ID: 32 letters and digits, shown in the dashboard under Workers & Pages', 400);
+  const secrets = [i.token, access]; const auth = { authorization: 'Bearer ' + i.token }; const base = `https://api.cloudflare.com/client/v4/accounts/${account}`;
+  const name = slug(i.name, 'polygate-relay');
+  const subdomain = (await api('Cloudflare', `${base}/workers/subdomain`, { headers: auth }, secrets))?.result?.subdomain;
+  if (!subdomain) throw fail('This Cloudflare account has no workers.dev address yet. Open Workers & Pages in the Cloudflare dashboard once to create it, then deploy again.', 400);
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify({ main_module: 'worker.js', compatibility_date: '2025-01-01', bindings: [{ type: 'secret_text', name: 'RELAY_TOKEN', text: access }] })], { type: 'application/json' }));
+  form.append('worker.js', new Blob([sources.cloudflare], { type: 'application/javascript+module' }), 'worker.js');
+  await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'PUT', headers: auth, body: form }, secrets);
+  // If anything after the upload fails, the half-made Worker is removed so a retry does not leave stray Workers behind.
+  try { await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}/subdomain`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true }) }, secrets); }
+  catch (e) { await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
+  return { name, url: `https://${name}.${subdomain}.workers.dev`, buffered: false, runtime: 'cloudflare-worker', only: 'kilo' };
+}
 // What the Vercel account allows. Limits are the published ones (vercel.com/docs/limits and /docs/functions/configuring-functions/region, read 26 October 2026).
 const PLAN_LIMITS: Record<string, { regionsPerProject: number; deploymentsPerDay: number; projects: number | null }> = {
   hobby: { regionsPerProject: 1, deploymentsPerDay: 100, projects: 200 }, pro: { regionsPerProject: 5, deploymentsPerDay: 6000, projects: null }, enterprise: { regionsPerProject: 99, deploymentsPerDay: 24000, projects: null },
@@ -106,6 +125,15 @@ export async function inspectVercel(rawToken: string, teamId?: string): Promise<
   return { plan, team: String(team?.slug || ''), teams: teams.length, projects: (list.projects || []).length, projectsMore: !!list.pagination?.next, limits: PLAN_LIMITS[plan] };
 }
 // Calls the new relay once, with its token, for something that is not limited (the model catalog). Fresh deployments take a few seconds to answer.
+// A new Worker is not live on every Cloudflare edge at once (early requests get Cloudflare's own "not found" page), so it must answer its ping several times in a row.
+async function verifyWorker(url: string, token: string): Promise<{ reachable: boolean; status: number }> {
+  let status = 0, streak = 0;
+  for (let i = 0; i < 60 && streak < 4; i++) {
+    try { const r = await fetch(url, { headers: { 'x-relay-key': token, 'x-relay-control': 'ping' }, signal: AbortSignal.timeout(15000) }); status = r.status; const json = (r.headers.get('content-type') || '').includes('json'); await r.body?.cancel(); streak = r.ok && json ? streak + 1 : 0; } catch { streak = 0; }
+    await sleep(__timing.verify);
+  }
+  return { reachable: streak >= 4, status };
+}
 export async function verifyRelay(url: string, token: string): Promise<{ reachable: boolean; status: number }> {
   let status = 0;
   for (let i = 0; i < 8; i++) {
@@ -115,10 +143,10 @@ export async function verifyRelay(url: string, token: string): Promise<{ reachab
   return { reachable: false, status };
 }
 export async function deployRelay(input: DeployInput): Promise<DeployResult> {
-  if (!PLATFORMS.includes(input.platform)) throw new GatewayError('Choose Vercel or Netlify', 400);
-  const token = String(input.token || '').trim(); if (token.length < 8) throw new GatewayError('Enter the Vercel API token', 400);
+  if (!PLATFORMS.includes(input.platform)) throw new GatewayError('Choose Vercel, Netlify or Cloudflare', 400);
+  const token = String(input.token || '').trim(); if (token.length < 8) throw new GatewayError('Enter the platform API token', 400);
   const i = { ...input, token }; const access = accessToken();
-  const made = i.platform === 'netlify' ? await deployNetlify(i, access) : await deployVercel(i, access);
-  const check = await verifyRelay(made.url, access);
-  return { platform: i.platform, ...made, accessToken: access, ...check, detail: check.reachable ? 'The relay answered a catalog request through its access token.' : `The relay was deployed but did not answer yet (HTTP ${check.status || 'no answer'}). Give it a minute and use Test.` };
+  const made = i.platform === 'netlify' ? await deployNetlify(i, access) : i.platform === 'cloudflare' ? await deployCloudflare(i, access) : await deployVercel(i, access);
+  const check = i.platform === 'cloudflare' ? await verifyWorker(made.url, access) : await verifyRelay(made.url, access);
+  return { platform: i.platform, ...made, accessToken: access, ...check, detail: check.reachable ? (i.platform === 'cloudflare' ? 'The Worker answered its status check several times in a row through its access token. It forwards to Kilo only.' : 'The relay answered a catalog request through its access token.') : `The relay was deployed but did not answer yet (HTTP ${check.status || 'no answer'}). Give it a minute and use Test.` };
 }

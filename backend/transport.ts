@@ -73,6 +73,8 @@ async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response
   return (await exitVerifier(routeId))==='refused'?undefined:ex;
 }
 // Where a request goes when its route's exit is used up: a pool proxy that just proved itself clean, else the next healthy route.
+// Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
+const carries=(r:Route,kind?:string)=>!r.only||r.only===kind;
 export function exhaustedAlternative(current:Route):Route|undefined{
   if(settings.exhaustedFailover===false)return;
   const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!coolingDown(r));
@@ -81,13 +83,13 @@ export function exhaustedAlternative(current:Route):Route|undefined{
 }
 // Virtual routes ("pool:<proxy>") let the pool tester send real traffic through one specific proxy without saving a route for it.
 export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id&&r.enabled);
-export function routeFor(model='', explicit=''): Route {
+export function routeFor(model='', explicit='', kind?: string): Route {
   const selected=explicit||settings.routeId;
   const current=findRoute(selected);
   // The selected route's exit has used up its daily allowance: stay on a clean alternative until the allowance resets.
   if(current&&isExhausted(current)){const alt=exhaustedAlternative(current);if(alt)return alt;}
   if(!settings.rotate||explicit){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
-  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDown(r));
+  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDown(r));
   if(!pool.length)throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
   if(settings.strategy==='round_robin')return pool[cursor++%pool.length];
@@ -96,8 +98,8 @@ export function routeFor(model='', explicit=''): Route {
   return pool.find(x=>x.id===selected)||pool[0];
 }
 // Deterministic order used when a connection fails: WARP first, then the other routes in the order they were added, direct only if allowed.
-export function failoverRoutes(current: Route): Route[] {
-  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
+export function failoverRoutes(current: Route, kind?: string): Route[] {
+  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
   return [...usable.filter(r=>r.kind==='warp'),...usable.filter(r=>r.kind!=='warp'&&r.kind!=='direct'),...usable.filter(r=>r.kind==='direct')];
 }
 // One description of every route, used by the Routing page and the Proxies page so they cannot disagree.

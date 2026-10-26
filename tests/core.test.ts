@@ -2,8 +2,8 @@ import { test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-const dir=mkdtempSync(path.join(os.tmpdir(),'polygate-test-'));
-process.env.POLYGATE_STATE=dir;process.env.POLYGATE_NO_DISCOVERY='1';process.env.POLYGATE_ADMIN_TOKEN='test-admin-secret';
+// The state folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts (shared by every test file and removed after the run).
+process.env.POLYGATE_ADMIN_TOKEN='test-admin-secret';
 const {startGateway}=await import('../backend/main');
 const {settings,models,saveModel,redactError,logs,db,record,usagePenalties}=await import('../backend/state');
 const {AdmissionQueue}=await import('../backend/queue');
@@ -28,7 +28,7 @@ beforeAll(async()=>{
   for(const id of ['working','limited'])saveModel({id:'mock/'+id,upstreamId:id,providerId:'mock',name:id,context:128000,output:4096,tools:true,reasoning:false,state:'unchecked',latency:0,score:50,priority:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});
   gateway=await startGateway(0);base=`http://127.0.0.1:${gateway.port}`;
 });
-afterAll(async()=>{await gateway?.close();upstream.stop(true);const {db}=await import('../backend/state');db.close();rmSync(dir,{recursive:true,force:true});});
+afterAll(async()=>{await gateway?.close();upstream.stop(true);});
 const call=(p:string,body:any,key=settings.keys[0].value,signal?:AbortSignal)=>fetch(base+p,{method:'POST',signal,headers:{authorization:'Bearer '+key,'content-type':'application/json'},body:JSON.stringify(body)});
 test('API keys and admin sessions are separate',async()=>{
   expect((await fetch(base+'/v1/models')).status).toBe(401);
@@ -621,7 +621,58 @@ test('The dashboard password can be changed and old sessions stop working', asyn
 test('Invalid API keys are throttled per address', async () => {
   keyGate.reset(); let last = 0;
   for (let i = 0; i < 31; i++) last = (await fetch(base + '/v1/models', { headers: { authorization: 'Bearer pg_wrong' + i } })).status;
-  expect(last).toBe(429); keyGate.reset();
+  expect(last).toBe(429);
+  // Only failures are throttled: a valid key from the same (paused) address still works, so one bad client cannot lock out the rest.
+  expect((await fetch(base + '/v1/models', { headers: { authorization: 'Bearer ' + settings.keys[0].value } })).status).toBe(200);
+  keyGate.reset();
+});
+test('Lockouts: parallel slow logins are all counted, the table evicts instead of resetting, and IPv6 counts per /64', async () => {
+  loginGate.reset();
+  const login = (password: string) => fetch(base + '/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
+  const answers = await Promise.all(Array.from({ length: 8 }, (_, i) => login('guess-' + i).then(r => r.status)));
+  expect(answers.filter(s => s === 401).length).toBeLessThanOrEqual(5); expect(answers).toContain(429);
+  loginGate.reset();
+  const { FailureGate, gateKey } = await import('../backend/auth');
+  const gate = new FailureGate(2, 60000, 3); gate.fail('10.0.0.1'); gate.fail('10.0.0.1');
+  for (const ip of ['10.0.0.2', '10.0.0.3']) gate.fail(ip); expect(gate.retryAfter('10.0.0.1')).toBeGreaterThan(0);   // at capacity, still locked
+  gate.fail('10.0.0.4'); expect(gate.retryAfter('10.0.0.1')).toBe(0);   // the oldest entry made room; the others are kept
+  expect(gateKey('2001:db8:1:2:aaaa::1')).toBe(gateKey('2001:db8:1:2:ffff:1:2:3')); expect(gateKey('2001:db8:1:3::1')).not.toBe(gateKey('2001:db8:1:2::1'));
+  expect(gateKey('::ffff:192.0.2.7')).toBe('192.0.2.7');
+  expect((await fetch(base + '/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'x'.repeat(5000) }) })).status).toBe(413);
+  loginGate.reset();
+});
+test('Behind a trusted proxy the client address is the one the proxy saw, not a forged left-hand X-Forwarded-For entry', async () => {
+  const { clientIp } = await import('../backend/auth'); const saved = process.env.POLYGATE_TRUST_PROXY;
+  const req = (xff: string) => ({ headers: { 'x-forwarded-for': xff }, socket: { remoteAddress: '127.0.0.1' } }) as any;
+  try {
+    process.env.POLYGATE_TRUST_PROXY = '1'; expect(clientIp(req('6.6.6.6, 198.51.100.9'))).toBe('198.51.100.9'); expect(clientIp(req('198.51.100.9'))).toBe('198.51.100.9');
+    process.env.POLYGATE_TRUST_PROXY = '2'; expect(clientIp(req('6.6.6.6, 198.51.100.9, 203.0.113.5'))).toBe('198.51.100.9');
+    delete process.env.POLYGATE_TRUST_PROXY; expect(clientIp(req('6.6.6.6'))).toBe('127.0.0.1');
+  } finally { if (saved === undefined) delete process.env.POLYGATE_TRUST_PROXY; else process.env.POLYGATE_TRUST_PROXY = saved; }
+});
+test('HTTPS: the certificate name is an allowed Host on a loopback-configured server, and the desktop app refuses HTTPS routes', async () => {
+  const { hostAllowed } = await import('../backend/auth'); const saved = settings.https;
+  try {
+    expect(hostAllowed('panel.example.com')).toBe(false);
+    settings.https = { mode: 'domain', domain: 'panel.example.com', httpPort: 80, redirect: true }; expect(hostAllowed('panel.example.com:443')).toBe(true); expect(hostAllowed('other.example.com')).toBe(false);
+    settings.https = { mode: 'ip', ip: '2001:db8::7', httpPort: 80, redirect: true }; expect(hostAllowed('[2001:db8::7]:443')).toBe(true);
+    settings.https = { mode: 'off', domain: 'panel.example.com', httpPort: 80, redirect: true }; expect(hostAllowed('panel.example.com')).toBe(false);
+  } finally { settings.https = saved; }
+  process.env.POLYGATE_DESKTOP = '1';
+  try { expect((await fetch(base + '/admin/https', { headers: { authorization: 'Bearer test-admin-secret' } })).status).toBe(404); }
+  finally { delete process.env.POLYGATE_DESKTOP; }
+  expect((await fetch(base + '/admin/https', { headers: { authorization: 'Bearer test-admin-secret' } })).status).toBe(200);
+});
+test('Diagnostics limits cannot be negative, and /v1/models lists what a short-name scope allows', async () => {
+  const diag = await fetch(base + '/admin/diagnostics?failures=-1&baseline=-1', { headers: { authorization: 'Bearer test-admin-secret' } }); expect(diag.status).toBe(200);
+  const d = (await diag.json()) as any; expect(d.failures.length).toBeLessThanOrEqual(1); expect(d.baseline.length).toBeLessThanOrEqual(1);   // -1 used to become LIMIT -1: every row
+  const key = settings.keys[0]; const saved = key.models;
+  try { key.models = ['working']; const ids = ((await (await fetch(base + '/v1/models', { headers: { authorization: 'Bearer ' + key.value } })).json()) as any).data.map((m: any) => m.id); expect(ids).toContain('mock/working'); expect(ids).not.toContain('mock/limited'); }
+  finally { key.models = saved; }
+});
+test('The health check reports the package version', async () => {
+  const { version } = await import('../backend/version'); expect(version).toBe((await Bun.file(path.join(import.meta.dir, '..', 'package.json')).json() as any).version);
+  expect(((await (await fetch(base + '/healthz')).json()) as any).version).toBe(version);
 });
 test('Health, readiness and CORS endpoints behave for a public deployment', async () => {
   expect((await fetch(base + '/healthz')).status).toBe(200);
@@ -765,6 +816,23 @@ test('WARP: "New identity" and "Set up" without the tunnel helper fail at once i
   const saved=settings.warp;settings.warp={engine:'embedded',autoStart:false,pool:2,rotateMinutes:0,wireproxyPath:''};
   try{for(const call of [warp.warpRotate,warp.warpConnect]){const t=Date.now();const e:any=await call().catch((x:any)=>x);expect(e.message).toContain('Download tunnel helper');expect(Date.now()-t).toBeLessThan(2500);}}
   finally{settings.warp=saved;}
+});
+test('WARP: a configured helper path that is a folder or cannot be run is not used (spawning it used to end the gateway)',async()=>{
+  const warp=await import('../backend/warp');const saved=settings.warp;const tmp=mkdtempSync(path.join(os.tmpdir(),'polygate-wp-'));
+  const {writeFileSync,chmodSync}=await import('node:fs');const file=path.join(tmp,process.platform==='win32'?'wireproxy.exe':'wireproxy');writeFileSync(file,'not a program');
+  const using=(wireproxyPath:string)=>{settings.warp={engine:'embedded',autoStart:false,pool:1,rotateMinutes:0,wireproxyPath};return warp.findWireproxy();};
+  try{
+    const other=using('');   // whatever this machine has without the setting
+    expect(using(tmp)).toBe(other);
+    if(process.platform!=='win32'){chmodSync(file,0o644);expect(using(file)).toBe(other);chmodSync(file,0o755);expect(using(file)).toBe(file);
+      // An executable file that is not a program: the kernel refuses it (ENOEXEC), the spawn emits 'error', and the connect call fails
+      // with a clear message. Before the listener existed this ended the whole process. A saved identity avoids registering with Cloudflare.
+      const {stateDir}=await import('../backend/state');const {mkdirSync,existsSync,readFileSync}=await import('node:fs');const acc=path.join(stateDir,'warp','accounts.json');const had=existsSync(acc)?readFileSync(acc):null;
+      mkdirSync(path.dirname(acc),{recursive:true});writeFileSync(acc,JSON.stringify([{privateKey:'x',addressV4:'172.16.0.2',addressV6:'',peerPublicKey:'y',accountId:'t',registeredAt:''}]));
+      try{const e:any=await warp.warpConnect().catch((x:any)=>x);expect(String(e?.message||e)).toContain('could not be started');}
+      finally{if(had)writeFileSync(acc,had);else rmSync(acc,{force:true});await warp.warpDisconnect().catch(()=>{});}
+    }
+  }finally{settings.warp=saved;rmSync(tmp,{recursive:true,force:true});}
 });
 test('The webhook test waits for the webhook, reports a refusal, and is not suppressed by the minimum level',async()=>{
   const post=(p:string,b:any)=>fetch(base+p,{method:'POST',headers:{authorization:'Bearer test-admin-secret','content-type':'application/json'},body:JSON.stringify(b)});

@@ -1,11 +1,11 @@
 import {useEffect,useRef,useState,type ReactNode} from 'react';
-import {Check,Diamond,ExternalLink,Rocket,TriangleAlert,X} from 'lucide-react';
+import {Check,Cloud,Diamond,ExternalLink,Rocket,TriangleAlert,X} from 'lucide-react';
 import {api} from './api';
 import {Button,Field,Select} from './ui';
 // One-click relay deployment. The platform's API token goes to the local gateway for this one call; the gateway deploys the bundled relay,
 // stores a freshly generated access token as the relay's secret, and saves the relay as a route. Nothing here keeps the API token.
-type Platform='vercel'|'netlify';
-type Result={ok:boolean;id:string;name:string;url:string;platform:Platform;runtime:'bun'|'node-bun-ciphers';region?:string;reachable:boolean;status:number;detail:string};
+type Platform='vercel'|'netlify'|'cloudflare';
+type Result={ok:boolean;id:string;name:string;url:string;platform:Platform;runtime:'bun'|'node-bun-ciphers'|'cloudflare-worker';region?:string;reachable:boolean;status:number;detail:string};
 const VercelMark=({size=16}:{size?:number})=><svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 21.5 20h-19z" fill="currentColor"/></svg>;
 type Spec={id:Platform;name:string;icon:ReactNode;color:string;intro:string;bullets:string[];steps:string[];tokenLabel:string;tokenHint:string;tokenUrl:string;tokenPlaceholder:string;nameLabel:string;namePlaceholder:string;verdict:{tone:'good'|'warn';text:string}};
 const SPECS:Spec[]=[
@@ -19,17 +19,22 @@ const SPECS:Spec[]=[
     steps:['Open User settings → Applications','Personal access tokens → New access token','Copy the token and paste it below'],
     tokenLabel:'API token',tokenHint:'Used once to deploy; not stored.',tokenUrl:'https://app.netlify.com/user/applications#personal-access-tokens',tokenPlaceholder:'nfp_…',nameLabel:'Site name',namePlaceholder:'polygate-relay',
     verdict:{tone:'good',text:'Tested on Netlify on 26 October 2026: a deployed relay carried real chat requests (a 2,200-character answer in 8.5 s). Answers are buffered and Netlify stops a function after 30 seconds, so a very long answer fails.'}},
+  {id:'cloudflare',name:'Cloudflare',icon:<Cloud size={16}/>,color:'#f6821f',intro:'Deploys a Cloudflare Worker as a relay for Kilo. Requests leave from Cloudflare’s network. OpenCode Free refuses a Worker’s TLS handshake, so this relay forwards to api.kilo.ai only and Polygate never sends OpenCode requests through it.',
+    bullets:['Free plan: 100,000 requests per day','Streams responses','A new Worker needs up to a minute before every Cloudflare location serves it'],
+    steps:['Open My Profile → API Tokens → Create Token','Use the “Edit Cloudflare Workers” template (or Workers Scripts: Edit on your account)','Copy the token, and your Account ID from Workers & Pages, and paste both below'],
+    tokenLabel:'API token',tokenHint:'Used once to deploy; not stored.',tokenUrl:'https://dash.cloudflare.com/profile/api-tokens',tokenPlaceholder:'cfut_…',nameLabel:'Worker name',namePlaceholder:'polygate-relay',
+    verdict:{tone:'warn',text:'Kilo only. Tested on 27 October 2026: a deployed Worker carried Kilo chat and streaming requests from a Cloudflare address. It needs the account to have a workers.dev address (Workers & Pages shows it).'}},
 ];
 const REGIONS=[['fra1','Frankfurt (fra1)'],['iad1','Washington, D.C. (iad1)'],['sfo1','San Francisco (sfo1)'],['lhr1','London (lhr1)'],['cdg1','Paris (cdg1)'],['arn1','Stockholm (arn1)'],['dub1','Dublin (dub1)'],['cle1','Cleveland (cle1)'],['pdx1','Portland (pdx1)'],['yul1','Montréal (yul1)'],['gru1','São Paulo (gru1)'],['sin1','Singapore (sin1)'],['hnd1','Tokyo (hnd1)'],['kix1','Osaka (kix1)'],['icn1','Seoul (icn1)'],['hkg1','Hong Kong (hkg1)'],['bom1','Mumbai (bom1)'],['syd1','Sydney (syd1)'],['cpt1','Cape Town (cpt1)']];
 export function RelayDeployBar({onDeployed,onNotice,existing=[]}:{onDeployed:()=>void;onNotice:(s:string)=>void;existing?:string[]}){
   const [open,setOpen]=useState<Platform|null>(null);
   return <section className="section-block form-section relay-deploy"><div className="section-top"><div><h2>Deploy a relay</h2><p className="subtle">Pick a platform, paste its API token and Polygate deploys the relay and adds it as a route. The token is used for this one call and is not stored. OpenCode Free accepts a relay only if it sends Bun’s TLS cipher list: Vercel runs it on Bun (or Node), Netlify on Node.</p></div></div>
-    <div className="deploy-buttons">{SPECS.map(s=><button key={s.id} type="button" className="deploy-button" style={{'--brand':s.color} as any} onClick={()=>setOpen(s.id)}><span className="deploy-icon">{s.icon}</span>Deploy {s.name} Relay{s.verdict.tone==='good'&&<span className="deploy-tag">Works with OpenCode Free</span>}</button>)}</div>
+    <div className="deploy-buttons">{SPECS.map(s=><button key={s.id} type="button" className="deploy-button" style={{'--brand':s.color} as any} onClick={()=>setOpen(s.id)}><span className="deploy-icon">{s.icon}</span>Deploy {s.name} Relay{s.id==='cloudflare'?<span className="deploy-tag">Kilo only</span>:s.verdict.tone==='good'&&<span className="deploy-tag">Works with OpenCode Free</span>}</button>)}</div>
     {open&&<DeployDialog existing={existing} spec={SPECS.find(s=>s.id===open)!} onClose={()=>setOpen(null)} onDone={(r)=>{onDeployed();onNotice(`${r.platform} relay deployed${r.reachable?'':' (not answering yet)'}`);}}/>}
   </section>;
 }
 function DeployDialog({spec,onClose,onDone,existing}:{spec:Spec;onClose:()=>void;onDone:(r:Result)=>void;existing:string[]}){
-  const [form,setForm]=useState({token:'',name:'',region:'fra1',runtime:'bun'});const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);
+  const [form,setForm]=useState({token:'',name:'',region:'fra1',runtime:'bun',accountId:''});const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);
   const first=useRef<HTMLInputElement>(null);const box=useRef<HTMLDivElement>(null);const note=useRef<HTMLDivElement>(null);const closing=useRef(onClose);const [done,setDone]=useState<string[]>([]);const [plan,setPlan]=useState<any>(null);const [next,setNext]=useState('');
   useEffect(()=>{closing.current=onClose;});
   useEffect(()=>{const opener=document.activeElement as HTMLElement|null;first.current?.focus();return()=>opener?.focus();},[]);
@@ -38,12 +43,12 @@ function DeployDialog({spec,onClose,onDone,existing}:{spec:Spec;onClose:()=>void
     if(e.key==='Escape'){if(!busy&&!e.defaultPrevented)closing.current();}
     else if(e.key==='Tab'&&box.current){const f=[...box.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled])')];const i=f.indexOf(document.activeElement as HTMLElement);if(!f.length)e.preventDefault();else if(e.shiftKey?i<=0:(i<0||i===f.length-1)){e.preventDefault();f[e.shiftKey?f.length-1:0].focus();}}
   };document.addEventListener('keydown',key);return()=>document.removeEventListener('keydown',key);},[busy]);
-  const ready=form.token.trim().length>7;
+  const ready=form.token.trim().length>7&&(spec.id!=='cloudflare'||/^[a-fA-F0-9]{32}$/.test(form.accountId.trim()));
   // Regions that already have a relay: the ones deployed from this window and the Vercel relays already saved (their route names carry the region).
   const taken=new Set([...done,...existing]);const free=REGIONS.filter(([v])=>!taken.has(v));
   async function deploy(region=form.region,name=form.name.trim()){
     setBusy(true);setError('');
-    try{const r:Result=await api('/admin/relays/deploy',{platform:spec.id,token:form.token.trim(),name,region,runtime:form.runtime});if(r.region)setDone(d=>[...d,r.region!]);setResult(r);setNext('');onDone(r);}
+    try{const r:Result=await api('/admin/relays/deploy',{platform:spec.id,token:form.token.trim(),name,region,runtime:form.runtime,accountId:form.accountId.trim()});if(r.region)setDone(d=>[...d,r.region!]);setResult(r);setNext('');onDone(r);}
     catch(e:any){setError(e.message||'Deployment failed');}finally{setBusy(false);}
   }
   async function checkPlan(){setBusy(true);setError('');try{setPlan(await api('/admin/relays/inspect',{platform:'vercel',token:form.token.trim()}));}catch(e:any){setError(e.message||'Could not read the account');}finally{setBusy(false);}}
@@ -66,6 +71,7 @@ function DeployDialog({spec,onClose,onDone,existing}:{spec:Spec;onClose:()=>void
         {spec.verdict.text&&<div className={`dialog-note ${spec.verdict.tone}`}>{spec.verdict.tone==='good'?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{spec.verdict.text}</p></div>}
         <Field label={spec.tokenLabel} hint={spec.tokenHint}><input ref={first} required type="password" autoComplete="new-password" value={form.token} onChange={e=>setForm({...form,token:e.target.value})} placeholder={spec.tokenPlaceholder} spellCheck={false}/></Field>
         <div className="token-row"><a className="token-link" href={spec.tokenUrl} target="_blank" rel="noreferrer noopener">Get a token<ExternalLink size={12}/></a>{spec.id==='vercel'&&<Button disabled={busy||form.token.trim().length<8} onClick={()=>void checkPlan()}>Check my plan</Button>}</div>{planNote}
+        {spec.id==='cloudflare'&&<Field label="Account ID" hint="32 letters and digits. Shown in the Cloudflare dashboard under Workers & Pages."><input required value={form.accountId} onChange={e=>setForm({...form,accountId:e.target.value})} placeholder="0123456789abcdef0123456789abcdef" spellCheck={false} autoComplete="off"/></Field>}
         <Field label={spec.nameLabel} hint="Lowercase letters, numbers and hyphens. Leave empty for a generated name."><input value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder={spec.namePlaceholder} spellCheck={false}/></Field>
         {spec.id==='vercel'&&<Field label="Region" hint="Decides which address the relay sends from. Deploy another one for a different address."><Select value={form.region} onChange={v=>setForm({...form,region:v})}>{REGIONS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</Select></Field>}
         {spec.id==='vercel'&&<Field label="Runtime" hint="Bun is the default and stays accepted if OpenCode's check changes. Node sends Bun's TLS cipher list itself and works the same today; use it if Vercel's Bun runtime gives you trouble."><Select value={form.runtime} onChange={v=>setForm({...form,runtime:v})}><option value="bun">Bun (recommended)</option><option value="node">Node</option></Select></Field>}

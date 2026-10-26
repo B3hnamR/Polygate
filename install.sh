@@ -28,10 +28,14 @@ esac
 command -v systemctl >/dev/null && [ -d /run/systemd/system ] || { echo 'A running systemd installation is required. For containers/non-systemd systems use the Docker image.' >&2; exit 1; }
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo 'Supported architectures: amd64, arm64.' >&2; exit 1;; esac
 if [ "${POLYGATE_SKIP_DEPS:-0}" != 1 ]; then
-  if command -v apt-get >/dev/null; then export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y curl ca-certificates tar python3 util-linux;
-  elif command -v dnf >/dev/null; then dnf install -y curl ca-certificates tar python3 python3-pip util-linux;
-  elif command -v yum >/dev/null; then yum install -y curl ca-certificates tar python3 python3-pip util-linux;
-  elif command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed curl ca-certificates tar python python-pip util-linux;
+  # Packages are installed only when something is missing, so a configured server is not changed (on Arch, pacman -Syu would
+  # upgrade the whole system). pip is not needed: python3 is only used for small checks.
+  missing=0; for c in curl tar python3 runuser; do command -v "$c" >/dev/null || missing=1; done; [ -d /etc/ssl/certs ] || missing=1
+  if [ "$missing" = 0 ]; then :
+  elif command -v apt-get >/dev/null; then export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y curl ca-certificates tar python3 util-linux;
+  elif command -v dnf >/dev/null; then dnf install -y curl ca-certificates tar python3 util-linux;
+  elif command -v yum >/dev/null; then yum install -y curl ca-certificates tar python3 util-linux;
+  elif command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed curl ca-certificates tar python util-linux;
   else echo 'Install curl, ca-certificates, tar, Python 3.11+, and util-linux first; rerun with POLYGATE_SKIP_DEPS=1.' >&2; exit 1; fi
 fi
 python3 -c 'import sys; assert sys.version_info >= (3,11), "Python 3.11+ is required (Ubuntu 24.04/Debian 12 or newer recommended)"'

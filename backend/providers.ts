@@ -3,6 +3,7 @@ import { stateDir, settings, models, saveModel, usagePenalties } from './state';
 import { networkFetch, routeContext } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
+import { kiloCatalog, kiloChat } from './kilo';
 import type { Provider, Model } from './types';
 process.env.AUTO_UPDATE='0';
 process.env.OPENCODE_BRIDGE_STATE_DIR=stateDir+'/bridge';
@@ -35,13 +36,15 @@ export async function discover(){
           catch(e){if(!p.models.length)throw e;authoritative=false;}
           const listed=new Set(found.map(x=>x?.id??x));found=[...found,...p.models.filter(id=>!listed.has(id)).map(id=>({id}))];
         }
+        // A failed fetch leaves the catalog and the models already listed untouched (the error is reported below).
+        else if(p.kind==='kilo')found=await kiloCatalog(p,p.routeId||settings.routeId);
         else found=p.models.map(id=>({id}));
         if(!found.length&&p.models.length)found=p.models.map(id=>({id}));
         if(!found.length)throw new Error(p.kind==='opencode'?'List this OpenCode server\'s provider/model IDs in Model IDs':'Provider returned an empty catalog; existing models were kept');
         const seen=new Set<string>();
         for(const x of found){const upstreamId=x.id||x;if(typeof upstreamId!=='string')continue;const id=p.id+'/'+upstreamId;seen.add(id);const prior=models.get(id);const facts=p.kind==='free'?bridge.identity.getModelFacts(upstreamId):null;
-          const info={name:x.name||upstreamId,context:x.context_length||facts?.context||0,output:facts?.maxOutput||0,reasoning:!!(facts?.reasoning||x.reasoning),tools:x.tool_call!==false};
-          if(!prior){saveModel({id,upstreamId,providerId:p.id,...info,state:'unchecked',latency:0,score:codingScore(id),priority:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});continue;}
+          const info={name:x.name||upstreamId,context:x.context_length||facts?.context||0,output:facts?.maxOutput||x.maxOutput||0,reasoning:!!(facts?.reasoning||x.reasoning),tools:x.tool_call!==false};
+          if(!prior){saveModel({id,upstreamId,providerId:p.id,...info,state:'unchecked',latency:0,score:codingScore(id),priority:p.kind==='kilo'?150:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});continue;}
           // Catalog facts refresh each pass; priority, score and measured health stay. A model that returns to the catalog is retried.
           const returned=prior.state==='unavailable'&&prior.error===ABSENT;
           saveModel({...prior,...info,context:info.context||prior.context,output:info.output||prior.output,reasoning:info.reasoning||prior.reasoning,...(returned?{state:'unchecked' as const,error:''}:{})});
@@ -55,6 +58,7 @@ export async function discover(){
 export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId=''):Promise<Response>{
   if(p.kind==='free')return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
   if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined},()=>realOpenCode(p,model,body,signal,routeId));
+  if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined},()=>kiloChat(p,model,body,signal,routeId));
   return routeContext.run({routeId,requestId:requestId||undefined},()=>networkFetch(p.baseUrl.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',...(p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal},routeId));
 }
 async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,routeId:string){
@@ -69,7 +73,7 @@ async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,route
     return new Response(chunks.map(x=>`data: ${JSON.stringify(x)}\n\n`).join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
   }finally{
     // Every request owns a throwaway session on the user's server; remove it without delaying or failing the reply.
-    networkFetch(sessionUrl,{method:'DELETE',headers,signal:AbortSignal.timeout(5000)},routeId).then(x=>x.body?.cancel(),()=>{});
+    networkFetch(sessionUrl,{method:'DELETE',headers,signal:AbortSignal.timeout(5000)},routeId).then(x=>x.body?.cancel().catch(()=>{}),()=>{});
   }
 }
 export function sessionFor(key:string,messages:any[],headers:Record<string,any>){
