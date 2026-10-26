@@ -35,10 +35,10 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
       <div className="dialog-body">
         <p className="subtle">Pick the provider to send through this route. Each provider has its own limits, so a route can pass for one and fail for another.</p>
         {route.only&&<div className="dialog-note info"><Check size={16}/><p>This relay carries {route.only==='kilo'?'Kilo':route.only} only, so other providers cannot be tested through it.</p></div>}
-        <fieldset className="field" style={{border:0,padding:0,margin:'0 0 14px'}} disabled={busy}>
-          {enabled.length?enabled.map(p=>{const ok=carries(route,p);return <label key={p.id} className="toggle-row" style={{opacity:ok?1:.5,cursor:ok?'pointer':'not-allowed',margin:'0 0 6px',padding:'10px 0'}}>
-            <span><strong>{nameOf(p)}</strong><small>{ok?detail(p):`This relay carries ${route.only==='kilo'?'Kilo':route.only} only.`}</small></span>
-            <input ref={p.id===chosen?first:undefined} type="radio" name="test-provider" disabled={!ok} checked={chosen===p.id} onChange={()=>setChosen(p.id)} aria-label={nameOf(p)}/></label>;}):<p className="subtle">No provider is enabled. Enable one on the Providers page.</p>}
+        <fieldset className="choices" disabled={busy}>
+          {enabled.length?enabled.map(p=>{const ok=carries(route,p);return <label key={p.id} className={'choice'+(chosen===p.id?' selected':'')+(ok?'':' disabled')}>
+            <input ref={p.id===chosen?first:undefined} type="radio" name="test-provider" disabled={!ok} checked={chosen===p.id} onChange={()=>setChosen(p.id)}/>
+            <span><strong>{nameOf(p)}</strong><small>{ok?detail(p):`This relay carries ${route.only==='kilo'?'Kilo':route.only} only.`}</small></span></label>;}):<p className="subtle">No provider is enabled. Enable one on the Providers page.</p>}
         </fieldset>
         {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}</p></div>}
         {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
