@@ -3,6 +3,8 @@ const {spawn,spawnSync}=require('node:child_process');
 const path=require('node:path');
 const fs=require('node:fs');
 const {randomBytes}=require('node:crypto');
+// The window and taskbar icon: the packaged app ships it in resources, a source checkout reads it from assets.
+const iconPath=app.isPackaged?path.join(process.resourcesPath,'icon.png'):path.join(__dirname,'..','assets','icon.png');
 let child,win,port,quitting=false,reaped=false;const token=randomBytes(32).toString('hex');
 const killTree=()=>{
   if(reaped||!child||child.exitCode!==null||child.signalCode)return;reaped=true;
@@ -23,7 +25,7 @@ app.whenReady().then(async()=>{
   child=spawn(exe,[entry],{cwd:root,windowsHide:true,env:{...env,POLYGATE_DESKTOP:'1',POLYGATE_HOST:'127.0.0.1',POLYGATE_PORT:'0',POLYGATE_ADMIN_TOKEN:token,POLYGATE_STATE:path.join(logDir,'state'),POLYGATE_UI_DIST:app.isPackaged?path.join(root,'ui'):path.join(root,'dist')},stdio:['ignore','pipe',log]});
   try{
     port=await new Promise((resolve,reject)=>{let buffer='';const timeout=setTimeout(()=>reject(new Error('Gateway startup timed out. See gateway.log in '+logDir)),25000);child.once('error',e=>{clearTimeout(timeout);reject(e);});child.stdout.on('data',chunk=>{fs.writeSync(log,chunk);buffer+=chunk.toString();let i;while((i=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,i);buffer=buffer.slice(i+1);try{const x=JSON.parse(line);if(x.polygateReady){clearTimeout(timeout);resolve(x.port);}}catch{}}});child.once('exit',code=>{clearTimeout(timeout);reject(new Error('Gateway exited before startup (code '+code+'). See '+logDir));});});
-    win=new BrowserWindow({width:1430,height:970,minWidth:880,minHeight:650,title:'Polygate',backgroundColor:'#14171c',show:false,autoHideMenuBar:true,webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
+    win=new BrowserWindow({width:1430,height:970,minWidth:880,minHeight:650,title:'Polygate',icon:iconPath,backgroundColor:'#14171c',show:false,autoHideMenuBar:true,webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
     win.webContents.setWindowOpenHandler(({url})=>{if(/^https:\/\//.test(url))shell.openExternal(url);return {action:'deny'};});
     const ses=win.webContents.session,ok=p=>p==='clipboard-sanitized-write';ses.setPermissionRequestHandler((_,p,cb)=>cb(ok(p)));ses.setPermissionCheckHandler((_,p)=>ok(p));
     const pin=e=>{let o;try{o=new URL(e.url).origin;}catch{}if(o!==`http://127.0.0.1:${port}`)e.preventDefault();};

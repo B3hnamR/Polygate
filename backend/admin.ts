@@ -68,7 +68,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId||settings.providers.some(p=>p.routeId===b.id))throw new GatewayError('Select another route before deleting this one',409);if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);persist();return json(res,200,{ok:true});}
-  if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id));}
+  if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
   // Reads the plan of a Vercel account (Hobby allows one function region per project; Pro up to five) before anything is deployed. The token is not kept.
   if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(String(b.token||''),b.teamId?String(b.teamId):undefined));}
   // One-click relay: deploys the bundled template with the platform's API token (used for this call only, never saved), then saves the relay as a route.

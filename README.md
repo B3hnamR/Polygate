@@ -1,4 +1,6 @@
-# Polygate
+<p align="center"><img src="assets/logo.svg" alt="Polygate" width="112"></p>
+
+<h1 align="center">Polygate</h1>
 
 A Windows desktop and Linux/VPS model gateway with built-in OpenCode Free and Kilo free-model providers, Chat/Responses/Anthropic compatibility, built-in WARP tunnels, and a proxy pool that is checked with real requests.
 

@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { settings, persist, redactError } from './state';
 import { GatewayError } from './queue';
-import type { Route } from './types';
+import type { Route, Provider } from './types';
 import { socksBridge, parseSocksUrl } from './socks-bridge';
 import { warpTarget, warpFailure, warpSuccess } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
@@ -262,19 +262,52 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     routeFailed(route,String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');throw e;
   }
 }
-export async function testRoute(id:string){
+// What a route test sends, and how its answer is read, depends on the provider chosen in the dialog. OpenCode Free keeps its own check (the model list
+// plus a chat that also settles the daily-allowance mark, checkChat); any other provider gets its model list and one small chat, read in plain words.
+export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string};
+function testProvider(route:Route,providerId?:string):Provider|undefined{
+  const enabled=settings.providers.filter(p=>p.enabled);
+  const chosen=providerId?enabled.find(p=>p.id===providerId):route.only?enabled.find(p=>p.kind===route.only):undefined;
+  if(providerId&&!chosen)throw new GatewayError('That provider is not enabled',400);
+  if(chosen&&route.only&&chosen.kind!==route.only)throw new GatewayError(`This relay carries ${route.only==='kilo'?'Kilo':route.only} only, so it cannot be tested with ${chosen.name}`,400);
+  if(!chosen&&route.only)throw new GatewayError(`This relay carries ${route.only==='kilo'?'Kilo':route.only} only; enable that provider to test it`,400);
+  return chosen&&chosen.kind!=='free'?chosen:undefined;
+}
+async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:string}>{
+  const {rankedModels,providerChat,sessionFor}=await import('./providers');const {isAddressLimit}=await import('./kilo');
+  const usable=rankedModels().filter(m=>m.providerId===p.id&&m.state!=='unavailable'&&m.cooldownUntil<=Date.now()).sort((a,b)=>(a.state==='available'?0:1)-(b.state==='available'?0:1)||(a.latency||1e9)-(b.latency||1e9));
+  const model=usable[0];if(!model)return {chat:'unknown',line:`a chat request could not be sent: no ${p.name} model is ready`};
+  let r:Response;
+  try{r=await providerChat(p,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},AbortSignal.timeout(30000),route.id,sessionFor('route-test',[{role:'user',content:'route-test'}],{}),newCanaryId());}
+  catch(e:any){return {chat:'unknown',line:`a chat request could not be sent (${redactError(String(e?.message||e)).slice(0,140)})`};}
+  if(r.ok){r.body?.cancel().catch(()=>{});return {chat:'ok',line:`and a real ${p.name} chat request passed`};}
+  const text=await r.text().catch(()=>'');const brief=redactError(text.replace(/\s+/g,' ')).slice(0,140);
+  if(p.kind==='kilo'&&isAddressLimit(r.status,text))return {chat:'limited',line:`but Kilo's free tier has stopped answering from this network address (it limits anonymous use per address). Try again later, from another exit, or with a saved Kilo key`};
+  if(r.status===429)return {chat:'busy',line:`but ${model.name} was busy (HTTP 429). Try again in a minute`};
+  if(r.status===401||r.status===403)return {chat:'refused',line:`but ${p.name} refused the request (HTTP ${r.status}) from this exit${brief?': '+brief:''}`};
+  return {chat:'unknown',line:`but a chat request through it failed (HTTP ${r.status}${brief?' '+brief:''})`};
+}
+export async function testRoute(id:string,providerId?:string):Promise<RouteTest>{
   if(typeof id!=='string'||!id)throw new GatewayError('Say which route to test',400);
   const route=id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id);if(!route)throw new GatewayError('Route not found',404);
+  const other=testProvider(route,providerId);
   const start=now();
   try{
-    const r=await networkFetch('https://opencode.ai/inference/v1/models',{signal:AbortSignal.timeout(15000)},id);await r.body?.cancel();
-    route.status=r.ok?'healthy':`HTTP ${r.status}`;route.latency=now()-start;if(r.status<500){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
+    // Reachability: OpenCode's catalog (not counted against any allowance), or the chosen provider's own catalog.
+    const catalog=other&&other.kind!=='opencode'?other.baseUrl.replace(/\/$/,'')+'/models':'https://opencode.ai/inference/v1/models';
+    const r=other?.kind==='opencode'?undefined:await networkFetch(catalog,{headers:other?.apiKey?{authorization:`Bearer ${other.apiKey}`}:{},signal:AbortSignal.timeout(15000)},id);await r?.body?.cancel();
+    const reached=r?r.ok:true;const code=r?.status??200;
+    route.status=reached?'healthy':`HTTP ${code}`;route.latency=now()-start;if(code<500){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
+    if(other){
+      const check=reached?await chatCheck(route,other):{chat:'unknown',line:`but ${other.name}'s model list answered HTTP ${code}`};
+      return {ok:reached,status:code,latency:route.latency,buffered:!!route.buffered,chat:check.chat,provider:other.name,summary:`${route.name}: ${reached?'connected, ':'reached, '}${check.line}.`};
+    }
     // The model list is not counted against the allowance, so reaching it proves only the connection. A chat request shows whether the Free tier accepts this exit.
-    const check:ChatCheck=r.ok&&!id.startsWith('pool:')&&id!=='proxy-pool'?await checkChat(route):{chat:'unknown'};
+    const check:ChatCheck=r!.ok&&!id.startsWith('pool:')&&id!=='proxy-pool'?await checkChat(route):{chat:'unknown'};
     const summary=check.chat==='ok'?`${route.name}: connected, and a real chat request passed.`
       :check.chat==='used-up'?`${route.name}: connected, but OpenCode Free says this exit's daily allowance is used up (resets ${resetTime(check.until!)}).`
       :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request through it.`
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
-    return {ok:r.ok,status:r.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary};
+    return {ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary,provider:'OpenCode Free'};
   }catch(e){route.status='unreachable';persist();throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+redactError(String((e as Error)?.message||e)),502,'route_unreachable');}
 }

@@ -1,7 +1,7 @@
 import {useState,useEffect,useRef,type FormEvent} from 'react';
 import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,Download,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
 import {api} from './api';
-import {Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
+import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
 export type Notice=(message:string,kind?:'ok'|'error')=>void;
 const errorOf=(e:unknown)=>String((e as Error)?.message||e);
 // ---------- sign in ----------
@@ -11,7 +11,7 @@ export function Login({onDone}:{onDone:()=>void}){
     try{const r=await fetch('/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error?.message||'Sign in failed');setPassword('');onDone();}
     catch(err){setError(errorOf(err));}finally{setBusy(false);}}
   return <div className="login-screen"><form className="login-card" onSubmit={submit}>
-    <div className="brand-mark"><Lock size={22}/></div><h1>Sign in to Polygate</h1><p className="muted">Enter the dashboard password for this server.</p>
+    <div className="brand-mark"><Logo size={52}/></div><h1>Sign in to Polygate</h1><p className="muted">Enter the dashboard password for this server.</p>
     <Field label="Password"><input type="password" autoFocus autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)}/></Field>
     {error&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{error}</span></div>}
     <Button type="submit" variant="primary" disabled={!password||busy}>{busy?<Loader2 size={15} className="spin"/>:<Lock size={15}/>} Sign in</Button>

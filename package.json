@@ -71,6 +71,10 @@
         "to": "LICENSE"
       },
       {
+        "from": "assets/icon.png",
+        "to": "icon.png"
+      },
+      {
         "from": "relays",
         "to": "relays"
       },
@@ -91,8 +95,9 @@
       "target": [
         "portable"
       ],
+      "icon": "assets/icon.ico",
       "artifactName": "Polygate-${version}-Windows-x64.exe",
-      "signAndEditExecutable": false
+      "signExecutable": false
     },
     "portable": {
       "requestExecutionLevel": "user"
