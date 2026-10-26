@@ -1,0 +1,23 @@
+services:
+  polygate:
+    build: .
+    image: polygate:local
+    restart: unless-stopped
+    ports:
+      - "${POLYGATE_PANEL_PORT:-4317}:4317"
+      - "${POLYGATE_HTTP_PORT:-80}:80"
+      - "${POLYGATE_HTTPS_PORT:-443}:443"
+    volumes:
+      - polygate-state:/data
+    environment:
+      POLYGATE_ADMIN_PASSWORD: "${POLYGATE_ADMIN_PASSWORD:-}"
+      POLYGATE_ALLOWED_HOSTS: "${POLYGATE_ALLOWED_HOSTS:-*}"
+      POLYGATE_COOKIE_SECURE: "${POLYGATE_COOKIE_SECURE:-auto}"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  polygate-state:

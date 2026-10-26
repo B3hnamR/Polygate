@@ -1,0 +1,12 @@
+.git
+.review-sources
+node_modules
+release
+build
+dist
+.state
+.test-state
+.impeccable
+**/__pycache__
+**/*.pyc
+*.log

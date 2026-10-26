@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ENV_FILE=${POLYGATE_ENV_FILE:-/etc/polygate/polygate.env}
+[ "$(id -u)" -eq 0 ] || { echo 'Run with sudo.' >&2; exit 1; }
+[ -f "$ENV_FILE" ] || { echo "Missing $ENV_FILE" >&2; exit 1; }
+set -a; . "$ENV_FILE"; set +a
+ROOT=${POLYGATE_APP_DIR:-/opt/polygate/current}
+control() { runuser -u polygate --preserve-environment -- "$ROOT/bin/bun" "$ROOT/build/manage.js" "$@"; }
+service_restart() { systemctl restart polygate; }
+case "${1:-help}" in
+  status) systemctl status polygate --no-pager ;;
+  health) control request /healthz </dev/null ;;
+  start|stop|restart) systemctl "$1" polygate ;;
+  logs) journalctl -u polygate -n 100 -f ;;
+  settings) control settings ;;
+  password)
+    was_active=0; systemctl is-active --quiet polygate && was_active=1
+    systemctl stop polygate
+    trap 'if [ "$was_active" = 1 ]; then systemctl start polygate; fi' EXIT
+    if [ "${2:-}" = '--stdin' ]; then control password --stdin; else control password; fi
+    if [ -f "$POLYGATE_STATE/admin-password.txt" ]; then cat "$POLYGATE_STATE/admin-password.txt"
+    else echo 'No password file was written, so there is nothing to show. A password you supplied stays valid; to change it run: polygate password --stdin'; fi
+    ;;
+  https)
+    mode=${2:-status}
+    case "$mode" in
+      status) control request /admin/https </dev/null ;;
+      disable) printf '{}' | control request /admin/https/disable ;;
+      renew) printf '{}' | control request /admin/https/renew ;;
+      ip|domain|custom)
+        # Build JSON with Python, never interpolate PEM, hostnames or e-mail into shell code.
+        python3 - "$mode" "${3:-}" "${4:-}" <<'PY' | control request /admin/https/apply
+import json,os,sys
+mode,value,email=sys.argv[1:]
+body={'mode':mode,'port':int(os.environ.get('POLYGATE_HTTPS_PORT','443')),'httpPort':int(os.environ.get('POLYGATE_HTTP_PORT','80')),'email':email,'staging':os.environ.get('POLYGATE_HTTPS_STAGING')=='1'}
+if mode=='custom':
+    body['certPem']=open(value).read();body['keyPem']=open(email).read();body.pop('email',None)
+else: body['domain' if mode=='domain' else 'ip']=value
+print(json.dumps(body))
+PY
+        ;;
+      *) echo 'Usage: polygate https status|ip [address] [email]|domain <domain> [email]|custom <cert> <key>|renew|disable' >&2; exit 2 ;;
+    esac ;;
+  update) export POLYGATE_REPO; bash "$ROOT/install.sh" --update ;;
+  uninstall)
+    [ "${2:-}" = '--yes' ] || { echo 'Use: polygate uninstall --yes [--purge]. Data is retained unless --purge is supplied.'; exit 2; }
+    systemctl disable --now polygate; rm -f /etc/systemd/system/polygate.service /usr/local/bin/polygate; systemctl daemon-reload
+    # Fixed installation paths only; preserve all user data by default.
+    rm -rf -- /opt/polygate
+    if [ "${3:-}" = '--purge' ]; then rm -rf -- /var/lib/polygate /etc/polygate; fi
+    echo 'Polygate removed.' ;;
+  *) echo 'polygate status | start | stop | restart | logs | password [--stdin] | settings | https … | update | uninstall --yes [--purge]' ;;
+esac

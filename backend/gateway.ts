@@ -1,0 +1,137 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { settings, models, record, saveModel, redactError } from './state';
+import { authenticate, modelAllowed, recordUsage } from './keys';
+import { AdmissionQueue, GatewayError } from './queue';
+import { toChat, fromChat, collect, stream, observeSse, type Protocol } from './protocols';
+import { rankedModels, providerChat, sessionFor } from './providers';
+import { routeFor, failoverRoutes, networkFetch, exhaustedAlternative } from './transport';
+import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
+import { notify } from './notifications';
+import { explainError, pausedModel } from './explain';
+import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
+import type { Model, ApiKey } from './types';
+export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
+export async function readJson(req:IncomingMessage){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>8*1024*1024)throw new GatewayError('Request exceeds 8 MiB',413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
+export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
+export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
+const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
+function chosenModels(requested:string,key?:ApiKey){
+  const all=rankedModels();const ranked=all.filter(m=>m.state!=='unavailable'&&m.cooldownUntil<=Date.now()&&(!key?.models?.length||modelAllowed(key,m.id)));
+  if(requested==='auto'||requested==='auto:smart'||requested==='auto:fast'){
+    const eligible=requested==='auto:smart'?ranked.filter(m=>m.reasoning||m.score>=65):requested==='auto:fast'?[...ranked].sort((a,b)=>(a.latency||1e9)-(b.latency||1e9)):ranked;
+    if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return eligible.slice(0,settings.fallback?3:1);
+  }
+  const exact=models.get(requested)||all.find(m=>m.upstreamId===requested);if(!exact)throw new GatewayError('Unknown model. Use a model from /v1/models.',404,'model_not_found');
+  if(!providerEnabled(exact))throw new GatewayError('Model belongs to a disabled or removed provider. Enable it in Providers.',404,'model_not_found');
+  if(key&&!modelAllowed(key,exact.id))throw new GatewayError('This API key is not allowed to use that model',403,'permission_error');
+  if(exact.cooldownUntil>Date.now()){const p=pausedModel(exact.id,exact.cooldownUntil,settings.cooldowns!==false);throw new GatewayError(p.message,429,'model_paused',p.retryAfter);}return [exact];
+}
+export function classifyModel(m:Model,status:number,message:string,latency:number,retryAfter=0){m.checkedAt=Date.now();m.latency=latency;m.error=status<400?'':redactError(message);const wait=Number.isFinite(retryAfter)?retryAfter:0;
+  if(status<400){m.state='available';m.failCount=0;m.cooldownUntil=0;}
+  else if(settings.cooldowns===false&&(status===429||status>=500||/quota|capacity|rate.?limit/i.test(message)||status===403)){m.state='unchecked';m.cooldownUntil=0;}
+  else if(status===429||/quota|capacity|rate.?limit/i.test(message)){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+Math.max(wait, m.failCount<=1?15*60000:m.failCount<=3?3600000:21600000);}
+  else if(status===404||status===410){m.state='unavailable';}
+  else if(status>=500||status===403){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+60000;}
+  saveModel(m);
+}
+export async function inference(req:IncomingMessage,res:ServerResponse,protocol:Protocol){
+  const k=authenticate(req,true);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
+  const requestId=crypto.randomUUID();const body=await readJson(req);const chat=toChat(body,protocol);
+  // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
+  const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const controller=new AbortController();(req as any).signal=controller.signal;
+  const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
+  const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
+  let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
+  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';
+  try{
+    release=await queue.acquire(k.id,k.limit,controller.signal,settings.queueWaitMs||0);
+    let upstream:Response|undefined;
+    for(const m of candidates){used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
+      let r=routeFor(m.id,p.routeId);route=r.name;
+      // Rotating through a proxy pool needs more tries than a single-route retry budget.
+      let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
+      for(let attempt=0;attempt<=attempts;attempt++){
+        if(attempt>0&&settings.rotate){r=routeFor(m.id,p.routeId);route=r.name;}
+        tried=true;t0=Date.now();
+        try{
+          upstream=await providerChat(p,m,chat,controller.signal,r.id,sessionFor(k.id,chat.messages,req.headers),requestId);status=upstream.status;
+          if(upstream.ok)break;
+          fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
+          // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
+          const refused=takeRefused(requestId);if(refused)confirmedClean=true;const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
+          // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
+          const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
+          if(ex){
+            exhausted=ex;notify(ex.refused?'Network exit refused':'Network exit used up',ex.refused?`${r.name} was refused by the Free tier; it is skipped until ${resetTime(ex.until)}.`:`${r.name} has used its daily Free allowance (resets ${resetTime(ex.until)}).`,'warning','exhausted|'+r.id,3600000);
+            const alt=switches<3?exhaustedAlternative(r):undefined;
+            if(alt){switches++;notify('Switched network exit',`Requests moved from ${r.name} to ${alt.name}.`,'info','switched|'+alt.id,600000);r=alt;route=r.name;attempts++;exhausted=undefined;continue;}
+            break;
+          }
+          const blocked=status===403||status===401||/abuse|unusual activity|ip.block/i.test(message);const final=status<500||attempt===attempts;
+          // A refusal through the proxy pool blames that proxy (already rotated out), not the model, and is retried on the next one.
+          if(blocked&&r.id==='proxy-pool'&&attempt<attempts)continue;
+          if(blocked||final)classifyModel(m,status,message,Date.now()-t0,retryMs);
+          if(blocked)throw new GatewayError(message,status,'upstream_error');
+          if(final)break;
+          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;}}
+        }catch(e){
+          // A route that is switched off or not connected is skipped like a failed connection when failover is on.
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&!settings.rotate&&attempt<attempts&&!controller.signal.aborted){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
+          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r)[0];if(alt){r=alt;route=r.name;}}}
+      }
+      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500)break;
+    }
+    if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
+    if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
+    if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
+    res.setHeader('x-polygate-model',used.id);res.setHeader('x-polygate-route',encodeURIComponent(route));
+    let ended=false;let firstAt=0;
+    const observed=upstream.body!.pipeThrough(observeSse(raw=>{
+      if(raw==='[DONE]'){ended=true;return;}
+      try{const d=JSON.parse(raw);if(d.choices?.some((x:any)=>x.finish_reason))ended=true;if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
+    },()=>{firstAt=Date.now();}));
+    const wrapped=new Response(observed,{headers:upstream.headers,status:upstream.status});
+    if(body.stream){
+      status=200;await stream(req,res,wrapped,protocol,used.id);
+      if(!controller.signal.aborted&&!ended){status=502;fault=true;message='Upstream stream ended before a terminal event';}
+    }else{const data=await collect(wrapped);input=data.usage?.prompt_tokens||0;output=data.usage?.completion_tokens||0;status=200;json(res,200,fromChat(data,protocol,used.id));}
+    if(controller.signal.aborted){const reason:any=controller.signal.reason;status=reason instanceof GatewayError?reason.status:499;message=reason?.message||'Request cancelled';fault=false;}
+    else classifyModel(used,status,message,firstAt?firstAt-t0:Date.now()-t0);
+  }catch(e:any){
+    const aborted=controller.signal.aborted;const reason:any=controller.signal.reason;const gateway=aborted&&reason instanceof GatewayError?reason:undefined;
+    status=aborted?(gateway?.status??499):(e.status||502);message=redactError(aborted?(reason?.message||e.message||'Request cancelled'):(e.message||String(e)));
+    // What the client reads is a plain sentence with the reset time and next steps; the provider's own answer stays in the request record.
+    upstreamMessage=message;let nice=aborted?undefined:explainError({status,type:gateway?.type||e.type,message,model:used.id,route,switches,exhausted,confirmedClean,cooldownsEnabled:settings.cooldowns!==false});
+    if(nice)message=nice.message;
+    if(!res.headersSent){const wait=nice?.retryAfter||e.retryAfter;if(retryAfter&&!nice?.retryAfter)res.setHeader('Retry-After',retryAfter);else if(wait)res.setHeader('Retry-After',String(wait));const type=gateway?.type||e.type;const body={type:nice?.code||type||(protocol==='anthropic'?'api_error':'gateway_error'),message,...(nice?{code:nice.code,...nice.extra}:{})};json(res,status,protocol==='anthropic'?{type:'error',error:body}:{error:body});}else if(!res.writableEnded)res.end();
+  }
+  finally{clearTimeout(timer);res.removeListener('close',cancel);release?.();if(input+output>0)recordUsage(k.id,input+output);
+    let detail:string|undefined;
+    if(tried){try{
+      const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
+      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns!==false,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
+    }catch{/* diagnostics never affect the request */}}
+    record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms:Date.now()-start,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});}
+}
+// Ready means a client request could succeed right now: enabled, at least one usable model, and at least one route that is not cooling down.
+export function readiness(){
+  const now=Date.now();const usableModels=[...models.values()].filter(m=>m.state!=='unavailable'&&settings.providers.some(p=>p.id===m.providerId&&p.enabled)).length;
+  const routes=settings.routes.filter(r=>r.enabled&&(!r.cooldownUntil||r.cooldownUntil<now)).length;
+  return {ready:settings.enabled&&usableModels>0&&routes>0,enabled:settings.enabled,models:usableModels,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
+}
+export async function probeModel(id:string){
+  const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);
+  const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)throw new GatewayError('Provider is disabled',400);
+  const route=routeFor(id,p.routeId);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
+  try{
+    release=await queue.acquire('availability-probe',1,c.signal);
+    const r=await providerChat(p,m,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:16,stream:true},c.signal,route.id,'probe-'+crypto.randomUUID());
+    let error='';if(r.ok)await collect(r);else error=await r.text();
+    classifyModel(m,r.status,error,Date.now()-start);return m;
+  }catch(e){
+    // A full queue or cancelled wait says nothing about the model; only failures after admission are its verdict.
+    if(release&&!(e instanceof GatewayError))classifyModel(m,timedOut?504:502,String(e),Date.now()-start);
+    throw e;
+  }finally{clearTimeout(timer);release?.();}
+}

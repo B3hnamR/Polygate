@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+release/
+.state/
+.test-state/
+.review-sources/
+.env
+.env.local
+*.log
+__pycache__/
+*.pyc
+# Local tool settings, documentation, reviews and research: kept on disk, not published.
+.claude/
+.impeccable/
+docs/
+PRODUCT.md
+REPOSITORY_METHODS_COMPARISON.md
+scripts/gate-probe.mjs
+scripts/hello-capture.mjs
+scripts/node-cipher-probe.mjs
+scripts/warp-probe.mjs

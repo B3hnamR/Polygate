@@ -1,0 +1,10 @@
+:root{color-scheme:dark;
+--canvas:#090c13;--sidebar:#0b1019;--surface:#10151f;--surface-raised:#171e2d;--table-head:#0d121c;--hover:#192135;--selection:#16323a;
+--text:#eaf0fa;--text-secondary:#c3cee2;--muted:#8d9bb4;--placeholder:#7b89a3;
+--line:#1d2636;--line-strong:#2d3a52;
+--accent:#5eead4;--accent-hover:#8ff3e1;--accent-dim:#2db3a1;--accent-2:#7c9cff;--accent-2-dim:#4f6fd6;--on-accent:#04201c;
+--accent-soft:rgba(94,234,212,.11);--accent-line:rgba(94,234,212,.34);--accent-2-soft:rgba(124,156,255,.12);--accent-2-line:rgba(124,156,255,.36);
+--brand-gradient:linear-gradient(135deg,#5eead4 0%,#7c9cff 100%);--bar-gradient:linear-gradient(180deg,#7c9cff,#2db3a1);
+--green:#4ade80;--green-soft:rgba(74,222,128,.12);--amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);--red:#fb7185;--red-soft:rgba(251,113,133,.12);--red-dim:#8a3144;--red-surface:#2a1520;
+--glow-teal:rgba(94,234,212,.09);--glow-blue:rgba(124,156,255,.11);--shadow:#02050c99;
+--font:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;--mono:'Cascadia Code',Consolas,monospace}

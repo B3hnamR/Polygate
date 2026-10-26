@@ -1,0 +1,52 @@
+{
+  "name": "opencode-free-bridge",
+  "version": "2.2.1",
+  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
+  "main": "server.js",
+  "bin": {
+    "opencode-free-bridge": "server.js"
+  },
+  "scripts": {
+    "start": "bun server.js",
+    "test": "bun test test/*.test.js",
+    "drill": "bun gate-drill.js",
+    "verify": "bun verify.js",
+    "verify:quick": "bun verify.js --quick",
+    "fingerprint": "bun transport-fingerprint.js",
+    "fingerprint:check": "bun transport-fingerprint.js --check",
+    "start:node": "node server.js",
+    "test:node": "node --test test/*.test.js",
+    "drill:node": "node gate-drill.js"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "files": [
+    "server.js",
+    "identity.js",
+    "token-budget.js",
+    "verify.js",
+    "gate-drill.js",
+    "README.md",
+    "AGENTS.md",
+    "install.sh",
+    "transport-fingerprint.js",
+    "transport-baseline.json",
+    "tunnel-doctor.sh",
+    "proxy.js",
+    "panel.js"
+  ],
+  "keywords": [
+    "opencode",
+    "openai",
+    "bridge",
+    "proxy",
+    "free",
+    "llm",
+    "9router",
+    "cursor",
+    "continue",
+    "vscode"
+  ],
+  "license": "MIT"
+}

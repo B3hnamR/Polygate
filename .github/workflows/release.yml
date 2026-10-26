@@ -1,0 +1,81 @@
+name: Build release artifacts
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - run: npm ci --ignore-scripts
+      - run: npm run check && bun test tests
+      - run: bash scripts/build-linux.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: polygate-linux-${{ matrix.arch }}
+          path: release/polygate-linux-*
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - run: npm ci
+      - run: bun test tests
+      - name: Fetch the Bun runtime and verify its release checksum
+        run: python scripts/fetch-bun.py 1.4.4 windows-x64
+      - run: bun run dist
+        env:
+          POLYGATE_BUN_RUNTIME: ${{ github.workspace }}\build\runtime\1.4.4\windows-x64\bun.exe
+      - name: Write the SHA-256 of the executable
+        run: |
+          $exes = @(Get-ChildItem release/*.exe)
+          if ($exes.Count -eq 0) { throw 'No executable to checksum' }
+          foreach ($exe in $exes) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash.ToLower()
+            [IO.File]::WriteAllText("$($exe.FullName).sha256", "$hash *$($exe.Name)`n")
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: polygate-windows-x64
+          path: |
+            release/*.exe
+            release/*.exe.sha256
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Prepare a draft for manual review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" artifacts/* --draft --verify-tag --title "Polygate $TAG" --notes 'Windows portable app and Linux amd64/arm64 server packages. Verify checksums before installation. See README.md.'

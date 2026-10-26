@@ -1,0 +1,33 @@
+[Unit]
+Description=Polygate model gateway
+Documentation=https://github.com/B3hnamR/Polygate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=polygate
+Group=polygate
+WorkingDirectory=/opt/polygate/current
+EnvironmentFile=/etc/polygate/polygate.env
+ExecStart=/opt/polygate/current/bin/bun /opt/polygate/current/build/gateway.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polygate
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

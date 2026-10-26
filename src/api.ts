@@ -1,0 +1,12 @@
+export const token = new URLSearchParams(location.hash.slice(1)).get('token') || sessionStorage.getItem('polygate-token') || '';
+if(token)sessionStorage.setItem('polygate-token',token);
+if(location.hash.includes('token='))history.replaceState(null,'',location.pathname);
+export class ApiError extends Error{constructor(message:string,public status:number){super(message);}}
+// The desktop app authenticates with a token; the web dashboard authenticates with its session cookie.
+const auth=():Record<string,string>=>token?{authorization:'Bearer '+token}:{};
+export async function api(path:string,body?:unknown){
+  const r=await fetch(path,{method:body===undefined?'GET':'POST',headers:{...auth(),...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  // Error pages and empty bodies are not always JSON; keep the HTTP status as the message instead of a parse error.
+  const text=await r.text();let data:any={};try{data=text?JSON.parse(text):{};}catch{}
+  if(!r.ok)throw new ApiError(typeof data.error==='string'?data.error:data.error?.message||`Request failed (${r.status})`,r.status);return data;
+}

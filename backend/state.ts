@@ -1,0 +1,62 @@
+import { Database } from 'bun:sqlite';
+import { randomBytes, createCipheriv, createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import type { Settings, Model, LogRow } from './types';
+
+// Windows keeps state under %LOCALAPPDATA%; Linux follows XDG (a service sets POLYGATE_STATE explicitly).
+export const stateDir = process.env.POLYGATE_STATE || (process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Polygate', 'state') : path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'polygate'));
+mkdirSync(stateDir, { recursive: true });
+const masterPath = path.join(stateDir, 'vault.key');
+if (!existsSync(masterPath)) writeFileSync(masterPath, randomBytes(32), { mode: 0o600, flag: 'wx' });
+const master = readFileSync(masterPath);
+export const deriveKey = (label: string) => createHmac('sha256', master).update(label).digest();
+const configPath = path.join(stateDir, 'settings.vault');
+export const initialSettings = (): Settings => ({
+  enabled: true, maxConcurrent: 4, maxQueue: 32, timeoutMs: 120000, retries: 1, fallback: true,
+  strategy: 'single', rotate: false, routeId: 'direct', refreshMinutes: 60, autoProbe: false, warpProxyPort: 40000,
+  providers: [{ id: 'opencode', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '' }],
+  routes: [{ id: 'direct', name: 'Direct connection', kind: 'direct', url: '', enabled: true, models: [] }],
+  keys: [{ id: crypto.randomUUID(), name: 'Local client', value: 'pg_' + randomBytes(24).toString('hex'), enabled: true, limit: 4 }]
+});
+function load(): Settings {
+  if (!existsSync(configPath)) return initialSettings();
+  const raw = readFileSync(configPath); const iv = raw.subarray(0, 12); const tag = raw.subarray(12, 28);
+  const d = createDecipheriv('aes-256-gcm', master, iv); d.setAuthTag(tag);
+  return { ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) };
+}
+export let settings = load();
+export function persist() {
+  const iv = randomBytes(12); const c = createCipheriv('aes-256-gcm', master, iv);
+  const body = Buffer.concat([c.update(JSON.stringify(settings)), c.final()]);
+  writeFileSync(configPath + '.tmp', Buffer.concat([iv, c.getAuthTag(), body]), { mode: 0o600 }); renameSync(configPath + '.tmp', configPath);
+}
+if(process.env.POLYGATE_READ_ONLY_STATE!=='1')persist();
+export function equal(a: string, b: string) { const x = Buffer.from(a); const y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
+export const db = new Database(path.join(stateDir, 'activity.sqlite'), { create: true });
+db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS models (id TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY,time INTEGER,model TEXT,provider TEXT,protocol TEXT,route TEXT,status INTEGER,ms INTEGER,input INTEGER,output INTEGER,error TEXT,keyId TEXT); CREATE INDEX IF NOT EXISTS requests_time ON requests(time);');
+// fault=1 marks rows where an upstream model returned the failing verdict; queue rejections, cancellations and local errors are not model faults.
+if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='fault'))db.exec('ALTER TABLE requests ADD COLUMN fault INTEGER NOT NULL DEFAULT 0; UPDATE requests SET fault=1 WHERE status>=500 OR status=429;');
+// detail is the request-shape record (sizes, counts, header names, upstream answer; no content) described in diagnostics.ts.
+if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='detail'))db.exec('ALTER TABLE requests ADD COLUMN detail TEXT;');
+export const models = new Map<string, Model>();
+for (const row of db.query('SELECT data FROM models').all() as {data: string}[]) { const m = JSON.parse(row.data); models.set(m.id, m); }
+export function saveModel(m: Model) { models.set(m.id, m); db.query('INSERT OR REPLACE INTO models VALUES (?,?)').run(m.id, JSON.stringify(m)); }
+export function removeModels(providerId: string) { for (const [id, m] of models) if (m.providerId === providerId) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); } }
+let lastPrune = 0;
+export function record(row: LogRow) {
+  db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null);
+  if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
+    // Failures keep their shape record for the whole retention window; successes only the latest 50, as a baseline to compare with.
+    db.exec('UPDATE requests SET detail=NULL WHERE detail IS NOT NULL AND status<400 AND id NOT IN (SELECT id FROM requests WHERE detail IS NOT NULL AND status<400 ORDER BY time DESC LIMIT 50)'); }
+}
+export function logs(limit = 150) { return db.query('SELECT id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,(detail IS NOT NULL) AS hasDetail FROM requests ORDER BY time DESC LIMIT ?').all(limit) as LogRow[]; }
+export function requestDetail(id: string) { const r = db.query('SELECT id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,detail FROM requests WHERE id=?').get(id) as any; if (!r) return undefined; const { detail, ...row } = r; return { ...row, detail: detail ? JSON.parse(detail) : null }; }
+export function recentFailureDetails(limit = 20) { return (db.query('SELECT id,time,model,protocol,route,status,ms,error,detail FROM requests WHERE fault=1 AND detail IS NOT NULL ORDER BY time DESC LIMIT ?').all(limit) as any[]).map(({ detail, ...row }) => ({ ...row, detail: JSON.parse(detail) })); }
+export function recentBaselineDetails(limit = 5) { return (db.query('SELECT id,time,model,protocol,route,status,ms,detail FROM requests WHERE status<400 AND detail IS NOT NULL ORDER BY time DESC LIMIT ?').all(limit) as any[]).map(({ detail, ...row }) => ({ ...row, detail: JSON.parse(detail) })); }
+export function stats() { return db.query('SELECT COUNT(*) total, SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) success, COALESCE(AVG(ms),0) latency, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output FROM requests WHERE time > ?').get(Date.now() - 86400000) as any; }
+export function usagePenalties() { const out = new Map<string, number>(); for (const x of db.query('SELECT model,COUNT(*) n,SUM(fault) errors FROM requests WHERE time>? AND (fault=1 OR status<400) GROUP BY model').all(Date.now()-7*86400000) as {model: string, n: number, errors: number}[]) out.set(x.model, x.n < 5 ? 0 : x.errors/x.n >= .8 ? 8 : x.errors/x.n >= .5 ? 4 : 0); return out; }
+export function publicSettings() { const { admin, ...rest } = settings; return { ...rest, notify: settings.notify ? { ...settings.notify, webhookUrl: settings.notify.webhookUrl ? '••••••••' : '' } : undefined, providers: settings.providers.map(p => ({ ...p, apiKey: p.apiKey ? '••••••••' : '' })), routes: settings.routes.map(r => ({ ...r, token: r.token ? '••••••••' : '', url: redactUrl(r.url) })) }; }
+export function redactUrl(raw: string) { try { const u = new URL(raw); if (u.username || u.password) { u.username='redacted'; u.password='redacted'; } return u.toString(); } catch { return raw; } }
+export function redactError(raw: string) { let s = raw; for (const v of [...settings.providers.map(p=>p.apiKey),...settings.routes.flatMap(r=>[r.token||'',r.url]),...settings.keys.map(k=>k.value)]) if(v.length>5) s=s.split(v).join('[redacted]'); return s.replace(/(Bearer\s+)[^\s"']+/gi,'$1[redacted]').slice(0,800); }
