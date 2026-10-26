@@ -10,12 +10,12 @@ const VercelMark=({size=16}:{size?:number})=><svg width={size} height={size} vie
 type Spec={id:Platform;name:string;icon:ReactNode;color:string;intro:string;bullets:string[];steps:string[];tokenLabel:string;tokenHint:string;tokenUrl:string;tokenPlaceholder:string;nameLabel:string;namePlaceholder:string;verdict:{tone:'good'|'warn';text:string}};
 const SPECS:Spec[]=[
   {id:'vercel',name:'Vercel',icon:<VercelMark/>,color:'#ffffff',intro:'Deploys a Vercel Function on the Bun runtime. Requests leave from Vercel’s network using Bun’s TLS handshake, which OpenCode Free accepts.',
-    bullets:['Hobby plan is free','Streams responses','Choose the region to choose the outbound address'],
+    bullets:['Hobby plan is free','Streams responses','Choose the region to choose the outbound address','Carries OpenCode Free and Kilo free models'],
     steps:['Open Account Settings → Tokens','Create a token (scope: your account, any expiry)','Paste it below'],
     tokenLabel:'API token',tokenHint:'Used only for deploys you start from this window; never stored.',tokenUrl:'https://vercel.com/account/tokens',tokenPlaceholder:'vcp_…',nameLabel:'Project name',namePlaceholder:'polygate-relay',
     verdict:{tone:'good',text:''}},
   {id:'netlify',name:'Netlify',icon:<Diamond size={16}/>,color:'#2dd4bf',intro:'Deploys a Netlify Function on Node as a relay. It calls OpenCode with Bun’s TLS cipher list, which is the part of the handshake OpenCode Free checks. Requests leave from Netlify’s network.',
-    bullets:['Free plan: 125,000 invocations per month','Answers are buffered, not streamed; a function is stopped after 30 seconds','Your relay URL ends in /.netlify/functions/relay'],
+    bullets:['Free plan: 125,000 invocations per month','Answers are buffered, not streamed; a function is stopped after 30 seconds','Your relay URL ends in /.netlify/functions/relay','Carries OpenCode Free and Kilo free models'],
     steps:['Open User settings → Applications','Personal access tokens → New access token','Copy the token and paste it below'],
     tokenLabel:'API token',tokenHint:'Used once to deploy; not stored.',tokenUrl:'https://app.netlify.com/user/applications#personal-access-tokens',tokenPlaceholder:'nfp_…',nameLabel:'Site name',namePlaceholder:'polygate-relay',
     verdict:{tone:'good',text:'Tested on Netlify on 26 October 2026: a deployed relay carried real chat requests (a 2,200-character answer in 8.5 s). Answers are buffered and Netlify stops a function after 30 seconds, so a very long answer fails.'}},
@@ -29,7 +29,7 @@ const REGIONS=[['fra1','Frankfurt (fra1)'],['iad1','Washington, D.C. (iad1)'],['
 export function RelayDeployBar({onDeployed,onNotice,existing=[]}:{onDeployed:()=>void;onNotice:(s:string)=>void;existing?:string[]}){
   const [open,setOpen]=useState<Platform|null>(null);
   return <section className="section-block form-section relay-deploy"><div className="section-top"><div><h2>Deploy a relay</h2><p className="subtle">Pick a platform, paste its API token and Polygate deploys the relay and adds it as a route. The token is used for this one call and is not stored. OpenCode Free accepts a relay only if it sends Bun’s TLS cipher list: Vercel runs it on Bun (or Node), Netlify on Node.</p></div></div>
-    <div className="deploy-buttons">{SPECS.map(s=><button key={s.id} type="button" className="deploy-button" style={{'--brand':s.color} as any} onClick={()=>setOpen(s.id)}><span className="deploy-icon">{s.icon}</span>Deploy {s.name} Relay{s.id==='cloudflare'?<span className="deploy-tag">Kilo only</span>:s.verdict.tone==='good'&&<span className="deploy-tag">Works with OpenCode Free</span>}</button>)}</div>
+    <div className="deploy-buttons">{SPECS.map(s=><button key={s.id} type="button" className="deploy-button" style={{'--brand':s.color} as any} onClick={()=>setOpen(s.id)}><span className="deploy-icon">{s.icon}</span>Deploy {s.name} Relay{s.id==='cloudflare'?<span className="deploy-tag">Kilo only</span>:<><span className="deploy-tag">Works with OpenCode Free</span><span className="deploy-tag">Works with Kilo</span></>}</button>)}</div>
     {open&&<DeployDialog existing={existing} spec={SPECS.find(s=>s.id===open)!} onClose={()=>setOpen(null)} onDone={(r)=>{onDeployed();onNotice(`${r.platform} relay deployed${r.reachable?'':' (not answering yet)'}`);}}/>}
   </section>;
 }
