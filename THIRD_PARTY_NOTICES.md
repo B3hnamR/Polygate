@@ -11,3 +11,13 @@ Protocol adapters are derived from 12errh/zen-proxy at 1e87076453974cfc11cf59821
 WARP engine and activation work follows Nystic-Shadow/Opencode2api and Maicon501a/opencode-zen-proxy. Copyright (c) 2026 OpenCode2API Contributors and copyright (c) 2026 Maicon, respectively. Their MIT notices are retained under vendor/licenses. Polygate ports these capabilities into its own modules; it does not run a second Nystic gateway.
 
 The relay templates were supplied locally by the user from 9router Proxy Pool Data and reviewed alongside AutoZCoder. No deployment accounts or credentials were copied.
+
+# Polygate's own license, and components that are not copied into the source
+
+Polygate's own code is under the MIT license in LICENSE (copyright (c) 2026 B3hnAM). The third-party source listed above keeps the licenses named there.
+
+Packages and downloads keep their own licenses and are not relicensed by Polygate:
+- Bun (the runtime that runs the gateway, bundled in the Windows app and the Linux packages and used by the Docker image) is MIT-licensed and statically links JavaScriptCore, which is LGPL-2.0 licensed. Bun's source and license texts are published with each release at https://github.com/oven-sh/bun.
+- React and React DOM (dashboard) are MIT-licensed. Lucide icons (dashboard) are ISC-licensed. Electron (Windows app) is MIT-licensed; its own notices ship inside the app.
+- wireproxy (userspace WireGuard for the WARP route) is downloaded at the user's request from its GitHub release, with a checksum check; it is not bundled. Its license applies to that download.
+- npm dependencies used to build the dashboard and the Windows app are under their own licenses; run `npm ls` for the list.

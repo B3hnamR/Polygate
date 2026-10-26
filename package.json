@@ -2,6 +2,7 @@
   "name": "polygate",
   "version": "0.2.0",
   "private": true,
+  "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
   "author": "Polygate",
   "main": "desktop/main.cjs",
@@ -64,6 +65,10 @@
       {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
       },
       {
         "from": "relays",

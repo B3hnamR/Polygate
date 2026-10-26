@@ -28,7 +28,7 @@ with zipfile.ZipFile(work/'bun.zip') as z:
 PY
 chmod 0755 "$pkg/bin/bun"
 cp -R dist install scripts relays "$pkg/"
-cp install.sh package.json README.md THIRD_PARTY_NOTICES.md "$pkg/"
+cp install.sh package.json README.md LICENSE THIRD_PARTY_NOTICES.md "$pkg/"
 mkdir -p "$pkg/vendor/bridge" "$pkg/vendor/protocols"
 cp -R vendor/licenses "$pkg/vendor/licenses"
 cp vendor/bridge/LICENSE "$pkg/vendor/bridge/"

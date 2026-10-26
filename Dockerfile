@@ -22,7 +22,7 @@ WORKDIR /app
 COPY --from=gateway /out /app/build
 COPY --from=ui /src/dist /app/dist
 COPY relays /app/relays
-COPY THIRD_PARTY_NOTICES.md /app/
+COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 COPY vendor/bridge/LICENSE /app/vendor/bridge/LICENSE
 COPY vendor/protocols/LICENSE /app/vendor/protocols/LICENSE
 COPY vendor/licenses /app/vendor/licenses
