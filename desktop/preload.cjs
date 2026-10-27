@@ -10,3 +10,7 @@ contextBridge.exposeInMainWorld('polygateUpdates', {
     return () => ipcRenderer.removeListener('polygate:updates:changed', listener);
   },
 });
+contextBridge.exposeInMainWorld('polygateDesktop', {
+  getPrefs: () => ipcRenderer.invoke('polygate:desktop:prefs'),
+  setCloseToTray: value => ipcRenderer.invoke('polygate:desktop:close-to-tray', value === true),
+});

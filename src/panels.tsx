@@ -1,6 +1,7 @@
 import {useState,useEffect,useRef,type FormEvent} from 'react';
 import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,Download,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
 import {api,at} from './api';
+import {ProxyLists} from './proxy-lists';
 import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
 export type Notice=(message:string,kind?:'ok'|'error')=>void;
 const errorOf=(e:unknown)=>String((e as Error)?.message||e);
@@ -82,7 +83,7 @@ export function PoolPanel({notice,action,refresh,go,backup}:{notice:Notice;actio
   const params=new URLSearchParams({tab,sort:'best',page:String(page),pageSize:String(pageSize)});if(q)params.set('q',q);if(proto)params.set('proto',proto);
   const {data,reload,error}=usePoll<PoolInfo>('/admin/pool?'+params,3500);
   const [picked,setPicked]=useState<Set<string>>(new Set());const [busy,setBusy]=useState('');const [pendingMain,setPendingMain]=useState(false);
-  const [adding,setAdding]=useState(false);const [text,setText]=useState('');const fileInput=useRef<HTMLInputElement>(null);
+  const [adding,setAdding]=useState(false);
   const [cfg,setCfg]=useState<PoolConfig|null>(null);useEffect(()=>{if(data&&!cfg)setCfg(data.config);},[data,cfg]);
   const rows=data?.entries||[];const counts=data?.counts;
   const toggle=(url:string)=>setPicked(s=>{const n=new Set(s);n.has(url)?n.delete(url):n.add(url);return n;});
@@ -105,10 +106,10 @@ export function PoolPanel({notice,action,refresh,go,backup}:{notice:Notice;actio
     <div className="pool-choice" role="radiogroup" aria-label="How the pool is used"><label><input type="radio" name="pool-use" checked={!asMain} disabled={busy==='role'} onChange={()=>setRole(false)}/><span>Use them only when my own IP is used up <small className="muted">Recommended. Your current route stays the active one.</small></span></label><label><input type="radio" name="pool-use" checked={asMain} disabled={busy==='role'} onChange={()=>setRole(true)}/><span>Use them for every request <small className="muted">The pool becomes the active route.</small></span></label></div>
     <p className="route-status subtle">{!route?.attached?'The pool is not attached yet. It is attached as soon as a run finds working proxies.':asMain?'Right now the pool is the active route.':`Right now the pool is standby only; the active route is ${route.previous}.`} {backup.length>0&&<>Backup order: {backup.filter(x=>x.usable).map(x=>x.name).join(' → ')||'none ready'}. </>}<button className="link-button" onClick={()=>go('Routing')}>Open Routing</button></p>
     <div className="form-actions left">{working?<Button onClick={()=>call('stop','/admin/proxies/stop',{})}><Square size={14}/>Stop</Button>:<Button variant="primary" disabled={!!busy} onClick={()=>call('find','/admin/proxies/scan',{select:asMain},'Looking for working proxies')}><Zap size={15}/>Find working proxies</Button>}
-      <Button disabled={working||!!busy} onClick={()=>setAdding(!adding)}><Plus size={15}/>Add my own list</Button>
+      <Button disabled={!!busy} aria-expanded={adding} onClick={()=>setAdding(!adding)}><Plus size={15}/>My proxies and lists</Button>
       <Button disabled={working||!!busy||!counts?.all} title="Runs the API check and the model test again on the proxies already saved." onClick={()=>call('retest','/admin/pool/find',{select:asMain},'Re-testing the saved proxies')}><RefreshCw size={15}/>Re-test saved</Button>
       <span className="subtle">{counts?<><strong>{counts.ready}</strong> working in the pool · {counts.all.toLocaleString()} saved proxies. {working?'Runs in the background; you can leave this page.':''}</>:'Loading…'}</span></div>
-    {adding&&<div className="section-block form-section"><p className="muted">Paste proxies, one per line: <code>host:port</code>, <code>socks5://host:port</code> or <code>http://user:password@host:port</code>. A line without a scheme is tried as HTTP, SOCKS5 and SOCKS4. Only proxies that reach the OpenCode API in time are kept.</p><textarea aria-label="Proxy list" rows={5} value={text} onChange={e=>setText(e.target.value)} placeholder={'1.2.3.4:8080\nsocks5://user:password@5.6.7.8:1080'}/><div className="form-actions"><Button onClick={()=>fileInput.current?.click()}><Download size={15}/>Load file</Button><input ref={fileInput} hidden type="file" accept=".txt,.csv,.list" onChange={async e=>{const f=e.target.files?.[0];e.target.value='';if(f)setText(await f.text());}}/><Button variant="primary" disabled={!text.trim()||!!busy} onClick={async()=>{if(await call('import','/admin/proxies/import',{text,select:asMain},'Checking your proxies')){setText('');setAdding(false);}}}>Check these proxies</Button></div></div>}
+    {adding&&<ProxyLists select={asMain} disabled={working} notice={notice} onStarted={()=>{setAdding(false);void reload();}}/>}
     {counts&&counts.ready>0&&<p className="subtle fine-print"><Info size={14}/> Working proxies are re-verified in the background. When your own IP has used up its daily allowance, requests move to one of them automatically.</p>}
     </div>
     <div className="section-toolbar"><div className="search"><Search size={16}/><input aria-label="Filter proxies" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter by address or protocol…"/></div>

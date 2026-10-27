@@ -1,4 +1,4 @@
-const {app,BrowserWindow,dialog,shell,Menu,ipcMain,net}=require('electron');
+const {app,BrowserWindow,dialog,shell,Menu,Tray,nativeImage,ipcMain,net}=require('electron');
 const {createPortableUpdater,portableTarget}=require('./updater.cjs');
 const {spawn,spawnSync}=require('node:child_process');
 const path=require('node:path');
@@ -6,7 +6,11 @@ const fs=require('node:fs');
 const {randomBytes}=require('node:crypto');
 // The window and taskbar icon: the packaged app ships it in resources, a source checkout reads it from assets.
 const iconPath=app.isPackaged?path.join(process.resourcesPath,'icon.png'):path.join(__dirname,'..','assets','icon.png');
-let child,win,port,quitting=false,reaped=false;const token=randomBytes(32).toString('hex');
+// The tray takes the .ico on Windows, which holds sharp small sizes.
+const trayIconPath=process.platform!=='win32'?iconPath:app.isPackaged?path.join(process.resourcesPath,'icon.ico'):path.join(__dirname,'..','assets','icon.ico');
+// The documented gateway port; a desktop launch falls back to a free one when another program already holds it.
+const DEFAULT_PORT=4317;
+let child,win,tray,port,quitting=false,reaped=false;const token=randomBytes(32).toString('hex');
 const killTree=()=>{
   if(reaped||!child||child.exitCode!==null||child.signalCode)return;reaped=true;
   if(process.platform==='win32'&&child.pid){const r=spawnSync(path.join(process.env.SystemRoot||'C:\\Windows','System32','taskkill.exe'),['/pid',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore',timeout:5000});if(r.error||r.status)child.kill();}
@@ -22,18 +26,37 @@ app.whenReady().then(async()=>{
   const exe=app.isPackaged?path.join(root,'bin','bun.exe'):(process.env.BUN_EXE||path.join(process.env.USERPROFILE,'.bun','bin','bun.exe'));
   const entry=app.isPackaged?path.join(root,'gateway.js'):path.join(root,'backend','main.ts');
   const logDir=app.getPath('userData');fs.mkdirSync(logDir,{recursive:true});const log=fs.openSync(path.join(logDir,'gateway.log'),'a');
+  // Desktop preferences: the API port (clients are set up with it, so it must not change between launches) and what closing the window does.
+  const prefsFile=path.join(logDir,'desktop.json');let prefs={};
+  try{const saved=JSON.parse(fs.readFileSync(prefsFile,'utf8'));if(saved&&typeof saved==='object')prefs=saved;}catch{/* first launch or an unreadable file: use the defaults */}
+  const savePrefs=next=>{prefs={...prefs,...next};try{fs.writeFileSync(prefsFile,JSON.stringify(prefs));}catch(e){fs.writeSync(log,`[desktop] could not save preferences: ${e.message}\n`);}};
+  const savedPort=Number(prefs.port);const preferred=Number.isInteger(savedPort)&&savedPort>=1024&&savedPort<=65535?savedPort:DEFAULT_PORT;
   const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/^POLYGATE_(HOST|ALLOWED_HOSTS|TRUST_PROXY|COOKIE_SECURE|DEV|ADMIN_PASSWORD|PUBLIC_IP|ACME_INSECURE|ACME_DIRECTORY)$/i.test(k)));
-  child=spawn(exe,[entry],{cwd:root,windowsHide:true,env:{...env,POLYGATE_DESKTOP:'1',POLYGATE_HOST:'127.0.0.1',POLYGATE_PORT:'0',POLYGATE_ADMIN_TOKEN:token,POLYGATE_STATE:path.join(logDir,'state'),POLYGATE_UI_DIST:app.isPackaged?path.join(root,'ui'):path.join(root,'dist')},stdio:['ignore','pipe',log]});
+  child=spawn(exe,[entry],{cwd:root,windowsHide:true,env:{...env,POLYGATE_DESKTOP:'1',POLYGATE_HOST:'127.0.0.1',POLYGATE_PORT:String(preferred),POLYGATE_ADMIN_TOKEN:token,POLYGATE_STATE:path.join(logDir,'state'),POLYGATE_UI_DIST:app.isPackaged?path.join(root,'ui'):path.join(root,'dist')},stdio:['ignore','pipe',log]});
   try{
     port=await new Promise((resolve,reject)=>{let buffer='';const timeout=setTimeout(()=>reject(new Error('Gateway startup timed out. See gateway.log in '+logDir)),25000);child.once('error',e=>{clearTimeout(timeout);reject(e);});child.stdout.on('data',chunk=>{fs.writeSync(log,chunk);buffer+=chunk.toString();let i;while((i=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,i);buffer=buffer.slice(i+1);try{const x=JSON.parse(line);if(x.polygateReady){clearTimeout(timeout);resolve(x.port);}}catch{}}});child.once('exit',code=>{clearTimeout(timeout);reject(new Error('Gateway exited before startup (code '+code+'). See '+logDir));});});
+    // When the saved port was taken, the gateway picked another; that one is kept from now on.
+    savePrefs({port});
     win=new BrowserWindow({width:1430,height:970,minWidth:880,minHeight:650,title:'Polygate',icon:iconPath,backgroundColor:'#14171c',show:false,autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
     const resultPath=path.join(logDir,'update-result.json');
     const updater=createPortableUpdater({version:app.getVersion(),target:portableTarget(process.env.PORTABLE_EXECUTABLE_FILE,app.isPackaged),tempDir:app.getPath('temp'),resultPath,fetcher:(...args)=>net.fetch(...args),onState:state=>{if(win&&!win.isDestroyed())win.webContents.send('polygate:updates:changed',state);},onReady:()=>setTimeout(()=>app.quit(),500)});
     // IPC is available only to this window's own top-level dashboard, never another frame or remote page.
-    const updateAction=fn=>async event=>{if(event.sender!==win.webContents||event.senderFrame!==win.webContents.mainFrame||new URL(event.senderFrame.url).origin!==`http://127.0.0.1:${port}`)throw new Error('Update action is not allowed from this page');return fn();};
-    ipcMain.handle('polygate:updates:state',updateAction(()=>updater.getState()));
-    ipcMain.handle('polygate:updates:check',updateAction(()=>updater.check(true)));
-    ipcMain.handle('polygate:updates:install',updateAction(()=>updater.install()));
+    const fromDashboard=fn=>async(event,...args)=>{if(event.sender!==win.webContents||event.senderFrame!==win.webContents.mainFrame||new URL(event.senderFrame.url).origin!==`http://127.0.0.1:${port}`)throw new Error('This action is not allowed from this page');return fn(...args);};
+    ipcMain.handle('polygate:updates:state',fromDashboard(()=>updater.getState()));
+    ipcMain.handle('polygate:updates:check',fromDashboard(()=>updater.check(true)));
+    ipcMain.handle('polygate:updates:install',fromDashboard(()=>updater.install()));
+    const desktopPrefs=()=>({closeToTray:prefs.closeToTray!==false});
+    ipcMain.handle('polygate:desktop:prefs',fromDashboard(desktopPrefs));
+    ipcMain.handle('polygate:desktop:close-to-tray',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');savePrefs({closeToTray:value});return desktopPrefs();}));
+    // Closing the window keeps the gateway serving clients from the tray, unless that is turned off in Settings; the tray's Exit stops it.
+    const showWindow=()=>{if(win.isDestroyed())return;if(win.isMinimized())win.restore();win.show();win.focus();};
+    tray=new Tray(nativeImage.createFromPath(trayIconPath));tray.setToolTip(`Polygate · 127.0.0.1:${port}`);
+    tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Polygate',click:showWindow},{type:'separator'},{label:'Exit',click:()=>app.quit()}]));
+    tray.on('click',showWindow);
+    win.on('close',e=>{
+      if(quitting||prefs.closeToTray===false)return;e.preventDefault();win.hide();
+      if(!prefs.trayHintShown&&process.platform==='win32'){tray.displayBalloon({iconType:'info',title:'Polygate is still running',content:'Your clients keep working. Open or exit Polygate from this tray icon.'});savePrefs({trayHintShown:true});}
+    });
     win.webContents.setWindowOpenHandler(({url})=>{if(/^https:\/\//.test(url))shell.openExternal(url);return {action:'deny'};});
     const ses=win.webContents.session,ok=p=>p==='clipboard-sanitized-write';ses.setPermissionRequestHandler((_,p,cb)=>cb(ok(p)));ses.setPermissionCheckHandler((_,p)=>ok(p));
     const pin=e=>{let o;try{o=new URL(e.url).origin;}catch{}if(o!==`http://127.0.0.1:${port}`)e.preventDefault();};
@@ -54,7 +77,7 @@ app.whenReady().then(async()=>{
 });
 app.on('window-all-closed',()=>app.quit());
 app.on('before-quit',event=>{
-  if(quitting||!child)return;event.preventDefault();quitting=true;
+  if(quitting||!child)return;event.preventDefault();quitting=true;tray?.destroy();
   const force=setTimeout(()=>{killTree();app.exit(0);},12000);
   (async()=>{try{if(!port){killTree();return;}await fetch(`http://127.0.0.1:${port}/admin/shutdown`,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:'{}'});if(child.exitCode===null&&!child.signalCode)await new Promise(r=>{child.once('exit',r);setTimeout(r,10000);});}catch{}finally{clearTimeout(force);killTree();app.exit(0);}})();
 });

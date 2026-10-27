@@ -1,6 +1,6 @@
 {
   "name": "polygate",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
@@ -42,6 +42,9 @@
   "build": {
     "appId": "dev.polygate.desktop",
     "productName": "Polygate",
+    "extraMetadata": {
+      "description": "Polygate"
+    },
     "directories": {
       "output": "release"
     },
@@ -73,6 +76,10 @@
       {
         "from": "assets/icon.png",
         "to": "icon.png"
+      },
+      {
+        "from": "assets/icon.ico",
+        "to": "icon.ico"
       },
       {
         "from": "relays",

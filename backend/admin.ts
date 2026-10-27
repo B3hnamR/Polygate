@@ -3,7 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { settings, publicSettings, persist, models, logs, stats, saveModel, removeModels, requestDetail, recentFailureDetails, recentBaselineDetails } from './state';
 import { json, readJson, queue, probeModel, readiness } from './gateway';
 import { discover, identityState, syncIdentity, rankedModels } from './providers';
-import { startScan, startImport, stopEngine, removeProxies } from './proxy-engine';
+import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
+import { PROXY_SOURCES } from './proxy-sources';
 import { testRoute, describeRoutes, backupChain } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, ensureRoute as ensureWarpRoute } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
@@ -17,6 +18,46 @@ import { serverConfig } from './auth';
 import { GatewayError } from './queue';
 import { version } from './version';
 import { checkForUpdates } from './updates';
+import { queryEvents, exportEvents, clearEvents, parseLogQuery } from './logbook';
+import { mcpConfig, mcpState, serverStatus, cleanServer, parseImport, slug, testServer, saveServers, settle, reconnect, callTool, canManageLocal, syncMcp } from './mcp';
+// The MCP page: hub settings, servers, their tools, connection tests and trying a tool.
+async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
+  const method=req.method;const cfg=mcpConfig();const local=canManageLocal(req);
+  const find=(id:unknown)=>{const s=cfg.servers.find(x=>x.id===id);if(!s)throw new GatewayError('No such MCP server',404);return s;};
+  if(pathname==='/admin/mcp'&&method==='GET')return json(res,200,mcpState(req));
+  if(method!=='POST')throw new GatewayError('Endpoint not found',404);
+  const b=await readJson(req);
+  if(pathname==='/admin/mcp/settings'){
+    if(b.enabled!==undefined)cfg.enabled=!!b.enabled;if(b.builtin!==undefined)cfg.builtin=!!b.builtin;
+    if(Array.isArray(b.builtinKeys)){const keys=b.builtinKeys.map(String).filter((id:string)=>settings.keys.some(k=>k.id===id));cfg.builtinKeys=keys.length?keys:undefined;}
+    persist();syncMcp();return json(res,200,mcpState(req));
+  }
+  if(pathname==='/admin/mcp/servers'){
+    const saved=b.id?find(b.id):undefined;const next=cleanServer(b,saved,local);
+    saveServers(saved?cfg.servers.map(s=>s.id===saved.id?next:s):[...cfg.servers,next]);await settle(next.id);return json(res,200,serverStatus(next));
+  }
+  if(pathname==='/admin/mcp/servers/delete'){const s=find(b.id);saveServers(cfg.servers.filter(x=>x.id!==s.id));return json(res,200,{ok:true});}
+  if(pathname==='/admin/mcp/servers/toggle'){const s=find(b.id);const next={...s,enabled:!!b.enabled};saveServers(cfg.servers.map(x=>x.id===s.id?next:x));await settle(next.id);return json(res,200,serverStatus(next));}
+  if(pathname==='/admin/mcp/servers/tools'){const s=find(b.id);const next=cleanServer({disabledTools:Array.isArray(b.disabledTools)?b.disabledTools:[]},s,local);saveServers(cfg.servers.map(x=>x.id===s.id?next:x));return json(res,200,serverStatus(next));}
+  if(pathname==='/admin/mcp/servers/reconnect')return json(res,200,await reconnect(String(b.id||'')));
+  if(pathname==='/admin/mcp/test'){const saved=b.id?find(b.id):undefined;const draft=cleanServer({...b,name:b.name||saved?.name||'test'},saved,local);return json(res,200,await testServer(draft));}
+  if(pathname==='/admin/mcp/call'){
+    const scope=b.server==='polygate'?'polygate':find(b.server).name;
+    return json(res,200,await callTool(String(b.tool||''),b.arguments,undefined,scope,'dashboard'));
+  }
+  if(pathname==='/admin/mcp/import'){
+    const added:any[]=[];const skipped:{name:string;reason:string}[]=[];const servers=[...cfg.servers];
+    for(const item of parseImport(b.config)){
+      const name=slug(item.name,servers.map(s=>s.name));
+      if(item.invalid){skipped.push({name:item.name,reason:item.invalid});continue;}
+      try{const next=cleanServer({...item,name},undefined,local);servers.push(next);added.push(next.name);}
+      catch(e:any){skipped.push({name:item.name,reason:e.message});}
+    }
+    if(added.length)saveServers(servers);
+    return json(res,200,{added,skipped});
+  }
+  throw new GatewayError('Endpoint not found',404);
+}
 import type { Provider, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
@@ -27,6 +68,15 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/updates/check'&&method==='POST'){await readJson(req);return json(res,200,await checkForUpdates(true));}
   if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
+  if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
+  if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));
+  if(pathname==='/admin/events/export'&&method==='GET'){
+    const params=new URL(req.url||'/','http://x').searchParams;const format=params.get('format')==='json'?'json':'txt';
+    const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    res.writeHead(200,{'content-type':format==='json'?'application/x-ndjson; charset=utf-8':'text/plain; charset=utf-8','content-disposition':`attachment; filename="polygate-logs-${stamp}.${format==='json'?'ndjson':'log'}"`,'cache-control':'no-store'});
+    res.end(exportEvents(parseLogQuery(params),format));return;
+  }
+  if(pathname==='/admin/events/clear'&&method==='POST'){await readJson(req);clearEvents();return json(res,200,{ok:true});}
   // Request-shape records (no prompt or completion content) for working out why a request was refused.
   if(pathname==='/admin/request'&&method==='GET'){const id=new URL(req.url||'','http://x').searchParams.get('id')||'';const row=requestDetail(id);if(!row)throw new GatewayError('Request not found',404);return json(res,200,row);}
   if(pathname==='/admin/diagnostics'&&method==='GET'){const q=new URL(req.url||'','http://x').searchParams;return json(res,200,{failures:recentFailureDetails(Math.max(1,Math.min(100,Math.floor(Number(q.get('failures')))||20))),baseline:recentBaselineDetails(Math.max(1,Math.min(20,Math.floor(Number(q.get('baseline')))||5)))});}
@@ -137,7 +187,25 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // Finding proxies: download the public lists (or read a pasted one), keep the ones that load the OpenCode API fast enough, then (find) model-test them.
   const engineOptions=(after?:()=>void)=>{const c=poolConfig();return {api:apiUrl(),timeoutSec:c.apiTimeoutSec!,gateMs:c.apiMaxLatencyMs!,after};};
   if(pathname==='/admin/proxies/scan'&&method==='POST'){const b=await readJson(req);return json(res,200,startScan(engineOptions(b.find===false?undefined:()=>{void testPool({deep:true,api:true,attach:{select:b.select===true}}).catch(()=>{});})));}
-  if(pathname==='/admin/proxies/import'&&method==='POST'){const b=await readJson(req);const text=String(b.text||'');if(!text.trim())throw new GatewayError('Paste at least one proxy address',400);return json(res,200,startImport(text,engineOptions(b.find===false?undefined:()=>{void testPool({deep:true,api:true,attach:{select:b.select===true}}).catch(()=>{});})));}
+  if(pathname==='/admin/proxies/import'&&method==='POST'){const b=await readJson(req);const text=String(b.text||'');if(!text.trim())throw new GatewayError('Paste at least one proxy address or list link',400);const hint=['http','https','socks4','socks5'].includes(b.proto)?b.proto:'all';return json(res,200,startImport(text,engineOptions(b.find===false?undefined:()=>{void testPool({deep:true,api:true,attach:{select:b.select===true}}).catch(()=>{});}),hint));}
+  // The list links "Find working proxies" downloads: the built-in public ones (on or off) and the user's own.
+  if(pathname==='/admin/proxies/sources'&&method==='GET'){const c=proxyLists();return json(res,200,{builtin:c.builtin!==false,builtinCount:PROXY_SOURCES.length,sources:c.sources});}
+  if(pathname==='/admin/proxies/sources'&&method==='POST'){
+    const b=await readJson(req);const c=proxyLists();
+    if(b.builtin!==undefined)c.builtin=!!b.builtin;
+    if(Array.isArray(b.sources)){
+      if(b.sources.length>200)throw new GatewayError('At most 200 list links',400);
+      const seen=new Set<string>();
+      c.sources=b.sources.map((x:any)=>{
+        const link=url(x?.url);if(seen.has(link))throw new GatewayError(`${link} is listed twice`,400);seen.add(link);
+        const proto=['http','https','socks4','socks5','all'].includes(x?.proto)?x.proto:'all';const prior=c.sources.find(s=>s.id===x?.id||s.url===link);
+        return {id:prior?.id||randomBytes(6).toString('hex'),url:link,proto,enabled:x?.enabled!==false,label:String(x?.label||'').trim().slice(0,60)||undefined,...(prior&&prior.url===link&&prior.proto===proto?{lastAt:prior.lastAt,lastCount:prior.lastCount,lastError:prior.lastError}:{})};
+      });
+    }
+    persist();return json(res,200,{builtin:c.builtin!==false,builtinCount:PROXY_SOURCES.length,sources:c.sources});
+  }
+  // Downloads one link now and says what is in it, without checking or saving anything.
+  if(pathname==='/admin/proxies/sources/test'&&method==='POST'){const b=await readJson(req);const link=url(b.url);const proto=['http','https','socks4','socks5'].includes(b.proto)?b.proto:'all';const r=await fetchList(link,proto);const by:Record<string,number>={};for(const c of r.found)by[c.proto]=(by[c.proto]||0)+1;return json(res,200,{count:r.found.length,byProtocol:by,error:r.error,sample:r.found.slice(0,5).map(c=>c.url)});}
   if(pathname==='/admin/proxies/stop'&&method==='POST'){stopEngine();stopPoolTest();return json(res,200,{ok:true});}
   if(pathname==='/admin/proxies/remove'&&method==='POST'){const b=await readJson(req);if(b.all===true)removeProxies();else if(Array.isArray(b.urls))removeProxies(b.urls.map(String).slice(0,5000));else throw new GatewayError('Say which proxies to remove',400);await poolEntries(true);return json(res,200,{ok:true});}
   // Model-test the proxies already saved: OpenCode API check, speed gate, model test, then the working ones go into the pool.

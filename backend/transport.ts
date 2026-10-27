@@ -9,6 +9,7 @@ import { warpTarget, warpFailure, warpSuccess } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
 import { detectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
+import { logEvent } from './logbook';
 const exec = promisify(execFile);
 // requestId ties outbound calls to the gateway request that caused them, so their shape can be logged with it.
 export const routeContext = new AsyncLocalStorage<{routeId: string; requestId?: string}>();
@@ -170,7 +171,8 @@ export function relayRequest(url: string, init: RequestInit, route: Route) {
 const BREAKER_THRESHOLD=3;
 export function routeFailed(route:Route,reason:string,immediate=false){
   route.status=redactError(reason);route.failures=(route.failures||0)+1;
-  if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;}
+  if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;
+    logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,pausedUntil:route.cooldownUntil});}
 }
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
 // A caller-side abort (client disconnect, request deadline) says nothing about the route; a timeout the caller set on the route itself does.

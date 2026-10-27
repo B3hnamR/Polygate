@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { settings, models, stateDir, redactError } from './state';
 import { GatewayError } from './queue';
+import { logEvent } from './logbook';
 export type Notice = { id: string; title: string; message: string; type: 'info' | 'success' | 'warning' | 'error'; time: number; read: boolean };
 const file = path.join(stateDir, 'notifications.json');
 let items: Notice[] = [];
@@ -15,7 +16,9 @@ export function notify(title: string, message: string, type: Notice['type'] = 'i
   recent.set(key, Date.now()); if (recent.size > 500) recent.clear();
   const item: Notice = { id: randomUUID(), title, message, type, time: Date.now(), read: false };
   items.unshift(item); items = items.slice(0, 100); save(); void deliver(item);
+  logEvent(type === 'error' ? 'error' : type === 'warning' ? 'warn' : 'info', noticeSource(title), `${title}: ${message}`);
 }
+const noticeSource = (title: string) => /warp/i.test(title) ? 'warp' : /https|certificate/i.test(title) ? 'https' : /prox/i.test(title) ? 'proxies' : /kilo|model/i.test(title) ? 'models' : /route|exit/i.test(title) ? 'routes' : /budget|key/i.test(title) ? 'keys' : 'gateway';
 export const notices = () => ({ items: items.slice(0, 50), unread: items.filter(n => !n.read).length });
 export function markAllRead() { for (const n of items) n.read = true; save(); }
 export function clearNotices() { items = []; save(); }

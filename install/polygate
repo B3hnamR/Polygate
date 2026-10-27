@@ -237,6 +237,9 @@ Polygate manager. Run  polygate  for the menu, or give a command:
   polygate start | stop | restart | logs
   polygate password [--stdin]  a new dashboard password (random unless --stdin)
   polygate https status | domain NAME [EMAIL] | ip [ADDRESS] [EMAIL] | custom CERT KEY | renew | disable
+  polygate mcp list | remove NAME | on NAME | off NAME
+  polygate mcp add-local NAME [--env KEY=VALUE]... COMMAND [ARGS...]
+                               add an MCP server that runs as a program on this server (remote ones: dashboard, MCP page)
   polygate update              install a newer release, keeping your data
   polygate uninstall --yes [--purge]   remove the program (--purge: its data and user too)
   polygate version | settings
@@ -257,6 +260,7 @@ case "${1:-menu}" in
   settings) control settings ;;
   password) shift; cmd_password "$@" ;;
   https) shift; cmd_https "$@" ;;
+  mcp) shift; control mcp "$@" </dev/null ;;
   update) export POLYGATE_REPO; bash "$ROOT/install.sh" --update ;;
   uninstall) shift; cmd_uninstall "$@" ;;
   help|-h|--help) usage ;;

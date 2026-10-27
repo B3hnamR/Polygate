@@ -32,8 +32,9 @@
 | **Free providers, built in** | OpenCode Free and Kilo Free. Discover their current catalogs, or add your own compatible API. |
 | **One address for your tools** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. |
 | **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. |
-| **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool, WARP, and deployable relays. |
-| **See what is happening** | Model availability, request timing, provider settings, client keys, and a Playground for real requests. |
+| **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool (from public lists or your own list links), WARP, and deployable relays. |
+| **One MCP address for your tools** | Add MCP servers once; every AI client gets all their tools from `/mcp` with its Polygate key, reached through your own routes. |
+| **See what is happening** | Model availability, request timing, a searchable log of everything the gateway does, client keys, and a Playground for real requests. |
 | **Run it your way** | Portable Windows app, Linux service with a manager, or Docker. Built-in HTTPS is available on servers. |
 
 > [!NOTE]
@@ -105,6 +106,8 @@ sudo bash install.sh --update      # newer release, keeps your data, settings an
 2. Run it. It is portable: no installer or administrator access is needed.
 3. The dashboard opens inside the app. Copy your connection details into an AI tool, or try the **Playground**.
 
+The API stays at `http://127.0.0.1:4317/v1` from one launch to the next (if another program holds that port, the app picks a free one once and keeps it). Closing the window keeps Polygate running in the tray so your tools keep working; right-click the tray icon and choose **Exit** to stop it, or turn this off in **Settings → Desktop app**.
+
 The app is currently unsigned, so Windows may show SmartScreen. Download from this repository’s release page and verify the executable against the supplied `.sha256` file. App data is kept in `%LOCALAPPDATA%\Polygate`.
 
 ### Docker
@@ -171,7 +174,7 @@ Choose a model and protocol, add a system instruction, and read the streamed res
 
 ## Explore
 
-[Client setup](#connect-your-client) · [Providers](#providers) · [Network routes and relays](#network-routes-and-relays) · [HTTPS](#https-and-domains) · [Server manager](#managing-a-server) · [Privacy](#privacy-and-access-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
+[Client setup](#connect-your-client) · [Providers](#providers) · [MCP hub](#mcp-hub) · [Network routes and relays](#network-routes-and-relays) · [HTTPS](#https-and-domains) · [Server manager](#managing-a-server) · [Privacy](#privacy-and-access-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
 ---
 
@@ -225,17 +228,31 @@ Responses continuation through `previous_response_id` is not implemented; send c
 | **OpenCode Free** | built in | OpenCode has a daily allowance per network address. When an address is used up, Polygate moves to another exit if you have one, and says when the limit resets. |
 | **Kilo Free** | built in; every model Kilo marks free, no account needed | Kilo limits anonymous use per network address. When that happens all Kilo models rest for 30 minutes (the answer says so and carries `Retry-After`). A single busy model rests for 2 minutes while the others keep working. You can save a Kilo API key on its row. Kilo models rank behind OpenCode's in `auto` and take over when OpenCode's are resting. |
 | **OpenAI-compatible** | add any endpoint that has `/v1/chat/completions` | needs a base URL and, usually, a key |
-| **OpenCode server** | add your own OpenCode server | text conversation only |
+| **OpenCode server** | an OpenCode you run yourself (`opencode serve`), reached over its own REST API | uses the providers and logins configured in that OpenCode; model ids are `provider/model` as that server lists them; text conversation only (no tool calls) |
 
-Built-in providers can be switched off but not deleted. A model's priority and score can be changed on the Models page. Models are not probed in the
+Built-in providers can be switched off but not deleted. A model's priority and score can be changed on the Models page, which can also show one provider's models at a time. Models are not probed in the
 background by default (a probe is a real request that uses up allowance); press *Check* on a model to test it.
+
+## MCP hub
+
+Add your MCP servers once on the **MCP** page; every AI client then connects to one address and gets all their tools, named `server__tool`, plus a few of Polygate's own (`polygate__gateway_status`, `list_models`, `list_routes`, `test_route`, `recent_errors`, `read_logs`, `list_mcp_servers`).
+
+```bash
+claude mcp add --transport http polygate http://127.0.0.1:4317/mcp --header "Authorization: Bearer pg_your_key"
+```
+
+The page has ready-to-paste settings for Claude Code, Cursor, Codex, OpenCode, VS Code and Claude Desktop, and can import the `mcpServers` block other tools use. `/mcp/<name>` offers one server alone, with its tools' own names.
+
+- **Remote servers** (Streamable HTTP, or HTTP + SSE for older ones) are reached through the route you choose: direct, a proxy, the proxy pool or WARP. Their headers and keys are stored encrypted and never shown again.
+- **Local programs** (`npx …`, `uvx …`) can be added in the Windows app. On a server they are added only from the server itself, `sudo polygate mcp add-local NAME COMMAND ARGS`, never from the web dashboard, so the dashboard password alone cannot run commands on your server.
+- Each server can be limited to some client keys, single tools can be hidden, and every tool call is on the **Logs** page (tool names, timing and errors; not what was sent).
 
 ## Network routes and relays
 
 A *route* is the path a request takes to the provider. Pick one on the Routing page, and give a provider its own route if it needs one.
 
 - **Direct**: your own connection.
-- **HTTP / SOCKS proxy**: your own proxy, or the **verified proxy pool**: Polygate downloads public lists, tests them with real model requests, and keeps the ones that work.
+- **HTTP / SOCKS proxy**: your own proxy, or the **verified proxy pool**: Polygate downloads public lists, tests them with real model requests, and keeps the ones that work. Under **My proxies and lists** you can paste proxies and links to lists (plain `ip:port`, `socks5://…`, `user:pass@ip:port`, `ip:port:user:pass`, web-page tables, JSON), or save list links that every search downloads before (or instead of) the public lists.
 - **Cloudflare WARP**: a built-in WireGuard tunnel (it downloads `wireproxy` on request and checks its checksum). It changes nothing on the machine: no network interface, route, DNS or firewall rule, only a local SOCKS port on `127.0.0.1` that Polygate's own requests use. If another program already uses that port (Cloudflare's own `warp-cli` and some xray setups use 40000), Polygate picks the next free one and never touches the other program. It needs outbound UDP to Cloudflare; some hosting networks block it.
 - **Relays**: one click on the Relays page deploys a small forwarding function to your own Vercel, Netlify or Cloudflare account. The platform token is used once and is not stored.
 
@@ -303,6 +320,7 @@ Every menu action is also a command:
 | Start / stop / restart | `sudo polygate start` / `sudo polygate stop` / `sudo polygate restart` |
 | Live logs | `sudo polygate logs` |
 | New dashboard password | `sudo polygate password` |
+| MCP servers: list / add a local program / remove / switch | `sudo polygate mcp list` / `sudo polygate mcp add-local files npx -y @modelcontextprotocol/server-filesystem /srv/share` / `sudo polygate mcp remove files` / `sudo polygate mcp on files` |
 | Update, keeping data | `sudo polygate update` |
 | Uninstall, keeping data | `sudo polygate uninstall --yes` |
 | Uninstall and delete data | `sudo polygate uninstall --yes --purge` |
@@ -334,7 +352,7 @@ Most things are changed in the dashboard. A server reads these environment varia
 ## Privacy and access control
 
 - Settings, provider keys and relay tokens are stored encrypted on disk; the key file is private to the service user. Client API keys are never forwarded to a provider.
-- The request log records sizes, status and timing, not what you typed or what came back.
+- The request log records sizes, status and timing, not what you typed or what came back. The **Logs** page (kept for 7 days) removes keys and tokens before anything is saved; MCP tool calls are logged by name and timing, without their arguments' values.
 - The dashboard needs a password and locks out guessing; API keys can be limited per key and expire.
 - The Linux service runs as an unprivileged user with systemd hardening (no new privileges, read-only system, private temp folder) and is a polite neighbour (low priority, task limit).
 - Releases are verified with SHA-256 before they are unpacked, and the installer refuses archives with unsafe paths or links.

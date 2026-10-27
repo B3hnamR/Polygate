@@ -7,6 +7,7 @@ import { rankedModels, providerChat, sessionFor } from './providers';
 import { routeFor, failoverRoutes, networkFetch, exhaustedAlternative } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
+import { logEvent } from './logbook';
 import { KILO_ID, KILO_LIMIT_PAUSE_MS, KILO_MODEL_PAUSE_MS, isAddressLimit, pauseKilo } from './kilo';
 import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
@@ -27,13 +28,20 @@ function chosenModels(requested:string,key?:ApiKey){
   if(key&&!modelAllowed(key,exact.id))throw new GatewayError('This API key is not allowed to use that model',403,'permission_error');
   if(exact.cooldownUntil>Date.now()){const p=pausedModel(exact.id,exact.cooldownUntil,settings.cooldowns!==false);throw new GatewayError(p.message,429,'model_paused',p.retryAfter);}return [exact];
 }
-export function classifyModel(m:Model,status:number,message:string,latency:number,retryAfter=0){m.checkedAt=Date.now();m.latency=latency;m.error=status<400?'':redactError(message);const wait=Number.isFinite(retryAfter)?retryAfter:0;
+// Logs a model's change of health (not every check): now usable, resting until a time, or gone from its provider.
+function logModelChange(m:Model,before:{state:string;cooldownUntil:number},status:number){
+  if(m.state===before.state&&m.cooldownUntil<=before.cooldownUntil)return;
+  const until=m.cooldownUntil>Date.now()?new Date(m.cooldownUntil).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+  const text=m.state==='available'?'is available':m.state==='cooldown'?`is resting until ${until} (HTTP ${status})`:m.state==='unavailable'?`is unavailable (HTTP ${status})`:`will be checked again (HTTP ${status})`;
+  logEvent(m.state==='available'?'info':m.state==='unavailable'?'error':'warn','models',`${m.id} ${text}`,{model:m.id,provider:m.providerId,from:before.state,to:m.state,status,cooldownUntil:m.cooldownUntil||undefined,error:m.error||undefined});
+}
+export function classifyModel(m:Model,status:number,message:string,latency:number,retryAfter=0){const before={state:m.state,cooldownUntil:m.cooldownUntil};m.checkedAt=Date.now();m.latency=latency;m.error=status<400?'':redactError(message);const wait=Number.isFinite(retryAfter)?retryAfter:0;
   if(status<400){m.state='available';m.failCount=0;m.cooldownUntil=0;}
   else if(settings.cooldowns===false&&(status===429||status>=500||/quota|capacity|rate.?limit/i.test(message)||status===403)){m.state='unchecked';m.cooldownUntil=0;}
   else if(status===429||/quota|capacity|rate.?limit/i.test(message)){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+Math.max(wait, m.failCount<=1?(m.providerId===KILO_ID?KILO_MODEL_PAUSE_MS:15*60000):m.failCount<=3?3600000:21600000);}
   else if(status===404||status===410){m.state='unavailable';}
   else if(status>=500||status===403){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+60000;}
-  saveModel(m);
+  saveModel(m);logModelChange(m,before,status);
 }
 export async function inference(req:IncomingMessage,res:ServerResponse,protocol:Protocol){
   const k=authenticate(req,true);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
@@ -118,7 +126,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
       detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns!==false,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
-    record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms:Date.now()-start,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});}
+    const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});
+    logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
 // Ready means a client request could succeed right now: enabled, at least one usable model, and at least one route that is not cooling down.
 export function readiness(){

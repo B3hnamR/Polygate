@@ -48,6 +48,31 @@ async function run(){
     else{if(extra)body.email=extra;if(mode==='domain')body.domain=value;else if(value)body.ip=value;}
     const r=await call('/admin/https/apply',body);console.log(r.text);if(!r.ok)process.exitCode=1;return;
   }
+  // mcp list | add-local NAME [--env KEY=VALUE]… COMMAND [ARGS…] | remove NAME | on NAME | off NAME
+  // Local programs are added here (or in the Windows app), never from the web dashboard: this runs as root's request with the admin token.
+  if(command==='mcp'){
+    const [action='list',...rest]=process.argv.slice(3);
+    const state=async()=>{const r=await call('/admin/mcp');if(!r.ok)throw new Error(r.text);return JSON.parse(r.text);};
+    const byName=async(name:string)=>{const s=(await state()).servers.find((x:any)=>x.name===name);if(!s)throw new Error(`No MCP server named "${name}". See: polygate mcp list`);return s;};
+    const done=(r:{ok:boolean;text:string})=>{if(!r.ok)throw new Error((()=>{try{return JSON.parse(r.text).error.message;}catch{return r.text;}})());return JSON.parse(r.text);};
+    if(action==='list'){
+      const s=await state();console.log(`MCP hub: ${s.enabled?'on':'off'} · Polygate's own tools: ${s.builtin?'on':'off'} · clients connect to /mcp with a client API key`);
+      if(!s.servers.length)console.log('  No servers yet. Add remote ones on the dashboard\'s MCP page, local programs with: polygate mcp add-local');
+      for(const x of s.servers)console.log(`  ${x.name.padEnd(24)} ${(x.transport==='stdio'?'local':x.transport).padEnd(6)} ${x.status.state.padEnd(10)} ${String(x.status.tools.length).padStart(3)} tool(s)  ${x.transport==='stdio'?[x.command,...(x.args||[])].join(' '):x.url}${x.status.error?`\n${' '.repeat(28)}${x.status.error}`:''}`);
+      return;
+    }
+    if(action==='add-local'){
+      const env:Record<string,string>={};let i=0;const name=rest[i++]||'';
+      while(rest[i]==='--env'){const pair=rest[i+1]||'';const eq=pair.indexOf('=');if(eq<1)throw new Error('--env needs KEY=VALUE');env[pair.slice(0,eq)]=pair.slice(eq+1);i+=2;}
+      if(rest[i]==='--')i++;const [program,...args]=rest.slice(i);
+      if(!name||!program)throw new Error('Usage: polygate mcp add-local NAME [--env KEY=VALUE]... COMMAND [ARGS...]   for example: polygate mcp add-local files npx -y @modelcontextprotocol/server-filesystem /srv/share');
+      const s=done(await call('/admin/mcp/servers',{name,transport:'stdio',command:program,args,env:Object.keys(env).length?env:undefined}));
+      console.log(`Added "${s.name}": ${s.status.state==='ready'?`connected, ${s.status.tools.length} tool(s)`:s.status.state==='error'?`could not start yet: ${s.status.error}`:'starting (the first start may download it)'}`);return;
+    }
+    if(action==='remove'){const s=await byName(rest[0]||'');done(await call('/admin/mcp/servers/delete',{id:s.id}));console.log(`Removed "${s.name}"`);return;}
+    if(action==='on'||action==='off'){const s=await byName(rest[0]||'');const r=done(await call('/admin/mcp/servers/toggle',{id:s.id,enabled:action==='on'}));console.log(`"${r.name}" is ${action==='on'?`on (${r.status.state})`:'off'}`);return;}
+    throw new Error('Usage: polygate mcp list | add-local NAME [--env KEY=VALUE]... COMMAND [ARGS...] | remove NAME | on NAME | off NAME');
+  }
   // doctor: a plain-words health report for whoever runs the server.
   if(command==='doctor'){
     const lines:string[]=[];let bad=0;

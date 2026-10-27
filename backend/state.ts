@@ -3,7 +3,7 @@ import { randomBytes, createCipheriv, createDecipheriv, createHmac, timingSafeEq
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { Settings, Model, LogRow, Provider } from './types';
+import type { Settings, Model, LogRow, Provider, McpServer } from './types';
 
 // Windows keeps state under %LOCALAPPDATA%; Linux follows XDG (a service sets POLYGATE_STATE explicitly).
 export const stateDir = process.env.POLYGATE_STATE || (process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Polygate', 'state') : path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'polygate'));
@@ -68,6 +68,12 @@ export function recentFailureDetails(limit = 20) { return (db.query('SELECT id,t
 export function recentBaselineDetails(limit = 5) { return (db.query('SELECT id,time,model,protocol,route,status,ms,detail FROM requests WHERE status<400 AND detail IS NOT NULL ORDER BY time DESC LIMIT ?').all(limit) as any[]).map(({ detail, ...row }) => ({ ...row, detail: JSON.parse(detail) })); }
 export function stats() { return db.query('SELECT COUNT(*) total, SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) success, COALESCE(AVG(ms),0) latency, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output FROM requests WHERE time > ?').get(Date.now() - 86400000) as any; }
 export function usagePenalties() { const out = new Map<string, number>(); for (const x of db.query('SELECT model,COUNT(*) n,SUM(fault) errors FROM requests WHERE time>? AND (fault=1 OR status<400) GROUP BY model').all(Date.now()-7*86400000) as {model: string, n: number, errors: number}[]) out.set(x.model, x.n < 5 ? 0 : x.errors/x.n >= .8 ? 8 : x.errors/x.n >= .5 ? 4 : 0); return out; }
-export function publicSettings() { const { admin, ...rest } = settings; return { ...rest, notify: settings.notify ? { ...settings.notify, webhookUrl: settings.notify.webhookUrl ? '••••••••' : '' } : undefined, providers: settings.providers.map(p => ({ ...p, apiKey: p.apiKey ? '••••••••' : '' })), routes: settings.routes.map(r => ({ ...r, token: r.token ? '••••••••' : '', url: redactUrl(r.url) })) }; }
+export function publicSettings() { const { admin, ...rest } = settings; return { ...rest, notify: settings.notify ? { ...settings.notify, webhookUrl: settings.notify.webhookUrl ? '••••••••' : '' } : undefined, providers: settings.providers.map(p => ({ ...p, apiKey: p.apiKey ? '••••••••' : '' })), routes: settings.routes.map(r => ({ ...r, token: r.token ? '••••••••' : '', url: redactUrl(r.url) })), mcp: settings.mcp ? { ...settings.mcp, servers: settings.mcp.servers.map(maskMcp) } : undefined }; }
+const maskValues = (o?: Record<string, string>) => o ? Object.fromEntries(Object.keys(o).map(k => [k, '••••••••'])) : undefined;
+// Remote MCP addresses often carry their key in the query (?api_key=…): those values are secrets too.
+const SECRET_PARAM = /key|token|secret|auth|pass|sig|credential/i;
+export const secretParams = (raw?: string) => { try { return [...new URL(raw || '').searchParams].filter(([k, v]) => SECRET_PARAM.test(k) && v).map(([, v]) => v); } catch { return []; } };
+export const maskUrl = (raw: string) => { try { const u = new URL(redactUrl(raw)); for (const [k, v] of [...u.searchParams]) if (SECRET_PARAM.test(k) && v) u.searchParams.set(k, '••••••••'); return u.toString(); } catch { return raw; } };
+export const maskMcp = (s: McpServer): McpServer => ({ ...s, url: s.url ? maskUrl(s.url) : s.url, headers: maskValues(s.headers), env: maskValues(s.env) });
 export function redactUrl(raw: string) { try { const u = new URL(raw); if (u.username || u.password) { u.username='redacted'; u.password='redacted'; } return u.toString(); } catch { return raw; } }
-export function redactError(raw: string) { let s = raw; for (const v of [...settings.providers.map(p=>p.apiKey),...settings.routes.flatMap(r=>[r.token||'',r.url]),...settings.keys.map(k=>k.value)]) if(v.length>5) s=s.split(v).join('[redacted]'); return s.replace(/(Bearer\s+)[^\s"']+/gi,'$1[redacted]').slice(0,800); }
+export function redactError(raw: string, max = 800) { let s = raw; for (const v of [...settings.providers.map(p=>p.apiKey),...settings.routes.flatMap(r=>[r.token||'',r.url]),...settings.keys.map(k=>k.value),...(settings.mcp?.servers||[]).flatMap(m=>[...Object.values(m.headers||{}),...Object.values(m.env||{}),...secretParams(m.url)])]) if(v.length>5) s=s.split(v).join('[redacted]'); return s.replace(/(Bearer\s+)[^\s"']+/gi,'$1[redacted]').slice(0,max); }

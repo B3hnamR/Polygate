@@ -58,6 +58,24 @@ test('SOCKS4 and SOCKS5 proxy URLs are both understood by the bridge', async () 
   expect(parseSocksUrl('socks4://1.2.3.4:1081')).toMatchObject({ version: 4, host: '1.2.3.4', port: 1081 }); expect(parseSocksUrl('socks4a://u@1.2.3.4')).toMatchObject({ version: 4, port: 1080, username: 'u' });
   expect(parseSocksUrl('socks5h://u:p@1.2.3.4:1')).toMatchObject({ version: 5, username: 'u', password: 'p' }); expect(parseSocksUrl('http://1.2.3.4:80')).toBeNull();
 });
+test('Lists in any format are read: logins in either place, small ranges, web-page tables and JSON records', () => {
+  const found = (text: string, hint: any = 'all', ipOnly = true) => engine.parseProxyText(text, hint, ipOnly).map(c => c.proxy);
+  expect(found('socks5://u1:p1@8.8.8.8:1080 and http://9.9.9.9:80, junk 1.2.3.4.5:6')).toEqual(['socks5://u1:p1@8.8.8.8:1080', 'http://9.9.9.9:80']);
+  expect(found('8.8.4.4:3128:alice:secret', 'socks5')).toEqual(['socks5://alice:secret@8.8.4.4:3128']);
+  expect(found('8.8.4.4:3128:US:elite', 'http')).toEqual(['http://8.8.4.4:3128']);   // country and level, not a login
+  expect(found('203.0.113.0/30:8080', 'http')).toEqual(['http://203.0.113.1:8080', 'http://203.0.113.2:8080']);
+  expect(found('8.8.0.0/16:8080', 'http')).toEqual([]);                                // a whole network is not a proxy list
+  expect(found('<table><tr><td>8.8.4.4</td><td>3128</td><td>US</td></tr></table>', 'http')).toEqual(['http://8.8.4.4:3128']);
+  expect(found(JSON.stringify({ data: [{ ip: '8.8.4.4', port: '1080', protocols: ['socks5', 'socks4'] }, { host: '9.9.9.9', port: 80, username: 'u', password: 'p' }] }), 'http'))
+    .toEqual(['socks5://8.8.4.4:1080', 'socks4://8.8.4.4:1080', 'http://u:p@9.9.9.9:80']);
+  expect(found('10.0.0.1:8080\n127.0.0.1:80\n192.168.1.2:3128', 'http')).toEqual([]);   // private addresses are never scanned
+  expect(found('8.8.4.4:3128')).toEqual(['http://8.8.4.4:3128', 'socks5://8.8.4.4:3128', 'socks4://8.8.4.4:3128']);
+});
+test('A pasted list may mix proxies with links to lists', () => {
+  const r = engine.splitLinks('1.2.3.4:80\nhttps://example.com/socks5.txt\nhttp://8.8.8.8:3128\nhttps://example.com/socks5.txt\nhttps://lists.example.org:8443/all?format=text');
+  expect(r.links).toEqual(['https://example.com/socks5.txt', 'https://lists.example.org:8443/all?format=text']);
+  expect(r.text).toBe('1.2.3.4:80\nhttp://8.8.8.8:3128');
+});
 test('Downloaded lists keep only IP addresses, so a host name cannot point the scan at this machine\'s network', () => {
   const text = ['8.8.4.4:3128', 'proxy.example.com:8080', 'socks5://evil.example.net:1080', '[2606:4700::1111]:3128'].join('\n');
   expect(engine.parseProxyText(text, 'http', true).map(c => c.host)).toEqual(['8.8.4.4', '[2606:4700::1111]']);

@@ -2,7 +2,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { stateDir } from './state';
+import { stateDir, settings, persist } from './state';
+import type { ProxySource } from './types';
 import { socksConnect } from './socks-bridge';
 import { PROXY_SOURCES } from './proxy-sources';
 // Finds and keeps public proxies. It downloads the lists in proxy-sources.ts (or reads a pasted list), asks each proxy to load the OpenCode API
@@ -22,21 +23,80 @@ export function isPublicHost(raw: string) {
 }
 const LINE = /^(?:(https?|socks4a?|socks5h?):\/\/)?(?:([^:@\s/]+):([^@\s/]*)@)?(\[[0-9a-f:]+\]|[a-z0-9][a-z0-9.-]*):(\d{1,5})(?![\w.-])/i;
 const SCHEME: Record<string, Proto> = { http: 'http', https: 'http', socks4: 'socks4', socks4a: 'socks4', socks5: 'socks5', socks5h: 'socks5' };
-// ipOnly (used for downloaded lists) drops host names, which could point at this machine's own network.
-// Accepts ip:port, scheme://ip:port and scheme://user:password@ip:port, one per line; anything after the address on a line is ignored.
-// An address without a scheme is tried as the hint says; "all" tries http, socks5 and socks4.
-export function parseProxyText(text: string, hint: Proto | 'https' | 'all' = 'all', ipOnly = false): Candidate[] {
-  const seen = new Set<string>(); const out: Candidate[] = [];
-  for (const line of text.split(/[\r\n]+/)) {
-    const m = LINE.exec(line.trim()); if (!m) continue;
-    const [, scheme, user, pass, host, portText] = m; const port = Number(portText); if (!(port > 0 && port < 65536) || !isPublicHost(host) || (ipOnly && !net.isIP(host.replace(/^\[|\]$/g, '')))) continue;
-    const protos: Proto[] = scheme ? [SCHEME[scheme.toLowerCase()]] : hint === 'all' ? ['http', 'socks5', 'socks4'] : [hint === 'https' ? 'http' : hint];
+export type Hint = Proto | 'https' | 'all';
+// Anywhere in a text: [scheme://][user:pass@]ip[/range]:port[:user:pass] (the same rules as ProxyHive). The trailing ":user:pass" is how many
+// paid providers hand out logins; "ip:port:US:elite" style lists put facts there instead, which are not taken as a login.
+const ANY_IP = /(?:([a-z][a-z0-9]*):\/\/)?(?:([^\s:@/<>"']{1,64}):([^\s@/<>"']{0,64})@)?(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?:\/(\d{1,2}))?:(\d{1,5})(?!\d)(?::([^\s:@/{}<>"']{1,200}):([^\s:@/{}<>"']{1,200}))?/gi;
+const NOT_A_LOGIN = new Set(['http', 'https', 'socks4', 'socks5', 'elite', 'anonymous', 'transparent', 'high', 'anon', 'none', 'yes', 'no', 'true', 'false', 'unknown']);
+const HOST_KEYS = ['ip', 'host', 'address', 'ip_address', 'ipAddress', 'proxy_ip', 'server'], PORT_KEYS = ['port', 'proxy_port', 'portNumber'], PROTO_KEYS = ['protocols', 'protocol', 'type', 'types', 'scheme'];
+// A list reached from the internet may hold a small address range (/24 or narrower), never a whole network.
+const MIN_RANGE = 24;
+const validIp = (host: string, port: number) => port > 0 && port < 65536 && host.split('.').every(o => Number(o) <= 255) && isPublicHost(host);
+function rangeHosts(host: string, prefix: number) {
+  if (prefix < MIN_RANGE || prefix > 32) return [];
+  const n = host.split('.').reduce((a, o) => a * 256 + Number(o), 0); const size = 2 ** (32 - prefix); const start = n - (n % size);
+  const first = prefix >= 31 ? start : start + 1, last = prefix >= 31 ? start + size - 1 : start + size - 2;
+  return Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => [24, 16, 8, 0].map(s => ((first + i) >>> s) & 255).join('.'));
+}
+// Finds every proxy in a pasted list, a downloaded file, a saved web page (an HTML table) or a JSON document.
+// An address without a scheme is tried as the hint says; "all" tries http, socks5 and socks4. ipOnly (downloaded lists) drops host names,
+// which could point at this machine's own network; a pasted list may use names.
+export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false): Candidate[] {
+  const seen = new Map<string, Candidate>();
+  const fallback = (): Proto[] => hint === 'all' ? ['http', 'socks5', 'socks4'] : [hint === 'https' ? 'http' : hint];
+  const add = (protos: Proto[], host: string, port: number, login?: [string, string]) => {
     for (const proto of protos) {
-      const url = `${proto}://${host}:${port}`; if (seen.has(url)) continue; seen.add(url);
-      out.push({ url, proxy: user ? `${proto}://${user}:${pass || ''}@${host}:${port}` : url, proto, host, port });
+      const url = `${proto}://${host}:${port}`;
+      // The first login listed for a proxy wins; a later bare mention does not drop it.
+      if (!seen.has(url) || (login && !seen.get(url)!.proxy.includes('@'))) seen.set(url, { url, proxy: login ? `${proto}://${login[0]}:${login[1]}@${host}:${port}` : url, proto, host, port });
     }
+  };
+  const scan = (body: string) => {
+    for (const m of body.matchAll(ANY_IP)) {
+      const [, scheme, user, pass, host, range, portText, u2, p2] = m; const port = Number(portText);
+      const proto = scheme ? SCHEME[scheme.toLowerCase()] : undefined; if (scheme && !proto) continue;
+      const trailing = u2 && (scheme || !(/^[A-Za-z]{2}$/.test(u2) || NOT_A_LOGIN.has(u2.toLowerCase()) || NOT_A_LOGIN.has(p2.toLowerCase()))) ? [u2, p2] as [string, string] : undefined;
+      const login = user ? [user, pass || ''] as [string, string] : trailing;
+      for (const h of range ? rangeHosts(host, Number(range)) : [host]) if (validIp(h, port)) add(proto ? [proto] : fallback(), h, port, login);
+    }
+  };
+  const body = text.slice(0, 8_000_000); scan(body);
+  // <td>1.2.3.4</td><td>8080</td> in a saved web page.
+  if (/<\/t[dh]/i.test(body.slice(0, 3_000_000))) scan(body.replace(/\s*<\/t[dh]\s*>\s*<t[dh][^>]*>\s*/gi, ':').replace(/<[^>]+>/g, ' '));
+  // JSON records such as {"ip": "1.2.3.4", "port": 8080, "protocols": ["socks5"]}, at any depth.
+  if (/^\s*[[{]/.test(body)) {
+    try {
+      const walk = (o: any, depth: number): void => {
+        if (depth > 12 || !o || typeof o !== 'object') return;
+        if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+        const host = HOST_KEYS.map(k => o[k]).find(v => typeof v === 'string'); const port = Number(PORT_KEYS.map(k => o[k]).find(v => v !== undefined && v !== ''));
+        if (host && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host.trim()) && validIp(host.trim(), port)) {
+          const named = PROTO_KEYS.flatMap(k => Array.isArray(o[k]) ? o[k] : [o[k]]).map(v => typeof v === 'string' ? SCHEME[v.toLowerCase()] : undefined).filter(Boolean) as Proto[];
+          const user = ['username', 'user', 'login'].map(k => o[k]).find(v => typeof v === 'string' && v); const pw = ['password', 'pass', 'pwd'].map(k => o[k]).find(v => typeof v === 'string') || '';
+          add(named.length ? [...new Set(named)] : fallback(), host.trim(), port, user ? [user, pw] : undefined);
+        }
+        for (const v of Object.values(o)) if (v && typeof v === 'object') walk(v, depth + 1);
+      };
+      walk(JSON.parse(body), 0);
+    } catch { /* not JSON after all */ }
   }
-  return out;
+  // IPv6 addresses, and host names (pasted lists only), one per line as before.
+  for (const line of body.split(/[\r\n]+/)) {
+    const m = LINE.exec(line.trim()); if (!m) continue;
+    const [, scheme, user, pass, host, portText] = m; const port = Number(portText); const ip = net.isIP(host.replace(/^\[|\]$/g, ''));
+    if (ip === 4 || (ipOnly && !ip) || !(port > 0 && port < 65536) || !isPublicHost(host)) continue;
+    add(scheme ? [SCHEME[scheme.toLowerCase()]] : fallback(), host, port, user ? [user, pass || ''] : undefined);
+  }
+  return [...seen.values()];
+}
+// A pasted text may mix proxies with links to lists: a line that is only a web address (and not a proxy) is a list to download.
+export function splitLinks(text: string) {
+  const links: string[] = []; const rest: string[] = [];
+  for (const raw of text.split(/[\r\n]+/)) {
+    const line = raw.trim(); if (/^https?:\/\/\S+$/i.test(line) && !/^https?:\/\/(?:[^\s:@/]+:[^\s@/]*@)?[^\s/:]+:\d{1,5}\/?$/i.test(line)) { if (!links.includes(line)) links.push(line); }
+    else rest.push(raw);
+  }
+  return { links, text: rest.join('\n') };
 }
 // --- one request through one proxy ---
 function httpConnect(c: Candidate, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
@@ -107,15 +167,51 @@ export const stopEngine = () => { stopFlag = true; };
 // after: runs when a job has finished without being stopped, so the caller can go on to the next stage.
 export type EngineOptions = { api: string; timeoutSec: number; gateMs: number; concurrency?: number; after?: () => void };
 function shuffle<T>(list: T[]) { for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; } return list; }
+// --- list links: the built-in public lists plus the user's own ---
+// A list with more than this many addresses is junk (or not a proxy list) and is refused, as in ProxyHive.
+const MAX_PER_LIST = 150000;
+export const proxyLists = () => (settings.proxyLists ||= { builtin: true, sources: [] });
+// Downloads one list. Links come from the user or the built-in table, so only public web addresses are fetched.
+export async function fetchList(url: string, hint: Hint): Promise<{ found: Candidate[]; error?: string }> {
+  let u: URL; try { u = new URL(url); } catch { return { found: [], error: 'Not a web address' }; }
+  if (!['http:', 'https:'].includes(u.protocol) || !isPublicHost(u.hostname)) return { found: [], error: 'Only public http(s) addresses can be downloaded' };
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(25000), headers: { 'user-agent': 'polygate' } });
+    if (!r.ok) { await r.body?.cancel().catch(() => {}); return { found: [], error: `HTTP ${r.status}` }; }
+    const found = parseProxyText((await r.text()).slice(0, 8_000_000), hint, true);
+    // Counted by address: "any type" tries each address three ways, which must not make a normal list look too big.
+    const addresses = new Set(found.map(c => `${c.host}:${c.port}`)).size;
+    if (addresses > MAX_PER_LIST) return { found: [], error: `Refused: ${addresses.toLocaleString()} addresses is more than a proxy list should hold` };
+    return { found, ...(found.length ? {} : { error: 'No proxy addresses in it' }) };
+  } catch (e: any) { return { found: [], error: e?.name === 'TimeoutError' ? 'No answer within 25 s' : String(e?.message || e).slice(0, 120) }; }
+}
+// Your own lists come first: when there are more addresses than one run checks, the public lists' share is cut, not yours.
 async function downloadSources(): Promise<Candidate[]> {
-  const all = new Map<string, Candidate>(); let done = 0; let next = 0; job.total = PROXY_SOURCES.length;
+  const cfg = proxyLists(); const own = cfg.sources.filter(s => s.enabled);
+  const lists: { hint: Hint; url: string; mine?: ProxySource }[] = [...own.map(s => ({ hint: s.proto, url: s.url, mine: s })), ...(cfg.builtin !== false ? PROXY_SOURCES.map(([hint, url]) => ({ hint, url })) : [])];
+  if (!lists.length) throw new Error('No lists to download: add a list link or switch the public lists back on.');
+  const mine = new Map<string, Candidate>(); const pub = new Map<string, Candidate>(); let done = 0; let next = 0; job.total = lists.length;
   await Promise.all(Array.from({ length: 6 }, async () => {
-    while (next < PROXY_SOURCES.length && !stopFlag) {
-      const [hint, url] = PROXY_SOURCES[next++];
-      try { const r = await fetch(url, { signal: AbortSignal.timeout(25000), headers: { 'user-agent': 'polygate' } }); if (r.ok) for (const c of parseProxyText((await r.text()).slice(0, 8_000_000), hint, true)) all.set(c.url, c); } catch { /* a dead list is skipped */ }
-      job.done = ++done; job.message = `Downloaded ${done} of ${PROXY_SOURCES.length} lists (${all.size.toLocaleString()} proxy addresses)…`;
+    while (next < lists.length && !stopFlag) {
+      const item = lists[next++]; const r = await fetchList(item.url, item.hint);
+      for (const c of r.found) (item.mine ? mine : pub).set(c.url, c);
+      if (item.mine) Object.assign(item.mine, { lastAt: Date.now(), lastCount: r.found.length, lastError: r.error });
+      job.done = ++done; job.message = `Downloaded ${done} of ${lists.length} lists (${(mine.size + pub.size).toLocaleString()} proxy addresses)…`;
     }
   }));
+  if (own.length) persist();
+  for (const url of mine.keys()) pub.delete(url);
+  const yours = [...mine.values()]; const room = Math.max(0, MAX_CANDIDATES - yours.length); const theirs = [...pub.values()];
+  return [...(yours.length > MAX_CANDIDATES ? shuffle(yours).slice(0, MAX_CANDIDATES) : yours), ...(theirs.length > room ? shuffle(theirs).slice(0, room) : theirs)];
+}
+// A pasted list: proxies and links to lists, mixed. A plain ip:port means what the hint says.
+async function readPasted(text: string, hint: Hint): Promise<Candidate[]> {
+  const { links, text: rest } = splitLinks(text.slice(0, 4_000_000)); const all = new Map<string, Candidate>();
+  for (const c of parseProxyText(rest, hint)) all.set(c.url, c);
+  if (links.length) { job.phase = 'download'; job.total = links.length; job.message = `Downloading ${links.length} list(s)…`; }
+  let done = 0; const failed: string[] = [];
+  await Promise.all(links.map(async url => { const r = await fetchList(url, hint); for (const c of r.found) all.set(c.url, c); if (r.error && !r.found.length) failed.push(`${url}: ${r.error}`); job.done = ++done; }));
+  if (!all.size && failed.length) throw new Error(`Nothing found. ${failed.slice(0, 3).join(' · ')}`);
   const list = [...all.values()]; return list.length > MAX_CANDIDATES ? shuffle(list).slice(0, MAX_CANDIDATES) : list;
 }
 function run(kind: 'scan' | 'import', gather: () => Promise<Candidate[]>, o: EngineOptions): EngineJob {
@@ -135,6 +231,6 @@ function run(kind: 'scan' | 'import', gather: () => Promise<Candidate[]>, o: Eng
   return engineJob();
 }
 export const startScan = (o: EngineOptions) => run('scan', downloadSources, o);
-export const startImport = (text: string, o: EngineOptions) => run('import', async () => parseProxyText(text.slice(0, 4_000_000)), o);
+export const startImport = (text: string, o: EngineOptions, hint: Hint = 'all') => run('import', () => readPasted(text, hint), o);
 // Test seam: forget everything, including the saved file.
 export function __resetEngine() { stored = []; job = { ...idle }; stopFlag = false; }

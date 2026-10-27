@@ -4,6 +4,7 @@ import { networkFetch, routeContext } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
 import { kiloCatalog, kiloChat } from './kilo';
+import { logEvent } from './logbook';
 import type { Provider, Model } from './types';
 process.env.AUTO_UPDATE='0';
 process.env.OPENCODE_BRIDGE_STATE_DIR=stateDir+'/bridge';
@@ -50,8 +51,10 @@ export async function discover(){
           saveModel({...prior,...info,context:info.context||prior.context,output:info.output||prior.output,reasoning:info.reasoning||prior.reasoning,...(returned?{state:'unchecked' as const,error:''}:{})});
         }
         if(authoritative)for(const m of models.values())if(m.providerId===p.id&&!seen.has(m.id)){m.state='unavailable';m.error=ABSENT;saveModel(m);}
-      }catch(e){errors.push(p.name+': '+String(e));}
+      }catch(e){errors.push(p.name+': '+String(e));logEvent('warn','models',`${p.name} catalog could not be read: ${String(e)}`,{provider:p.id});}
     }
+    const listed=[...models.values()].filter(m=>m.state!=='unavailable'&&settings.providers.some(p=>p.id===m.providerId&&p.enabled)).length;
+    logEvent('info','models',`Model catalog refreshed: ${listed} model(s) listed`,{providers:settings.providers.filter(p=>p.enabled).map(p=>p.name),errors:errors.length||undefined});
     if(errors.length)throw new GatewayError(errors.join('; '),502,'catalog_error');
   })().finally(()=>{discovery=undefined;});return discovery;
 }
