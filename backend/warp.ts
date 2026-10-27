@@ -13,7 +13,16 @@ const run = promisify(execFile);
 const warpDir = path.join(stateDir, 'warp'); const binDir = path.join(stateDir, 'bin');
 const isWin = process.platform === 'win32';
 const appDir = process.env.POLYGATE_APP_DIR || process.cwd();
-const ENDPOINTS = ['162.159.192.1:2408', '162.159.193.1:2408', '162.159.195.1:2408', '188.114.97.1:2408', '188.114.96.1:2408', 'engage.cloudflareclient.com:2408'];
+// Cloudflare accepts WARP on several UDP ports for every address, so the list mixes ports as well as addresses: a network that blocks one port
+// often lets another through.
+const ENDPOINTS = ['162.159.192.1:2408', '162.159.193.1:500', '162.159.195.1:4500', '188.114.97.1:2408', '188.114.96.1:1701', 'engage.cloudflareclient.com:2408'];
+// Another program may already listen on the port a tunnel wants (Cloudflare's own warp-cli uses 40000 by default; so can an xray inbound).
+// That listener is never used or taken over: the tunnel moves to the next free port instead.
+const portFree = (port: number) => new Promise<boolean>(resolve => { const s = net.createServer(); s.once('error', () => resolve(false)); s.listen({ port, host: '127.0.0.1', exclusive: true }, () => s.close(() => resolve(true))); });
+export async function freePort(from: number, avoid: Set<number> = new Set()): Promise<number> {
+  for (let port = from; port < Math.min(65535, from + 300); port++) if (!avoid.has(port) && await portFree(port)) return port;
+  throw new GatewayError(`No free local port was found from ${from} up. Free one or choose another SOCKS port.`, 503, 'warp_no_port');
+}
 // Polygate runs WARP itself (wireproxy: userspace WireGuard + SOCKS5). The official client and external SOCKS5 sidecars were removed on 26 October 2026:
 // they gave OpenCode the same WARP exit but could not manage identities, and any SOCKS5 endpoint can still be added as an ordinary route.
 export type WarpEngine = 'embedded' | 'disabled';
@@ -78,8 +87,9 @@ export async function registerAccount(): Promise<Account> {
 }
 async function startTunnel(port: number, account: Account): Promise<Tunnel> {
   const bin = findWireproxy(); if (!bin) throw new GatewayError('wireproxy is not installed. Use Install to download it.', 503, 'warp_not_installed');
-  let lastError = 'no endpoint answered';
+  let lastError = 'no endpoint answered'; let silent = 0, tried = 0;
   for (const endpoint of ENDPOINTS) {
+    tried++;
     mkdirSync(warpDir, { recursive: true });
     const conf = path.join(warpDir, `wireproxy_${port}.conf`);
     writeFileSync(conf, `[Interface]\nPrivateKey = ${account.privateKey}\nAddress = ${account.addressV4}/32${account.addressV6 ? `, ${account.addressV6}/128` : ''}\nDNS = 1.1.1.1, 8.8.8.8\n\n[Peer]\nPublicKey = ${account.peerPublicKey}\nEndpoint = ${endpoint}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n\n[Socks5]\nBindAddress = 127.0.0.1:${port}\n`, { mode: 0o600 });
@@ -100,15 +110,17 @@ async function startTunnel(port: number, account: Account): Promise<Tunnel> {
         proc.once('exit', code => { if (tunnels.get(port)?.proc !== proc) return; tunnels.delete(port); if (!stopping) { notify('WARP tunnel stopped', `Tunnel on port ${port} exited (${code}).`, 'warning', 'warp-tunnel-' + port); setTimeout(() => void restartTunnel(port, account, tunnel.restarts + 1), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref(); } });
         return tunnel;
       }
-      lastError = `endpoint ${endpoint} did not carry traffic through WARP`;
+      lastError = `endpoint ${endpoint} did not carry traffic through WARP`; silent++;
     } else lastError = `wireproxy ${exited ? 'exited' : 'did not answer'} on endpoint ${endpoint}${output ? ': ' + output.trim().split('\n').pop() : ''}`;
     try { proc.kill('SIGKILL'); } catch { /* already gone */ }
   }
+  // Every address answered the local SOCKS side but none replied to the WireGuard handshake: the network drops the traffic.
+  if (silent === tried) throw new Error(`Could not start a WARP tunnel: none of the ${tried} Cloudflare WARP addresses answered (UDP ports ${[...new Set(ENDPOINTS.map(e => e.split(':').pop()))].join(', ')}). The tunnel itself is fine; this network is probably blocking outbound UDP to Cloudflare, which some hosting providers do. Try another network, or send traffic through a proxy or relay route instead.`);
   throw new Error(`Could not start a WARP tunnel on port ${port}: ${lastError}`);
 }
 async function restartTunnel(port: number, account: Account, restarts: number) {
   if (stopping || tunnels.has(port) || engineMode() !== 'embedded') return;
-  try { const t = await startTunnel(port, account); t.restarts = restarts; tunnels.set(port, t); ensureRoute(); } catch (e) { if (restarts < 6) setTimeout(() => void restartTunnel(port, account, restarts + 1), Math.min(120000, 5000 * 2 ** restarts)).unref(); }
+  try { if (!await portFree(port)) port = await freePort(port + 1, new Set(tunnels.keys())); const t = await startTunnel(port, account); t.restarts = restarts; tunnels.set(port, t); ensureRoute(); } catch (e) { if (restarts < 6) setTimeout(() => void restartTunnel(port, account, restarts + 1), Math.min(120000, 5000 * 2 ** restarts)).unref(); }
 }
 async function embeddedConnect(fresh = false) {
   // Without the helper nothing can start, so do not register identities with Cloudflare (or wait out the registration pause) first.
@@ -116,7 +128,9 @@ async function embeddedConnect(fresh = false) {
   const want = Math.max(1, Math.min(4, warpConfig().pool)); let accounts = fresh ? [] : loadAccounts();
   progress(15, 'accounts', 'Preparing WARP identities…');
   for (let i = 0; i < want; i++) {
-    const port = basePort() + i; if (tunnels.has(port)) continue;
+    const wanted = basePort() + i; if (tunnels.has(wanted)) continue;
+    const port = await freePort(wanted, new Set(tunnels.keys()));
+    if (port !== wanted) notify('WARP uses another local port', `Port ${wanted} is used by another program on this machine, so WARP tunnel ${i + 1} listens on ${port} instead. The other program is not touched.`, 'info', 'warp-port-' + wanted, 3600000);
     if (!accounts[i]) { progress(25 + i * 10, 'registering', `Registering WARP identity ${i + 1}/${want}…`); try { accounts[i] = await registerAccount(); saveAccounts(accounts.filter(Boolean)); } catch (e) { if (tunnels.size) break; throw e; } }
     progress(50 + i * 10, 'starting', `Starting WARP tunnel ${i + 1}/${want} on port ${port}…`);
     try { tunnels.set(port, await startTunnel(port, accounts[i])); } catch (e) { if (!tunnels.size) throw e; }
