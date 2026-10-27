@@ -28,6 +28,8 @@ RestrictSUIDSGID=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 LimitNOFILE=65536
+Nice=5
+TasksMax=1024
 
 [Install]
 WantedBy=multi-user.target

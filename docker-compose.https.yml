@@ -1,0 +1,8 @@
+# Optional add-on: publishes ports 80 and 443 so Polygate can get and serve its own HTTPS certificate.
+# Use it only when nothing else on the machine listens on those ports:
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d
+services:
+  polygate:
+    ports:
+      - "${POLYGATE_HTTP_PORT:-80}:80"
+      - "${POLYGATE_HTTPS_PORT:-443}:443"

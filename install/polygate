@@ -1,53 +1,264 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# polygate-cli: the management command installed by install.sh (/usr/local/bin/polygate).
+# Run "polygate" for the manager (a menu), or give it a command: polygate help
+set -u -o pipefail
+# Needs root: ask sudo to run it again instead of just complaining.
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then exec sudo -- "$0" "$@"; fi
+  echo 'Run this as root (sudo polygate).' >&2; exit 1
+fi
 ENV_FILE=${POLYGATE_ENV_FILE:-/etc/polygate/polygate.env}
-[ "$(id -u)" -eq 0 ] || { echo 'Run with sudo.' >&2; exit 1; }
-[ -f "$ENV_FILE" ] || { echo "Missing $ENV_FILE" >&2; exit 1; }
+[ -f "$ENV_FILE" ] || { echo "Missing $ENV_FILE. Is Polygate installed here?" >&2; exit 1; }
 set -a; . "$ENV_FILE"; set +a
 ROOT=${POLYGATE_APP_DIR:-/opt/polygate/current}
+DASH=${POLYGATE_DASHBOARD_PATH:-}; DASH=${DASH%/}
+
+# ---- ui:begin (the same block is in install.sh and install/polygate; tests/installer.test.ts checks that they match)
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; GBG=$'\033[42;30m'
+else R=; B=; D=; RED=; GRN=; YEL=; CYN=; GBG=; fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF=1; S_OK='✓'; S_BAD='✗'; S_WARN='!'; S_ON='●'; S_OFF='○'; S_GO='▸' ;;
+  *) UTF=0; S_OK='+'; S_BAD='x'; S_WARN='!'; S_ON='*'; S_OFF='o'; S_GO='>' ;;
+esac
+# banner VERSION INFO: the big name with a gradient, then a line with the version, the tagline and a short status.
+banner() {
+  local ver=${1:-} info=${2:-} cols row i n ch line tc=0 step
+  local -a art=(
+    '██████╗  ██████╗ ██╗     ██╗   ██╗ ██████╗  █████╗ ████████╗███████╗'
+    '██╔══██╗██╔═══██╗██║     ╚██╗ ██╔╝██╔════╝ ██╔══██╗╚══██╔══╝██╔════╝'
+    '██████╔╝██║   ██║██║      ╚████╔╝ ██║  ███╗███████║   ██║   █████╗  '
+    '██╔═══╝ ██║   ██║██║       ╚██╔╝  ██║   ██║██╔══██║   ██║   ██╔══╝  '
+    '██║     ╚██████╔╝███████╗   ██║   ╚██████╔╝██║  ██║   ██║   ███████╗'
+    '╚═╝      ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝'
+  )
+  local -a ramp=(86 80 81 75 75 111 105 141)
+  cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+  case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
+  printf '\n'
+  if [ "$UTF" = 1 ] && [ -n "$R" ] && [ "$cols" -ge 72 ]; then
+    for row in "${art[@]}"; do
+      line=; n=${#row}
+      for ((i = 0; i < n; i++)); do
+        ch=${row:i:1}
+        if [ "$ch" = ' ' ]; then line+=' '
+        elif [ "$tc" = 1 ]; then line+=$'\033[38;2;'"$((94 + 30 * i / n));$((234 - 78 * i / n));$((212 + 43 * i / n))m$ch"
+        else step=$((i * 8 / n)); line+=$'\033[38;5;'"${ramp[$step]}m$ch"; fi
+      done
+      printf '  %s%s\n' "$line" "$R"
+    done
+  else printf '  %s%sP O L Y G A T E%s\n' "$B" "$CYN" "$R"; fi
+  printf '  %s%s%s%s  Free model gateway, made simple%s%s\n' "$GBG" "${ver:+ v$ver }" "$R" "$B" "$R" "${info:+   $D$info$R}"
+  printf '  %smade by B3hnamR · github.com/B3hnamR/Polygate%s\n\n' "$D" "$R"
+}
+# kv LABEL VALUE [NOTE]: one aligned line of a summary
+kv() { printf '    %s%-11s%s %s%s%s%s\n' "$D" "$1" "$R" "$B" "$2" "$R" "${3:+   $D$3$R}"; }
+# ---- ui:end
+
 control() { runuser -u polygate --preserve-environment -- "$ROOT/bin/bun" "$ROOT/build/manage.js" "$@"; }
-service_restart() { systemctl restart polygate; }
-case "${1:-help}" in
+jq_() { "$ROOT/bin/bun" -e "$1" 2>/dev/null; }   # reads JSON on stdin and runs a one-line script on it (d = the parsed object)
+is_running() { systemctl is-active --quiet polygate; }
+release_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/release.json" 2>/dev/null | head -n 1; }
+port_owner() { # the program listening on TCP port $1, empty when free
+  local line
+  line=$(ss -H -ltnp "sport = :$1" 2>/dev/null | head -n 1 || true)
+  [ -n "$line" ] || return 0
+  sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line" | head -n 1 | grep . || echo 'another program'
+}
+panel_url() { # the address people open
+  local url
+  url=$(control request /admin/https </dev/null 2>/dev/null | jq_ 'try{const d=JSON.parse(await Bun.stdin.text());console.log(d.active?d.url:"")}catch{console.log("")}')
+  if [ -n "$url" ]; then printf '%s' "$url"; return; fi
+  case "${POLYGATE_ALLOWED_HOSTS:-}" in ''|'*') ;; *) printf 'https://%s%s/' "${POLYGATE_ALLOWED_HOSTS%%,*}" "$DASH"; return ;; esac
+  printf 'http://127.0.0.1:%s%s/' "${POLYGATE_PORT:-4317}" "$DASH"
+}
+wait_healthy() { local i; for i in $(seq 1 30); do if control request /healthz </dev/null >/dev/null 2>&1; then return 0; fi; sleep 1; done; return 1; }
+
+ask() { local ans; IFS= read -r -p "  $1 " ans </dev/tty || ans=; REPLY=${ans:-${2:-}}; }
+yes_no() { local ans def=${2:-n}; while :; do IFS= read -r -p "  $1 [$([ "$def" = y ] && echo Y/n || echo y/N)] " ans </dev/tty || ans=; case "${ans:-$def}" in y|Y|yes) return 0 ;; n|N|no) return 1 ;; esac; done; }
+pause() { printf '\n  %sPress Enter to go back%s ' "$D" "$R"; IFS= read -r _ </dev/tty || true; }
+
+# ------------------------------------------------------------------------------------------------------------------------ commands
+cmd_info() {
+  local url pw
+  url=$(panel_url)
+  printf '\n'
+  kv 'Dashboard' "$url"
+  kv 'API base' "${url%/}/v1" 'any OpenAI-compatible tool; the key is on the Overview page'
+  if [ -f "${POLYGATE_STATE:-/var/lib/polygate}/admin-password.txt" ]; then pw=$(cat "${POLYGATE_STATE:-/var/lib/polygate}/admin-password.txt"); kv 'Password' "$pw" 'change it: polygate password'
+  else kv 'Password' 'set by you' 'it is not kept in a file; change it: polygate password'; fi
+  printf '\n'
+}
+cmd_doctor() {
+  if is_running; then printf '  %sok%s  The service is running\n' "$GRN" "$R"; else printf '  %s!!%s  The service is not running (start it with: sudo polygate start)\n' "$RED" "$R"; return 1; fi
+  control doctor
+}
+cmd_password() {
+  local was=0 rc=0
+  is_running && was=1
+  systemctl stop polygate
+  if [ "${1:-}" = '--stdin' ]; then control password --stdin; rc=$?; else control password; rc=$?; fi
+  [ "$rc" -eq 0 ] && [ -f "${POLYGATE_STATE:-/var/lib/polygate}/admin-password.txt" ] && cat "${POLYGATE_STATE:-/var/lib/polygate}/admin-password.txt"
+  [ "$was" = 0 ] || systemctl start polygate
+  return "$rc"
+}
+cmd_start() { systemctl start polygate && wait_healthy && printf '  %s%s%s Polygate is running\n' "$GRN" "$S_OK" "$R" || { printf '  %s%s%s It did not start. See: sudo polygate logs\n' "$RED" "$S_BAD" "$R"; return 1; }; }
+cmd_restart() { systemctl restart polygate && wait_healthy && printf '  %s%s%s Polygate restarted\n' "$GRN" "$S_OK" "$R" || { printf '  %s%s%s It did not come back. See: sudo polygate logs\n' "$RED" "$S_BAD" "$R"; return 1; }; }
+cmd_stop() { systemctl stop polygate && printf '  %s%s%s Polygate is stopped. Clients cannot reach it until you start it again (sudo polygate start).\n' "$YEL" "$S_OFF" "$R"; }
+
+# Follows a certificate request and prints its steps as they happen.
+https_follow() {
+  local seen=0 out first err state active url total level msg i
+  local parse='const d=JSON.parse(await Bun.stdin.text());const skip=Number(process.env.SKIP)||0;const j=d.job||{};const s=j.steps||[];console.log([j.running?"running":"idle",d.active?"active":"inactive",d.url||"-",String(s.length)].join("\t"));console.log(String(j.error||"").replace(/\s+/g," ")||"-");for(const x of s.slice(skip))console.log(x.level+"\t"+String(x.msg).replace(/\s+/g," "));'
+  for i in $(seq 1 150); do
+    out=$(control request /admin/https </dev/null 2>/dev/null | SKIP=$seen "$ROOT/bin/bun" -e "$parse" 2>/dev/null) || out=
+    if [ -z "$out" ]; then sleep 2; continue; fi
+    first=$(sed -n 1p <<<"$out"); err=$(sed -n 2p <<<"$out"); IFS=$'\t' read -r state active url total <<<"$first"
+    while IFS=$'\t' read -r level msg; do
+      [ -n "${msg:-}" ] || continue
+      case "$level" in ok) printf '  %s%s%s %s\n' "$GRN" "$S_OK" "$R" "$msg" ;; warn) printf '  %s%s%s %s\n' "$YEL" "$S_WARN" "$R" "$msg" ;; error) printf '  %s%s%s %s\n' "$RED" "$S_BAD" "$R" "$msg" ;; *) printf '      %s%s%s\n' "$D" "$msg" "$R" ;; esac
+    done < <(sed -n '3,$p' <<<"$out")
+    seen=${total:-$seen}
+    if [ "$state" != running ]; then [ "$active" = active ] && return 0; [ "$err" = - ] || printf '\n  %s%s%s HTTPS could not be set up: %s\n' "$RED" "$S_BAD" "$R" "$err"; return 1; fi
+    sleep 2
+  done
+  return 1
+}
+cmd_https() {
+  local mode=${1:-status}
+  case "$mode" in
+    status) control request /admin/https </dev/null ;;
+    disable) printf '{}' | control request /admin/https/disable ;;
+    renew) printf '{}' | control request /admin/https/renew ;;
+    ip|domain)
+      # The request is built by the management program, so names and e-mail addresses never pass through shell quoting.
+      control https-apply "$mode" "${2:-}" "${3:-}" </dev/null ;;
+    custom)
+      [ -r "${2:-}" ] && [ -r "${3:-}" ] || { echo 'Usage: polygate https custom <certificate file> <key file> (both readable by root)' >&2; return 2; }
+      cat "$2" "$3" | control https-apply custom - ;;
+    *) echo 'Usage: polygate https status|ip [address] [email]|domain <domain> [email]|custom <cert file> <key file>|renew|disable' >&2; return 2 ;;
+  esac
+}
+cmd_uninstall() {
+  local purge=0 yes=0 a
+  for a in "$@"; do case "$a" in --yes) yes=1 ;; --purge) purge=1 ;; esac; done
+  [ "$yes" = 1 ] || { echo 'Use: polygate uninstall --yes [--purge]. Your data is kept unless --purge is given. (Or run "polygate" for the menu.)'; return 2; }
+  systemctl disable --now polygate 2>/dev/null; rm -f /etc/systemd/system/polygate.service; systemctl daemon-reload
+  # Fixed installation paths only; user data stays by default. Firewall rules are never touched (the installer never adds any).
+  rm -f /usr/local/bin/polygate; rm -rf -- /opt/polygate
+  if [ "$purge" = 1 ]; then
+    rm -rf -- /var/lib/polygate /etc/polygate /var/log/polygate-install.log
+    if [ "$(getent passwd polygate | cut -d: -f6)" = /var/lib/polygate ]; then userdel polygate 2>/dev/null || true; fi
+  fi
+  echo 'Polygate removed.'
+}
+
+# ----------------------------------------------------------------------------------------------------------------------- the menu
+https_menu() {
+  local c o80 o443 domain mail ip cert key mainpid
+  while :; do
+    printf '\033[2J\033[H'; banner "$(release_version)" "$(hostname)"
+    printf '  %sHTTPS and certificate%s\n\n' "$B" "$R"
+    printf '    %s1%s  Show the current state\n    %s2%s  Use a domain name (automatic certificate)\n    %s3%s  Use this server'"'"'s IP address (automatic certificate)\n' "$B" "$R" "$B" "$R" "$B" "$R"
+    printf '    %s4%s  Use my own certificate files\n    %s5%s  Renew the certificate now\n    %s6%s  Turn HTTPS off\n    %s0%s  Back\n\n' "$B" "$R" "$B" "$R" "$B" "$R" "$B" "$R"
+    ask 'Choose:' ''; c=$REPLY
+    case "$c" in
+      1) printf '\n'; control doctor | sed -n '3,4p'; control request /admin/https </dev/null | jq_ 'const d=JSON.parse(await Bun.stdin.text());console.log("   mode:",d.mode,"| active:",d.active,"| address:",d.url||"-","| expires in",d.daysLeft,"day(s)")'; pause ;;
+      2|3)
+        mainpid=$(systemctl show -p MainPID --value polygate 2>/dev/null || echo 0); o80=$(port_owner 80); o443=$(port_owner 443)
+        # Polygate's own listeners do not count; anything else on 80 or 443 does.
+        if [ -n "$o80" ] && ss -H -ltnp "sport = :80" 2>/dev/null | grep -q "pid=$mainpid,"; then o80=; fi
+        if [ -n "$o443" ] && ss -H -ltnp "sport = :443" 2>/dev/null | grep -q "pid=$mainpid,"; then o443=; fi
+        if [ -n "$o80$o443" ]; then
+          printf '\n  %s%s%s Automatic HTTPS needs ports 80 and 443, and they are in use%s%s.\n' "$YEL" "$S_WARN" "$R" "${o80:+ (80: $o80)}" "${o443:+ (443: $o443)}"
+          printf '  Stop that program for good first (it must stay off those ports), or keep it and put Polygate behind it. Nothing was changed.\n'; pause; continue
+        fi
+        if [ "$c" = 2 ]; then ask 'Domain name (for example panel.example.com):' ''; domain=$REPLY; ask 'E-mail for expiry notices (optional):' ''; mail=$REPLY
+          [ -n "$domain" ] || { pause; continue; }; printf '\n'; cmd_https domain "$domain" "$mail" >/dev/null && https_follow
+        else ask 'IP address (Enter for this server'"'"'s public address):' ''; ip=$REPLY; ask 'E-mail for expiry notices (optional):' ''; mail=$REPLY
+          printf '\n'; cmd_https ip "$ip" "$mail" >/dev/null && https_follow; fi
+        pause ;;
+      4) ask 'Certificate file (full chain, PEM):' ''; cert=$REPLY; ask 'Private key file (PEM):' ''; key=$REPLY; printf '\n'
+         if cmd_https custom "$cert" "$key" >/dev/null; then https_follow; fi; pause ;;
+      5) printf '\n'; cmd_https renew >/dev/null && https_follow; pause ;;
+      6) if yes_no 'Turn HTTPS off? The dashboard goes back to plain local HTTP.' n; then cmd_https disable >/dev/null && printf '  %s%s%s HTTPS is off\n' "$GRN" "$S_OK" "$R"; pause; fi ;;
+      0|'') return ;;
+    esac
+  done
+}
+uninstall_menu() {
+  local c word
+  printf '\n  %sUninstall Polygate%s\n\n    %s1%s  Remove Polygate and keep my data and settings\n    %s2%s  Remove everything, including my data, settings and the polygate user\n    %s0%s  Cancel\n\n' "$B" "$R" "$B" "$R" "$B" "$R" "$B" "$R"
+  ask 'Choose:' ''; c=$REPLY
+  case "$c" in 1|2) ;; *) return 0 ;; esac
+  printf '\n  %sThis stops the service and deletes the program%s%s.%s Your other services and your firewall are not touched.\n' "$YEL" "$([ "$c" = 2 ] && echo ' AND ALL OF ITS DATA' || true)" "$R" "$R"
+  ask 'Type  delete  to confirm:' ''; word=$REPLY
+  [ "$word" = delete ] || { echo '  Cancelled.'; return 0; }
+  printf '\n'; if [ "$c" = 2 ]; then cmd_uninstall --yes --purge; else cmd_uninstall --yes; fi
+  exit 0
+}
+manager() {
+  local c state url ver
+  trap ':' INT
+  while :; do
+    printf '\033[2J\033[H'
+    ver=$(release_version); if is_running; then state="${GRN}${S_ON} running${R}"; else state="${RED}${S_OFF} stopped${R}"; fi
+    banner "$ver" "$(hostname)"
+    url=$(panel_url)
+    printf '  %s   %s%s%s\n\n' "$state" "$D" "$url" "$R"
+    printf '    %s1%s  Dashboard address and password\n    %s2%s  Health check\n    %s3%s  Live logs  %s(Ctrl-C to come back)%s\n' "$B" "$R" "$B" "$R" "$B" "$R" "$D" "$R"
+    if is_running; then printf '    %s4%s  Restart\n    %s5%s  Stop\n' "$B" "$R" "$B" "$R"; else printf '    %s4%s  Start\n    %s5%s  %sStop (already stopped)%s\n' "$B" "$R" "$D" "$R" "$D" "$R"; fi
+    printf '    %s6%s  HTTPS and certificate\n    %s7%s  Change the dashboard password\n    %s8%s  Update Polygate\n    %s9%s  Uninstall\n    %s0%s  Exit\n\n' "$B" "$R" "$B" "$R" "$B" "$R" "$B" "$R" "$B" "$R"
+    ask 'Choose:' ''; c=$REPLY
+    case "$c" in
+      1) cmd_info; pause ;;
+      2) printf '\n'; cmd_doctor; pause ;;
+      3) printf '\n'; journalctl -u polygate -n 60 -f || true ;;
+      4) printf '\n'; if is_running; then cmd_restart; else cmd_start; fi; pause ;;
+      5) if is_running; then
+           if yes_no 'Stop Polygate now? Clients lose access until it is started again.' n; then cmd_stop
+             if yes_no 'Also keep it from starting at boot?' n; then systemctl disable polygate >/dev/null 2>&1 && printf '  %s%s%s It will not start at boot (re-enable: sudo systemctl enable polygate)\n' "$GRN" "$S_OK" "$R"; fi; pause; fi
+         fi ;;
+      6) https_menu ;;
+      7) printf '\n'; if yes_no 'Create a new random dashboard password?' y; then printf '\n'; cmd_password; else IFS= read -rs -p '  New password (12 or more characters, not shown): ' REPLY </dev/tty; printf '
+'; if [ "${#REPLY}" -ge 12 ]; then printf '%s' "$REPLY" | cmd_password --stdin; else echo '  Not changed: it needs at least 12 characters.'; fi; fi; pause ;;
+      8) printf '\n'; if yes_no 'Look for a newer release and update?' y; then export POLYGATE_REPO; bash "$ROOT/install.sh" --update; fi; pause ;;
+      9) uninstall_menu; pause ;;
+      0|q|'') printf '\n'; return ;;
+    esac
+  done
+}
+usage() {
+  cat <<'HELP'
+Polygate manager. Run  polygate  for the menu, or give a command:
+
+  polygate info                the dashboard address, API address and password
+  polygate status | doctor     the service state, or a plain-words health report
+  polygate start | stop | restart | logs
+  polygate password [--stdin]  a new dashboard password (random unless --stdin)
+  polygate https status | domain NAME [EMAIL] | ip [ADDRESS] [EMAIL] | custom CERT KEY | renew | disable
+  polygate update              install a newer release, keeping your data
+  polygate uninstall --yes [--purge]   remove the program (--purge: its data and user too)
+  polygate version | settings
+HELP
+}
+
+case "${1:-menu}" in
+  menu) if [ -t 0 ] && [ -t 1 ]; then manager; else usage; fi ;;
+  info) cmd_info ;;
   status) systemctl status polygate --no-pager ;;
   health) control request /healthz </dev/null ;;
-  start|stop|restart) systemctl "$1" polygate ;;
+  doctor) cmd_doctor ;;
+  version) release_version ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
   logs) journalctl -u polygate -n 100 -f ;;
   settings) control settings ;;
-  password)
-    was_active=0; systemctl is-active --quiet polygate && was_active=1
-    systemctl stop polygate
-    trap 'if [ "$was_active" = 1 ]; then systemctl start polygate; fi' EXIT
-    if [ "${2:-}" = '--stdin' ]; then control password --stdin; else control password; fi
-    if [ -f "$POLYGATE_STATE/admin-password.txt" ]; then cat "$POLYGATE_STATE/admin-password.txt"
-    else echo 'No password file was written, so there is nothing to show. A password you supplied stays valid; to change it run: polygate password --stdin'; fi
-    ;;
-  https)
-    mode=${2:-status}
-    case "$mode" in
-      status) control request /admin/https </dev/null ;;
-      disable) printf '{}' | control request /admin/https/disable ;;
-      renew) printf '{}' | control request /admin/https/renew ;;
-      ip|domain|custom)
-        # Build JSON with Python, never interpolate PEM, hostnames or e-mail into shell code.
-        python3 - "$mode" "${3:-}" "${4:-}" <<'PY' | control request /admin/https/apply
-import json,os,sys
-mode,value,email=sys.argv[1:]
-body={'mode':mode,'port':int(os.environ.get('POLYGATE_HTTPS_PORT','443')),'httpPort':int(os.environ.get('POLYGATE_HTTP_PORT','80')),'email':email,'staging':os.environ.get('POLYGATE_HTTPS_STAGING')=='1'}
-if mode=='custom':
-    body['certPem']=open(value).read();body['keyPem']=open(email).read();body.pop('email',None)
-else: body['domain' if mode=='domain' else 'ip']=value
-print(json.dumps(body))
-PY
-        ;;
-      *) echo 'Usage: polygate https status|ip [address] [email]|domain <domain> [email]|custom <cert> <key>|renew|disable' >&2; exit 2 ;;
-    esac ;;
+  password) shift; cmd_password "$@" ;;
+  https) shift; cmd_https "$@" ;;
   update) export POLYGATE_REPO; bash "$ROOT/install.sh" --update ;;
-  uninstall)
-    [ "${2:-}" = '--yes' ] || { echo 'Use: polygate uninstall --yes [--purge]. Data is retained unless --purge is supplied.'; exit 2; }
-    systemctl disable --now polygate; rm -f /etc/systemd/system/polygate.service /usr/local/bin/polygate; systemctl daemon-reload
-    # Fixed installation paths only; preserve all user data by default.
-    rm -rf -- /opt/polygate
-    if [ "${3:-}" = '--purge' ]; then rm -rf -- /var/lib/polygate /etc/polygate; fi
-    echo 'Polygate removed.' ;;
-  *) echo 'polygate status | start | stop | restart | logs | password [--stdin] | settings | https … | update | uninstall --yes [--purge]' ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
 esac
