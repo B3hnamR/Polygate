@@ -1,6 +1,7 @@
 import {useState,useEffect,useCallback,useRef,type ReactNode} from 'react';
 import {RelayDeployBar} from './relay-deploy';
 import {RouteTestDialog} from './route-test';
+import {useUpdates,UpdateBanner,UpdatesPanel} from './updates';
 import {Activity,ArrowDownToLine,ArrowRight,ArrowUpRight,Box,Check,CheckCircle2,ChevronRight,Clipboard,Code2,Copy,Database,FileText,Globe,Layers3,Loader2,Network,Pause,Play,Plus,RefreshCw,Search,Send,Server,Settings2,Shield,SlidersHorizontal,Square,Terminal,Trash2,Workflow,X,ExternalLink,Eye,EyeOff,AlertCircle,KeyRound,Radio,Route, Zap, LogOut} from 'lucide-react';
 import {api,at,BASE,hasToken,dropToken} from './api';
 import {Login,NotificationsMenu,WarpPanel,PoolPanel,KeysPanel,SecurityPanel,NotifySettings,HttpsPanel,MetricsPanel,RequestDetail,type Notice} from './panels';
@@ -13,6 +14,7 @@ import {Logo,ms,time,statusState,tickWhileVisible,Button,Badge,Empty,Field,Toggl
 
 export function App(){
   const [page,setPage]=useState<Page>('Overview');const [data,setData]=useState<Snapshot|null>(null);const [error,setError]=useState('');const [toast,setToast]=useState<{message:string;kind:'ok'|'error';seq:number}|null>(null);const [pending,setPending]=useState('');const [selectedModel,setSelectedModel]=useState('auto');const [auth,setAuth]=useState<'checking'|'login'|'ok'>('checking');
+  const updates=useUpdates(auth==='ok');
   const latest=useRef(0);const toasts=useRef(0);
   const setNotice:Notice=useCallback((message,kind='ok')=>setToast(message?{message,kind,seq:++toasts.current}:null),[]);
   const refresh=useCallback(async()=>{const id=++latest.current;try{const next=await api('/admin/state');if(id===latest.current){setData(next);setError('');}}catch(e:any){if(id===latest.current){if(e.status===401)setAuth('login');else setError(e.message);}}},[]);
@@ -38,6 +40,7 @@ export function App(){
     </aside>
     <main><header className="page-header"><div><div className="breadcrumb">Workspace <ChevronRight size={13}/> {page}</div><h1>{page}</h1><p>{descriptions[page]}</p></div><div className="header-actions">{data&&<NotificationsMenu unread={data.notices||0} onChange={refresh}/>}{data&&<Badge state={data.settings.enabled?'running':'neutral'}>{data.settings.enabled?'Gateway online':'Paused'}</Badge>}<Button disabled={!data||!!pending} onClick={()=>act('gateway','/admin/settings',{enabled:!data?.settings.enabled},data?.settings.enabled?'Gateway paused':'Gateway resumed')}>{data?.settings.enabled?<Pause size={15}/>:<Play size={15}/>} {data?.settings.enabled?'Pause gateway':'Resume gateway'}</Button></div></header>
       {error&&<div className="error-banner" role="alert"><AlertCircle size={18}/><span>{error}</span><Button onClick={refresh}>Reconnect</Button></div>}
+      {data&&<UpdateBanner updates={updates} openSettings={()=>{setPage('Settings');window.scrollTo(0,0);}}/>}
       {!data?<div className="loading"><Loader2 className="spin"/> Loading your workspace…</div>:<div className="page-content">
         {page==='Overview'&&<Overview data={data} base={base} apiKey={key} copy={copy} page={setPage} run={()=>{setSelectedModel('auto');setPage('Playground');}}/>}
         {page==='Models'&&<Models data={data} pending={pending} act={act} select={id=>{setSelectedModel(id);setPage('Playground');}}/>}
@@ -46,7 +49,7 @@ export function App(){
         {(page==='Relays'||page==='Routing')&&<Routes data={data} act={act} action={action} pending={pending} relayOnly={page==='Relays'} notice={setNotice} refresh={refresh} go={setPage}/>}
         {page==='Playground'&&<Playground data={data} apiKey={key} model={selectedModel} setModel={setSelectedModel} refresh={refresh}/>}
         {page==='Requests'&&<RequestPage data={data} act={act}/>}
-        {page==='Settings'&&<Preferences data={data} act={act} copy={copy} pending={pending} notice={setNotice} refresh={refresh} onSignedOut={signOut}/>}
+        {page==='Settings'&&<><UpdatesPanel updates={updates}/><Preferences data={data} act={act} copy={copy} pending={pending} notice={setNotice} refresh={refresh} onSignedOut={signOut}/></>}
         {page==='Guide'&&<Guide/>}
       </div>}
       <footer className="app-footer"><span><Shield size={12}/> Local-first. No request content in activity logs.</span><span>Bun {data?.runtime||'—'} <span className="footer-separator">/</span> OpenCode Free provider</span></footer>

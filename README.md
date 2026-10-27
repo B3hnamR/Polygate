@@ -1,50 +1,69 @@
-<p align="center"><img src="assets/logo.svg" alt="Polygate" width="112"></p>
+<p align="center">
+  <img src="assets/social-preview.png" alt="Polygate — a free AI model gateway" width="900">
+</p>
 
-<h1 align="center">Polygate</h1>
+<p align="center">
+  <a href="https://github.com/B3hnamR/Polygate/releases/latest"><img src="https://img.shields.io/github/v/release/B3hnamR/Polygate?color=5eead4&label=release" alt="Latest release"></a>
+  <a href="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml"><img src="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml/badge.svg" alt="Build and tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-7c9cff" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20Docker-94a3b8" alt="Windows, Linux, and Docker">
+</p>
 
-<p align="center"><b>One gateway for free AI models.</b><br>
-Point any OpenAI- or Anthropic-compatible tool at Polygate and it picks a working free model for you,<br>
-switches when one is busy, and can send its traffic through WARP, proxies or relays when a provider limits an address.</p>
+<h1 align="center">Your models. One endpoint.</h1>
 
----
+<p align="center">
+  Connect your AI tools to free models through a gateway you control.<br>
+  Switch providers, manage network routes, and see every request from one dashboard.
+</p>
 
-## What it is
+<p align="center">
+  <a href="#quick-start"><b>Install Polygate</b></a> ·
+  <a href="#dashboard-showcase">See the dashboard</a> ·
+  <a href="#connect-your-client">Connect a client</a> ·
+  <a href="https://github.com/B3hnamR/Polygate/releases/latest">Downloads</a>
+</p>
 
-Polygate runs on your computer (Windows app) or on a server (Linux service or Docker) and gives you **one local endpoint** that speaks three
-protocols: OpenAI Chat Completions, OpenAI Responses and Anthropic Messages. Behind that endpoint it uses free model providers, tracks which models
-are working, and keeps going when one is rate-limited.
+![Polygate overview with connection details, gateway activity, model health, and performance](assets/screenshots/overview.png)
 
-- **Free providers built in:** **OpenCode Free** and **Kilo Free** (about 16 free chat models). You can add any OpenAI-compatible API, or a real OpenCode server.
-- **It picks for you.** Ask for `auto`, `auto:smart` or `auto:fast`, or name an exact model. A model that fails rests for a while and the next one takes over.
-- **Several ways out to the internet.** Direct, HTTP/SOCKS proxies, built-in Cloudflare WARP, a proxy pool that is tested with real requests, and one-click relays on Vercel, Netlify and Cloudflare.
-- **Per-key control.** Give each client its own API key with its own concurrency, requests-per-minute, tokens-per-minute, token budget, expiry and model allow-list.
-- **A dashboard** to see what is happening: models, providers, routes, a Playground, and a request log that never stores what you typed.
-- **HTTPS built in** on a server: automatic certificates for a domain or for the server's IP address, or your own certificate. No nginx or Caddy needed.
+## Why Polygate?
 
-> Free tiers change and have limits. Polygate shows you what each provider is doing; it does not make a limit go away. Please follow each provider's terms.
+| | What you get |
+|---|---|
+| **Free providers, built in** | OpenCode Free and Kilo Free. Discover their current catalogs, or add your own compatible API. |
+| **One address for your tools** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. |
+| **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. |
+| **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool, WARP, and deployable relays. |
+| **See what is happening** | Model availability, request timing, provider settings, client keys, and a Playground for real requests. |
+| **Run it your way** | Portable Windows app, Linux service with a manager, or Docker. Built-in HTTPS is available on servers. |
 
-## Contents
+> [!NOTE]
+> Free models have provider limits and changing availability. Polygate helps you manage access; it cannot guarantee capacity or remove provider limits. Follow each provider’s terms.
 
-[Install](#install) · [Use it](#use-it) · [Providers](#providers) · [Network routes and relays](#network-routes-and-relays) · [HTTPS and domains](#https-and-domains) ·
-[Managing a server](#managing-a-server) · [Settings](#settings) · [Security](#security) · [Troubleshooting](#troubleshooting) · [Development](#development)
+## Quick start
 
----
+### Linux server
 
-## Install
-
-### Windows
-
-1. Download `Polygate-<version>-Windows-x64.exe` from the [Releases](../../releases) page (and check it against the `.sha256` file next to it).
-2. Run it. It is a portable app, so nothing is installed. Windows may show a SmartScreen warning because the app is not code-signed yet: choose *More info → Run anyway*.
-3. The dashboard opens inside the app. Your data is kept in `%LOCALAPPDATA%\Polygate`.
-
-### Linux server (Ubuntu, Debian, Fedora, RHEL family, Arch, openSUSE; x86-64 or ARM64)
+**Copy these two commands into your server’s terminal:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/B3hnamR/Polygate/main/install.sh -o install.sh
-sudo bash install.sh --check      # optional: looks at the machine, changes nothing
-sudo bash install.sh              # guided install
+sudo bash install.sh
 ```
+
+1. Press **Enter** to start. The installer checks the machine and installs missing dependencies.
+2. Choose how to open the dashboard: a domain, the server’s IP with HTTPS, your existing web server, your own certificate, or a local SSH tunnel.
+3. Review the plan and confirm. Open the **Dashboard** address shown at the end and sign in with the supplied password.
+
+Run **`polygate`** any time to open the server manager.
+
+> [!TIP]
+> The `curl` command is silent when it succeeds: it saves `install.sh`. The second command starts the installer.
+> To check the machine first, run `sudo bash install.sh --check`.
+
+**Requirements:** Linux with systemd and glibc, on x86-64 or ARM64. Ubuntu, Debian, Fedora/RHEL, Arch, and openSUSE families are supported. Alpine and environments without systemd should use Docker. ARM64 packages are built in CI; running them on ARM64 hardware has not yet been verified.
+
+<details>
+<summary><b>Advanced install options, HTTPS choices, and server changes</b></summary>
 
 The installer opens with the Polygate banner and waits for you to press Enter. Then it checks the machine and installs what is missing in one quiet step (details go to `/var/log/polygate-install.log`; only problems are shown), asks how you want to open the dashboard, shows a short summary and asks once more before it installs. It needs systemd and glibc (Alpine and containers without systemd should use Docker). When it finishes, run `polygate` any time to open the manager.
 
@@ -78,29 +97,90 @@ sudo bash install.sh --update      # newer release, keeps your data, settings an
 
 `bash install.sh --help` lists every option. The dashboard is served at `/polygate/` (set `POLYGATE_DASHBOARD_PATH` to another path, or to an empty value for the root), so on a shared domain only that one path belongs to Polygate. The password is shown once at the end and kept in `/var/lib/polygate/admin-password.txt`.
 
+</details>
+
+### Windows
+
+1. **[Download the Windows app](https://github.com/B3hnamR/Polygate/releases/latest)** — choose `Polygate-<version>-Windows-x64.exe`.
+2. Run it. It is portable: no installer or administrator access is needed.
+3. The dashboard opens inside the app. Copy your connection details into an AI tool, or try the **Playground**.
+
+The app is currently unsigned, so Windows may show SmartScreen. Download from this repository’s release page and verify the executable against the supplied `.sha256` file. App data is kept in `%LOCALAPPDATA%\Polygate`.
+
 ### Docker
 
-```bash
-docker compose up -d                                                  # dashboard on 127.0.0.1:4317 only
-docker compose -f docker-compose.yml -f docker-compose.https.yml up -d   # also publishes 80 and 443 for built-in HTTPS
-```
-
-By default only `127.0.0.1:4317` is published, so it cannot clash with a web server on the host. Set `POLYGATE_ADMIN_PASSWORD` in your environment to choose the dashboard password.
-
-### From source
+From a machine with Docker Compose and Git:
 
 ```bash
-npm install
-bun run dev          # dashboard with live reload
-bun run dist         # Windows portable app (needs the pinned Bun runtime, see scripts/fetch-bun.py)
-bash scripts/build-linux.sh amd64   # Linux package (or arm64)
+git clone https://github.com/B3hnamR/Polygate.git
+cd Polygate
+docker compose up -d --build
 ```
+
+Open **[http://127.0.0.1:4317](http://127.0.0.1:4317)**. Retrieve the generated dashboard password with:
+
+```bash
+docker compose exec polygate cat /data/admin-password.txt
+```
+
+To choose your own password before the first start, set `POLYGATE_ADMIN_PASSWORD` in your shell or a local `.env` file. Docker publishes port 4317 on loopback only and keeps data in a named volume.
+
+<details>
+<summary><b>Docker with built-in HTTPS</b></summary>
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+```
+
+This also publishes ports 80 and 443. Enable HTTPS in **Settings**; both ports must be free and reachable. For an existing reverse proxy, keep the default Compose file and forward requests to Polygate.
+
+</details>
+
+## Dashboard showcase
+
+Real screenshots from **Polygate v0.2.1 running in WSL**. Model availability and activity reflect that workspace at capture time. Credentials stay hidden; private relay addresses are masked.
+
+### Find a model and set its priority
+
+See both providers in one catalog, check availability, compare latency, and choose which models run first.
+
+![Model catalog showing providers, availability, capabilities, latency, and priority controls](assets/screenshots/models.png)
+
+### Try a request before configuring your tools
+
+Choose a model and protocol, add a system instruction, and read the streamed response beside your request.
+
+![Playground showing a real request and response through the WSL gateway](assets/screenshots/playground.png)
+
+<details>
+<summary><b>More views: providers, relays, and mobile</b></summary>
+
+**Providers** — built-in free providers and your own compatible endpoints.
+
+![Providers page showing OpenCode Free and Kilo Free](assets/screenshots/providers.png)
+
+**Relays** — deploy to your own account, test the connection, and select a route.
+
+![Relays page with Vercel, Netlify, and Cloudflare deployment options](assets/screenshots/relays.png)
+
+**Mobile** — check your gateway from a smaller screen.
+
+<p align="center"><img src="assets/screenshots/mobile.png" alt="Polygate overview on a mobile viewport" width="360"></p>
+
+</details>
+
+## Explore
+
+[Client setup](#connect-your-client) · [Providers](#providers) · [Network routes and relays](#network-routes-and-relays) · [HTTPS](#https-and-domains) · [Server manager](#managing-a-server) · [Privacy](#privacy-and-access-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
 ---
 
-## Use it
+## Connect your client
 
-Open the dashboard, copy the **address** and an **API key** from the Overview page, and give them to your tool.
+Open **Overview → Connect your client**. Copy the base URL and client API key into your tool, then set the model to **`auto`**. The API key starts with `pg_`; it is different from your dashboard password.
+
+> [!TIP]
+> The Windows app and Linux installer can choose a free port. Copy the address from your own dashboard instead of assuming port 4317.
 
 | | |
 |---|---|
@@ -127,12 +207,14 @@ print(client.chat.completions.create(model="auto", messages=[{"role": "user", "c
 
 | `model` | Meaning |
 |---|---|
-| `auto` | the best working model right now, with automatic fallback to the next two |
+| `auto` | highest-ranked usable model, with fallback attempts for supported failure types |
 | `auto:smart` | prefers reasoning and larger models |
 | `auto:fast` | prefers the models that answered fastest |
 | `kilo/kilo-auto/free`, `opencode/<name>` | an exact model: the provider, then its model id (see `/v1/models`) |
 
-Your client's key is never sent to a provider, tool calls and streaming work as the client expects, and each key can be limited on the Overview page.
+Your client’s key is never sent to a provider. Streaming and tool support depend on the selected provider and model. Manage client key limits, expiry, and model allowlists in **Settings**.
+
+Responses continuation through `previous_response_id` is not implemented; send conversation input explicitly. The real OpenCode server adapter supports text conversations rather than native tool execution.
 
 ---
 
@@ -140,7 +222,7 @@ Your client's key is never sent to a provider, tool calls and streaming work as 
 
 | Provider | What it is | Good to know |
 |---|---|---|
-| **OpenCode Free** | built in | OpenCode limits each network address per day. When an address is used up, Polygate moves to another exit if you have one, and says when the limit resets. |
+| **OpenCode Free** | built in | OpenCode has a daily allowance per network address. When an address is used up, Polygate moves to another exit if you have one, and says when the limit resets. |
 | **Kilo Free** | built in; every model Kilo marks free, no account needed | Kilo limits anonymous use per network address. When that happens all Kilo models rest for 30 minutes (the answer says so and carries `Retry-After`). A single busy model rests for 2 minutes while the others keep working. You can save a Kilo API key on its row. Kilo models rank behind OpenCode's in `auto` and take over when OpenCode's are resting. |
 | **OpenAI-compatible** | add any endpoint that has `/v1/chat/completions` | needs a base URL and, usually, a key |
 | **OpenCode server** | add your own OpenCode server | text conversation only |
@@ -184,6 +266,22 @@ Certificates come from Let's Encrypt, renew by themselves, and need the validati
 so use *behind my web server* (`POLYGATE_TRUST_PROXY=1`, `POLYGATE_COOKIE_SECURE=1`, `POLYGATE_ALLOWED_HOSTS=your.domain`) if something else needs them.
 The installer writes a ready nginx and Caddy snippet to `/etc/polygate/proxy-example.conf`.
 
+## Updates
+
+The dashboard checks for a newer **published stable release** when you open it, then every 6 hours while open. A small banner announces a new version, and **Settings → Updates** shows the installed version, latest version, release notes, and a manual check button. Drafts and prereleases are ignored.
+
+| Where you run Polygate | How to update |
+|---|---|
+| **Windows portable app** | Click **Update & restart**. The app downloads the official Windows executable, verifies its SHA-256, closes, replaces its portable executable, and reopens. Settings and keys are kept. Finish active requests first. |
+| **Linux service** | Connect to your VPS over SSH and run `sudo polygate update`, or open `sudo polygate` and choose **8 · Update Polygate**. The dashboard shows the command; it does not run server commands for you. |
+| **Docker** | In your checkout, run `git pull --ff-only`, then `docker compose up -d --build`. Keep your existing volume and Compose options. |
+| **Source / standalone package** | Update using your original deployment method, then restart the gateway. |
+
+> [!NOTE]
+> Update notices and Windows one-click updates are included from **v0.2.1**. If you use the v0.2.0 Windows app, download and open v0.2.1 once; future updates can then be installed from the app. Linux users can run `sudo polygate update` to get the new dashboard notices.
+
+Checks contact GitHub directly and are cached. Downloads only begin when you click the Windows update button. A failed download or checksum check leaves the current app running.
+
 ## Managing a server
 
 Run **`polygate`** for the manager: the banner, whether the service is running, the dashboard address, and a menu.
@@ -196,20 +294,25 @@ Run **`polygate`** for the manager: the banner, whether the service is running, 
  5  Stop                                0  Exit
 ```
 
-Every menu action is also a command, for scripts:
+Every menu action is also a command:
 
-```text
-sudo polygate info | status | doctor | version | start | stop | restart | logs
-sudo polygate password [--stdin]       # new dashboard password (random unless --stdin)
-sudo polygate https status | domain NAME [EMAIL] | ip [ADDRESS] [EMAIL] | custom CERT KEY | renew | disable
-sudo polygate update                   # newer release, data kept
-sudo polygate uninstall --yes [--purge]   # removes the program; --purge also removes data and the user
-```
+| Task | Command |
+|---|---|
+| Dashboard address and password | `sudo polygate info` |
+| Service state / health report / version | `sudo polygate status` / `sudo polygate doctor` / `sudo polygate version` |
+| Start / stop / restart | `sudo polygate start` / `sudo polygate stop` / `sudo polygate restart` |
+| Live logs | `sudo polygate logs` |
+| New dashboard password | `sudo polygate password` |
+| Update, keeping data | `sudo polygate update` |
+| Uninstall, keeping data | `sudo polygate uninstall --yes` |
+| Uninstall and delete data | `sudo polygate uninstall --yes --purge` |
 
 `polygate doctor` explains in plain words whether the service, HTTPS and the catalog are healthy. Files: program in `/opt/polygate`, settings in
 `/etc/polygate/polygate.env`, data in `/var/lib/polygate`, installer log in `/var/log/polygate-install.log`.
 
-## Settings
+<details>
+<summary><b>Advanced environment settings</b></summary>
+
 
 Most things are changed in the dashboard. A server reads these environment variables (the installer writes them to `/etc/polygate/polygate.env`):
 
@@ -219,14 +322,16 @@ Most things are changed in the dashboard. A server reads these environment varia
 | `POLYGATE_HOST` | address to listen on | `127.0.0.1` |
 | `POLYGATE_DASHBOARD_PATH` | serve the dashboard and the API under this path, e.g. `/polygate`, so a reverse proxy can forward just that path (the root only redirects to it) | empty (the root); the Linux installer sets `/polygate` |
 | `POLYGATE_STATE` | where data is kept | per user (`%LOCALAPPDATA%\Polygate\state`, `~/.local/state/polygate`) |
-| `POLYGATE_ADMIN_PASSWORD` | dashboard password, 12 or more characters (only used the first time) | a random one is generated |
-| `POLYGATE_ALLOWED_HOSTS` | names the dashboard answers to, comma separated (`*` for any) | loopback names and the certificate's name |
+| `POLYGATE_ADMIN_PASSWORD` | dashboard password, 12 or more characters (when set, controls the password instead of the dashboard) | a random one is generated |
+| `POLYGATE_ALLOWED_HOSTS` | names the dashboard answers to, comma separated (`*` for any) | loopback names and the certificate’s name; public listeners accept any hostname |
 | `POLYGATE_TRUST_PROXY` | how many reverse proxies sit in front (reads the client address from `X-Forwarded-For`) | `0` |
 | `POLYGATE_COOKIE_SECURE` | `1`, `0` or `auto` | `auto` |
 | `POLYGATE_HTTP_PORT`, `POLYGATE_HTTPS_PORT` | ports for built-in HTTPS | `80`, `443` |
 | `POLYGATE_HTTPS_STAGING` | `1` uses Let's Encrypt's test servers while you experiment | off |
 
-## Security
+</details>
+
+## Privacy and access control
 
 - Settings, provider keys and relay tokens are stored encrypted on disk; the key file is private to the service user. Client API keys are never forwarded to a provider.
 - The request log records sizes, status and timing, not what you typed or what came back.
@@ -239,10 +344,12 @@ Most things are changed in the dashboard. A server reads these environment varia
 
 | You see | What it means and what to do |
 |---|---|
+| The download command prints nothing | Normal: `curl -fsSL` saved `install.sh`. Run `sudo bash install.sh` next. |
+| The installer says *The download failed* | Check outbound GitHub access and that the selected published release has a package for your architecture. [Latest release](https://github.com/B3hnamR/Polygate/releases/latest). |
 | `Unrecognized Host header` | the dashboard was opened with a name it does not know. Set `POLYGATE_ALLOWED_HOSTS` to that name, or use the HTTPS name. |
 | A model says *paused* or answers 429 | the provider limited it. The message says when it comes back. Use `auto`, or add another route. |
 | OpenCode: *daily allowance used up* | that network address has used OpenCode's daily allowance (it resets at 00:00 UTC). Add WARP, a proxy or a relay on the Routing page. |
-| Kilo: *stopped answering from this network address* | Kilo's anonymous limit for the address. All Kilo models rest for 30 minutes and then try again. A Kilo key on its row removes the anonymous limit. |
+| Kilo: *stopped answering from this network address* | Kilo's anonymous limit for the address. All Kilo models rest for 30 minutes and then try again. You can save an optional Kilo key on its provider row; whether it lifts this limit has not been verified here. |
 | WARP: *none of the Cloudflare WARP addresses answered* | this network drops the traffic WARP needs (outbound UDP to Cloudflare; some hosting providers block it). Try another network, or use a proxy or relay route instead. |
 | HTTPS fails at the certificate step | check that the domain points at the server, that ports 80 and 443 reach it (also in your hosting provider's firewall), and that nothing else uses them. Run `sudo polygate https status` for the exact reason. |
 | The Linux installer stops with *problems to fix* | it lists them and changed nothing. Fix them and run it again, or use `--check` to look first. |
@@ -250,7 +357,11 @@ Most things are changed in the dashboard. A server reads these environment varia
 
 ## Development
 
+With Node.js, npm, and Bun installed (release builds use Bun 1.4.4):
+
 ```bash
+git clone https://github.com/B3hnamR/Polygate.git
+cd Polygate
 npm install
 bun run check        # type check
 bun test tests       # the test suite
@@ -261,6 +372,16 @@ bun run dev          # dashboard + gateway with live reload
 `install.sh` and `install/` the Linux installer and the `polygate` command, `vendor/` code reused from other open projects (see below).
 Releases are built by GitHub Actions: pushing a `v*` tag builds the Windows app and the Linux packages and prepares a draft release.
 
+To build the portable Windows app in PowerShell, with Python available:
+
+```powershell
+python scripts/fetch-bun.py 1.4.4 windows-x64
+$env:POLYGATE_BUN_RUNTIME = "$PWD\build\runtime\1.4.4\windows-x64\bun.exe"
+bun run dist
+```
+
+The executable is written to `release/`. For Linux packages, run `bash scripts/build-linux.sh amd64` (or `arm64`).
+
 ## License
 
-MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Made by **[B3hnamR](https://github.com/B3hnamR)**. Released under the [MIT license](LICENSE). Third-party components keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -10,6 +10,7 @@ FROM oven/bun:1.4.4 AS gateway
 WORKDIR /src
 COPY package.json ./
 COPY backend ./backend
+COPY desktop/releases.cjs ./desktop/releases.cjs
 COPY vendor/bridge ./vendor/bridge
 COPY vendor/protocols ./vendor/protocols
 COPY relays ./relays
@@ -27,7 +28,7 @@ COPY vendor/bridge/LICENSE /app/vendor/bridge/LICENSE
 COPY vendor/protocols/LICENSE /app/vendor/protocols/LICENSE
 COPY vendor/licenses /app/vendor/licenses
 RUN mkdir /data && chown bun:bun /data && chmod 0700 /data
-ENV POLYGATE_APP_DIR=/app POLYGATE_HOST=0.0.0.0 POLYGATE_PORT=4317 POLYGATE_STATE=/data POLYGATE_UI_DIST=/app/dist POLYGATE_ALLOWED_HOSTS=*
+ENV POLYGATE_INSTALL_KIND=docker POLYGATE_APP_DIR=/app POLYGATE_HOST=0.0.0.0 POLYGATE_PORT=4317 POLYGATE_STATE=/data POLYGATE_UI_DIST=/app/dist POLYGATE_ALLOWED_HOSTS=*
 USER bun
 VOLUME ["/data"]
 EXPOSE 4317 80 443

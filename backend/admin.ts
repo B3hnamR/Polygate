@@ -16,12 +16,15 @@ import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig } from './auth';
 import { GatewayError } from './queue';
 import { version } from './version';
+import { checkForUpdates } from './updates';
 import type { Provider, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
 export async function admin(req:IncomingMessage,res:ServerResponse,pathname:string){
   const method=req.method;
+  if(pathname==='/admin/updates'&&method==='GET')return json(res,200,await checkForUpdates());
+  if(pathname==='/admin/updates/check'&&method==='POST'){await readJson(req);return json(res,200,await checkForUpdates(true));}
   if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Request-shape records (no prompt or completion content) for working out why a request was refused.
