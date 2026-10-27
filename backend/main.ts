@@ -30,7 +30,17 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
     res.setHeader('x-content-type-options','nosniff');res.setHeader('referrer-policy','no-referrer');
     try{
       const hostHeader=String(req.headers.host||'');if(!hostAllowed(hostHeader))throw new GatewayError('Unrecognized Host header. Set POLYGATE_ALLOWED_HOSTS to this hostname.',403);
-      const url=new URL(req.url||'/','http://'+hostHeader);const p=url.pathname;
+      const url=new URL(req.url||'/','http://'+hostHeader);let p=url.pathname;
+      // With a dashboard path (POLYGATE_DASHBOARD_PATH=/polygate) everything under it is the same app, so "/polygate/admin/..." and "/polygate/v1/..."
+      // behave like "/admin/..." and "/v1/...". The bare root only forwards to it; the pages and assets are not served there. The API, the health
+      // checks and the local management commands keep answering at the root as well, so existing clients and monitoring do not break.
+      const dashboard=serverConfig().dashboardPath;
+      if(dashboard){
+        if(p===dashboard){res.writeHead(301,{location:dashboard+'/'+url.search});return res.end();}
+        if(p.startsWith(dashboard+'/'))p=p.slice(dashboard.length);
+        else if(p==='/'&&req.method==='GET'){res.writeHead(302,{location:dashboard+'/'+url.search});return res.end();}
+        else if(req.method==='GET'&&!/^\/(v1\/|admin\/|health$|healthz$|readyz$|metrics$)/.test(p))throw new GatewayError('Endpoint not found',404);
+      }
       // The OpenAI/Anthropic surface is protected by API keys and must be callable from browser clients; everything else is same-origin only.
       if(p.startsWith('/v1/')){res.setHeader('access-control-allow-origin','*');res.setHeader('access-control-allow-headers','authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id');res.setHeader('access-control-allow-methods','GET, POST, OPTIONS');res.setHeader('access-control-expose-headers','x-polygate-model, x-polygate-route, retry-after');res.setHeader('access-control-max-age','600');if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}}
       else if(req.headers.origin){let originHost='';try{originHost=new URL(String(req.headers.origin)).host;}catch{/* malformed origin is refused below */}

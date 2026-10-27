@@ -2,7 +2,7 @@ import {useState,useEffect,useCallback,useRef,type ReactNode} from 'react';
 import {RelayDeployBar} from './relay-deploy';
 import {RouteTestDialog} from './route-test';
 import {Activity,ArrowDownToLine,ArrowRight,ArrowUpRight,Box,Check,CheckCircle2,ChevronRight,Clipboard,Code2,Copy,Database,FileText,Globe,Layers3,Loader2,Network,Pause,Play,Plus,RefreshCw,Search,Send,Server,Settings2,Shield,SlidersHorizontal,Square,Terminal,Trash2,Workflow,X,ExternalLink,Eye,EyeOff,AlertCircle,KeyRound,Radio,Route, Zap, LogOut} from 'lucide-react';
-import {api,hasToken,dropToken} from './api';
+import {api,at,BASE,hasToken,dropToken} from './api';
 import {Login,NotificationsMenu,WarpPanel,PoolPanel,KeysPanel,SecurityPanel,NotifySettings,HttpsPanel,MetricsPanel,RequestDetail,type Notice} from './panels';
 import type {Model,Settings,LogRow,Provider,Route as NetworkRoute} from '../backend/types';
 
@@ -23,8 +23,8 @@ export function App(){
   async function action(name:string,path:string,body:unknown={},success='Saved'){setPending(name);try{const result=await api(path,body);if(success)setNotice((result as any)?.summary||success);await refresh();return result;}catch(e:any){if(e.status===401){setAuth('login');throw e;}setNotice(e.message,'error');void refresh().catch(()=>{});throw e;}finally{setPending('');}}
   const act=(name:string,path:string,body:unknown={},success='Saved')=>action(name,path,body,success).then(()=>true,()=>false);
   const copy=async(value:string)=>{try{await navigator.clipboard.writeText(value);setNotice('Copied to clipboard');}catch{setNotice('Clipboard unavailable. Select and copy the value.','error');}};
-  const base=location.origin+'/v1';
-  async function signOut(){++latest.current;await fetch('/admin/logout',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).catch(()=>{});dropToken();setData(null);setAuth('login');}
+  const base=location.origin+BASE+'/v1';
+  async function signOut(){++latest.current;await fetch(at('/admin/logout'),{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).catch(()=>{});dropToken();setData(null);setAuth('login');}
   const serverMode=data?.server?.mode==='server';
   // The first key that can actually be used: a disabled or expired first key made Overview and Playground fail with 401.
   const usableKey=data?.settings.keys.find(k=>k.enabled&&(!k.expiresAt||k.expiresAt>Date.now()));const key=usableKey?.value||'';
@@ -125,7 +125,7 @@ function Playground({data,apiKey,model,setModel,refresh}:{data:Snapshot;apiKey:s
     const endpoint=protocol==='chat'?'chat/completions':protocol==='responses'?'responses':'messages';
     const messages=[...(system?[{role:'system',content:system}]:[]),{role:'user',content:prompt}];
     const body=protocol==='responses'?{model,input:prompt,instructions:system,stream:streaming,max_output_tokens:1024}:protocol==='anthropic'?{model,messages:[{role:'user',content:prompt}],system,max_tokens:1024,stream:streaming}:{model,messages,max_tokens:1024,stream:streaming};
-    const r=await fetch('/v1/'+endpoint,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+apiKey},body:JSON.stringify(body),signal:cancel.current.signal});
+    const r=await fetch(at('/v1/'+endpoint),{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+apiKey},body:JSON.stringify(body),signal:cancel.current.signal});
     if(!r.ok){const text=await r.text();let e:any;try{e=JSON.parse(text);}catch{/* an HTML error page from a proxy */}throw new Error((typeof e?.error==='string'?e.error:e?.error?.message)||`Request failed (HTTP ${r.status})`);}
     if(streaming){const reader=r.body!.getReader();const decoder=new TextDecoder();let buffer='',all='';
       // CRLF framing is normalised, and an event left without a closing blank line when the stream ends is still shown.

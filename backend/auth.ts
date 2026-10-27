@@ -12,8 +12,12 @@ export function serverConfig() {
   const list = (process.env.POLYGATE_ALLOWED_HOSTS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
   // POLYGATE_TRUST_PROXY=1 trusts one reverse proxy in front; a larger number trusts that many hops (for example a CDN plus a proxy).
   const hops = /^\d+$/.test(process.env.POLYGATE_TRUST_PROXY || '') ? Math.min(10, Number(process.env.POLYGATE_TRUST_PROXY)) : 0;
+  // POLYGATE_DASHBOARD_PATH=/polygate serves the dashboard (and, under the same prefix, the API) at https://server/polygate/ instead of the root.
+  // A reverse proxy can then forward just that path and leave the rest of the site alone. Empty (the default) keeps everything at the root.
+  const rawPath = (process.env.POLYGATE_DASHBOARD_PATH || '').trim();
+  const dashboardPath = /^\/[A-Za-z0-9._~-]+(\/[A-Za-z0-9._~-]+)*\/?$/.test(rawPath) && !rawPath.split('/').some(part => part === '.' || part === '..') ? rawPath.replace(/\/$/, '') : '';
   return {
-    host, desktop: process.env.POLYGATE_DESKTOP === '1',
+    host, dashboardPath, desktop: process.env.POLYGATE_DESKTOP === '1',
     trustProxy: hops > 0, proxyHops: hops,
     // Host-header pinning defends a loopback listener against DNS rebinding; a public listener is protected by login and API keys instead.
     allowAnyHost: list.includes('*') || !loopbackHost.test(host), allowedHosts: list,

@@ -1,3 +1,4 @@
+import { serverConfig } from './auth';
 import { X509Certificate, createPrivateKey, generateKeyPairSync, createHash, sign as signData, type KeyObject } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import dns from 'node:dns/promises';
@@ -147,8 +148,8 @@ export async function httpsStatus() {
     mode: cfg.mode, domain: cfg.domain || '', ip: cfg.ip || '', email: cfg.email || '', port: cfg.port || 443, httpPort: cfg.httpPort, redirect: cfg.redirect, staging: !!cfg.staging,
     active: !!tls && expiresAt > Date.now(), issuedAt: tls ? Date.parse(tls.cert509.validFrom) : 0, expiresAt, daysLeft: tls ? Math.floor((expiresAt - Date.now()) / day) : 0, issuer: tls ? tls.cert509.issuer.split('\n').find(l => l.startsWith('O='))?.slice(2) || tls.cert509.issuer.replace(/\n/g, ', ') : '',
     lastError: cfg.lastError || '', challengeServer: !!challengeServer, publicIp: await detectPublicIp(), job: { ...job },
-    url: cfg.mode === 'off' ? '' : `https://${cfg.domain || cfg.ip}${(cfg.port || 443) === 443 ? '' : ':' + (cfg.port || 443)}/`,
-    httpUrl: `http://${cfg.domain || cfg.ip || process.env.POLYGATE_PUBLIC_IP || plain.host}:${plain.port}/`,
+    url: cfg.mode === 'off' ? '' : `https://${cfg.domain || cfg.ip}${(cfg.port || 443) === 443 ? '' : ':' + (cfg.port || 443)}${serverConfig().dashboardPath}/`,
+    httpUrl: `http://${cfg.domain || cfg.ip || process.env.POLYGATE_PUBLIC_IP || plain.host}:${plain.port}${serverConfig().dashboardPath}/`,
   };
 }
 const hostnameOk = (h: string) => h.length <= 253 && /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(h);
@@ -181,7 +182,7 @@ export async function httpsApply(b: any) {
       const c = new X509Certificate(result!.cert); next.issuedAt = Date.parse(c.validFrom); next.expiresAt = expiryOf(c); settings.https = next; persist();
       log('Certificate installed. Switching the listener to HTTPS…', 'ok'); await applyListener();
       if (mode === 'custom') { stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined; } else { await startChallengeServer().catch(() => {}); startRenewal(); }
-      job.url = `https://${next.domain || next.ip}${next.port === 443 ? '' : ':' + next.port}/`; log(`HTTPS is active at ${job.url}`, 'ok');
+      job.url = `https://${next.domain || next.ip}${next.port === 443 ? '' : ':' + next.port}${serverConfig().dashboardPath}/`; log(`HTTPS is active at ${job.url}`, 'ok');
       notify('HTTPS enabled', `The dashboard is now served at ${job.url}`, 'success', 'https-on', 0);
     } catch (e: any) { job.error = redactError(String(e.message || e)); log(job.error, 'error'); settings.https = { ...previous, lastError: job.error }; persist(); }
     finally { challenges.clear(); job.running = false; job.finishedAt = Date.now(); }

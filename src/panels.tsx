@@ -1,6 +1,6 @@
 import {useState,useEffect,useRef,type FormEvent} from 'react';
 import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,Download,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
-import {api} from './api';
+import {api,at} from './api';
 import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
 export type Notice=(message:string,kind?:'ok'|'error')=>void;
 const errorOf=(e:unknown)=>String((e as Error)?.message||e);
@@ -8,7 +8,7 @@ const errorOf=(e:unknown)=>String((e as Error)?.message||e);
 export function Login({onDone}:{onDone:()=>void}){
   const [password,setPassword]=useState('');const [error,setError]=useState('');const [busy,setBusy]=useState(false);
   async function submit(e:FormEvent){e.preventDefault();setBusy(true);setError('');
-    try{const r=await fetch('/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error?.message||'Sign in failed');setPassword('');onDone();}
+    try{const r=await fetch(at('/admin/login'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error?.message||'Sign in failed');setPassword('');onDone();}
     catch(err){setError(errorOf(err));}finally{setBusy(false);}}
   return <div className="login-screen"><form className="login-card" onSubmit={submit}>
     <div className="brand-mark"><Logo size={52}/></div><h1>Sign in to Polygate</h1><p className="muted">Enter the dashboard password for this server.</p>
