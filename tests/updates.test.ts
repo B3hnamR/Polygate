@@ -150,7 +150,8 @@ describe('real Windows replacement helper', () => {
       expect(JSON.parse(readFileSync(resultPath, 'utf8')).ok).toBe(!badHash);
       if (!badHash) { expect(existsSync(staging)).toBe(false); expect(readdirSync(directory).sort()).toEqual([path.basename(target), 'result.json'].sort()); }
     } finally { cleanup(directory); if (existsSync(staging)) cleanup(staging); }
-  });
+  // The first PowerShell start on a fresh CI machine can take longer than the default 5 s.
+  }, 30000);
 });
 
 const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
