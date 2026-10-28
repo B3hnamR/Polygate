@@ -30,6 +30,8 @@ beforeAll(async () => {
 });
 afterAll(async () => { settings.providers = savedProviders; settings.chains = savedChains; await gateway?.close(); upstream.stop(true); });
 const save = (body: any) => adminCall('/admin/chains/save', body);
+// Chain names are prefixed tc- so they cannot match a model another test file left in the shared state.
+const made = async (body: any) => { const r = await save(body); expect(r.status).toBe(200); return r.body.chain; };
 const listed = async () => (await (await fetch(base + '/v1/models', { headers: { authorization: 'Bearer ' + settings.keys[0].value } })).json() as any).data as { id: string; owned_by: string }[];
 
 test('a chain is validated before it is saved', async () => {
@@ -60,57 +62,57 @@ test('a saved chain is listed as a model, edited in place, and removed', async (
 
 test('a chain moves past a refused, missing or busy model to the next one', async () => {
   reset();
-  const c = (await save({ name: 'walk', models: ['chain/blocked', 'chain/gone', 'chain/busy', 'chain/fine'] })).body.chain;
-  const r = await ask('walk'); const x = await r.json() as any;
+  const c = await made({ name: 'tc-walk', models: ['chain/blocked', 'chain/gone', 'chain/busy', 'chain/fine'] });
+  const r = await ask('tc-walk'); const x = await r.json() as any;
   expect(r.status).toBe(200); expect(x.choices[0].message.content).toBe('from fine');
   expect(asked).toEqual(['blocked', 'gone', 'busy', 'fine']);
-  expect(r.headers.get('x-polygate-chain')).toBe('walk'); expect(r.headers.get('x-polygate-model')).toBe('chain/fine');
+  expect(r.headers.get('x-polygate-chain')).toBe('tc-walk'); expect(r.headers.get('x-polygate-model')).toBe('chain/fine');
   expect(decodeURIComponent(r.headers.get('x-polygate-skipped')!)).toBe('chain/blocked (403), chain/gone (404), chain/busy (429)');
-  expect(queryEvents({ q: 'walk' }).entries.some(e => e.message.includes('skipped'))).toBe(true);
+  expect(queryEvents({ q: 'tc-walk' }).entries.some(e => e.message.includes('skipped'))).toBe(true);
   await adminCall('/admin/chains/delete', { id: c.id });
 });
 
 test('models that are resting are skipped without being asked, and the first ready one answers', async () => {
   reset(); fresh('busy', { state: 'cooldown', cooldownUntil: Date.now() + 600000 });
-  const c = (await save({ name: 'rest', models: ['chain/busy', 'chain/second', 'chain/fine'] })).body.chain;
-  const r = await ask('rest'); expect(r.status).toBe(200);
+  const c = await made({ name: 'tc-rest', models: ['chain/busy', 'chain/second', 'chain/fine'] });
+  const r = await ask('tc-rest'); expect(r.status).toBe(200);
   expect(asked).toEqual(['second']); expect(r.headers.get('x-polygate-skipped')).toBeNull();
   await adminCall('/admin/chains/delete', { id: c.id });
 });
 
 test('a request the client got wrong stops the chain instead of trying every model', async () => {
   reset();
-  const c = (await save({ name: 'wrong', models: ['chain/badrequest', 'chain/fine'] })).body.chain;
-  const r = await ask('wrong'); expect(r.status).toBe(400); expect(asked).toEqual(['badrequest']);
+  const c = await made({ name: 'tc-wrong', models: ['chain/badrequest', 'chain/fine'] });
+  const r = await ask('tc-wrong'); expect(r.status).toBe(400); expect(asked).toEqual(['badrequest']);
   await adminCall('/admin/chains/delete', { id: c.id });
 });
 
 test('when every step fails the last failure is the answer; when none is ready the client is told why', async () => {
   reset();
-  const c = (await save({ name: 'allbad', models: ['chain/gone', 'chain/blocked'] })).body.chain;
-  const r = await ask('allbad'); expect(r.status).toBe(403); expect(asked).toEqual(['gone', 'blocked']);
+  const c = await made({ name: 'tc-allbad', models: ['chain/gone', 'chain/blocked'] });
+  const r = await ask('tc-allbad'); expect(r.status).toBe(403); expect(asked).toEqual(['gone', 'blocked']);
   // both are now unavailable or resting, so a second request is refused before anything is sent
-  asked = []; const again = await ask('allbad'); expect(again.status).toBeGreaterThanOrEqual(429); expect(asked).toEqual([]);
+  asked = []; const again = await ask('tc-allbad'); expect(again.status).toBeGreaterThanOrEqual(429); expect(asked).toEqual([]);
   const body = await again.json() as any; expect(body.error.message).toContain('allbad');
   await adminCall('/admin/chains/delete', { id: c.id });
 });
 
 test('a switched-off chain is not offered or answered, and an auto step expands to ready models', async () => {
   reset(); for (const id of ['blocked', 'busy', 'badrequest']) fresh(id, { state: 'unavailable' });
-  const c = (await save({ name: 'pause', models: ['chain/gone', 'auto'], enabled: false })).body.chain;
-  expect((await ask('pause')).status).toBe(404);
-  expect((await listed()).some(m => m.id === 'pause')).toBe(false);
-  await save({ id: c.id, name: 'pause', models: ['chain/gone', 'auto'], enabled: true });
-  const r = await ask('pause'); expect(r.status).toBe(200); expect(asked[0]).toBe('gone'); expect(decodeURIComponent(r.headers.get('x-polygate-skipped')!)).toContain('chain/gone (404)');
+  const c = await made({ name: 'tc-pause', models: ['chain/gone', 'auto'], enabled: false });
+  expect((await ask('tc-pause')).status).toBe(404);
+  expect((await listed()).some(m => m.id === 'tc-pause')).toBe(false);
+  await save({ id: c.id, name: 'tc-pause', models: ['chain/gone', 'auto'], enabled: true });
+  const r = await ask('tc-pause'); expect(r.status).toBe(200); expect(asked[0]).toBe('gone'); expect(decodeURIComponent(r.headers.get('x-polygate-skipped')!)).toContain('chain/gone (404)');
   await adminCall('/admin/chains/delete', { id: c.id });
 });
 
 test('a key limited to some models can use a chain, but only reaches the models it may use', async () => {
   reset();
-  const c = (await save({ name: 'limited', models: ['chain/blocked', 'chain/fine'] })).body.chain;
+  const c = await made({ name: 'tc-limited', models: ['chain/blocked', 'chain/fine'] });
   const key = { id: 'k-limited', name: 'Limited', value: 'pg_limited_test_key', enabled: true, limit: 2, models: ['chain/fine'] };
   settings.keys.push(key);
-  try { const r = await ask('limited', key.value); expect(r.status).toBe(200); expect(asked).toEqual(['fine']); }
+  try { const r = await ask('tc-limited', key.value); expect(r.status).toBe(200); expect(asked).toEqual(['fine']); }
   finally { settings.keys = settings.keys.filter(k => k.id !== key.id); }
   await adminCall('/admin/chains/delete', { id: c.id });
 });
