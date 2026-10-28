@@ -1,0 +1,140 @@
+diff --git a/api/fragment.go b/api/fragment.go
+new file mode 100644
+index 0000000..6929f07
+--- /dev/null
++++ b/api/fragment.go
+@@ -0,0 +1,82 @@
++package api
++
++import (
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// fragmentConn splits the first bytes written to a TCP connection into small
++// segments. TLS ClientHellos carry the SNI in the clear, so a DPI device that
++// drops the connection on that name never sees a complete handshake. Only the
++// opening bytes are fragmented; application data is passed through untouched.
++type fragmentConn struct {
++	net.Conn
++	remaining int
++	chunk     int
++	delay     time.Duration
++}
++
++func (c *fragmentConn) Write(p []byte) (int, error) {
++	total := 0
++	for len(p) > 0 && c.remaining > 0 {
++		n := c.chunk
++		if n > len(p) {
++			n = len(p)
++		}
++		if n > c.remaining {
++			n = c.remaining
++		}
++		written, err := c.Conn.Write(p[:n])
++		total += written
++		c.remaining -= written
++		p = p[written:]
++		if err != nil {
++			return total, err
++		}
++		if c.remaining > 0 && c.delay > 0 {
++			time.Sleep(c.delay)
++		}
++	}
++	if len(p) > 0 {
++		written, err := c.Conn.Write(p)
++		total += written
++		if err != nil {
++			return total, err
++		}
++	}
++	return total, nil
++}
++
++// fragmentIfEnabled wraps a connection when USQUE_FRAGMENT is set as
++// "chunk:delay_ms:bytes" (for example "64:2:2048"). It is opt-in so other
++// users of the library keep the normal single-write handshake.
++func fragmentIfEnabled(conn net.Conn) net.Conn {
++	spec := strings.TrimSpace(os.Getenv("USQUE_FRAGMENT"))
++	if spec == "" {
++		return conn
++	}
++	chunk, delayMs, total := 64, 2, 2048
++	parts := strings.Split(spec, ":")
++	if len(parts) > 0 {
++		if v, err := strconv.Atoi(parts[0]); err == nil && v > 0 {
++			chunk = v
++		}
++	}
++	if len(parts) > 1 {
++		if v, err := strconv.Atoi(parts[1]); err == nil && v >= 0 {
++			delayMs = v
++		}
++	}
++	if len(parts) > 2 {
++		if v, err := strconv.Atoi(parts[2]); err == nil && v > 0 {
++			total = v
++		}
++	}
++	if tcp, ok := conn.(*net.TCPConn); ok {
++		_ = tcp.SetNoDelay(true)
++	}
++	return &fragmentConn{Conn: conn, remaining: total, chunk: chunk, delay: time.Duration(delayMs) * time.Millisecond}
++}
+diff --git a/api/masque.go b/api/masque.go
+index 6b2c5d9..0453b45 100644
+--- a/api/masque.go
++++ b/api/masque.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
++	"time"
+ 
+ 	connectip "github.com/Diniboy1123/connect-ip-go"
+ 	"github.com/quic-go/quic-go"
+@@ -239,6 +240,8 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 
+ 	if proxyURL == nil {
+ 		transport := &http2.Transport{
++			ReadIdleTimeout: 10 * time.Second,
++			PingTimeout:     5 * time.Second,
+ 			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+ 				dialer := &net.Dialer{}
+ 				conn, err := dialer.DialContext(ctx, network, endpoint.String())
+@@ -246,7 +249,7 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 					return nil, err
+ 				}
+ 
+-				tlsConn := tls.Client(conn, tlsConfig)
++				tlsConn := tls.Client(fragmentIfEnabled(conn), tlsConfig)
+ 				if err := tlsConn.HandshakeContext(ctx); err != nil {
+ 					_ = conn.Close()
+ 					return nil, err
+@@ -286,7 +289,7 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 				return nil, err
+ 			}
+ 
+-			tlsConn := tls.Client(conn, dialTLSConfig)
++			tlsConn := tls.Client(fragmentIfEnabled(conn), dialTLSConfig)
+ 			if err := tlsConn.HandshakeContext(ctx); err != nil {
+ 				_ = conn.Close()
+ 				return nil, err
+diff --git a/internal/consts.go b/internal/consts.go
+index 9c279ae..d2aa877 100644
+--- a/internal/consts.go
++++ b/internal/consts.go
+@@ -1,7 +1,7 @@
+ package internal
+ 
+ const (
+-	ApiUrl     = "https://api.cloudflareclient.com"
++	ApiUrl     = "https://api.devices.cloudflare.com"
+ 	ApiVersion = "v0a4471"
+ 	ConnectSNI   = "consumer-masque.cloudflareclient.com"
+ 	L4ConnectSNI = "consumer-masque-proxy.cloudflareclient.com"

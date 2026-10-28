@@ -23,6 +23,8 @@ WORKDIR /app
 COPY --from=gateway /out /app/build
 COPY --from=ui /src/dist /app/dist
 COPY relays /app/relays
+COPY resources/warp /app/warp
+RUN chmod 0755 /app/warp/usque-linux-amd64 /app/warp/usque-linux-arm64
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 COPY vendor/bridge/LICENSE /app/vendor/bridge/LICENSE
 COPY vendor/protocols/LICENSE /app/vendor/protocols/LICENSE

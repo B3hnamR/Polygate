@@ -28,6 +28,10 @@ with zipfile.ZipFile(work/'bun.zip') as z:
 PY
 chmod 0755 "$pkg/bin/bun"
 cp -R dist install scripts relays "$pkg/"
+mkdir -p "$pkg/warp"
+cp "resources/warp/usque-linux-$ARCH" "$pkg/warp/"
+cp resources/warp/LICENSE resources/warp/README.md resources/warp/usque.patch "$pkg/warp/"
+chmod 0755 "$pkg/warp/usque-linux-$ARCH"
 cp install.sh package.json README.md LICENSE THIRD_PARTY_NOTICES.md "$pkg/"
 mkdir -p "$pkg/vendor/bridge" "$pkg/vendor/protocols"
 cp -R vendor/licenses "$pkg/vendor/licenses"

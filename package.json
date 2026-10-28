@@ -66,6 +66,22 @@
         "to": "bin/bun.exe"
       },
       {
+        "from": "resources/warp/usque-windows-amd64.exe",
+        "to": "warp/usque-windows-amd64.exe"
+      },
+      {
+        "from": "resources/warp/LICENSE",
+        "to": "warp/LICENSE"
+      },
+      {
+        "from": "resources/warp/README.md",
+        "to": "warp/README.md"
+      },
+      {
+        "from": "resources/warp/usque.patch",
+        "to": "warp/usque.patch"
+      },
+      {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
       },

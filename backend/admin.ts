@@ -6,7 +6,7 @@ import { discover, identityState, syncIdentity, rankedModels } from './providers
 import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
 import { PROXY_SOURCES } from './proxy-sources';
 import { testRoute, describeRoutes, backupChain } from './transport';
-import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, ensureRoute as ensureWarpRoute } from './warp';
+import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
@@ -148,7 +148,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/warp/disconnect'&&method==='POST')return json(res,200,await warpDisconnect());
   if(pathname==='/admin/warp/install'&&method==='POST')return json(res,200,await warpInstall());
   if(pathname==='/admin/warp/rotate'&&method==='POST')return json(res,200,await warpRotate());
-  if(pathname==='/admin/warp/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['engine','autoStart','pool','rotateMinutes','wireproxyPath'])if(k in b)patch[k]=b[k];if('port' in b)settings.warpProxyPort=bounded(b.port,1024,65535);await setWarpSettings(patch);return json(res,200,await warpStatus());}
+  if(pathname==='/admin/warp/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['engine','autoStart','pool','rotateMinutes','helperPath','endpoint'])if(k in b)patch[k]=b[k];const port='port' in b?bounded(b.port,1024,65535):undefined;await setWarpSettings(patch,port);return json(res,200,await warpStatus());}
   // --- scoped client keys ---
   if(pathname==='/admin/keys'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:createKey(b)});}
   if(pathname==='/admin/keys/update'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:updateKey(String(b.id),b)});}

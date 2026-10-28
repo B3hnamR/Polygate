@@ -14,7 +14,7 @@ beforeAll(async () => {
   ui = mkdtempSync(path.join(os.tmpdir(), 'polygate-ui-')); mkdirSync(path.join(ui, 'assets'));
   writeFileSync(path.join(ui, 'index.html'), '<!doctype html><title>Polygate</title><script type="module" src="./assets/app.js"></script>'); writeFileSync(path.join(ui, 'assets', 'app.js'), 'console.log(1)');
   set('POLYGATE_UI_DIST', ui); set('POLYGATE_ADMIN_TOKEN', 'path-test-secret'); set('POLYGATE_DASHBOARD_PATH', '/polygate');
-  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' };
+  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => { await gateway?.close(); for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } rmSync(ui, { recursive: true, force: true }); });

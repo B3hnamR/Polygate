@@ -30,7 +30,7 @@ const kilo=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
 const admin=(p:string,body:any)=>fetch(base+p,{method:'POST',headers:{authorization:'Bearer test-admin-secret','content-type':'application/json'},body:JSON.stringify(body)});
 const chat=(model:string,extra:any={})=>fetch(base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+settings.keys[0].value,'content-type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:'hi'}],stream:false,...extra})});
 beforeAll(async()=>{
-  settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,wireproxyPath:''};
+  settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,helperPath:'',endpoint:''};
   settings.providers=[];removeModels('kilo');settings.cooldowns=true;settings.fallback=true;
   gateway=await startGateway(0);base=`http://127.0.0.1:${gateway.port}`;
 });

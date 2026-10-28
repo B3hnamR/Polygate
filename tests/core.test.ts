@@ -23,7 +23,7 @@ const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
 }});
 beforeAll(async()=>{
   // Do not discover or borrow a WARP listener belonging to another local app/test session.
-  settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,wireproxyPath:''};
+  settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,helperPath:'',endpoint:''};
   settings.providers=[{id:'mock',name:'Mock upstream',kind:'openai',enabled:true,baseUrl:`http://127.0.0.1:${upstream.port}/v1`,apiKey:'upstream-secret',models:[],routeId:'direct'}];
   for(const id of ['working','limited'])saveModel({id:'mock/'+id,upstreamId:id,providerId:'mock',name:id,context:128000,output:4096,tools:true,reasoning:false,state:'unchecked',latency:0,score:50,priority:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});
   gateway=await startGateway(0);base=`http://127.0.0.1:${gateway.port}`;
@@ -766,15 +766,15 @@ test('The queue answers 429 with Retry-After when full and when a wait expires',
   hold(); (await queued)();
 });
 
-test('WARP: only the built-in engine exists; a saved engine from an older version is read as built-in, and an unknown one is refused', async () => {
+test('WARP: only the built-in engine exists; saved fields from older versions are ignored, and an unknown one is refused', async () => {
   const warp = await import('../backend/warp'); const saved = settings.warp;
   try {
     settings.warp = { engine: 'cli', host: '127.0.0.1', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' } as any;
-    expect(warp.engineMode()).toBe('embedded'); expect((warp.warpConfig() as any).host).toBeUndefined();
-    settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' }; expect(warp.engineMode()).toBe('disabled');
+    expect(warp.engineMode()).toBe('embedded'); expect((warp.warpConfig() as any).host).toBeUndefined(); expect((warp.warpConfig() as any).wireproxyPath).toBeUndefined();
+    settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' }; expect(warp.engineMode()).toBe('disabled');
     await expect(warp.setWarpSettings({ engine: 'sidecar' as any })).rejects.toThrow(/Unknown WARP setting/);
     await expect(warp.warpConnect()).rejects.toThrow(/turned off/);
-    settings.warp = undefined; expect((await warp.warpStatus()).install.kind).toBe('wireproxy');
+    settings.warp = undefined; const info = await warp.warpStatus(); expect(info.install.kind).toBe('usque'); expect(info.helper.kind).toBe('usque');
   } finally { settings.warp = saved; }
 });
 
@@ -811,26 +811,53 @@ test('A route test with no usable id is a 400, and a route that cannot connect i
   try{const r=await post({id:'dead-proxy'});const x:any=await r.json();expect(r.status).toBe(502);expect(x.error.type).toBe('route_unreachable');expect(x.error.message).toContain('Could not connect');}
   finally{settings.routes=saved;}
 });
-test('WARP: "New identity" and "Set up" without the tunnel helper fail at once instead of registering identities first',async()=>{
-  const warp=await import('../backend/warp');if(warp.findWireproxy())return; // a machine that has wireproxy installed cannot show this
-  const saved=settings.warp;settings.warp={engine:'embedded',autoStart:false,pool:2,rotateMinutes:0,wireproxyPath:''};
-  try{for(const call of [warp.warpRotate,warp.warpConnect]){const t=Date.now();const e:any=await call().catch((x:any)=>x);expect(e.message).toContain('Download tunnel helper');expect(Date.now()-t).toBeLessThan(2500);}}
+test('WARP: a rejected endpoint does not half-apply the proxy port', async () => {
+  const savedWarp = settings.warp, savedPort = settings.warpProxyPort;
+  try {
+    settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
+    const before = settings.warpProxyPort; const port = before === 65535 ? before - 1 : before + 1;
+    const r = await fetch(base + '/admin/warp/settings', { method: 'POST', headers: { authorization: 'Bearer test-admin-secret', 'content-type': 'application/json' }, body: JSON.stringify({ port, endpoint: 'not an endpoint!' }) });
+    expect(r.status).toBe(400); expect(settings.warpProxyPort).toBe(before); expect(settings.warp?.endpoint).toBe('');
+  } finally { settings.warp = savedWarp; settings.warpProxyPort = savedPort; }
+});
+test('WARP: changing the SOCKS port updates the managed route, and an invalid port is refused', async () => {
+  const warp = await import('../backend/warp'); const savedWarp = settings.warp, savedPort = settings.warpProxyPort, savedRoutes = settings.routes;
+  try {
+    settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
+    settings.routes = [];
+    await warp.setWarpSettings({ autoStart: true });
+    expect(settings.routes.some(r => r.id === 'warp')).toBe(false);
+    settings.routes = [{ id: 'warp', name: 'Cloudflare WARP', kind: 'warp', url: `socks5://127.0.0.1:${settings.warpProxyPort}`, enabled: true, models: [], managed: true } as any];
+    const port = settings.warpProxyPort === 65535 ? settings.warpProxyPort - 1 : settings.warpProxyPort + 1;
+    await warp.setWarpSettings({}, port);
+    expect(settings.warpProxyPort).toBe(port);
+    expect(settings.routes.find(r => r.id === 'warp')?.url).toBe(`socks5://127.0.0.1:${port}`);
+    await expect(warp.setWarpSettings({}, 80)).rejects.toThrow(/between 1024 and 65535/);
+    expect(settings.warpProxyPort).toBe(port);
+  } finally { settings.warp = savedWarp; settings.warpProxyPort = savedPort; settings.routes = savedRoutes; }
+});
+test('WARP: "New identity" and "Set up" without the bundled helper fail at once instead of registering identities first',async()=>{
+  const warp=await import('../backend/warp');if(warp.findWarpHelper())return; // normal builds ship the helper, so this can only show on a stripped build
+  const saved=settings.warp;settings.warp={engine:'embedded',autoStart:false,pool:2,rotateMinutes:0,helperPath:'',endpoint:''};
+  try{for(const call of [warp.warpRotate,warp.warpConnect]){const t=Date.now();const e:any=await call().catch((x:any)=>x);expect(e.message).toContain('WARP helper is not installed');expect(Date.now()-t).toBeLessThan(2500);}}
   finally{settings.warp=saved;}
 });
 test('WARP: a configured helper path that is a folder or cannot be run is not used (spawning it used to end the gateway)',async()=>{
+  if(!['win32','linux'].includes(process.platform))return; // the backend intentionally has no bundled helper on other platforms
+  if(process.platform==='linux'&&!['x64','arm64'].includes(process.arch))return;
   const warp=await import('../backend/warp');const saved=settings.warp;const tmp=mkdtempSync(path.join(os.tmpdir(),'polygate-wp-'));
-  const {writeFileSync,chmodSync}=await import('node:fs');const file=path.join(tmp,process.platform==='win32'?'wireproxy.exe':'wireproxy');writeFileSync(file,'not a program');
-  const using=(wireproxyPath:string)=>{settings.warp={engine:'embedded',autoStart:false,pool:1,rotateMinutes:0,wireproxyPath};return warp.findWireproxy();};
+  const {writeFileSync,chmodSync}=await import('node:fs');const name=process.platform==='win32'?'usque-windows-amd64.exe':process.arch==='arm64'?'usque-linux-arm64':'usque-linux-amd64';const file=path.join(tmp,name);writeFileSync(file,'not a program');
+  const using=(helperPath:string)=>{settings.warp={engine:'embedded',autoStart:false,pool:1,rotateMinutes:0,helperPath,endpoint:''};return warp.findWarpHelper();};
   try{
     const other=using('');   // whatever this machine has without the setting
     expect(using(tmp)).toBe(other);
-    if(process.platform!=='win32'){chmodSync(file,0o644);expect(using(file)).toBe(other);chmodSync(file,0o755);expect(using(file)).toBe(file);
+    if(process.platform==='linux'){chmodSync(file,0o644);expect(using(file)).toBe(other);chmodSync(file,0o755);expect(using(file)).toBe(file);
       // An executable file that is not a program: the kernel refuses it (ENOEXEC), the spawn emits 'error', and the connect call fails
       // with a clear message. Before the listener existed this ended the whole process. A saved identity avoids registering with Cloudflare.
-      const {stateDir}=await import('../backend/state');const {mkdirSync,existsSync,readFileSync}=await import('node:fs');const acc=path.join(stateDir,'warp','accounts.json');const had=existsSync(acc)?readFileSync(acc):null;
-      mkdirSync(path.dirname(acc),{recursive:true});writeFileSync(acc,JSON.stringify([{privateKey:'x',addressV4:'172.16.0.2',addressV6:'',peerPublicKey:'y',accountId:'t',registeredAt:''}]));
+      const {stateDir}=await import('../backend/state');const {mkdirSync,existsSync,readFileSync}=await import('node:fs');const id=path.join(stateDir,'warp','identity-1.json');const had=existsSync(id)?readFileSync(id):null;
+      mkdirSync(path.dirname(id),{recursive:true});writeFileSync(id,JSON.stringify({private_key:'x',access_token:'y',endpoint_pub_key:'z'}));
       try{const e:any=await warp.warpConnect().catch((x:any)=>x);expect(String(e?.message||e)).toContain('could not be started');}
-      finally{if(had)writeFileSync(acc,had);else rmSync(acc,{force:true});await warp.warpDisconnect().catch(()=>{});}
+      finally{if(had)writeFileSync(id,had);else rmSync(id,{force:true});await warp.warpDisconnect().catch(()=>{});}
     }
   }finally{settings.warp=saved;rmSync(tmp,{recursive:true,force:true});}
 });
