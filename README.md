@@ -151,9 +151,7 @@ See both providers in one catalog, check availability, compare latency, and choo
 
 ### Try a request before configuring your tools
 
-Choose a model (or one of your chains) and a protocol, add a system instruction, and read the streamed response beside your request. Keep the conversation going, compare two models side by side, see the model's thinking and tool calls, check speed and token figures, and copy the request as curl, Python or JavaScript. The screenshot shows the first version of this page.
-
-![Playground showing a real request and response through the WSL gateway](assets/screenshots/playground.png)
+Choose a model (or one of your chains) and a protocol, add a system instruction, and read the streamed response beside your request. Keep the conversation going, compare two models side by side, see the model's thinking and tool calls, check speed and token figures, and copy the request as curl, Python or JavaScript.
 
 <details>
 <summary><b>More views: providers, relays, and mobile</b></summary>
