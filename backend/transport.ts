@@ -110,11 +110,17 @@ export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtu
 export function routeFor(model='', explicit='', kind?: string): Route {
   const selected=explicit||settings.routeId;
   const current=findRoute(selected);
-  // The selected route's exit has used up its daily allowance: stay on a clean alternative until the allowance resets.
-  if(current&&isExhausted(current)){const alt=exhaustedAlternative(current);if(alt)return alt;}
-  if(!settings.rotate||explicit){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
+  const rotating=settings.rotate&&!explicit;
+  // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
+  // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
+  if(!rotating&&current&&isExhausted(current)){const alt=exhaustedAlternative(current);if(alt)return alt;}
+  if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
   const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDown(r));
-  if(!pool.length)throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
+  if(!pool.length){
+    // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
+    const last=current&&isExhausted(current)?exhaustedAlternative(current):undefined;if(last)return last;
+    throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
+  }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
   if(settings.strategy==='round_robin')return pool[cursor++%pool.length];
   // Unmeasured routes are tried first so every route gets a latency before the fastest one is locked in.
