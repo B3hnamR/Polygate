@@ -63,11 +63,13 @@ function Pairs({ label, hint, rows, onChange, keyLabel, valueLabel, secret }: { 
   </div>;
 }
 function ServerDialog({ initial, hub, data, onClose, onSaved }: { initial: Draft; hub: HubState; data: Snapshot; onClose: () => void; onSaved: (s: ServerView) => void }) {
-  const [d, setD] = useState(initial); const [busy, setBusy] = useState(''); const [error, setError] = useState('');
+  // A route that is switched off (Direct, when the user turned it off) is not offered: a new server starts on one that can carry it.
+  const usable = data.settings.routes.filter(r => r.kind !== 'relay' && r.enabled);
+  const [d, setD] = useState(initial.routeId && !usable.some(r => r.id === initial.routeId) && usable.length ? { ...initial, routeId: usable[0].id } : initial); const [busy, setBusy] = useState(''); const [error, setError] = useState('');
   const [test, setTest] = useState<{ ok: boolean; ms: number; error?: string; tools?: { name: string; description?: string }[]; serverInfo?: { name?: string; version?: string } } | null>(null);
   const editing = !!initial.id; const local = d.transport === 'stdio'; const lockedLocal = local && !hub.canAddLocal;
   const set = (patch: Partial<Draft>) => { setD({ ...d, ...patch }); setTest(null); };
-  const routes = data.settings.routes.filter(r => r.kind !== 'relay');
+  const routes = data.settings.routes.filter(r => r.kind !== 'relay' && r.enabled);
   const run = async (what: 'test' | 'save') => {
     setBusy(what); setError('');
     try {

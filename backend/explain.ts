@@ -6,8 +6,13 @@ export const human = (seconds: number) => { const s = Math.max(0, Math.round(sec
 export function upstreamFields(message: string): { type?: string; code?: number; logId?: string; text?: string } {
   try { const d = JSON.parse(message); const e = d?.error ?? d; return { type: e?.type, code: e?.code, logId: e?.log_id, text: typeof e?.message === 'string' ? e.message : undefined }; } catch { return {}; }
 }
-export type ErrorContext = { status: number; type?: string; message: string; model: string; route: string; switches: number; confirmedClean?: boolean; exhausted?: { until: number; seconds: number; refused?: boolean }; cooldownUntil?: number; cooldownsEnabled: boolean };
+export type ErrorContext = { status: number; type?: string; message: string; model: string; route: string; switches: number; confirmedClean?: boolean; exhausted?: { until: number; seconds: number; refused?: boolean }; cooldownUntil?: number; cooldownsEnabled: boolean; requestBytes?: number; messages?: number };
 export type Explained = { message: string; code: string; extra: Record<string, unknown>; retryAfter?: number };
+// A very large conversation is a different story from a small request. The Free limit seems to count what is sent, so an address can
+// pass a small test and still refuse a big conversation, and the next address may refuse it too.
+const LARGE_REQUEST_BYTES = 400_000;
+export const largeRequestNote = (bytes?: number, messages?: number) => bytes && bytes >= LARGE_REQUEST_BYTES
+  ? ` This request is large (${messages ? messages + ' messages, ' : ''}${(bytes / 1048576).toFixed(1)} MB), and the Free limit appears to count what is sent, so an address can pass a small test and still refuse a big conversation, and the next address may refuse it too. Starting a new chat, or compacting this one, usually helps.` : '';
 export function pausedModel(model: string, until: number, cooldownsEnabled = true): Explained {
   const seconds = Math.max(0, Math.ceil((until - Date.now()) / 1000));
   return { code: 'model_paused', retryAfter: seconds, extra: { resets_at: new Date(until).toISOString(), retry_after_seconds: seconds, model },
@@ -24,7 +29,7 @@ export function explainError(c: ErrorContext): Explained | undefined {
     const tried = c.switches ? ` Polygate already moved to ${c.switches} other network exit${c.switches > 1 ? 's' : ''} and none had allowance left.` : '';
     return { code: 'egress_exhausted', retryAfter: seconds,
       extra: { resets_at: new Date(c.exhausted.until).toISOString(), retry_after_seconds: seconds, route: c.route, upstream: { status: c.status, ...up } },
-      message: `OpenCode Free: the daily allowance for this network exit (${c.route || 'direct'}) is used up. It resets at ${resetTime(c.exhausted.until)} (in ${human(seconds)}).${tried} This is a limit on the IP address, not a problem with your request or key. To continue now, use a different IP (VPN or another network), or add verified proxies or a WARP route in Polygate so it can switch automatically.` };
+      message: `OpenCode Free: the daily allowance for this network exit (${c.route || 'direct'}) is used up. It resets at ${resetTime(c.exhausted.until)} (in ${human(seconds)}).${tried} This is a limit on the IP address, not a problem with your request or key.${largeRequestNote(c.requestBytes, c.messages)} To continue now, use a different IP (VPN or another network), or add verified proxies or a WARP route in Polygate so it can switch automatically.` };
   }
   if (c.status === 429 && /FreeUsageLimit|Free usage limit/i.test(c.message + (up.type || ''))) {
     return { code: 'request_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },

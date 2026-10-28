@@ -36,3 +36,25 @@ describe('compact window placement', () => {
     expect(placeFull(undefined, [screen])).toBeNull();
   });
 });
+
+describe('windows that do not fit the screen', () => {
+  const laptop = { x: 0, y: 0, width: 1366, height: 728 };
+  test('the first full window never exceeds the work area, and is centred in it', async () => {
+    const { defaultFull } = await import('../desktop/window-mode.cjs');
+    expect(defaultFull(screen)).toEqual({ x: Math.round((1920 - 1430) / 2), y: Math.round((1040 - 970) / 2), width: 1430, height: 970 });
+    const small = defaultFull(laptop); expect(small.width).toBe(1366); expect(small.height).toBe(728); expect(small.x).toBe(0); expect(small.y).toBe(0);
+  });
+  test('a saved window taller than its display is shrunk, and one hanging below it is moved back up', async () => {
+    const { fitToArea } = await import('../desktop/window-mode.cjs');
+    expect(fitToArea({ x: 0, y: 0, width: 1430, height: 970 }, [laptop])).toEqual({ x: 0, y: 0, width: 1366, height: 728 });
+    expect(fitToArea({ x: 100, y: 500, width: 1000, height: 600 }, [laptop])).toEqual({ x: 100, y: 128, width: 1000, height: 600 });
+    expect(fitToArea({ x: 100, y: 50, width: 1000, height: 600 }, [laptop])).toEqual({ x: 100, y: 50, width: 1000, height: 600 }); // already inside
+    // it is fitted to the display that holds most of it
+    expect(fitToArea({ x: 1900, y: 100, width: 1000, height: 600 }, [screen, second]).x).toBeGreaterThanOrEqual(1920);
+  });
+  test('placeFull and placeCompact apply the fit, so a window saved on a larger screen never hangs off a smaller one', () => {
+    const saved = { x: 100, y: 50, width: 1430, height: 970 };
+    const b = placeFull(saved, [laptop])!; expect(b.y + b.height).toBeLessThanOrEqual(728); expect(b.x + b.width).toBeLessThanOrEqual(1366);
+    const c = placeCompact({ x: 1000, y: 400, width: 380, height: 700 }, [laptop], laptop); expect(c.y + c.height).toBeLessThanOrEqual(728);
+  });
+});

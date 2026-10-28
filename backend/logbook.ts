@@ -73,7 +73,7 @@ const actions: Record<string, [string, string]> = {
   '/admin/shutdown': ['gateway', 'Shutdown requested'], '/admin/identity/refresh': ['providers', 'OpenCode identity refreshed'],
   '/admin/discover': ['models', 'Model catalog refreshed'], '/admin/probe': ['models', 'Model availability checked'], '/admin/model': ['models', 'Model settings changed'],
   '/admin/providers': ['providers', 'Provider saved'], '/admin/providers/delete': ['providers', 'Provider removed'],
-  '/admin/routes': ['routes', 'Route saved'], '/admin/routes/delete': ['routes', 'Route removed'], '/admin/routes/toggle': ['routes', 'Route switched on or off'], '/admin/routes/test': ['routes', 'Route tested'],
+  '/admin/routes': ['routes', 'Route saved'], '/admin/routes/delete': ['routes', 'Route removed'], '/admin/routes/toggle': ['routes', 'Route switched on or off'], 
   '/admin/relays/deploy': ['relays', 'Relay deployed'], '/admin/relays/inspect': ['relays', 'Relay checked'],
   '/admin/keys': ['keys', 'Client API key created'], '/admin/keys/update': ['keys', 'Client API key changed'], '/admin/keys/delete': ['keys', 'Client API key deleted'],
   '/admin/pool/settings': ['proxies', 'Proxy pool settings saved'], '/admin/pool/test': ['proxies', 'Proxy pool test started'], '/admin/pool/stop': ['proxies', 'Proxy pool test stopped'], '/admin/pool/find': ['proxies', 'Proxy search started'], '/admin/pool/role': ['proxies', 'Proxy role changed'],

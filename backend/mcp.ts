@@ -26,7 +26,9 @@ class SessionExpired extends Error { constructor() { super('The server ended the
 export const mcpConfig = (): McpSettings => (settings.mcp ||= { enabled: true, builtin: true, servers: [] });
 const allowed = (key: ApiKey | undefined, keys?: string[]) => !key || !keys?.length || keys.includes(key.id);
 // The route for a remote server: its own, else Direct. Relays only forward OpenCode and Kilo, so they cannot carry MCP traffic.
-const routeOf = (s: McpServer) => s.routeId && settings.routes.some(r => r.id === s.routeId && r.kind !== 'relay') ? s.routeId : 'direct';
+// Direct unless the user switched it off; then the selected route, or the first other one that can carry MCP traffic.
+export const mcpDefaultRoute = () => settings.routes.find(r => r.id === 'direct')?.enabled !== false ? 'direct' : (settings.routes.find(r => r.id === settings.routeId && r.enabled && r.kind !== 'relay') || settings.routes.find(r => r.enabled && r.kind !== 'relay'))?.id || 'direct';
+const routeOf = (s: McpServer) => s.routeId && settings.routes.some(r => r.id === s.routeId && r.enabled && r.kind !== 'relay') ? s.routeId : mcpDefaultRoute();
 const plain = (e: any) => redactError(String(e?.message || e)).replace(/^Error: /, '');
 
 // ------------------------------------------------------------------------------------------------------------------- transports
@@ -401,7 +403,7 @@ export function cleanServer(input: any, saved: McpServer | undefined, local: boo
   }
   let url = String(input.url ?? saved?.url ?? '').trim(); if (saved?.url && url === maskUrl(saved.url)) url = saved.url;
   try { const u = new URL(url); if (!['http:', 'https:'].includes(u.protocol)) throw new Error(); } catch { throw new GatewayError('Enter the server\'s full address, starting with https://', 400); }
-  const routeId = String(input.routeId ?? saved?.routeId ?? 'direct');
+  const routeId = String(input.routeId ?? saved?.routeId ?? mcpDefaultRoute());
   if (!settings.routes.some(r => r.id === routeId)) throw new GatewayError('That route does not exist', 400);
   if (settings.routes.find(r => r.id === routeId)?.kind === 'relay') throw new GatewayError('Relays only forward OpenCode and Kilo traffic. Choose Direct, a proxy, the proxy pool or WARP.', 400);
   return { ...base, url, headers: input.headers === undefined ? saved?.headers : secrets(input.headers, saved?.headers, 'header'), routeId };

@@ -3,6 +3,9 @@ export const COMPACT: { width: number; height: number; minWidth: number; minHeig
 export const FULL_MIN: { width: number; height: number };
 export function cleanBounds(b: unknown, minWidth: number, minHeight: number): Bounds | null;
 export function reachable(b: Bounds, areas: Bounds[]): boolean;
+export const FULL: { width: number; height: number };
+export function defaultFull(area: Bounds): Bounds;
+export function fitToArea(b: Bounds, areas: Bounds[]): Bounds;
 export function defaultCompact(area: Bounds): Bounds;
 export function placeCompact(saved: unknown, areas: Bounds[], primary: Bounds): Bounds;
 export function placeFull(saved: unknown, areas: Bounds[]): Bounds | null;

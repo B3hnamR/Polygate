@@ -1,5 +1,6 @@
 const {app,BrowserWindow,dialog,shell,Menu,Tray,nativeImage,ipcMain,net,screen}=require('electron');
 const {createPortableUpdater,portableTarget}=require('./updater.cjs');
+const {COMPACT,FULL_MIN,placeCompact,placeFull,defaultFull}=require('./window-mode.cjs');
 const {spawn,spawnSync}=require('node:child_process');
 const path=require('node:path');
 const fs=require('node:fs');
@@ -37,7 +38,8 @@ app.whenReady().then(async()=>{
     port=await new Promise((resolve,reject)=>{let buffer='';const timeout=setTimeout(()=>reject(new Error('Gateway startup timed out. See gateway.log in '+logDir)),25000);child.once('error',e=>{clearTimeout(timeout);reject(e);});child.stdout.on('data',chunk=>{fs.writeSync(log,chunk);buffer+=chunk.toString();let i;while((i=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,i);buffer=buffer.slice(i+1);try{const x=JSON.parse(line);if(x.polygateReady){clearTimeout(timeout);resolve(x.port);}}catch{}}});child.once('exit',code=>{clearTimeout(timeout);reject(new Error('Gateway exited before startup (code '+code+'). See '+logDir));});});
     // When the saved port was taken, the gateway picked another; that one is kept from now on.
     savePrefs({port});
-    win=new BrowserWindow({width:1430,height:970,minWidth:880,minHeight:650,title:'Polygate',icon:iconPath,backgroundColor:'#14171c',show:false,autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
+    const first=defaultFull(screen.getPrimaryDisplay().workArea);
+    win=new BrowserWindow({x:first.x,y:first.y,width:first.width,height:first.height,minWidth:Math.min(FULL_MIN.width,first.width),minHeight:Math.min(FULL_MIN.height,first.height),title:'Polygate',icon:iconPath,backgroundColor:'#14171c',show:false,autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
     const resultPath=path.join(logDir,'update-result.json');
     const updater=createPortableUpdater({version:app.getVersion(),target:portableTarget(process.env.PORTABLE_EXECUTABLE_FILE,app.isPackaged),tempDir:app.getPath('temp'),resultPath,fetcher:(...args)=>net.fetch(...args),onState:state=>{if(win&&!win.isDestroyed())win.webContents.send('polygate:updates:changed',state);},onReady:()=>setTimeout(()=>app.quit(),500)});
     // IPC is available only to this window's own top-level dashboard, never another frame or remote page.
@@ -51,7 +53,6 @@ app.whenReady().then(async()=>{
     // Closing the window keeps the gateway serving clients from the tray, unless that is turned off in Settings; the tray's Exit stops it.
     const showWindow=()=>{if(win.isDestroyed())return;if(win.isMinimized())win.restore();win.show();win.focus();};
     // Compact view: a small portrait window to keep beside other work. It remembers where it was, and where the full window was.
-    const {COMPACT,FULL_MIN,placeCompact,placeFull}=require('./window-mode.cjs');
     let compact=prefs.compact===true,pinned=prefs.pinned!==false;
     const viewState=()=>({compact,pinned});
     const areas=()=>screen.getAllDisplays().map(d=>d.workArea);
@@ -62,7 +63,7 @@ app.whenReady().then(async()=>{
     let remember;const rememberSoon=()=>{clearTimeout(remember);remember=setTimeout(rememberBounds,600);};
     const placeWindow=()=>{
       if(compact){if(win.isMaximized())win.unmaximize();win.setMinimumSize(COMPACT.minWidth,COMPACT.minHeight);win.setBounds(placeCompact(prefs.compactBounds,areas(),screen.getPrimaryDisplay().workArea));win.setAlwaysOnTop(pinned,'floating');}
-      else{win.setAlwaysOnTop(false);win.setMinimumSize(FULL_MIN.width,FULL_MIN.height);const b=placeFull(prefs.fullBounds,areas());if(b)win.setBounds(b);else{win.setSize(1430,970);win.center();}if(prefs.fullMaximized)win.maximize();}
+      else{win.setAlwaysOnTop(false);const wa=screen.getPrimaryDisplay().workArea;win.setMinimumSize(Math.min(FULL_MIN.width,wa.width),Math.min(FULL_MIN.height,wa.height));const b=placeFull(prefs.fullBounds,areas());win.setBounds(b||defaultFull(wa));if(prefs.fullMaximized)win.maximize();}
     };
     const setCompact=value=>{if(value===compact)return viewState();rememberBounds();compact=value;savePrefs({compact});placeWindow();refreshTray();sendView();return viewState();};
     const setPinned=value=>{pinned=value;savePrefs({pinned});if(compact)win.setAlwaysOnTop(pinned,'floating');sendView();return viewState();};

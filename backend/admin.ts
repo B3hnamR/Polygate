@@ -127,7 +127,9 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/routes/toggle'&&method==='POST'){
     const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(!route)throw new GatewayError('Route not found',404);
     if(typeof b.enabled!=='boolean')throw new GatewayError('Expected a boolean',400);
-    if(!b.enabled&&(route.id==='direct'||route.id===settings.routeId||settings.providers.some(p=>p.routeId===route.id)))throw new GatewayError('Select another route before disabling this one',409);
+    if(!b.enabled&&(route.id===settings.routeId||settings.providers.some(p=>p.routeId===route.id)))throw new GatewayError('Select another route before disabling this one',409);
+    // Direct can be switched off so requests never leave from this network's own address, but only while another route is on to carry them.
+    if(!b.enabled&&route.id==='direct'&&!settings.routes.some(r=>r.id!=='direct'&&r.enabled))throw new GatewayError('Turn on another route first (a proxy, a relay or WARP): with Direct off, requests need somewhere else to go',409);
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId||settings.providers.some(p=>p.routeId===b.id))throw new GatewayError('Select another route before deleting this one',409);if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);persist();return json(res,200,{ok:true});}

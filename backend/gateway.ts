@@ -135,7 +135,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const aborted=controller.signal.aborted;const reason:any=controller.signal.reason;const gateway=aborted&&reason instanceof GatewayError?reason:undefined;
     status=aborted?(gateway?.status??499):(e.status||502);message=redactError(aborted?(reason?.message||e.message||'Request cancelled'):(e.message||String(e)));
     // What the client reads is a plain sentence with the reset time and next steps; the provider's own answer stays in the request record.
-    upstreamMessage=message;let nice=aborted?undefined:explainError({status,type:gateway?.type||e.type,message,model:used.id,route,switches,exhausted,confirmedClean,cooldownsEnabled:settings.cooldowns!==false});
+    upstreamMessage=message;let nice=aborted?undefined:explainError({status,type:gateway?.type||e.type,message,model:used.id,route,switches,exhausted,confirmedClean,cooldownsEnabled:settings.cooldowns!==false,requestBytes:Number(clientShape.body?.bytes)||undefined,messages:Number(clientShape.body?.messages)||undefined});
     if(nice)message=nice.message;
     if(!res.headersSent){const wait=nice?.retryAfter||e.retryAfter;if(retryAfter&&!nice?.retryAfter)res.setHeader('Retry-After',retryAfter);else if(wait)res.setHeader('Retry-After',String(wait));const type=gateway?.type||e.type;const body={type:nice?.code||type||(protocol==='anthropic'?'api_error':'gateway_error'),message,...(nice?{code:nice.code,...nice.extra}:{})};json(res,status,protocol==='anthropic'?{type:'error',error:body}:{error:body});}else if(!res.writableEnded)res.end();
   }

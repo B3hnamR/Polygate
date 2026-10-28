@@ -195,7 +195,7 @@ export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: bo
 // Active route or standby. Becoming standby gives the route back that requests used before the pool took over.
 export function setPoolRole(active: boolean) {
   if (active) { if (settings.routeId !== 'proxy-pool') settings.previousRouteId = settings.routeId; settings.routeId = 'proxy-pool'; }
-  else if (settings.routeId === 'proxy-pool') settings.routeId = settings.routes.find(r => r.id === settings.previousRouteId && r.enabled && r.id !== 'proxy-pool')?.id || 'direct';
+  else if (settings.routeId === 'proxy-pool') settings.routeId = settings.routes.find(r => r.id === settings.previousRouteId && r.enabled && r.id !== 'proxy-pool')?.id || settings.routes.find(r => r.enabled && r.id !== 'proxy-pool')?.id || 'direct';
 }
 // The pool route: every model-ready proxy (or an explicit selection). select:false leaves the active route alone, so the pool is
 // only used when that route's exit has used up its daily allowance.

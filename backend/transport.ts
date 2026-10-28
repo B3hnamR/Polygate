@@ -154,7 +154,7 @@ export function backupChain(): { id: string; name: string; usable: boolean; why:
   if (pool) { const s = poolSummary(); const ok = pool.enabled && !coolingDown(pool) && s.ready > 0; add(pool, ok, !pool.enabled ? 'disabled' : s.ready ? `${s.ready} model-ready` : 'no clean proxy yet'); }
   const others = settings.routes.filter(r => r.id !== 'proxy-pool' && r.id !== current?.id && r.kind !== 'direct');
   for (const r of [...others.filter(r => r.kind === 'warp'), ...others.filter(r => r.kind !== 'warp')]) add(r, r.enabled && !coolingDown(r) && (r.kind !== 'warp' || !!warpTarget()), !r.enabled ? 'disabled' : isExhausted(r) ? 'used up today' : coolingDown(r) ? 'cooling down' : r.kind === 'warp' && !warpTarget() ? 'not connected' : 'ready');
-  const direct = settings.routes.find(r => r.kind === 'direct' && r.id !== current?.id); if (direct) add(direct, settings.allowDirect === true && !coolingDown(direct), settings.allowDirect === true ? (isExhausted(direct) ? 'used up today' : 'allowed as last resort') : 'blocked (allow it under the policy below)');
+  const direct = settings.routes.find(r => r.kind === 'direct' && r.id !== current?.id); if (direct) add(direct, direct.enabled && settings.allowDirect === true && !coolingDown(direct), !direct.enabled ? 'switched off' : settings.allowDirect === true ? (isExhausted(direct) ? 'used up today' : 'allowed as last resort') : 'blocked (allow it under the policy below)');
   return chain;
 }
 // --- Relay instances ---
@@ -192,10 +192,20 @@ export function relayRequest(url: string, init: RequestInit, route: Route) {
 }
 // Circuit breaker: three consecutive connection failures open the route for 30s, doubling on each re-open up to 5 minutes. One success closes it.
 const BREAKER_THRESHOLD=3;
+// What a failed route shows in the dashboard: the network's verdict in a few plain words. The raw text stays in the log.
+export function plainRouteError(raw:string,kind?:string):string{
+  const t=String(raw);
+  if(/ECONNRESET|socket connection was closed|connection (was )?reset|forcibly closed|closed unexpectedly/i.test(t))return kind==='relay'?'Connection reset: the network or the relay host closed it (a network that blocks the site looks like this)':'Connection reset: the network closed it';
+  if(/ETIMEDOUT|timed? ?out|TimeoutError|deadline/i.test(t))return 'No answer in time';
+  if(/ENOTFOUND|EAI_AGAIN|getaddrinfo|no such host|could not resolve/i.test(t))return "Name not found: check the address and this computer's DNS";
+  if(/ECONNREFUSED|connection refused|unable to connect/i.test(t))return 'Connection refused: nothing is listening at that address';
+  if(/certificate|CERT_|self.signed|SSL|TLS handshake|unable to verify/i.test(t))return 'Secure connection failed: the certificate or handshake was rejected';
+  return t.replace(/^(Type|Syntax)?Error:\s*/i,'').slice(0,160);
+}
 export function routeFailed(route:Route,reason:string,immediate=false){
-  route.status=redactError(reason);route.failures=(route.failures||0)+1;
+  const raw=redactError(reason);route.status=plainRouteError(raw,route.kind);route.failures=(route.failures||0)+1;
   if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;
-    logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,pausedUntil:route.cooldownUntil});}
+    logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,raw:raw===route.status?undefined:raw,pausedUntil:route.cooldownUntil});}
 }
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
 // A caller-side abort (client disconnect, request deadline) says nothing about the route; a timeout the caller set on the route itself does.
@@ -312,6 +322,8 @@ async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:strin
   if(r.status===401||r.status===403)return {chat:'refused',line:`but ${p.name} refused the request (HTTP ${r.status}) from this exit${brief?': '+brief:''}`};
   return {chat:'unknown',line:`but a chat request through it failed (HTTP ${r.status}${brief?' '+brief:''})`};
 }
+// Every route test leaves its outcome in the Logs page: a test that passed and a chat that is then refused are easier to understand side by side.
+function tested<T extends {chat:string;summary:string;status?:number;latency?:number}>(route:Route,res:T):T{logEvent(res.chat==='ok'?'info':'warn','routes',res.summary,{route:route.id,chat:res.chat,status:res.status,ms:res.latency});return res;}
 export async function testRoute(id:string,providerId?:string):Promise<RouteTest>{
   if(typeof id!=='string'||!id)throw new GatewayError('Say which route to test',400);
   const route=id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id);if(!route)throw new GatewayError('Route not found',404);
@@ -325,7 +337,7 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
     route.status=reached?'healthy':`HTTP ${code}`;route.latency=now()-start;if(code<500){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
     if(other){
       const check=reached?await chatCheck(route,other):{chat:'unknown',line:`but ${other.name}'s model list answered HTTP ${code}`};
-      return {ok:reached,status:code,latency:route.latency,buffered:!!route.buffered,chat:check.chat,provider:other.name,summary:`${route.name}: ${reached?'connected, ':'reached, '}${check.line}.`};
+      return tested(route,{ok:reached,status:code,latency:route.latency,buffered:!!route.buffered,chat:check.chat,provider:other.name,summary:`${route.name}: ${reached?'connected, ':'reached, '}${check.line}.`});
     }
     // The model list is not counted against the allowance, so reaching it proves only the connection. A chat request shows whether the Free tier accepts this exit.
     const check:ChatCheck=r!.ok&&!id.startsWith('pool:')&&id!=='proxy-pool'?await checkChat(route):{chat:'unknown'};
@@ -333,6 +345,6 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
       :check.chat==='used-up'?`${route.name}: connected, but OpenCode Free says this exit's daily allowance is used up (resets ${resetTime(check.until!)}).`
       :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request through it.`
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
-    return {ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary,provider:'OpenCode Free'};
-  }catch(e){route.status='unreachable';persist();throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+redactError(String((e as Error)?.message||e)),502,'route_unreachable');}
+    return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary,provider:'OpenCode Free'});
+  }catch(e){const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }
