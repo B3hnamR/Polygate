@@ -275,14 +275,15 @@ export async function setWarpSettings(patch: Partial<WarpSettings>, port?: numbe
   if (port !== undefined) {
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new GatewayError('The SOCKS port must be between 1024 and 65535', 400);
     // Running helpers listen on the old ports: the managed route still picks warpTarget(), but the dashboard and the saved
-    // route URL would advertise a port nothing listens on. Refuse the port move instead of leaving that half-applied state.
-    if (port !== basePort() && tunnels.size && next.engine !== 'disabled') throw new GatewayError('Disconnect WARP before changing its SOCKS port', 409, 'warp_port_in_use');
+    // route URL would advertise a port nothing listens on. Refuse the move unless the requested port is already live.
+    if (port !== basePort() && tunnels.size && !tunnels.has(port) && next.engine !== 'disabled') throw new GatewayError('Disconnect WARP before changing its SOCKS port', 409, 'warp_port_in_use');
   }
   settings.warp = { engine: next.engine, autoStart: !!next.autoStart, pool: next.pool, rotateMinutes: next.rotateMinutes, helperPath: next.helperPath, endpoint: next.endpoint };
   if (port !== undefined) settings.warpProxyPort = port;
   persist(); status.checkedAt = 0; startTimers();
   if (next.engine === 'disabled' && tunnels.size) await stopTunnels(); // a disabled engine must not leave helper processes running
-  ensureRoute();
+  // Only move an existing managed route: saving settings must not create an enabled route before WARP has ever connected.
+  if (port !== undefined && settings.routes.some(r => r.id === 'warp')) ensureRoute();
   await refreshStatus(true);
 }
 function startTimers() {

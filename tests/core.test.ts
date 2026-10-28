@@ -824,6 +824,9 @@ test('WARP: changing the SOCKS port updates the managed route, and an invalid po
   const warp = await import('../backend/warp'); const savedWarp = settings.warp, savedPort = settings.warpProxyPort, savedRoutes = settings.routes;
   try {
     settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
+    settings.routes = [];
+    await warp.setWarpSettings({ autoStart: true });
+    expect(settings.routes.some(r => r.id === 'warp')).toBe(false);
     settings.routes = [{ id: 'warp', name: 'Cloudflare WARP', kind: 'warp', url: `socks5://127.0.0.1:${settings.warpProxyPort}`, enabled: true, models: [], managed: true } as any];
     const port = settings.warpProxyPort === 65535 ? settings.warpProxyPort - 1 : settings.warpProxyPort + 1;
     await warp.setWarpSettings({}, port);
