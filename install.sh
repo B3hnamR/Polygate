@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
     --key) POLYGATE_KEY_FILE=${2:?--key needs a file}; shift ;;
     --https-port) POLYGATE_HTTPS_PORT=${2:?--https-port needs a number}; shift ;;
     --port) POLYGATE_PORT=${2:?--port needs a number}; shift ;;
-    --release) VERSION=${2:?--release needs a version such as v0.3.2}; shift ;;
+    --release) VERSION=${2:?--release needs a version such as v0.4.0}; shift ;;
     *) printf 'Unknown option: %s (see --help)\n' "$1" >&2; exit 2 ;;
   esac
   shift
