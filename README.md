@@ -23,7 +23,7 @@
   <a href="https://github.com/B3hnamR/Polygate/releases/latest">Downloads</a>
 </p>
 
-![Polygate overview with connection details, gateway activity, model health, and performance](assets/screenshots/overview.png)
+![Polygate overview on a Linux server: 30 requests at a 100% success rate, with connection details, gateway activity, model health, and performance](assets/screenshots/overview.png)
 
 ## Why Polygate?
 
@@ -141,7 +141,7 @@ This also publishes ports 80 and 443. Enable HTTPS in **Settings**; both ports m
 
 ## Dashboard showcase
 
-Real screenshots from **Polygate v0.2.1 running in WSL**. Model availability and activity reflect that workspace at capture time. Credentials stay hidden; private relay addresses are masked.
+Real screenshots. The overview at the top is from **Polygate v0.3.2 running on a Linux server**; the views below are from v0.2.1 running in WSL. Model availability and activity reflect each workspace at capture time. Credentials stay hidden; server and private relay addresses are masked.
 
 ### Find a model and set its priority
 
