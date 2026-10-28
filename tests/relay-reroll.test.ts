@@ -7,8 +7,10 @@ const LIMIT = JSON.stringify({ error: { message: 'Free usage limit reached. Free
 const usedUp = () => new Response(LIMIT, { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '7200', 'x-relay-runtime': 'bun' } });
 const passes = () => new Response('data: {}\n\n', { status: 200, headers: { 'x-relay-runtime': 'bun' } });
 const relay = (id: string, over: object = {}) => { const r: any = { id, name: 'Relay ' + id, kind: 'relay' as const, url: 'https://relay.example/' + id, enabled: true, models: [] as string[], exhaustedUntil: Date.now() + 3600e3, status: 'Daily Free allowance used (resets 00:00)', ...over }; settings.routes.push(r as any); return r; };
-const saved = settings.routes;
-afterEach(() => { __setCanarySender(); __resetReroll(); settings.routes = saved; settings.relayRecheck = undefined; });
+// The routes are shared with every other test file: the list is restored in place, so nothing these tests add is left behind.
+const saved = settings.routes.slice();
+const restore = () => { settings.routes.length = 0; settings.routes.push(...saved); };
+afterEach(() => { __setCanarySender(); __resetReroll(); restore(); settings.relayRecheck = undefined; });
 
 test('a used-up relay that comes back on a fresh address is usable again, and stops being asked', async () => {
   const r = relay('rr-back'); let asked = 0;
@@ -42,4 +44,9 @@ test('a check that cannot be made (no answer, or a different problem) ends the a
   __setCanarySender(async () => { asked++; return undefined; });
   expect(await rerollRelay(r as any, 0)).toBe(false); expect(asked).toBe(1);
   expect(r.exhaustedUntil!).toBeGreaterThan(Date.now());
+});
+
+test('the test relays are gone afterwards, so other test files see the routes they expect', () => {
+  relay('rr-leftover'); restore();
+  expect(settings.routes.map(r => r.id)).toEqual(saved.map(r => r.id));
 });
