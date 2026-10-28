@@ -1,4 +1,4 @@
-const {app,BrowserWindow,dialog,shell,Menu,Tray,nativeImage,ipcMain,net}=require('electron');
+const {app,BrowserWindow,dialog,shell,Menu,Tray,nativeImage,ipcMain,net,screen}=require('electron');
 const {createPortableUpdater,portableTarget}=require('./updater.cjs');
 const {spawn,spawnSync}=require('node:child_process');
 const path=require('node:path');
@@ -50,10 +50,34 @@ app.whenReady().then(async()=>{
     ipcMain.handle('polygate:desktop:close-to-tray',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');savePrefs({closeToTray:value});return desktopPrefs();}));
     // Closing the window keeps the gateway serving clients from the tray, unless that is turned off in Settings; the tray's Exit stops it.
     const showWindow=()=>{if(win.isDestroyed())return;if(win.isMinimized())win.restore();win.show();win.focus();};
+    // Compact view: a small portrait window to keep beside other work. It remembers where it was, and where the full window was.
+    const {COMPACT,FULL_MIN,placeCompact,placeFull}=require('./window-mode.cjs');
+    let compact=prefs.compact===true,pinned=prefs.pinned!==false;
+    const viewState=()=>({compact,pinned});
+    const areas=()=>screen.getAllDisplays().map(d=>d.workArea);
+    const sendView=()=>{if(!win.isDestroyed())win.webContents.send('polygate:desktop:view',viewState());};
+    const refreshTray=()=>{if(tray&&!tray.isDestroyed())tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Polygate',click:showWindow},{label:'Compact view',type:'checkbox',checked:compact,click:()=>setCompact(!compact)},{type:'separator'},{label:'Exit',click:()=>app.quit()}]));};
+    // Where the window is now is remembered for the view it is in; a maximized full window is remembered as maximized, with its normal size.
+    const rememberBounds=()=>{if(win.isDestroyed()||win.isMinimized()||!win.isVisible())return;if(compact)savePrefs({compactBounds:win.getBounds()});else if(!win.isFullScreen())savePrefs({fullMaximized:win.isMaximized(),fullBounds:win.getNormalBounds()});};
+    let remember;const rememberSoon=()=>{clearTimeout(remember);remember=setTimeout(rememberBounds,600);};
+    const placeWindow=()=>{
+      if(compact){if(win.isMaximized())win.unmaximize();win.setMinimumSize(COMPACT.minWidth,COMPACT.minHeight);win.setBounds(placeCompact(prefs.compactBounds,areas(),screen.getPrimaryDisplay().workArea));win.setAlwaysOnTop(pinned,'floating');}
+      else{win.setAlwaysOnTop(false);win.setMinimumSize(FULL_MIN.width,FULL_MIN.height);const b=placeFull(prefs.fullBounds,areas());if(b)win.setBounds(b);else{win.setSize(1430,970);win.center();}if(prefs.fullMaximized)win.maximize();}
+    };
+    const setCompact=value=>{if(value===compact)return viewState();rememberBounds();compact=value;savePrefs({compact});placeWindow();refreshTray();sendView();return viewState();};
+    const setPinned=value=>{pinned=value;savePrefs({pinned});if(compact)win.setAlwaysOnTop(pinned,'floating');sendView();return viewState();};
+    const initView=()=>{if(compact)placeWindow();else{const b=placeFull(prefs.fullBounds,areas());if(b)win.setBounds(b);if(prefs.fullMaximized)win.maximize();}};
+    win.on('resized',rememberSoon);win.on('moved',rememberSoon);win.on('maximize',rememberSoon);win.on('unmaximize',rememberSoon);
+    // Ctrl+Shift+M switches between the two views from inside the window.
+    win.webContents.on('before-input-event',(e,input)=>{if(input.type==='keyDown'&&input.control&&input.shift&&!input.alt&&!input.meta&&String(input.key).toLowerCase()==='m'){e.preventDefault();setCompact(!compact);}});
+    ipcMain.handle('polygate:desktop:view',fromDashboard(()=>viewState()));
+    ipcMain.handle('polygate:desktop:set-compact',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');return setCompact(value);}));
+    ipcMain.handle('polygate:desktop:set-pinned',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');return setPinned(value);}));
     tray=new Tray(nativeImage.createFromPath(trayIconPath));tray.setToolTip(`Polygate · 127.0.0.1:${port}`);
-    tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Polygate',click:showWindow},{type:'separator'},{label:'Exit',click:()=>app.quit()}]));
+    refreshTray();
     tray.on('click',showWindow);
     win.on('close',e=>{
+      rememberBounds();
       if(quitting||prefs.closeToTray===false)return;e.preventDefault();win.hide();
       if(!prefs.trayHintShown&&process.platform==='win32'){tray.displayBalloon({iconType:'info',title:'Polygate is still running',content:'Your clients keep working. Open or exit Polygate from this tray icon.'});savePrefs({trayHintShown:true});}
     });
@@ -63,6 +87,7 @@ app.whenReady().then(async()=>{
     win.webContents.on('will-navigate',pin);win.webContents.on('will-redirect',pin);
     const home=`http://127.0.0.1:${port}/#token=${token}`;let gone=0;
     win.webContents.on('render-process-gone',(_,d)=>{fs.writeSync(log,`[desktop] renderer gone: ${d.reason} (${d.exitCode})\n`);if(quitting||d.reason==='clean-exit')return;if(gone++){dialog.showErrorBox('Polygate window crashed',`The window crashed twice. Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}else win.loadURL(home);});
+    initView();
     await win.loadURL(home);if(process.env.POLYGATE_DESKTOP_SMOKE!=='1')win.show();
     if(fs.existsSync(resultPath)){try{const result=JSON.parse(fs.readFileSync(resultPath,'utf8'));fs.unlinkSync(resultPath);if(!result.ok)dialog.showErrorBox('Update could not finish',String(result.error||'Your previous app was kept. Download the latest release to try again.'));}catch{/* An interrupted result file must not prevent startup. */}}
     if(process.env.POLYGATE_DESKTOP_SMOKE==='1'){

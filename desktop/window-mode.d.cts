@@ -1,0 +1,8 @@
+export type Bounds = { x: number; y: number; width: number; height: number };
+export const COMPACT: { width: number; height: number; minWidth: number; minHeight: number };
+export const FULL_MIN: { width: number; height: number };
+export function cleanBounds(b: unknown, minWidth: number, minHeight: number): Bounds | null;
+export function reachable(b: Bounds, areas: Bounds[]): boolean;
+export function defaultCompact(area: Bounds): Bounds;
+export function placeCompact(saved: unknown, areas: Bounds[], primary: Bounds): Bounds;
+export function placeFull(saved: unknown, areas: Bounds[]): Bounds | null;

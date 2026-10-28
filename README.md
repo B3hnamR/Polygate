@@ -108,6 +108,8 @@ sudo bash install.sh --update      # newer release, keeps your data, settings an
 
 The API stays at `http://127.0.0.1:4317/v1` from one launch to the next (if another program holds that port, the app picks a free one once and keeps it). Closing the window keeps Polygate running in the tray so your tools keep working; right-click the tray icon and choose **Exit** to stop it, or turn this off in **Settings → Desktop app**.
 
+**Compact view.** Press **Compact view** in the header (or Ctrl+Shift+M, or the tray menu) to shrink the app into a small portrait window you can keep beside your work. It shows whether the gateway is online, the route, the success rate and speed, and your latest requests, with buttons to pause it and copy the base URL or API key. It stays on top of other windows (turn that off with the pin), and the app remembers where each view was.
+
 The app is currently unsigned, so Windows may show SmartScreen. Download from this repository’s release page and verify the executable against the supplied `.sha256` file. App data is kept in `%LOCALAPPDATA%\Polygate`.
 
 ### Docker

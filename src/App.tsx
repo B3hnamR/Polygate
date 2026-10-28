@@ -2,12 +2,13 @@ import {useState,useEffect,useCallback,useRef,type ReactNode} from 'react';
 import {RelayDeployBar} from './relay-deploy';
 import {RouteTestDialog} from './route-test';
 import {useUpdates,UpdateBanner,UpdatesPanel} from './updates';
-import {DesktopPanel} from './desktop';
+import {DesktopPanel,useDesktopView} from './desktop';
+import {MiniView} from './mini';
 import {LogsPage} from './logs';
 import {McpPage} from './mcp';
 import {ChainsPage} from './chains';
 import {Playground} from './playground';
-import {Activity,ArrowDownToLine,ArrowRight,ArrowUpRight,Box,Check,CheckCircle2,ChevronRight,Clipboard,Code2,Copy,Database,FileText,Globe,Layers3,Loader2,Network,Pause,Play,Plus,RefreshCw,Search,Send,Server,Settings2,Shield,SlidersHorizontal,Square,Terminal,Trash2,Workflow,X,ExternalLink,Eye,EyeOff,AlertCircle,KeyRound,Radio,Route, Zap, LogOut,ScrollText,Plug,ListOrdered} from 'lucide-react';
+import {Activity,ArrowDownToLine,ArrowRight,ArrowUpRight,Box,Check,CheckCircle2,ChevronRight,Clipboard,Code2,Copy,Database,FileText,Globe,Layers3,Loader2,Network,Pause,Play,Plus,RefreshCw,Search,Send,Server,Settings2,Shield,SlidersHorizontal,Square,Terminal,Trash2,Workflow,X,ExternalLink,Eye,EyeOff,AlertCircle,KeyRound,Radio,Route, Zap, LogOut,ScrollText,Plug,ListOrdered,Minimize2} from 'lucide-react';
 import {api,at,BASE,hasToken,dropToken} from './api';
 import {Login,NotificationsMenu,WarpPanel,PoolPanel,KeysPanel,SecurityPanel,NotifySettings,HttpsPanel,MetricsPanel,RequestDetail,type Notice} from './panels';
 import type {Model,Settings,LogRow,Provider,Route as NetworkRoute} from '../backend/types';
@@ -20,12 +21,13 @@ import {Logo,ms,time,statusState,tickWhileVisible,Button,Badge,Empty,Field,Toggl
 export function App(){
   const [page,setPage]=useState<Page>('Overview');const [data,setData]=useState<Snapshot|null>(null);const [error,setError]=useState('');const [toast,setToast]=useState<{message:string;kind:'ok'|'error';seq:number}|null>(null);const [pending,setPending]=useState('');const [selectedModel,setSelectedModel]=useState('auto');const [auth,setAuth]=useState<'checking'|'login'|'ok'>('checking');
   const updates=useUpdates(auth==='ok');
+  const desktop=useDesktopView();
   const latest=useRef(0);const toasts=useRef(0);
   const setNotice:Notice=useCallback((message,kind='ok')=>setToast(message?{message,kind,seq:++toasts.current}:null),[]);
   const refresh=useCallback(async()=>{const id=++latest.current;try{const next=await api('/admin/state');if(id===latest.current){setData(next);setError('');}}catch(e:any){if(id===latest.current){if(e.status===401)setAuth('login');else setError(e.message);}}},[]);
   // The desktop app signs in with its token; the web dashboard with the password (session cookie).
   useEffect(()=>{(async()=>{try{if(hasToken()){await api('/admin/session',{});dropToken();setAuth('ok');}else{const who=await api('/admin/whoami');setAuth(who.authenticated?'ok':'login');}}catch(e:any){if(e.status===401)setAuth('login');else{setAuth('ok');setError(e.message);}}})();},[]);
-  useEffect(()=>{if(auth!=='ok')return;return tickWhileVisible(refresh,4000);},[refresh,auth]);
+  useEffect(()=>{if(auth!=='ok')return;return tickWhileVisible(refresh,desktop.compact?2500:4000);},[refresh,auth,desktop.compact]);
   useEffect(()=>{if(!toast)return;const t=setTimeout(()=>setToast(null),toast.kind==='error'?10000:4500);return()=>clearTimeout(t);},[toast]);
   async function action(name:string,path:string,body:unknown={},success='Saved'){setPending(name);try{const result=await api(path,body);if(success)setNotice((result as any)?.summary||success);await refresh();return result;}catch(e:any){if(e.status===401){setAuth('login');throw e;}setNotice(e.message,'error');void refresh().catch(()=>{});throw e;}finally{setPending('');}}
   const act=(name:string,path:string,body:unknown={},success='Saved')=>action(name,path,body,success).then(()=>true,()=>false);
@@ -37,13 +39,16 @@ export function App(){
   const usableKey=data?.settings.keys.find(k=>k.enabled&&(!k.expiresAt||k.expiresAt>Date.now()));const key=usableKey?.value||'';
   if(auth==='checking')return <div className="loading"><Loader2 className="spin"/> Starting…</div>;
   if(auth==='login')return <Login onDone={()=>setAuth('ok')}/>;
+  const toastEl=toast&&<div key={toast.seq} className={`toast ${toast.kind}`} role={toast.kind==='error'?'alert':'status'}>{toast.kind==='error'?<AlertCircle size={18}/>:<CheckCircle2 size={18}/>}<span>{toast.message}</span><button className="icon-button" aria-label="Dismiss notification" onClick={()=>setToast(null)}><X size={15}/></button></div>;
+  // The compact portrait view of the Windows app replaces the whole dashboard layout.
+  if(desktop.compact)return <>{data?<MiniView data={data} base={base} apiKey={key} busy={!!pending} copy={copy} pinned={desktop.pinned} onPin={desktop.setPinned} onFull={()=>desktop.setCompact(false)} onToggle={()=>void act('gateway','/admin/settings',{enabled:!data.settings.enabled},data.settings.enabled?'Gateway paused':'Gateway resumed')}/>:<div className="loading"><Loader2 className="spin"/> Loading…</div>}{toastEl}</>;
   return <div className="app-shell">
     <aside className="sidebar"><a className="brand" href="#" onClick={e=>{e.preventDefault();setPage('Overview');}} aria-label="Polygate overview"><div className="brand-mark"><Logo size={38}/></div><span>Polygate<small>FREE MODEL GATEWAY</small></span></a>
       <div className="workspace-label"><span className="workspace-avatar">{serverMode?'S':'L'}</span><span>{serverMode?'Server dashboard':'Personal workspace'}<small>{serverMode?location.hostname:'On this computer'}</small></span><Shield size={15}/></div>
       <nav aria-label="Workspace">{navigation.map(n=><button key={n.name} className={`nav-item ${page===n.name?'active':''}`} aria-label={n.name} title={n.name} onClick={()=>setPage(n.name)}><n.icon size={18}/><span>{n.name}</span>{n.name==='Proxies'&&<span className="nav-note">Built in</span>}</button>)}</nav>
       <div className="sidebar-bottom"><button className={`nav-item ${page==='Guide'?'active':''}`} title="Guide & architecture" onClick={()=>setPage('Guide')}><FileText size={18}/>Guide & architecture</button><button className={`nav-item ${page==='Settings'?'active':''}`} title="Settings" onClick={()=>setPage('Settings')}><Settings2 size={18}/>Settings</button>{serverMode&&<button className="nav-item" title="Sign out" onClick={signOut}><LogOut size={18}/>Sign out</button>}<div className="local-status"><span className={`status-dot ${data?.settings.enabled?'online':''}`}/><span>{data?(data.settings.enabled?'Gateway is running':'Gateway paused'):'Connecting to gateway'}<small>{serverMode?location.hostname:'127.0.0.1'} {data?.version?<> · v{data.version}</>:null}</small></span></div></div>
     </aside>
-    <main><header className="page-header"><div><div className="breadcrumb">Workspace <ChevronRight size={13}/> {page}</div><h1>{page}</h1><p>{descriptions[page]}</p></div><div className="header-actions">{data&&<NotificationsMenu unread={data.notices||0} onChange={refresh}/>}{data&&<Badge state={data.settings.enabled?'running':'neutral'}>{data.settings.enabled?'Gateway online':'Paused'}</Badge>}<Button disabled={!data||!!pending} onClick={()=>act('gateway','/admin/settings',{enabled:!data?.settings.enabled},data?.settings.enabled?'Gateway paused':'Gateway resumed')}>{data?.settings.enabled?<Pause size={15}/>:<Play size={15}/>} {data?.settings.enabled?'Pause gateway':'Resume gateway'}</Button></div></header>
+    <main><header className="page-header"><div><div className="breadcrumb">Workspace <ChevronRight size={13}/> {page}</div><h1>{page}</h1><p>{descriptions[page]}</p></div><div className="header-actions">{desktop.available&&<Button onClick={()=>desktop.setCompact(true)} title="A small window to keep beside your work (Ctrl+Shift+M)"><Minimize2 size={15}/> Compact view</Button>}{data&&<NotificationsMenu unread={data.notices||0} onChange={refresh}/>}{data&&<Badge state={data.settings.enabled?'running':'neutral'}>{data.settings.enabled?'Gateway online':'Paused'}</Badge>}<Button disabled={!data||!!pending} onClick={()=>act('gateway','/admin/settings',{enabled:!data?.settings.enabled},data?.settings.enabled?'Gateway paused':'Gateway resumed')}>{data?.settings.enabled?<Pause size={15}/>:<Play size={15}/>} {data?.settings.enabled?'Pause gateway':'Resume gateway'}</Button></div></header>
       {error&&<div className="error-banner" role="alert"><AlertCircle size={18}/><span>{error}</span><Button onClick={refresh}>Reconnect</Button></div>}
       {data&&<UpdateBanner updates={updates} openSettings={()=>{setPage('Settings');window.scrollTo(0,0);}}/>}
       {!data?<div className="loading"><Loader2 className="spin"/> Loading your workspace…</div>:<div className="page-content">
@@ -62,7 +67,7 @@ export function App(){
       </div>}
       <footer className="app-footer"><span><Shield size={12}/> Local-first. No request content in activity logs.</span><span>Bun {data?.runtime||'—'} <span className="footer-separator">/</span> OpenCode Free provider</span></footer>
     </main>
-    {toast&&<div key={toast.seq} className={`toast ${toast.kind}`} role={toast.kind==='error'?'alert':'status'}>{toast.kind==='error'?<AlertCircle size={18}/>:<CheckCircle2 size={18}/>}<span>{toast.message}</span><button className="icon-button" aria-label="Dismiss notification" onClick={()=>setToast(null)}><X size={15}/></button></div>}
+    {toastEl}
   </div>;
 }
 
