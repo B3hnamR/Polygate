@@ -1,10 +1,38 @@
-:root{color-scheme:dark;
---canvas:#090c13;--sidebar:#0b1019;--surface:#10151f;--surface-raised:#171e2d;--table-head:#0d121c;--hover:#192135;--selection:#16323a;
---text:#eaf0fa;--text-secondary:#c3cee2;--muted:#8d9bb4;--placeholder:#7b89a3;
---line:#1d2636;--line-strong:#2d3a52;
---accent:#5eead4;--accent-hover:#8ff3e1;--accent-dim:#2db3a1;--accent-2:#7c9cff;--accent-2-dim:#4f6fd6;--on-accent:#04201c;
---accent-soft:rgba(94,234,212,.11);--accent-line:rgba(94,234,212,.34);--accent-2-soft:rgba(124,156,255,.12);--accent-2-line:rgba(124,156,255,.36);
---brand-gradient:linear-gradient(135deg,#5eead4 0%,#7c9cff 100%);--bar-gradient:linear-gradient(180deg,#7c9cff,#2db3a1);
---green:#4ade80;--green-soft:rgba(74,222,128,.12);--amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);--red:#fb7185;--red-soft:rgba(251,113,133,.12);--red-dim:#8a3144;--red-surface:#2a1520;
---glow-teal:rgba(94,234,212,.09);--glow-blue:rgba(124,156,255,.11);--shadow:#02050c99;
---font:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;--mono:'Cascadia Code',Consolas,monospace}
+/* Night sea: every colour is a shade of one teal family. Light by default, dark when Windows (or the Settings choice) asks for it. */
+:root{color-scheme:light;
+--canvas:#eef3f1;--sidebar:#183d3d;--surface:#f8fbfa;--surface-raised:#e3ece8;--table-head:transparent;--hover:#183d3d0f;--selection:#c6d8d1;
+--text:#040d12;--text-secondary:#2c4545;--muted:#4b6660;--placeholder:#6c827c;
+--line:#040d1221;--line-strong:#040d1245;
+--accent:#183d3d;--accent-hover:#0f2a2a;--accent-dim:#5c8374;--accent-2:#5c8374;--accent-2-dim:#4a6d60;--on-accent:#eef3f1;
+--accent-soft:#183d3d12;--accent-line:#183d3d4d;--accent-2-soft:#5c837418;--accent-2-line:#5c837466;
+--brand-gradient:#183d3d;--bar-gradient:#183d3d;
+--green:#1d6b45;--green-soft:#1d6b4517;--amber:#94470b;--amber-soft:#94470b17;--red:#ad2029;--red-soft:#ad202914;--red-dim:#7c1820;--red-surface:#f6e3e3;
+--glow-teal:transparent;--glow-blue:transparent;--shadow:#040d1238;
+--rail:#183d3d;--rail-ink:#e7f0ec;--rail-ink2:#a9c3b9;
+--stock-1:#c6d8d1;--stock-2:#dfe9e4;--stock-3:#b2c8bf;--stamp:#183d3d;
+--lift:0 12px 26px -12px #040d1259,0 2px 4px #040d121a;--rest:0 1px 0 #040d121f;
+--font:'Barlow','Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;--display:'Barlow Condensed','Barlow',sans-serif;--stamp-font:'Doto','Cascadia Code',monospace;--mono:'Cascadia Code',Consolas,monospace}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
+--canvas:#040d12;--sidebar:#183d3d;--surface:#0a1a1f;--surface-raised:#12262a;--hover:#93b1a612;--selection:#264a42;
+--text:#e4eeea;--text-secondary:#c3d4cd;--muted:#93aba2;--placeholder:#7b938b;
+--line:#e4eeea1c;--line-strong:#e4eeea3d;
+--accent:#93b1a6;--accent-hover:#b5cdc4;--accent-dim:#5c8374;--accent-2:#93b1a6;--accent-2-dim:#5c8374;--on-accent:#040d12;
+--accent-soft:#93b1a61a;--accent-line:#93b1a657;--accent-2-soft:#93b1a614;--accent-2-line:#93b1a64d;
+--brand-gradient:#93b1a6;--bar-gradient:#5c8374;
+--green:#6bd39c;--green-soft:#6bd39c1a;--amber:#f0a35d;--amber-soft:#f0a35d1a;--red:#ff8d92;--red-soft:#ff8d921a;--red-dim:#b2454c;--red-surface:#2a1316;
+--shadow:#0009;
+--rail:#183d3d;--rail-ink:#e7f0ec;--rail-ink2:#93b1a6;
+--stock-1:#14302f;--stock-2:#1d3b37;--stock-3:#264a42;--stamp:#93b1a6;
+--lift:0 14px 30px -12px #000c,0 2px 6px #0007;--rest:0 1px 0 #0006}}
+:root[data-theme="dark"]{color-scheme:dark;
+--canvas:#040d12;--sidebar:#183d3d;--surface:#0a1a1f;--surface-raised:#12262a;--hover:#93b1a612;--selection:#264a42;
+--text:#e4eeea;--text-secondary:#c3d4cd;--muted:#93aba2;--placeholder:#7b938b;
+--line:#e4eeea1c;--line-strong:#e4eeea3d;
+--accent:#93b1a6;--accent-hover:#b5cdc4;--accent-dim:#5c8374;--accent-2:#93b1a6;--accent-2-dim:#5c8374;--on-accent:#040d12;
+--accent-soft:#93b1a61a;--accent-line:#93b1a657;--accent-2-soft:#93b1a614;--accent-2-line:#93b1a64d;
+--brand-gradient:#93b1a6;--bar-gradient:#5c8374;
+--green:#6bd39c;--green-soft:#6bd39c1a;--amber:#f0a35d;--amber-soft:#f0a35d1a;--red:#ff8d92;--red-soft:#ff8d921a;--red-dim:#b2454c;--red-surface:#2a1316;
+--shadow:#0009;
+--rail:#183d3d;--rail-ink:#e7f0ec;--rail-ink2:#93b1a6;
+--stock-1:#14302f;--stock-2:#1d3b37;--stock-3:#264a42;--stamp:#93b1a6;
+--lift:0 14px 30px -12px #000c,0 2px 6px #0007;--rest:0 1px 0 #0006}

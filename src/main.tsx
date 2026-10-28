@@ -1,6 +1,14 @@
 import React from 'react';
 import {createRoot} from 'react-dom/client';
 import {App} from './App';
+// Fonts are bundled so the desktop app looks the same offline.
+import '@fontsource/barlow/latin-400.css';
+import '@fontsource/barlow/latin-500.css';
+import '@fontsource/barlow/latin-600.css';
+import '@fontsource/barlow/latin-700.css';
+import '@fontsource/barlow-condensed/latin-600.css';
+import '@fontsource/barlow-condensed/latin-700.css';
+import '@fontsource/doto/latin-900.css';
 import './styles.css';
 // A render error (for example a snapshot shape from a newer gateway) used to unmount the whole dashboard and leave a blank window.
 class Boundary extends React.Component<{children:React.ReactNode},{error:string}>{

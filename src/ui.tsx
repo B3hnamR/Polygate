@@ -4,10 +4,10 @@ import {api} from './api';
 import type {LogRow,Model,Settings} from '../backend/types';
 export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
 // The Polygate mark (assets/logo.svg): a hexagon with a lit gate archway. Gradient ids are unique per instance so several can share a page.
+// The mark takes the colour of the text around it; the gate opening shows the ground it sits on (the sidebar sets --logo-door).
 export function Logo({size=36}:{size?:number}){
-  const id='pg'+useId().replace(/:/g,'');
-  return <svg width={size} height={size} viewBox="0 0 256 256" role="img" aria-label="Polygate"><defs><linearGradient id={id+'g'} gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="256" y2="256"><stop offset="0" stopColor="#5eead4"/><stop offset="1" stopColor="#7c9cff"/></linearGradient><linearGradient id={id+'l'} gradientUnits="userSpaceOnUse" x1="0" y1="95" x2="0" y2="190"><stop offset="0" stopColor="#e6fffb"/><stop offset="1" stopColor="#7defdc"/></linearGradient></defs>
-    <polygon points="128.0,33.1 210.2,80.5 210.2,175.5 128.0,222.9 45.8,175.5 45.8,80.5" fill={`url(#${id}g)`} stroke={`url(#${id}g)`} strokeWidth="40" strokeLinejoin="round"/><path d="M86 190V124A42 42 0 0 1 170 124V190Z" fill="#090c13"/><path d="M99 190V124A29 29 0 0 1 157 124V190Z" fill={`url(#${id}l)`}/></svg>;
+  return <svg width={size} height={size} viewBox="0 0 256 256" role="img" aria-label="Polygate">
+    <polygon points="128.0,33.1 210.2,80.5 210.2,175.5 128.0,222.9 45.8,175.5 45.8,80.5" fill="currentColor" stroke="currentColor" strokeWidth="40" strokeLinejoin="round"/><path d="M86 190V124A42 42 0 0 1 170 124V190Z" style={{fill:'var(--logo-door,var(--canvas))'}}/><path d="M99 190V124A29 29 0 0 1 157 124V190Z" fill="currentColor" opacity=".55"/></svg>;
 }
 export const ms=(n:number)=>n?`${Math.round(n).toLocaleString()} ms`:'—';
 export const time=(n:number)=>new Date(n).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
