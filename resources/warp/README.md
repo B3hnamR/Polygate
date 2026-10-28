@@ -36,5 +36,7 @@ GOPROXY=https://proxy.golang.org,direct ./scripts/build-warp-helper.sh
 ```
 
 The script needs Go 1.26.3 or newer and replaces the binaries and `sha256.txt`.
+It clones tag `v4.2.1`, then refuses to build unless `HEAD` is the commit above,
+so a moved or re-tagged release cannot silently change the bundled binaries.
 `usque` is copyright (c) 2025 github.com/Diniboy1123 and is distributed under
 the MIT license in `LICENSE`.

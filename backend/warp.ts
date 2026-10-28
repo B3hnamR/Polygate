@@ -56,9 +56,12 @@ function runnable(file: string) {
   try { if (!statSync(file).isFile()) return false; if (!isWin) accessSync(file, fsConstants.X_OK); return true; } catch { return false; }
 }
 export function findWarpHelper() {
-  const name = helperName(); if (!name) return '';
+  const name = helperName();
   const configured = warpConfig().helperPath;
-  const candidates = [configured, process.env.POLYGATE_WARP_HELPER || '', path.join(appDir, 'warp', name), path.join(binDir, name), path.join(appDir, 'resources', 'warp', name), path.join(path.dirname(process.execPath), name), which('usque')];
+  // A configured path is checked even on platforms Polygate does not ship a helper for: a user-supplied usque build
+  // works there too. Bundled names only exist where the packages carry them.
+  const bundled = name ? [path.join(appDir, 'warp', name), path.join(binDir, name), path.join(appDir, 'resources', 'warp', name), path.join(path.dirname(process.execPath), name)] : [];
+  const candidates = [configured, process.env.POLYGATE_WARP_HELPER || '', ...bundled, which('usque')];
   return candidates.find(c => c && runnable(c)) || '';
 }
 export const engineMode = (): WarpEngine => warpConfig().engine;

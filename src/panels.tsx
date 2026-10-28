@@ -63,7 +63,7 @@ export function WarpPanel({notice,onChanged}:{notice:Notice;onChanged:()=>void})
           <Field label="Parallel tunnels" hint="Each tunnel has its own WARP identity (1–4)."><input type="number" min={1} max={4} value={form.pool} onChange={e=>edit({pool:+e.target.value})}/></Field>
           <Field label="Rotate identity every (minutes)" hint="0 keeps the same identity until you ask for a new one."><input type="number" min={0} value={form.rotateMinutes} onChange={e=>edit({rotateMinutes:+e.target.value})}/></Field>
           <Field label="MASQUE endpoint (optional)" hint="Leave empty to try Cloudflare's HTTP/2 endpoints automatically. Override only if your network needs a specific address."><input value={form.endpoint} placeholder="162.159.198.183" onChange={e=>edit({endpoint:e.target.value})}/></Field>
-          <Field label="Helper path (optional)" hint={s.helper.path?`Using ${s.helper.path}`:'Bundled with Polygate. Set only to use another build.'}><input value={form.helperPath} placeholder="Auto (bundled)" onChange={e=>edit({helperPath:e.target.value})}/></Field>
+          <Field label="Helper path (optional)" hint={s.helper.path?`Using ${s.helper.path}`:'Bundled on Windows and Linux. Elsewhere, point to a usque build.'}><input value={form.helperPath} placeholder="Auto (bundled)" onChange={e=>edit({helperPath:e.target.value})}/></Field>
         </div>
         <Toggle checked={form.engine!=='disabled'} onChange={v=>edit({engine:v?'embedded':'disabled'})} label="WARP enabled" detail="Turn it off to stop using WARP altogether."/>
         <Toggle checked={form.autoStart} onChange={v=>edit({autoStart:v})} label="Connect when Polygate starts" detail="Brings WARP up automatically after a restart or reboot."/>

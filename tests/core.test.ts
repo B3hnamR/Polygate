@@ -811,6 +811,15 @@ test('A route test with no usable id is a 400, and a route that cannot connect i
   try{const r=await post({id:'dead-proxy'});const x:any=await r.json();expect(r.status).toBe(502);expect(x.error.type).toBe('route_unreachable');expect(x.error.message).toContain('Could not connect');}
   finally{settings.routes=saved;}
 });
+test('WARP: a rejected endpoint does not half-apply the proxy port', async () => {
+  const savedWarp = settings.warp, savedPort = settings.warpProxyPort;
+  try {
+    settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
+    const before = settings.warpProxyPort; const port = before === 65535 ? before - 1 : before + 1;
+    const r = await fetch(base + '/admin/warp/settings', { method: 'POST', headers: { authorization: 'Bearer test-admin-secret', 'content-type': 'application/json' }, body: JSON.stringify({ port, endpoint: 'not an endpoint!' }) });
+    expect(r.status).toBe(400); expect(settings.warpProxyPort).toBe(before); expect(settings.warp?.endpoint).toBe('');
+  } finally { settings.warp = savedWarp; settings.warpProxyPort = savedPort; }
+});
 test('WARP: "New identity" and "Set up" without the bundled helper fail at once instead of registering identities first',async()=>{
   const warp=await import('../backend/warp');if(warp.findWarpHelper())return; // normal builds ship the helper, so this can only show on a stripped build
   const saved=settings.warp;settings.warp={engine:'embedded',autoStart:false,pool:2,rotateMinutes:0,helperPath:'',endpoint:''};
@@ -818,13 +827,15 @@ test('WARP: "New identity" and "Set up" without the bundled helper fail at once 
   finally{settings.warp=saved;}
 });
 test('WARP: a configured helper path that is a folder or cannot be run is not used (spawning it used to end the gateway)',async()=>{
+  if(!['win32','linux'].includes(process.platform))return; // the backend intentionally has no bundled helper on other platforms
+  if(process.platform==='linux'&&!['x64','arm64'].includes(process.arch))return;
   const warp=await import('../backend/warp');const saved=settings.warp;const tmp=mkdtempSync(path.join(os.tmpdir(),'polygate-wp-'));
   const {writeFileSync,chmodSync}=await import('node:fs');const name=process.platform==='win32'?'usque-windows-amd64.exe':process.arch==='arm64'?'usque-linux-arm64':'usque-linux-amd64';const file=path.join(tmp,name);writeFileSync(file,'not a program');
   const using=(helperPath:string)=>{settings.warp={engine:'embedded',autoStart:false,pool:1,rotateMinutes:0,helperPath,endpoint:''};return warp.findWarpHelper();};
   try{
     const other=using('');   // whatever this machine has without the setting
     expect(using(tmp)).toBe(other);
-    if(process.platform!=='win32'){chmodSync(file,0o644);expect(using(file)).toBe(other);chmodSync(file,0o755);expect(using(file)).toBe(file);
+    if(process.platform==='linux'){chmodSync(file,0o644);expect(using(file)).toBe(other);chmodSync(file,0o755);expect(using(file)).toBe(file);
       // An executable file that is not a program: the kernel refuses it (ENOEXEC), the spawn emits 'error', and the connect call fails
       // with a clear message. Before the listener existed this ended the whole process. A saved identity avoids registering with Cloudflare.
       const {stateDir}=await import('../backend/state');const {mkdirSync,existsSync,readFileSync}=await import('node:fs');const id=path.join(stateDir,'warp','identity-1.json');const had=existsSync(id)?readFileSync(id):null;
