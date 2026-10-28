@@ -293,3 +293,5 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .mini-field{display:flex;flex-direction:column;gap:5px}.mini-field .select{width:100%}
 .mini-warp{display:flex;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid var(--line)}.mini-warp strong.good{color:var(--green)}.mini-note{margin:0;font-size:11px}
 .mini-model{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Playground form: the settings box, quick tests, message and saved prompts each need room between them */
+.pg-settings{margin-bottom:14px}.pg-quick{margin-bottom:16px}.pg-saved{margin-top:16px}

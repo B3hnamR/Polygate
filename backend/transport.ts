@@ -51,7 +51,7 @@ export type ChatCheck={chat:'ok'|'used-up'|'refused'|'unknown';until?:number;not
 // A "used up" mark is only the countdown the provider announced. Asking again settles it: a passing request clears the mark, a refusal renews it.
 export async function checkChat(route:Route):Promise<ChatCheck>{
   const r=await canarySender(route.id);if(!r)return {chat:'unknown',note:canaryNote};
-  if(r.ok){r.body?.cancel().catch(()=>{});route.exhaustedUntil=0;route.cooldownUntil=0;route.status='healthy';persist();return {chat:'ok'};}
+  if(r.ok){r.body?.cancel().catch(()=>{});route.exhaustedUntil=0;route.recheckedAt=0;route.cooldownUntil=0;route.status='healthy';persist();return {chat:'ok'};}
   // The bridge answers a refusal without the provider's Retry-After header, so the limit text alone also counts (the reset is the next 00:00 UTC).
   let seen=await detectExhaustion(r);const text=seen?'':await r.text().catch(()=>'');r.body?.cancel().catch(()=>{});
   if(!seen&&r.status===429&&FREE_LIMIT_TEXT.test(text)){const until=nextResetAt();seen={until,seconds:Math.round((until-Date.now())/1000)};}
@@ -61,10 +61,33 @@ export async function checkChat(route:Route):Promise<ChatCheck>{
 }
 // Routes marked used up are asked again every few minutes, so a stale mark (an address that recovered, a wrong countdown) does not keep a working exit out of play.
 export function startExitRecheck(){
-  const run=async()=>{for(const r of settings.routes)if(r.enabled&&isExhausted(r)&&!r.status?.startsWith('Refused')&&r.id!=='proxy-pool')await checkChat(r).catch(()=>{});};
+  const run=async()=>{for(const r of settings.routes)if(r.enabled&&isExhausted(r)&&!r.status?.startsWith('Refused')&&r.id!=='proxy-pool')await (r.kind==='relay'&&settings.relayRecheck!==false?rerollRelay(r):checkChat(r)).catch(()=>{});};
   const first=setTimeout(()=>void run(),60000);const timer=setInterval(()=>void run(),10*60000);first.unref?.();timer.unref?.();
   return ()=>{clearTimeout(first);clearInterval(timer);};
 }
+// A used-up relay can come back on a new address: Vercel and Netlify hand out a different one now and then, and a relay that runs the Polygate
+// Bun template can be recycled to get one on purpose. So a relay marked used up is asked again once or twice, a little apart (recycling it
+// first when it can be), and then left to the slow re-check above. A refusal is never retried: a new address does not change that.
+const REROLL_TRIES=2,REROLL_PAUSE_MS=12000,REROLL_GAP_MS=9*60000;
+const rerolling=new Set<string>(),lastReroll=new Map<string,number>();
+export const __resetReroll=()=>{rerolling.clear();lastReroll.clear();};
+export async function rerollRelay(route:Route,pauseMs=REROLL_PAUSE_MS):Promise<boolean>{
+  if(settings.relayRecheck===false||route.kind!=='relay'||rerolling.has(route.id)||now()-(lastReroll.get(route.id)||0)<REROLL_GAP_MS)return false;
+  rerolling.add(route.id);lastReroll.set(route.id,now());
+  try{
+    for(let i=0;i<REROLL_TRIES;i++){
+      if(!route.enabled||!isExhausted(route)||route.status?.startsWith('Refused'))return !isExhausted(route);
+      if(bunRelays.has(route.id))await rotateRelay(route).catch(()=>false);
+      const check=await checkChat(route).catch(()=>undefined);
+      if(check?.chat==='ok'){logEvent('info','routes',`${route.name} found a fresh address and is usable again`,{route:route.id,tries:i+1});return true;}
+      if(check?.chat!=='used-up')break;
+      if(i+1<REROLL_TRIES)await new Promise(r=>setTimeout(r,pauseMs));
+    }
+    route.recheckedAt=now();persist();logEvent('info','routes',`${route.name} is still used up after being asked again; it is left until the next check`,{route:route.id});return false;
+  }finally{rerolling.delete(route.id);}
+}
+// Called when a live request has just found a relay used up: the first re-ask comes a few seconds later, while requests use other exits.
+const scheduleReroll=(route:Route)=>{if(route.kind!=='relay'||settings.relayRecheck===false)return;const t=setTimeout(()=>void rerollRelay(route).catch(()=>{}),15000);t.unref?.();};
 let exitVerifier=defaultVerifier;export const __setExitVerifier=(fn?:typeof defaultVerifier)=>{exitVerifier=fn||defaultVerifier;};
 // Returns the exhaustion to record, or undefined when the exit is fine and only this request was refused.
 async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response,ex:Exhaustion,rid?:string):Promise<Exhaustion|undefined>{
@@ -112,7 +135,7 @@ export function describeRoutes(): Record<string, RouteInfo> {
     const role: RouteInfo['role'] = !r.enabled ? 'off' : r.id === settings.routeId ? 'active' : backupOn && (r.id === 'proxy-pool' || r.kind !== 'direct' || settings.allowDirect === true) ? 'backup' : 'off';
     let label = r.status || 'Not tested'; let tone: RouteInfo['tone'] = 'neutral'; let detail = '';
     if (!r.enabled) { label = 'Disabled'; }
-    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'Refused by Free tier' : 'Used up today'; tone = 'cooldown'; detail = refused ? `Skipped until ${resetTime(r.exhaustedUntil!)}` : `Resets ${resetTime(r.exhaustedUntil!)}`; }
+    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'Refused by Free tier' : 'Used up today'; tone = 'cooldown'; detail = refused ? `Skipped until ${resetTime(r.exhaustedUntil!)}` : rerolling.has(r.id) ? 'Asking again for a fresh address…' : `Resets ${resetTime(r.exhaustedUntil!)}` + (r.recheckedAt ? ` · asked again ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
     else if (r.id === 'proxy-pool') { const s = poolSummary(); label = s.clean ? `${s.clean} clean exit${s.clean > 1 ? 's' : ''} ready` : s.ready ? `${s.ready} model-ready` : 'No clean proxy yet'; tone = s.clean || s.ready ? 'healthy' : 'cooldown'; detail = `${s.exhausted} used up today · keeps ${s.target} ready`; }
     else if (r.kind === 'warp') { const up = !!warpTarget(); label = up ? 'Connected' : 'Not connected'; tone = up ? 'healthy' : 'neutral'; detail = up ? '' : 'Connect it in the WARP panel below'; }
     else if (coolingDown(r)) { label = 'Cooling down'; tone = 'cooldown'; detail = `Until ${new Date(r.cooldownUntil!).toISOString().slice(11, 16)} UTC`; }
@@ -250,7 +273,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     finishAttempt(attempt,response);
     // A 429 with a Retry-After that counts down to the daily reset is probably this exit's allowance, but is confirmed first (judgeExhaustion); the gateway learns of it by request id.
     let exhausted=false;const rid=routeContext.getStore()?.requestId;
-    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'){const seen=judged?judged.seen:await detectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&!ex)noteRefused(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(route.id!=='proxy-pool')routeExhausted(route,ex);}}
+    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'){const seen=judged?judged.seen:await detectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&!ex)noteRefused(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(route.id!=='proxy-pool'){routeExhausted(route,ex);if(!ex.refused)scheduleReroll(route);}}}
     // Route health follows delivery, not the model's verdict: a 429 or 500 from the provider means the route worked.
     if(quiet){/* diagnostic lookup: leave route health alone */}
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}

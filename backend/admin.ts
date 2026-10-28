@@ -83,7 +83,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/diagnostics'&&method==='GET'){const q=new URL(req.url||'','http://x').searchParams;return json(res,200,{failures:recentFailureDetails(Math.max(1,Math.min(100,Math.floor(Number(q.get('failures')))||20))),baseline:recentBaselineDetails(Math.max(1,Math.min(20,Math.floor(Number(q.get('baseline')))||5)))});}
   if(pathname==='/admin/settings'&&method==='POST'){
     const b=await readJson(req);const next:Partial<Settings>={};
-    for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','exhaustedFailover','catalogDirect'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
+    for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','exhaustedFailover','relayRecheck','catalogDirect'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
     for(const [key,lo,hi] of [['maxConcurrent',1,64],['maxQueue',0,512],['timeoutMs',1000,600000],['retries',0,2],['refreshMinutes',5,1440],['warpProxyPort',1024,65535],['queueWaitMs',0,120000],['relayRotations',0,10]] as const)if(key in b)(next as any)[key]=bounded(b[key],lo,hi);
     if(b.strategy){if(!['single','round_robin','random','fastest'].includes(b.strategy))throw new GatewayError('Unknown selection strategy',400);next.strategy=b.strategy;}
     if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
