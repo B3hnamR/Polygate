@@ -47,7 +47,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
       // The MCP hub: client API keys, like the model API, and callable from browser-based MCP clients.
       if(p==='/mcp'||p.startsWith('/mcp/'))return await handleMcp(req,res,p);
       // The OpenAI/Anthropic surface is protected by API keys and must be callable from browser clients; everything else is same-origin only.
-      if(p.startsWith('/v1/')){res.setHeader('access-control-allow-origin','*');res.setHeader('access-control-allow-headers','authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id');res.setHeader('access-control-allow-methods','GET, POST, OPTIONS');res.setHeader('access-control-expose-headers','x-polygate-model, x-polygate-route, retry-after');res.setHeader('access-control-max-age','600');if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}}
+      if(p.startsWith('/v1/')){res.setHeader('access-control-allow-origin','*');res.setHeader('access-control-allow-headers','authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id');res.setHeader('access-control-allow-methods','GET, POST, OPTIONS');res.setHeader('access-control-expose-headers','x-polygate-model, x-polygate-route, x-polygate-chain, x-polygate-skipped, retry-after');res.setHeader('access-control-max-age','600');if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}}
       else if(req.headers.origin){let originHost='';try{originHost=new URL(String(req.headers.origin)).host;}catch{/* malformed origin is refused below */}
         if(originHost!==hostHeader&&!(process.env.POLYGATE_DEV==='1'&&req.headers.origin==='http://127.0.0.1:5173'))throw new GatewayError('Cross-origin request refused',403);}
       if(isHttps(req))res.setHeader('strict-transport-security','max-age=31536000');
@@ -78,7 +78,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
           if(action)logEvent('info',action[0],action[1]);return;
         }catch(e:any){if(action)logEvent('warn',action[0],`${action[2]} failed: ${redactError(e?.message||String(e))}`);throw e;}
       }
-      if(p==='/v1/models'&&req.method==='GET'){const k=clientKey(req);return json(res,200,{object:'list',data:[{id:'auto',object:'model',owned_by:'polygate'},...[...models.values()].filter(m=>settings.providers.some(x=>x.id===m.providerId&&x.enabled)&&m.state!=='unavailable'&&modelAllowed(k,m.id)).map(m=>({id:m.id,object:'model',owned_by:m.providerId}))]});}
+      if(p==='/v1/models'&&req.method==='GET'){const k=clientKey(req);return json(res,200,{object:'list',data:[{id:'auto',object:'model',owned_by:'polygate'},...(settings.chains||[]).filter(c=>c.enabled).map(c=>({id:c.name,object:'model',owned_by:'polygate-chain'})),...[...models.values()].filter(m=>settings.providers.some(x=>x.id===m.providerId&&x.enabled)&&m.state!=='unavailable'&&modelAllowed(k,m.id)).map(m=>({id:m.id,object:'model',owned_by:m.providerId}))]});}
       if(req.method==='POST'&&['/v1/chat/completions','/v1/responses','/v1/messages'].includes(p))return await inference(req,res,p.endsWith('/responses')?'responses':p.endsWith('/messages')?'anthropic':'chat');
       if(p==='/v1/messages/count_tokens'&&req.method==='POST'){clientKey(req);const b=await readJson(req);return json(res,200,{input_tokens:Math.ceil(JSON.stringify(b).length/4),estimated:true});}
       if(req.method==='GET'&&!p.startsWith('/v1/')){

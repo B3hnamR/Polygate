@@ -34,7 +34,7 @@ function skeleton(schema: any): unknown {
   if (type === 'object' || schema.properties) return Object.fromEntries(Object.entries(schema.properties || {}).map(([k, v]) => [k, skeleton(v)]));
   return type === 'string' ? '' : type === 'number' || type === 'integer' ? 0 : type === 'boolean' ? false : type === 'array' ? [] : null;
 }
-function Dialog({ title, icon, onClose, busy, wide, children }: { title: string; icon: ReactNode; onClose: () => void; busy?: boolean; wide?: boolean; children: ReactNode }) {
+export function Dialog({ title, icon, onClose, busy, wide, children }: { title: string; icon: ReactNode; onClose: () => void; busy?: boolean; wide?: boolean; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null); const closing = useRef(onClose);
   useEffect(() => { closing.current = onClose; });
   useEffect(() => { const opener = document.activeElement as HTMLElement | null; box.current?.querySelector<HTMLElement>('input,textarea,button.select-trigger')?.focus(); return () => opener?.focus(); }, []);

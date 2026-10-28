@@ -31,10 +31,10 @@
 |---|---|
 | **Free providers, built in** | OpenCode Free and Kilo Free. Discover their current catalogs, or add your own compatible API. |
 | **One address for your tools** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. |
-| **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. |
+| **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. Or name your own **chain** (`my-coding`: try model A, then B, then C). |
 | **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool (from public lists or your own list links), WARP, and deployable relays. |
 | **One MCP address for your tools** | Add MCP servers once; every AI client gets all their tools from `/mcp` with its Polygate key, reached through your own routes. |
-| **See what is happening** | Model availability, request timing, a searchable log of everything the gateway does, client keys, and a Playground for real requests. |
+| **See what is happening** | Model availability, request timing, a searchable log of everything the gateway does, client keys, and a Playground for real requests: conversations, side-by-side model comparison, tool and reasoning output, speed and token figures. |
 | **Run it your way** | Portable Windows app, Linux service with a manager, or Docker. Built-in HTTPS is available on servers. |
 
 > [!NOTE]
@@ -151,7 +151,7 @@ See both providers in one catalog, check availability, compare latency, and choo
 
 ### Try a request before configuring your tools
 
-Choose a model and protocol, add a system instruction, and read the streamed response beside your request.
+Choose a model (or one of your chains) and a protocol, add a system instruction, and read the streamed response beside your request. Keep the conversation going, compare two models side by side, see the model's thinking and tool calls, check speed and token figures, and copy the request as curl, Python or JavaScript. The screenshot shows the first version of this page.
 
 ![Playground showing a real request and response through the WSL gateway](assets/screenshots/playground.png)
 
@@ -213,7 +213,10 @@ print(client.chat.completions.create(model="auto", messages=[{"role": "user", "c
 | `auto` | highest-ranked usable model, with fallback attempts for supported failure types |
 | `auto:smart` | prefers reasoning and larger models |
 | `auto:fast` | prefers the models that answered fastest |
+| `my-coding` (a chain you create) | your own list, tried in your order: see below |
 | `kilo/kilo-auto/free`, `opencode/<name>` | an exact model: the provider, then its model id (see `/v1/models`) |
+
+**Chains.** Open **Chains** and press New chain: name it (for example `my-coding`) and list up to 8 models in the order you want them tried. A step can also be `auto`, `auto:smart` or `auto:fast`. Clients then use that name as the model. Polygate asks the first model that is ready; if it is resting, refuses the request (401, 403, 404, 429, 5xx) or is full, it moves to the next. A request the client got wrong (such as a 400) is not retried on other models. The reply names the model that answered in `x-polygate-model`, the chain in `x-polygate-chain` and anything it passed over in `x-polygate-skipped`; the Logs page shows the same. A key limited to some models reaches only those models inside a chain.
 
 Your client’s key is never sent to a provider. Streaming and tool support depend on the selected provider and model. Manage client key limits, expiry, and model allowlists in **Settings**.
 

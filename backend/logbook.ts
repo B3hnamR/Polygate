@@ -69,7 +69,7 @@ export function exportEvents(f: LogQuery, format: 'txt' | 'json') {
 export function clearEvents() { db.exec('DELETE FROM events'); }
 // Dashboard and manager actions (POST to /admin/…) in plain words, filed under the part of Polygate they change.
 const actions: Record<string, [string, string]> = {
-  '/admin/settings': ['settings', 'Gateway settings saved'], '/admin/password': ['auth', 'Dashboard password changed'], '/admin/signout-all': ['auth', 'Sign-out on every device'],
+  '/admin/settings': ['settings', 'Gateway settings saved'], '/admin/chains/save': ['chains', 'Model chain saved'], '/admin/chains/delete': ['chains', 'Model chain deleted'], '/admin/password': ['auth', 'Dashboard password changed'], '/admin/signout-all': ['auth', 'Sign-out on every device'],
   '/admin/shutdown': ['gateway', 'Shutdown requested'], '/admin/identity/refresh': ['providers', 'OpenCode identity refreshed'],
   '/admin/discover': ['models', 'Model catalog refreshed'], '/admin/probe': ['models', 'Model availability checked'], '/admin/model': ['models', 'Model settings changed'],
   '/admin/providers': ['providers', 'Provider saved'], '/admin/providers/delete': ['providers', 'Provider removed'],

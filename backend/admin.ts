@@ -16,6 +16,7 @@ import { notices, markAllRead, clearNotices, testWebhook } from './notifications
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig } from './auth';
 import { GatewayError } from './queue';
+import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
 import { checkForUpdates } from './updates';
 import { queryEvents, exportEvents, clearEvents, parseLogQuery } from './logbook';
@@ -94,6 +95,15 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     Object.assign(settings,next);queue.max=settings.maxConcurrent;queue.capacity=settings.maxQueue;queue.drain();
     persist();return json(res,200,{ok:true});
   }
+  // Fallback chains: a named, ordered list of models that a client asks for like any model.
+  if(pathname==='/admin/chains/save'&&method==='POST'){
+    const b=await readJson(req);const existing=b.id?settings.chains?.find(c=>c.id===b.id):undefined;
+    if(b.id&&!existing)throw new GatewayError('Chain not found',404);
+    if(!existing&&(settings.chains?.length||0)>=MAX_CHAINS)throw new GatewayError(`Up to ${MAX_CHAINS} chains are supported.`,400,'invalid_chain');
+    const chain=cleanChain(b,existing);settings.chains=existing?settings.chains!.map(c=>c.id===chain.id?chain:c):[...(settings.chains||[]),chain];
+    persist();return json(res,200,{ok:true,chain});
+  }
+  if(pathname==='/admin/chains/delete'&&method==='POST'){const b=await readJson(req);if(!settings.chains?.some(c=>c.id===b.id))throw new GatewayError('Chain not found',404);settings.chains=settings.chains.filter(c=>c.id!==b.id);persist();return json(res,200,{ok:true});}
   if(pathname==='/admin/discover'&&method==='POST'){await discover();return json(res,200,{ok:true,count:models.size});}
   if(pathname==='/admin/identity/refresh'&&method==='POST')return json(res,200,await syncIdentity());
   if(pathname==='/admin/probe'&&method==='POST'){const b=await readJson(req);return json(res,200,await probeModel(String(b.id)));}

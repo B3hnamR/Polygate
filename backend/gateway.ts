@@ -11,16 +11,33 @@ import { logEvent } from './logbook';
 import { KILO_ID, KILO_LIMIT_PAUSE_MS, KILO_MODEL_PAUSE_MS, isAddressLimit, pauseKilo } from './kilo';
 import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
-import type { Model, ApiKey } from './types';
+import { chainFor, modelFor, AUTO_STEPS } from './chains';
+import type { Model, ApiKey, Chain } from './types';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
 export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
 export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
 export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
 const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
+const autoOrder=(requested:string,ranked:Model[])=>requested==='auto:smart'?ranked.filter(m=>m.reasoning||m.score>=65):requested==='auto:fast'?[...ranked].sort((a,b)=>(a.latency||1e9)-(b.latency||1e9)):ranked;
+// A chain is the user's own order: its steps that are ready right now, each tried when the one before it fails. The "fallback" setting
+// does not shorten it, because the user listed these on purpose.
+function chainModels(chain:Chain,ranked:Model[]){
+  if(!chain.enabled)throw new GatewayError(`The chain "${chain.name}" is switched off in Polygate.`,404,'model_not_found');
+  const out:Model[]=[];
+  for(const step of chain.models){
+    if(AUTO_STEPS.includes(step)){for(const m of autoOrder(step,ranked).slice(0,3))if(!out.includes(m))out.push(m);continue;}
+    const m=modelFor(step);if(m&&ranked.includes(m)&&!out.includes(m))out.push(m);
+  }
+  if(out.length)return out;
+  const resting=chain.models.map(modelFor).filter((m):m is Model=>!!m&&m.state!=='unavailable'&&m.cooldownUntil>Date.now());
+  if(resting.length){const soon=Math.min(...resting.map(m=>m.cooldownUntil));throw new GatewayError(`Every model in the chain "${chain.name}" is resting. The first is back at ${resetTime(soon)}.`,429,'model_paused',Math.max(1,Math.ceil((soon-Date.now())/1000)));}
+  throw new GatewayError(`None of the models in the chain "${chain.name}" can answer: they are unavailable, switched off, or not allowed for this API key.`,503,'models_unavailable');
+}
 function chosenModels(requested:string,key?:ApiKey){
   const all=rankedModels();const ranked=all.filter(m=>m.state!=='unavailable'&&m.cooldownUntil<=Date.now()&&(!key?.models?.length||modelAllowed(key,m.id)));
+  const chain=chainFor(requested);if(chain)return chainModels(chain,ranked);
   if(requested==='auto'||requested==='auto:smart'||requested==='auto:fast'){
-    const eligible=requested==='auto:smart'?ranked.filter(m=>m.reasoning||m.score>=65):requested==='auto:fast'?[...ranked].sort((a,b)=>(a.latency||1e9)-(b.latency||1e9)):ranked;
+    const eligible=autoOrder(requested,ranked);
     if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return eligible.slice(0,settings.fallback?3:1);
   }
   const exact=models.get(requested)||all.find(m=>m.upstreamId===requested);if(!exact)throw new GatewayError('Unknown model. Use a model from /v1/models.',404,'model_not_found');
@@ -47,7 +64,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const k=authenticate(req,true);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
   const requestId=crypto.randomUUID();const body=await readJson(req);const chat=toChat(body,protocol);
   // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
-  const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const controller=new AbortController();(req as any).signal=controller.signal;
+  const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const chain=chainFor(chat.model);const hops:string[]=[];const controller=new AbortController();(req as any).signal=controller.signal;
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
@@ -85,7 +102,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // A refusal through the proxy pool blames that proxy (already rotated out), not the model, and is retried on the next one.
           if(blocked&&r.id==='proxy-pool'&&attempt<attempts)continue;
           if(blocked||final)classifyModel(m,status,message,Date.now()-t0,retryMs);
-          if(blocked)throw new GatewayError(message,status,'upstream_error');
+          // A chain moves past a model that refuses it (blocked, or no longer offered) to the next step; the last step's refusal is the answer.
+          if(blocked){if(chain&&m!==candidates[candidates.length-1]&&!controller.signal.aborted)break;throw new GatewayError(message,status,'upstream_error');}
           if(final)break;
           if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}
         }catch(e){
@@ -94,12 +112,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
           if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}}
       }
-      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500)break;
+      if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);
+      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status)))break;
     }
     if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
     if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
-    res.setHeader('x-polygate-model',used.id);res.setHeader('x-polygate-route',encodeURIComponent(route));
+    res.setHeader('x-polygate-model',used.id);if(chain){res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));}res.setHeader('x-polygate-route',encodeURIComponent(route));
     let ended=false;let firstAt=0;
     const observed=upstream.body!.pipeThrough(observeSse(raw=>{
       if(raw==='[DONE]'){ended=true;return;}
@@ -127,7 +146,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns!==false,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
     const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});
-    logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
+    logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
 // Ready means a client request could succeed right now: enabled, at least one usable model, and at least one route that is not cooling down.
 export function readiness(){
