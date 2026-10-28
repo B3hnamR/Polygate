@@ -1,6 +1,6 @@
 // Where the app's window goes when it switches between the full dashboard and the compact portrait view. Pure functions, so they can be
 // tested without Electron: the caller passes the work areas of the connected displays.
-const COMPACT = { width: 380, height: 720, minWidth: 320, minHeight: 440 };
+const COMPACT = { width: 380, height: 720, minWidth: 320, minHeight: 560 };
 const FULL_MIN = { width: 880, height: 650 };
 const MARGIN = 16;
 const sane = n => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 100000;

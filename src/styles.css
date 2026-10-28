@@ -290,3 +290,6 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .mini-result{padding:0 6px;border-radius:5px;font-size:10.5px}.mini-result.ok{background:var(--green-soft);color:var(--green)}.mini-result.bad{background:var(--red-soft);color:var(--red)}
 .mini-foot{display:flex;gap:8px}
 .mini-button{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface-raised);color:var(--text);font-size:12px}.mini-button:hover:not(:disabled){border-color:var(--accent-line)}.mini-button:disabled{opacity:.5;cursor:not-allowed}
+.mini-field{display:flex;flex-direction:column;gap:5px}.mini-field .select{width:100%}
+.mini-warp{display:flex;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid var(--line)}.mini-warp strong.good{color:var(--green)}.mini-note{margin:0;font-size:11px}
+.mini-model{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

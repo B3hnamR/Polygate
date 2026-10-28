@@ -10,8 +10,8 @@ describe('compact window placement', () => {
     expect(b.x + b.width).toBe(screen.width - 16); expect(b.y).toBe(Math.round((screen.height - b.height) / 2));
   });
   test('on a small display it shrinks to fit but never below the minimum', () => {
-    const b = defaultCompact({ x: 0, y: 0, width: 800, height: 560 });
-    expect(b.height).toBe(560 - 32); expect(b.width).toBe(COMPACT.width); expect(b.x).toBeGreaterThanOrEqual(0);
+    const b = defaultCompact({ x: 0, y: 0, width: 800, height: 700 });
+    expect(b.height).toBe(700 - 32); expect(b.width).toBe(COMPACT.width); expect(b.x).toBeGreaterThanOrEqual(0);
     const tiny = defaultCompact({ x: 0, y: 0, width: 300, height: 400 });
     expect(tiny.width).toBe(COMPACT.minWidth); expect(tiny.height).toBe(COMPACT.minHeight);
   });
