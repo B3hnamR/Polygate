@@ -151,7 +151,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/warp/disconnect'&&method==='POST')return json(res,200,await warpOut(warpDisconnect()));
   if(pathname==='/admin/warp/install'&&method==='POST')return json(res,200,await warpOut(warpInstall()));
   if(pathname==='/admin/warp/rotate'&&method==='POST')return json(res,200,await warpOut(warpRotate()));
-  if(pathname==='/admin/warp/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['engine','autoStart','pool','rotateMinutes','helperPath','endpoint'])if(k in b)patch[k]=b[k];const port='port' in b?bounded(b.port,1024,65535):undefined;checkHelperPath(b.helperPath,local);await setWarpSettings(patch,port);return json(res,200,await warpOut(warpStatus()));}
+  if(pathname==='/admin/warp/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['engine','autoStart','pool','rotateMinutes','helperPath','endpoint','split'])if(k in b)patch[k]=b[k];const port='port' in b?bounded(b.port,1024,65535):undefined;checkHelperPath(b.helperPath,local);await setWarpSettings(patch,port);return json(res,200,await warpOut(warpStatus()));}
   // --- scoped client keys ---
   if(pathname==='/admin/keys'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:createKey(b)});}
   if(pathname==='/admin/keys/update'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:updateKey(String(b.id),b)});}

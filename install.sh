@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
     --key) POLYGATE_KEY_FILE=${2:?--key needs a file}; shift ;;
     --https-port) POLYGATE_HTTPS_PORT=${2:?--https-port needs a number}; shift ;;
     --port) POLYGATE_PORT=${2:?--port needs a number}; shift ;;
-    --release) VERSION=${2:?--release needs a version such as v0.3.1}; shift ;;
+    --release) VERSION=${2:?--release needs a version such as v0.3.2}; shift ;;
     *) printf 'Unknown option: %s (see --help)\n' "$1" >&2; exit 2 ;;
   esac
   shift
@@ -548,6 +548,8 @@ install_release() {
   chown -R root:root "$release"
   # The service user must be able to read the program files; only its data is private.
   chmod -R a+rX "$release"; chmod 0755 "$release/bin/bun" "$release/install/polygate"
+  # A package unpacked on a filesystem without execute bits (or built on Windows) would leave the WARP helper unrunnable.
+  chmod 0755 "$release"/warp/usque-* 2>/dev/null || true
   old=$(readlink /opt/polygate/current || true)
   ln -sfnT "$release" /opt/polygate/.current-new; mv -Tf /opt/polygate/.current-new /opt/polygate/current
   BUNX="$release/bin/bun"
