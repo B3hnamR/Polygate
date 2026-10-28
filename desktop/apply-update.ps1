@@ -10,6 +10,13 @@ function Get-UpdateHash([string]$File) {
   try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
   finally { $stream.Dispose(); $algorithm.Dispose() }
 }
+# The old app quits as soon as the helper reports it is ready, so it can be gone before, or while, this waits. A process that is already
+# gone counts as closed; only one that is still running after the wait is a failure.
+function Wait-ForOldApp([int]$ProcessId, [int]$TimeoutSeconds) {
+  if ($ProcessId -le 0) { return }
+  Wait-Process -Id $ProcessId -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
+  if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { throw 'The old app did not close in time.' }
+}
 try {
   $configFile = [IO.Path]::GetFullPath($ConfigPath)
   $stageDir = [IO.Path]::GetDirectoryName($configFile)
@@ -29,7 +36,7 @@ try {
   if (!(Test-Path -LiteralPath $target -PathType Leaf) -or $config.expectedHash -notmatch '^[a-f0-9]{64}$') { throw 'The current executable or checksum is missing.' }
   if ((Get-UpdateHash $staged) -ne $config.expectedHash) { throw 'The downloaded update failed its checksum check.' }
   [IO.File]::WriteAllText((Join-Path $stageDir 'ready'), 'ready')
-  if ($config.parentPid -gt 0 -and (Get-Process -Id $config.parentPid -ErrorAction SilentlyContinue)) { Wait-Process -Id $config.parentPid -Timeout 45 -ErrorAction Stop }
+  Wait-ForOldApp $config.parentPid 45
   $suffix = [guid]::NewGuid().ToString('N')
   $incoming = Join-Path $targetDir ('.polygate-incoming-' + $suffix + '.exe')
   $backup = Join-Path $targetDir ('.polygate-backup-' + $suffix + '.exe')

@@ -209,3 +209,19 @@ restartTest('one click downloads, verifies, closes the old process, replaces the
     cleanup(directory); if (staging && existsSync(staging)) cleanup(staging);
   }
 }, 30000);
+
+// The old app quits as soon as the helper says it is ready, so it can vanish between the helper's checks. That used to fail the update with
+// "Cannot find a process"; a process that is already gone now counts as closed, and one that stays open is still a failure.
+windowsTest('the helper waits for the old app without failing when it has already gone', () => {
+  const script = readFileSync(path.join(import.meta.dir, '..', 'desktop', 'apply-update.ps1'), 'utf8').replace(/\r\n/g, '\n'); // the script may be checked out with Windows line endings
+  const fn = script.match(/function Wait-ForOldApp[\s\S]*?\n}\n/)![0];
+  const run = (code: string) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fn + '\n$ErrorActionPreference = "Stop"\n' + code], { encoding: 'utf8', timeout: 60000 });
+  const gone = spawnSync('cmd.exe', ['/c', 'exit', '0']).pid!;
+  const missing = run(`Wait-ForOldApp ${gone} 5; 'finished'`); expect(missing.stdout).toContain('finished'); expect(missing.status).toBe(0);
+  expect(run(`Wait-ForOldApp 0 5; 'finished'`).stdout).toContain('finished');
+  const brief = spawn('powershell.exe', ['-NoProfile', '-Command', 'Start-Sleep -Milliseconds 800'], { stdio: 'ignore' });
+  const closes = run(`Wait-ForOldApp ${brief.pid} 20; 'finished'`); expect(closes.stdout).toContain('finished');
+  const stays = spawn('powershell.exe', ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
+  try { const result = run(`Wait-ForOldApp ${stays.pid} 1; 'finished'`); expect(result.stdout).not.toContain('finished'); expect(result.stderr + result.stdout).toContain('did not close in time'); }
+  finally { stays.kill(); brief.kill(); }
+}, 60000);
