@@ -820,6 +820,19 @@ test('WARP: a rejected endpoint does not half-apply the proxy port', async () =>
     expect(r.status).toBe(400); expect(settings.warpProxyPort).toBe(before); expect(settings.warp?.endpoint).toBe('');
   } finally { settings.warp = savedWarp; settings.warpProxyPort = savedPort; }
 });
+test('WARP: changing the SOCKS port updates the managed route, and an invalid port is refused', async () => {
+  const warp = await import('../backend/warp'); const savedWarp = settings.warp, savedPort = settings.warpProxyPort, savedRoutes = settings.routes;
+  try {
+    settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
+    settings.routes = [{ id: 'warp', name: 'Cloudflare WARP', kind: 'warp', url: `socks5://127.0.0.1:${settings.warpProxyPort}`, enabled: true, models: [], managed: true } as any];
+    const port = settings.warpProxyPort === 65535 ? settings.warpProxyPort - 1 : settings.warpProxyPort + 1;
+    await warp.setWarpSettings({}, port);
+    expect(settings.warpProxyPort).toBe(port);
+    expect(settings.routes.find(r => r.id === 'warp')?.url).toBe(`socks5://127.0.0.1:${port}`);
+    await expect(warp.setWarpSettings({}, 80)).rejects.toThrow(/between 1024 and 65535/);
+    expect(settings.warpProxyPort).toBe(port);
+  } finally { settings.warp = savedWarp; settings.warpProxyPort = savedPort; settings.routes = savedRoutes; }
+});
 test('WARP: "New identity" and "Set up" without the bundled helper fail at once instead of registering identities first',async()=>{
   const warp=await import('../backend/warp');if(warp.findWarpHelper())return; // normal builds ship the helper, so this can only show on a stripped build
   const saved=settings.warp;settings.warp={engine:'embedded',autoStart:false,pool:2,rotateMinutes:0,helperPath:'',endpoint:''};

@@ -265,16 +265,24 @@ export async function warpInstall() {
   if (!helper) throw new GatewayError('The WARP helper is not bundled with this build. Put the platform helper in the app\'s warp folder, set its path in WARP settings, or run scripts/build-warp-helper.sh.', 503, 'warp_not_installed');
   progress(100, 'installed', 'WARP helper found'); return { installed: true, ...await warpStatus() };
 }
-export async function setWarpSettings(patch: Partial<WarpSettings>) {
+export async function setWarpSettings(patch: Partial<WarpSettings>, port?: number) {
   const next = { ...warpConfig(), ...patch };
   if (!['embedded', 'disabled'].includes(next.engine)) throw new GatewayError('Unknown WARP setting', 400);
   next.pool = Math.max(1, Math.min(4, Math.floor(Number(next.pool) || 1))); next.rotateMinutes = Math.max(0, Math.min(10080, Math.floor(Number(next.rotateMinutes) || 0)));
   next.helperPath = String(next.helperPath || '').slice(0, 500);
   next.endpoint = String(next.endpoint || '').trim().slice(0, 200);
   if (next.endpoint && !/^[A-Za-z0-9.:[\]-]+$/.test(next.endpoint)) throw new GatewayError('The MASQUE endpoint must be a hostname or IP address', 400);
+  if (port !== undefined) {
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new GatewayError('The SOCKS port must be between 1024 and 65535', 400);
+    // Running helpers listen on the old ports: the managed route still picks warpTarget(), but the dashboard and the saved
+    // route URL would advertise a port nothing listens on. Refuse the port move instead of leaving that half-applied state.
+    if (port !== basePort() && tunnels.size && next.engine !== 'disabled') throw new GatewayError('Disconnect WARP before changing its SOCKS port', 409, 'warp_port_in_use');
+  }
   settings.warp = { engine: next.engine, autoStart: !!next.autoStart, pool: next.pool, rotateMinutes: next.rotateMinutes, helperPath: next.helperPath, endpoint: next.endpoint };
+  if (port !== undefined) settings.warpProxyPort = port;
   persist(); status.checkedAt = 0; startTimers();
   if (next.engine === 'disabled' && tunnels.size) await stopTunnels(); // a disabled engine must not leave helper processes running
+  ensureRoute();
   await refreshStatus(true);
 }
 function startTimers() {

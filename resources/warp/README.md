@@ -29,7 +29,7 @@ The upstream source is MIT-licensed; the full patch is in `usque.patch`.
 | `usque-linux-amd64` | Linux x64 |
 | `usque-linux-arm64` | Linux arm64 |
 
-Rebuild them with:
+From a source checkout, rebuild them with:
 
 ```sh
 GOPROXY=https://proxy.golang.org,direct ./scripts/build-warp-helper.sh
@@ -38,5 +38,7 @@ GOPROXY=https://proxy.golang.org,direct ./scripts/build-warp-helper.sh
 The script needs Go 1.26.3 or newer and replaces the binaries and `sha256.txt`.
 It clones tag `v4.2.1`, then refuses to build unless `HEAD` is the commit above,
 so a moved or re-tagged release cannot silently change the bundled binaries.
+Packaged builds ship the binaries, license, patch, and this README, but not
+`scripts/build-warp-helper.sh`; the rebuild command is for a source checkout.
 `usque` is copyright (c) 2025 github.com/Diniboy1123 and is distributed under
 the MIT license in `LICENSE`.
