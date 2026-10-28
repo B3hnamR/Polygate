@@ -1,5 +1,5 @@
 import {useState,useEffect,useRef,type FormEvent} from 'react';
-import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,Download,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
+import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
 import {api,at} from './api';
 import {ProxyLists} from './proxy-lists';
 import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
@@ -30,19 +30,19 @@ export function NotificationsMenu({unread,onChange}:{unread:number;onChange:()=>
       {data?.items.length?<ul>{data.items.map(n=><li key={n.id} className={`${n.type} ${n.read?'':'unread'}`}><i/><div><strong>{n.title}</strong><p>{n.message}</p><small>{when(n.time)}</small></div></li>)}</ul>:<p className="notify-empty">Nothing yet. Route, model and WARP changes show up here.</p>}</div>}</div>;
 }
 // ---------- Cloudflare WARP ----------
-type WarpInfo={engine:string;state:string;busy:boolean;port:number;wireproxy:{path:string;installed:boolean};egress:null|{ip:string;colo:string;warp:string};tunnels:{port:number;egressIp:string;endpoint:string;since:number;cooling:boolean}[];progress:{percent:number;stage:string;message:string};lastError:string;autoStart:boolean;pool:number;rotateMinutes:number;platform:string;canRotate:boolean;config:{wireproxyPath:string};install:{kind:string;automatic:boolean;note:string}};
+type WarpInfo={engine:string;state:string;busy:boolean;port:number;helper:{path:string;installed:boolean;kind:string};egress:null|{ip:string;colo:string;warp:string;loc?:string};tunnels:{port:number;egressIp:string;endpoint:string;since:number;cooling:boolean}[];progress:{percent:number;stage:string;message:string};lastError:string;autoStart:boolean;pool:number;rotateMinutes:number;platform:string;canRotate:boolean;config:{helperPath:string;endpoint:string};install:{kind:string;automatic:boolean;note:string}};
 const warpLabel:Record<string,[string,string]>={connected:['healthy','Connected'],connecting:['cooldown','Connecting…'],disconnected:['neutral','Disconnected'],not_installed:['cooldown','Not installed'],not_registered:['cooldown','Not registered'],error:['error','Needs attention'],disabled:['neutral','Turned off']};
 export function WarpPanel({notice,onChanged}:{notice:Notice;onChanged:()=>void}){
   const {data:s,reload}=usePoll<WarpInfo>('/admin/warp/status',3000);
-  const [form,setForm]=useState({engine:'embedded',port:40000,pool:2,rotateMinutes:0,autoStart:false,wireproxyPath:''});const [dirty,setDirty]=useState(false);const [busy,setBusy]=useState('');
-  useEffect(()=>{if(s&&!dirty)setForm({engine:s.engine,port:s.port,pool:s.pool,rotateMinutes:s.rotateMinutes,autoStart:s.autoStart,wireproxyPath:s.config.wireproxyPath});},[s,dirty]);
+  const [form,setForm]=useState({engine:'embedded',port:40000,pool:2,rotateMinutes:0,autoStart:false,helperPath:'',endpoint:''});const [dirty,setDirty]=useState(false);const [busy,setBusy]=useState('');
+  useEffect(()=>{if(s&&!dirty)setForm({engine:s.engine,port:s.port,pool:s.pool,rotateMinutes:s.rotateMinutes,autoStart:s.autoStart,helperPath:s.config.helperPath,endpoint:s.config.endpoint});},[s,dirty]);
   const edit=(patch:Partial<typeof form>)=>{setDirty(true);setForm(f=>({...f,...patch}));};
   async function run(name:string,path:string,body:unknown={},done=''){setBusy(name);try{await api(path,body);if(done)notice(done);await reload();onChanged();return true;}catch(e){notice(errorOf(e),'error');await reload();return false;}finally{setBusy('');}}
   const [tone,label]=warpLabel[s?.state||'disconnected']||['neutral',s?.state||''];const working=!!busy||!!s?.busy;const connected=s?.state==='connected';
-  const needsInstall=!!s&&s.engine==='embedded'&&!s.wireproxy.installed;
+  const needsInstall=!!s&&s.engine==='embedded'&&!s.helper.installed;
   return <section className="section-block form-section warp-panel">
     <div className="section-top"><div className="section-title"><Cloud size={19}/><h2>Cloudflare WARP</h2></div>{s&&<Badge state={tone}>{label}</Badge>}</div>
-    <p className="muted">Send model traffic through Cloudflare WARP. Polygate runs its own tunnels (no WARP app needed), so only the gateway's own requests use it — never the rest of this machine.</p>
+    <p className="muted">Send model traffic through Cloudflare WARP. Polygate runs its own MASQUE tunnel over HTTP/2, so it works on networks that block WireGuard and UDP. Only the gateway's own requests use it — never the rest of this machine.</p>
     {!s?<div className="loading"><Loader2 className="spin"/> Checking WARP…</div>:<>
       <div className="warp-stats"><div><span>Exit IP</span><strong className="mono">{s.egress?.ip||'—'}</strong></div><div><span>Data center</span><strong>{s.egress?.colo||'—'}</strong></div><div><span>Local proxy</span><strong className="mono">127.0.0.1:{s.port}</strong></div></div>
       {s.tunnels.length>0&&<div className="chip-row">{s.tunnels.map(t=><span key={t.port} className={`chip ${t.cooling?'warn':'ok'}`} title={t.endpoint}>:{t.port} · {t.egressIp||'starting'}{t.cooling?' · cooling':''}</span>)}</div>}
@@ -51,16 +51,19 @@ export function WarpPanel({notice,onChanged}:{notice:Notice;onChanged:()=>void})
       <div className="button-row">
         <Button variant="primary" disabled={working||s.engine==='disabled'||needsInstall} onClick={()=>run('connect','/admin/warp/connect',{},'WARP is connected')}>{busy==='connect'?<Loader2 size={15} className="spin"/>:<Power size={15}/>}{connected?'Reconnect':'Set up & connect'}</Button>
         <Button disabled={working||!connected} onClick={()=>run('disconnect','/admin/warp/disconnect',{},'WARP disconnected')}>Disconnect</Button>
-        {needsInstall&&<Button variant="primary" disabled={working} onClick={()=>run('install','/admin/warp/install',{},'Installed')}>{busy==='install'?<Loader2 size={15} className="spin"/>:<Download size={15}/>}Download tunnel helper</Button>}
+        {needsInstall&&<Button variant="primary" disabled={working} onClick={()=>run('install','/admin/warp/install',{},'Helper found')}>{busy==='install'?<Loader2 size={15} className="spin"/>:<Search size={15}/>}Locate helper</Button>}
         {s.canRotate&&<Button disabled={working||!connected} title="Request a fresh WARP identity and exit IP" onClick={()=>run('rotate','/admin/warp/rotate',{},'WARP identity rotated')}><RefreshCw size={15}/>New identity</Button>}
         <Button disabled={working} onClick={async()=>{setBusy('detect');await reload();setBusy('');}}><Search size={15}/>Detect</Button>
       </div>
       {needsInstall&&<p className="muted">{s.install.note}</p>}
+      <p className="muted fine-print"><Info size={14}/> Cloudflare's WARP exit addresses are shared, so a service can still rate-limit them. The tunnel can be healthy while that particular exit is refused.</p>
       <details className="disclosure"><summary>Settings</summary>
         <div className="form-grid">
-          <Field label="SOCKS port" hint="Where WARP's local proxy listens."><input type="number" min={1024} max={65535} value={form.port} onChange={e=>edit({port:+e.target.value})}/></Field>
+          <Field label="SOCKS port" hint="Where the helper's local proxy listens."><input type="number" min={1024} max={65535} value={form.port} onChange={e=>edit({port:+e.target.value})}/></Field>
           <Field label="Parallel tunnels" hint="Each tunnel has its own WARP identity (1–4)."><input type="number" min={1} max={4} value={form.pool} onChange={e=>edit({pool:+e.target.value})}/></Field>
           <Field label="Rotate identity every (minutes)" hint="0 keeps the same identity until you ask for a new one."><input type="number" min={0} value={form.rotateMinutes} onChange={e=>edit({rotateMinutes:+e.target.value})}/></Field>
+          <Field label="MASQUE endpoint (optional)" hint="Leave empty to try Cloudflare's HTTP/2 endpoints automatically. Override only if your network needs a specific address."><input value={form.endpoint} placeholder="162.159.198.183" onChange={e=>edit({endpoint:e.target.value})}/></Field>
+          <Field label="Helper path (optional)" hint={s.helper.path?`Using ${s.helper.path}`:'Bundled with Polygate. Set only to use another build.'}><input value={form.helperPath} placeholder="Auto (bundled)" onChange={e=>edit({helperPath:e.target.value})}/></Field>
         </div>
         <Toggle checked={form.engine!=='disabled'} onChange={v=>edit({engine:v?'embedded':'disabled'})} label="WARP enabled" detail="Turn it off to stop using WARP altogether."/>
         <Toggle checked={form.autoStart} onChange={v=>edit({autoStart:v})} label="Connect when Polygate starts" detail="Brings WARP up automatically after a restart or reboot."/>

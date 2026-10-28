@@ -39,7 +39,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:r})+'\\n');}})
 beforeAll(async () => {
   savedToken = process.env.POLYGATE_ADMIN_TOKEN; process.env.POLYGATE_ADMIN_TOKEN = 'mcp-test-secret';
   dir = mkdtempSync(path.join(os.tmpdir(), 'polygate-mcp-')); writeFileSync(path.join(dir, 'server.js'), stdioScript);
-  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' }; settings.mcp = { enabled: true, builtin: true, servers: [] };
+  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' }; settings.mcp = { enabled: true, builtin: true, servers: [] };
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => { settings.mcp = { enabled: true, builtin: true, servers: [] }; await gateway?.close(); fixture.stop(true); for (const c of sseClients) try { c.close(); } catch { /* closed */ } if (savedToken === undefined) delete process.env.POLYGATE_ADMIN_TOKEN; else process.env.POLYGATE_ADMIN_TOKEN = savedToken; rmSync(dir, { recursive: true, force: true }); });

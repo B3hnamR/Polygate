@@ -66,6 +66,10 @@
         "to": "bin/bun.exe"
       },
       {
+        "from": "resources/warp",
+        "to": "warp"
+      },
+      {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
       },

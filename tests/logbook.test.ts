@@ -10,7 +10,7 @@ const post = (p: string, body: unknown = {}) => fetch(base + p, { method: 'POST'
 
 beforeAll(async () => {
   savedToken = process.env.POLYGATE_ADMIN_TOKEN; process.env.POLYGATE_ADMIN_TOKEN = 'logbook-test-secret';
-  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' };
+  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => { await gateway?.close(); if (savedToken === undefined) delete process.env.POLYGATE_ADMIN_TOKEN; else process.env.POLYGATE_ADMIN_TOKEN = savedToken; });
