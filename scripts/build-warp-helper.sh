@@ -14,19 +14,14 @@ case "$OUT" in
   *) OUT="$PWD/$OUT" ;;
 esac
 PATCH="$PWD/resources/warp/usque.patch"
-command -v go >/dev/null || { echo 'build-warp-helper.sh needs Go 1.26.3 or newer on PATH.' >&2; exit 1; }
+command -v go >/dev/null || { echo 'build-warp-helper.sh needs Go on PATH.' >&2; exit 1; }
 [ -f "$PATCH" ] || { echo "Missing $PATCH" >&2; exit 1; }
+# The committed binaries were built with one Go release; another release produces different bytes, so a rebuild would not match
+# sha256.txt. Set GO_VERSION to rebuild with a different release on purpose, then commit the new binaries and hashes.
+GO_VERSION=${GO_VERSION:-1.27.2}
 go_version=$(go env GOVERSION | sed 's/^go//')
-# sort -V is GNU-only (absent on macOS); compare the three numeric parts with POSIX awk instead.
-if ! awk -v have="$go_version" -v need='1.26.3' 'BEGIN {
-  split(have, h, "."); split(need, n, ".")
-  for (i = 1; i <= 3; i++) {
-    if ((h[i] + 0) > (n[i] + 0)) exit 0
-    if ((h[i] + 0) < (n[i] + 0)) exit 1
-  }
-  exit 0
-}'; then
-  echo "Go 1.26.3 or newer is required (found $go_version)." >&2; exit 1
+if [ "$go_version" != "$GO_VERSION" ]; then
+  echo "Go $GO_VERSION is required to reproduce the bundled binaries (found $go_version). Install it, or run with GOTOOLCHAIN=go$GO_VERSION so Go fetches it." >&2; exit 1
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/polygate-usque.XXXXXXXX")

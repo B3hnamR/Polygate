@@ -265,13 +265,19 @@ export async function warpInstall() {
   if (!helper) throw new GatewayError('The WARP helper is not bundled with this build. Put the platform helper in the app\'s warp folder, set its path in WARP settings, or run scripts/build-warp-helper.sh.', 503, 'warp_not_installed');
   progress(100, 'installed', 'WARP helper found'); return { installed: true, ...await warpStatus() };
 }
+// The helper is a program Polygate starts, so only the Windows app or the server's admin token may point it somewhere else; a dashboard
+// session (anyone who knows the dashboard password) may only leave it as it is.
+export function checkHelperPath(requested: unknown, allowed: boolean) {
+  if (requested === undefined || allowed || String(requested || '') === warpConfig().helperPath) return;
+  throw new GatewayError('The WARP helper program can be changed in the Windows app, or on a server with the admin token, not from a dashboard session.', 403, 'forbidden');
+}
 export async function setWarpSettings(patch: Partial<WarpSettings>, port?: number) {
   const next = { ...warpConfig(), ...patch };
   if (!['embedded', 'disabled'].includes(next.engine)) throw new GatewayError('Unknown WARP setting', 400);
   next.pool = Math.max(1, Math.min(4, Math.floor(Number(next.pool) || 1))); next.rotateMinutes = Math.max(0, Math.min(10080, Math.floor(Number(next.rotateMinutes) || 0)));
   next.helperPath = String(next.helperPath || '').slice(0, 500);
   next.endpoint = String(next.endpoint || '').trim().slice(0, 200);
-  if (next.endpoint && !/^[A-Za-z0-9.:[\]-]+$/.test(next.endpoint)) throw new GatewayError('The MASQUE endpoint must be a hostname or IP address', 400);
+  if (next.endpoint && !net.isIPv4(next.endpoint)) throw new GatewayError('The MASQUE endpoint must be an IPv4 address such as 162.159.198.183', 400);
   if (port !== undefined) {
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new GatewayError('The SOCKS port must be between 1024 and 65535', 400);
     // Running helpers listen on the old ports: the managed route still picks warpTarget(), but the dashboard and the saved

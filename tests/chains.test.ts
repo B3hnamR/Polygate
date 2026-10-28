@@ -23,7 +23,7 @@ const fresh = (id: string, over: Partial<{ cooldownUntil: number; state: 'unchec
 const reset = () => { asked = []; for (const id of ['gone', 'blocked', 'busy', 'badrequest', 'fine', 'second']) fresh(id); };
 beforeAll(async () => {
   savedProviders = settings.providers; savedChains = settings.chains;
-  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, wireproxyPath: '' };
+  settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
   settings.providers = [{ id: 'chain', name: 'Chain upstream', kind: 'openai', enabled: true, baseUrl: `http://127.0.0.1:${upstream.port}/v1`, apiKey: '', models: [], routeId: 'direct' }];
   settings.chains = [];
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;

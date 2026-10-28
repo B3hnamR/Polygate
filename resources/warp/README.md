@@ -35,7 +35,7 @@ From a source checkout, rebuild them with:
 GOPROXY=https://proxy.golang.org,direct ./scripts/build-warp-helper.sh
 ```
 
-The script needs Go 1.26.3 or newer and replaces the binaries and `sha256.txt`.
+The script needs exactly Go 1.27.2 (the release the bundled binaries were built with; another release gives different bytes, so the hashes would not match). Run it with `GOTOOLCHAIN=go1.27.2` if that is not your installed version. It replaces the binaries and `sha256.txt`. Set `GO_VERSION` to rebuild with another release on purpose, then commit the new binaries and hashes.
 It clones tag `v4.2.1`, then refuses to build unless `HEAD` is the commit above,
 so a moved or re-tagged release cannot silently change the bundled binaries.
 Packaged builds ship the binaries, license, patch, and this README. The rebuild
