@@ -35,9 +35,9 @@ export function ExitPass({data,metrics,onManage}:{data:Snapshot;metrics?:Metrics
     </div>
     <div className="pass-stub">
       <div><strong className="pass-count">{count(metrics,r).toLocaleString()}</strong><span>requests in 24 h</span></div>
-      <div><span>{info?.label||'Not tested'}</span><strong className="pass-state">{info?.detail||(r.latency?ms(r.latency):'—')}</strong></div>
+      {/* A used-up exit is stamped on its stub, where the stamp says what the status text would. */}
+      {usedUp(r)?<Stamp until={r.exhaustedUntil!} refused={r.status?.startsWith('Refused')}/>:<div><span>{info?.label||'Not tested'}</span><strong className="pass-state">{info?.detail||(r.latency?ms(r.latency):'—')}</strong></div>}
     </div>
-    {usedUp(r)&&<Stamp until={r.exhaustedUntil!} refused={r.status?.startsWith('Refused')}/>}
   </article>;
 }
 

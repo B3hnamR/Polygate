@@ -312,16 +312,16 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .stamp-ink{color:var(--stamp)}
 
 .pass-lead{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,1fr);gap:30px;align-items:start;margin-bottom:30px}
-.pass{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 168px;background:var(--stock-1);border-radius:8px;box-shadow:var(--rest);color:var(--text)}
+.pass{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 188px;background:var(--stock-1);border-radius:8px;box-shadow:var(--rest);color:var(--text)}
 .pass-body{padding:24px 28px 22px;min-width:0}
-.pass-name{font:700 52px/1 var(--display);letter-spacing:.002em;overflow-wrap:anywhere}
+.pass-name{font:700 clamp(38px,3.6vw,52px)/1 var(--display);letter-spacing:.002em;overflow-wrap:anywhere}
 .pass-where{color:var(--text-secondary);font-size:16px;margin-top:8px;overflow-wrap:anywhere}
 .pass-stub{border-left:2px dashed color-mix(in srgb,var(--text) 34%,transparent);padding:24px 20px 22px;display:flex;flex-direction:column;justify-content:space-between;gap:18px;position:relative}
 .pass-stub::before,.pass-stub::after{content:"";position:absolute;left:-12px;width:22px;height:22px;border-radius:50%;background:var(--canvas)}
 .pass-stub::before{top:-11px}.pass-stub::after{bottom:-11px}
 .pass-stub span{display:block;font-size:14.5px;color:var(--text-secondary);line-height:1.35}
 .pass-count{display:block;font:700 56px/.95 var(--display);font-variant-numeric:tabular-nums}
-.pass-state{display:block;font:700 19px/1.2 var(--display);margin-top:3px}
+.pass-state{display:block;font:600 15px/1.35 var(--font);margin-top:3px;overflow-wrap:anywhere}
 .pass-missing{grid-template-columns:1fr}.pass-missing .button{margin-top:16px}
 .punches{margin-top:22px;display:grid;grid-template-columns:repeat(24,minmax(0,1fr));gap:4px;align-items:center}
 .punches i{aspect-ratio:1;border-radius:50%;box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--text) 22%,transparent);display:grid;place-items:center}
@@ -333,8 +333,8 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .pass-facts b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
 
 .stamp{position:absolute;right:16px;bottom:16px;transform:rotate(-7deg);border:2.5px solid var(--stamp);color:var(--stamp);border-radius:5px;padding:5px 10px 6px;text-align:center;font:900 16px/1.1 var(--stamp-font);letter-spacing:.03em;pointer-events:none;animation:stamp-in .5s cubic-bezier(.16,1,.3,1)}
-.stamp small{display:block;font:700 12.5px/1.25 var(--display);letter-spacing:.06em}
-.pass .stamp{right:200px;bottom:20px;font-size:20px}
+.stamp small{display:block;font:700 12.5px/1.25 var(--display);letter-spacing:.05em;white-space:nowrap}
+.pass-stub .stamp{position:relative;right:auto;bottom:auto;align-self:flex-start;margin:0 0 4px -4px;font-size:18px}
 @keyframes stamp-in{from{transform:rotate(-7deg) scale(1.35);opacity:0}to{transform:rotate(-7deg) scale(1);opacity:1}}
 
 .next-line h2{margin-bottom:12px}
@@ -377,7 +377,7 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 
 @media(max-width:1180px){.pass-lead{grid-template-columns:1fr}}
 @media(max-width:850px){.sidebar{width:68px;padding:23px 0 0 8px}main{margin-left:68px}.nav-item{justify-content:center;padding:14px 10px}.workspace-label,.local-status{margin-right:8px}}
-@media(max-width:700px){.pass{grid-template-columns:1fr}.pass-stub{border-left:0;border-top:2px dashed color-mix(in srgb,var(--text) 34%,transparent);flex-direction:row;align-items:flex-end}.pass-stub::before{left:-11px;top:-12px}.pass-stub::after{left:auto;right:-11px;top:-12px;bottom:auto}.pass-name{font-size:40px}.pass .stamp{right:16px;bottom:auto;top:16px}.route-ticket{grid-template-columns:1fr}.route-ticket.used .row-actions{margin-right:0}.route-ticket .stamp{top:16px;margin-top:0}}
+@media(max-width:700px){.pass{grid-template-columns:1fr}.pass-stub{border-left:0;border-top:2px dashed color-mix(in srgb,var(--text) 34%,transparent);flex-direction:row;align-items:flex-end}.pass-stub::before{left:-11px;top:-12px}.pass-stub::after{left:auto;right:-11px;top:-12px;bottom:auto}.pass-name{font-size:40px}.pass-stub .stamp{margin:0 0 4px auto}.route-ticket{grid-template-columns:1fr}.route-ticket.used .row-actions{margin-right:0}.route-ticket .stamp{top:16px;margin-top:0}}
 @media(prefers-reduced-motion:reduce){.stamp{animation:none}.route-ticket{transition:none}}
 .backup-list{gap:0;border-top:1.5px solid var(--line-strong)}
 .backup-list li{border:0;border-bottom:1px solid var(--line);border-radius:0;padding:12px 0;background:transparent}
