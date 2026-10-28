@@ -45,6 +45,6 @@ test('with Direct off, MCP uses another route that can carry it, never a relay',
 });
 
 test('a provider pinned to Direct keeps it on: Direct is not switched off from under it', async () => {
-  proxy('do-d'); settings.routeId = 'do-d'; settings.providers = savedProviders.map((p, i) => ({ ...p, routeId: i === 0 ? 'direct' : '' }));
+  proxy('do-d'); settings.routeId = 'do-d'; settings.providers = [{ id: 'do-pinned', name: 'Pinned', kind: 'openai', enabled: true, baseUrl: 'http://127.0.0.1:1/v1', apiKey: '', models: [], routeId: 'direct' }];
   const r = await toggle('direct', false); expect(r.status).toBe(409); expect(r.body.error.message).toContain('Select another route');
 });
