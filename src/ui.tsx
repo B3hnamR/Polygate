@@ -4,10 +4,10 @@ import {api} from './api';
 import type {LogRow,Model,Settings} from '../backend/types';
 export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
 // The Polygate mark (assets/logo.svg): a hexagon with a lit gate archway. Gradient ids are unique per instance so several can share a page.
-// The mark takes the colour of the text around it; the gate opening shows the ground it sits on (the sidebar sets --logo-door).
+// The same Night sea mark as the app icon and favicon (assets/logo.svg).
 export function Logo({size=36}:{size?:number}){
   return <svg width={size} height={size} viewBox="0 0 256 256" role="img" aria-label="Polygate">
-    <polygon points="128.0,33.1 210.2,80.5 210.2,175.5 128.0,222.9 45.8,175.5 45.8,80.5" fill="currentColor" stroke="currentColor" strokeWidth="40" strokeLinejoin="round"/><path d="M86 190V124A42 42 0 0 1 170 124V190Z" style={{fill:'var(--logo-door,var(--canvas))'}}/><path d="M99 190V124A29 29 0 0 1 157 124V190Z" fill="currentColor" opacity=".55"/></svg>;
+    <polygon points="128.0,33.1 210.2,80.5 210.2,175.5 128.0,222.9 45.8,175.5 45.8,80.5" fill="#5c8374" stroke="#5c8374" strokeWidth="40" strokeLinejoin="round"/><path d="M86 190V124A42 42 0 0 1 170 124V190Z" fill="#040d12"/><path d="M99 190V124A29 29 0 0 1 157 124V190Z" fill="#93b1a6"/></svg>;
 }
 export const ms=(n:number)=>n?`${Math.round(n).toLocaleString()} ms`:'—';
 export const time=(n:number)=>new Date(n).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});

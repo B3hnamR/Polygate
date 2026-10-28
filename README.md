@@ -3,9 +3,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/Polygate/releases/latest"><img src="https://img.shields.io/github/v/release/B3hnamR/Polygate?color=5eead4&label=release" alt="Latest release"></a>
+  <a href="https://github.com/B3hnamR/Polygate/releases/latest"><img src="https://img.shields.io/github/v/release/B3hnamR/Polygate?color=5c8374&label=release" alt="Latest release"></a>
   <a href="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml"><img src="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml/badge.svg" alt="Build and tests"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-7c9cff" alt="MIT license"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-183d3d" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20Docker-94a3b8" alt="Windows, Linux, and Docker">
 </p>
 
@@ -18,12 +18,9 @@
 
 <p align="center">
   <a href="#quick-start"><b>Install Polygate</b></a> ·
-  <a href="#dashboard-showcase">See the dashboard</a> ·
   <a href="#connect-your-client">Connect a client</a> ·
   <a href="https://github.com/B3hnamR/Polygate/releases/latest">Downloads</a>
 </p>
-
-![Polygate overview on a Linux server: 30 requests at a 100% success rate, with connection details, gateway activity, model health, and performance](assets/screenshots/overview.png)
 
 ## Why Polygate?
 
@@ -138,37 +135,6 @@ docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
 ```
 
 This also publishes ports 80 and 443. Enable HTTPS in **Settings**; both ports must be free and reachable. For an existing reverse proxy, keep the default Compose file and forward requests to Polygate.
-
-</details>
-
-## Dashboard showcase
-
-Real screenshots. The overview at the top is from **Polygate v0.3.2 running on a Linux server**; the views below are from v0.2.1 running in WSL. Model availability and activity reflect each workspace at capture time. Credentials stay hidden; server and private relay addresses are masked.
-
-### Find a model and set its priority
-
-See both providers in one catalog, check availability, compare latency, and choose which models run first.
-
-![Model catalog showing providers, availability, capabilities, latency, and priority controls](assets/screenshots/models.png)
-
-### Try a request before configuring your tools
-
-Choose a model (or one of your chains) and a protocol, add a system instruction, and read the streamed response beside your request. Keep the conversation going, compare two models side by side, see the model's thinking and tool calls, check speed and token figures, and copy the request as curl, Python or JavaScript.
-
-<details>
-<summary><b>More views: providers, relays, and mobile</b></summary>
-
-**Providers** — built-in free providers and your own compatible endpoints.
-
-![Providers page showing OpenCode Free and Kilo Free](assets/screenshots/providers.png)
-
-**Relays** — deploy to your own account, test the connection, and select a route.
-
-![Relays page with Vercel, Netlify, and Cloudflare deployment options](assets/screenshots/relays.png)
-
-**Mobile** — check your gateway from a smaller screen.
-
-<p align="center"><img src="assets/screenshots/mobile.png" alt="Polygate overview on a mobile viewport" width="360"></p>
 
 </details>
 
