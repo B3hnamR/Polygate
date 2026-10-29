@@ -22,6 +22,8 @@ const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
   return new Response(data.map(x=>'data: '+JSON.stringify(x)+'\n\n').join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
 }});
 beforeAll(async()=>{
+  // These tests cover the model pause, which is off by default: switch it on for this file.
+  settings.cooldowns=true;
   // Do not discover or borrow a WARP listener belonging to another local app/test session.
   settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,helperPath:'',endpoint:''};
   settings.providers=[{id:'mock',name:'Mock upstream',kind:'openai',enabled:true,baseUrl:`http://127.0.0.1:${upstream.port}/v1`,apiKey:'upstream-secret',models:[],routeId:'direct'}];

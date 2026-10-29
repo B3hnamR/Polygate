@@ -26,6 +26,7 @@ beforeAll(async () => {
   settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' };
   settings.providers = [{ id: 'chain', name: 'Chain upstream', kind: 'openai', enabled: true, baseUrl: `http://127.0.0.1:${upstream.port}/v1`, apiKey: '', models: [], routeId: 'direct' }];
   settings.chains = [];
+  settings.cooldowns = true; // chains skip paused models; the pause is off by default, so switch it on here
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => { settings.providers = savedProviders; settings.chains = savedChains; await gateway?.close(); upstream.stop(true); });

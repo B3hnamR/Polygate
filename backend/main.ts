@@ -2,7 +2,7 @@ import type { IncomingMessage } from 'node:http';
 import path from 'node:path';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { settings, models, stateDir, equal, redactError } from './state';
+import { settings, models, stateDir, equal, redactError, saveModel } from './state';
 import { admin } from './admin';
 import { GatewayError } from './queue';
 import { inference, clientKey, readJson, json, probeModel, queue, readiness } from './gateway';
@@ -27,6 +27,8 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
   if(!process.env.POLYGATE_ADMIN_TOKEN)writeFileSync(path.join(stateDir,'admin-token'),token,{mode:0o600});
   const password=ensureAdminPassword(token);
   await initBridge();
+  // Model pauses are off unless switched on: a pause saved by an earlier version is released at start, so it cannot outlast the setting.
+  if(settings.cooldowns!==true)for(const m of models.values())if(m.cooldownUntil||m.state==='cooldown'){m.cooldownUntil=0;m.failCount=0;if(m.state==='cooldown')m.state='unchecked';saveModel(m);}
   // The admin token (root-only file on a server) is what the local manager signs in with; dashboard sessions use the password.
   const authed=(req:IncomingMessage)=>{const bearer=String(req.headers.authorization||'').replace(/^Bearer\s+/i,'');if(!!bearer&&equal(bearer,token)){(req as any).polygateManager=true;return true;}return sessionValid(readSession(req));};
   const handler=async(req:IncomingMessage,res:any)=>{

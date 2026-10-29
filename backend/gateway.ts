@@ -43,7 +43,7 @@ function chosenModels(requested:string,key?:ApiKey){
   const exact=models.get(requested)||all.find(m=>m.upstreamId===requested);if(!exact)throw new GatewayError('Unknown model. Use a model from /v1/models.',404,'model_not_found');
   if(!providerEnabled(exact))throw new GatewayError('Model belongs to a disabled or removed provider. Enable it in Providers.',404,'model_not_found');
   if(key&&!modelAllowed(key,exact.id))throw new GatewayError('This API key is not allowed to use that model',403,'permission_error');
-  if(exact.cooldownUntil>Date.now()){const p=pausedModel(exact.id,exact.cooldownUntil,settings.cooldowns!==false);throw new GatewayError(p.message,429,'model_paused',p.retryAfter);}return [exact];
+  if(exact.cooldownUntil>Date.now()){const p=pausedModel(exact.id,exact.cooldownUntil,settings.cooldowns===true);throw new GatewayError(p.message,429,'model_paused',p.retryAfter);}return [exact];
 }
 // Logs a model's change of health (not every check): now usable, resting until a time, or gone from its provider.
 function logModelChange(m:Model,before:{state:string;cooldownUntil:number},status:number){
@@ -54,7 +54,7 @@ function logModelChange(m:Model,before:{state:string;cooldownUntil:number},statu
 }
 export function classifyModel(m:Model,status:number,message:string,latency:number,retryAfter=0){const before={state:m.state,cooldownUntil:m.cooldownUntil};m.checkedAt=Date.now();m.latency=latency;m.error=status<400?'':redactError(message);const wait=Number.isFinite(retryAfter)?retryAfter:0;
   if(status<400){m.state='available';m.failCount=0;m.cooldownUntil=0;}
-  else if(settings.cooldowns===false&&(status===429||status>=500||/quota|capacity|rate.?limit/i.test(message)||status===403)){m.state='unchecked';m.cooldownUntil=0;}
+  else if(settings.cooldowns!==true&&(status===429||status>=500||/quota|capacity|rate.?limit/i.test(message)||status===403)){m.state='unchecked';m.cooldownUntil=0;}
   else if(status===429||/quota|capacity|rate.?limit/i.test(message)){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+Math.max(wait, m.failCount<=1?(m.providerId===KILO_ID?KILO_MODEL_PAUSE_MS:15*60000):m.failCount<=3?3600000:21600000);}
   else if(status===404||status===410){m.state='unavailable';}
   else if(status>=500||status===403){m.state='cooldown';m.failCount++;m.cooldownUntil=Date.now()+60000;}
@@ -135,7 +135,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const aborted=controller.signal.aborted;const reason:any=controller.signal.reason;const gateway=aborted&&reason instanceof GatewayError?reason:undefined;
     status=aborted?(gateway?.status??499):(e.status||502);message=redactError(aborted?(reason?.message||e.message||'Request cancelled'):(e.message||String(e)));
     // What the client reads is a plain sentence with the reset time and next steps; the provider's own answer stays in the request record.
-    upstreamMessage=message;let nice=aborted?undefined:explainError({status,type:gateway?.type||e.type,message,model:used.id,route,switches,exhausted,confirmedClean,cooldownsEnabled:settings.cooldowns!==false,requestBytes:Number(clientShape.body?.bytes)||undefined,messages:Number(clientShape.body?.messages)||undefined});
+    upstreamMessage=message;let nice=aborted?undefined:explainError({status,type:gateway?.type||e.type,message,model:used.id,route,switches,exhausted,confirmedClean,cooldownsEnabled:settings.cooldowns===true,requestBytes:Number(clientShape.body?.bytes)||undefined,messages:Number(clientShape.body?.messages)||undefined});
     if(nice)message=nice.message;
     if(!res.headersSent){const wait=nice?.retryAfter||e.retryAfter;if(retryAfter&&!nice?.retryAfter)res.setHeader('Retry-After',retryAfter);else if(wait)res.setHeader('Retry-After',String(wait));const type=gateway?.type||e.type;const body={type:nice?.code||type||(protocol==='anthropic'?'api_error':'gateway_error'),message,...(nice?{code:nice.code,...nice.extra}:{})};json(res,status,protocol==='anthropic'?{type:'error',error:body}:{error:body});}else if(!res.writableEnded)res.end();
   }
@@ -143,7 +143,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     let detail:string|undefined;
     if(tried){try{
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
-      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns!==false,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
+      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
     const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});
     logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
