@@ -177,13 +177,17 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(String(b.id));if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);for(const p of settings.providers)if(p.routes?.ids.includes(String(b.id))){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==b.id)};p.routeId=p.routes.ids[0]||'';}persist();return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
   // Reads the plan of a Vercel account (Hobby allows one function region per project; Pro up to five) before anything is deployed. The token is not kept.
-  if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(String(b.token||''),b.teamId?String(b.teamId):undefined));}
-  // One-click relay: deploys the bundled template with the platform's API token (used for this call only, never saved), then saves the relay as a route.
+  // A Vercel token the user chose to remember (b.useSaved) is read from the encrypted settings here and never sent to the dashboard.
+  const deployToken=(b:any)=>{if(b.useSaved!==true||b.platform!=='vercel')return String(b.token||'');const saved=settings.deployTokens?.vercel;if(!saved)throw new GatewayError('No Vercel token is saved. Paste a token to continue.',400);return saved;};
+  if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(deployToken(b),b.teamId?String(b.teamId):undefined));}
+  if(pathname==='/admin/relays/token/forget'&&method==='POST'){delete settings.deployTokens;persist();return json(res,200,{ok:true});}
+  // One-click relay: deploys the bundled template with the platform's API token, then saves the relay as a route.
+  // The token is used for this call only and not saved, unless the user ticked "remember": then a Vercel token that was just accepted is kept in the encrypted settings.
   if(pathname==='/admin/relays/deploy'&&method==='POST'){
-    const b=await readJson(req);const r=await deployRelay({platform:b.platform,token:String(b.token||''),name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:b.accountId?String(b.accountId):undefined});
+    const b=await readJson(req);const token=deployToken(b);const r=await deployRelay({platform:b.platform,token,name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:b.accountId?String(b.accountId):undefined});
     const label={netlify:'Netlify',cloudflare:'Cloudflare',vercel:'Vercel'}[r.platform];
     const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${label} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{}),...(r.only?{only:r.only}:{})};
-    settings.routes.push(route);persist();
+    settings.routes.push(route);if(b.remember===true&&r.platform==='vercel')settings.deployTokens={...settings.deployTokens,vercel:token.trim()};persist();
     return json(res,200,{ok:true,id:route.id,name:r.name,url:r.url,platform:r.platform,runtime:r.runtime,region:r.region,only:r.only,reachable:r.reachable,status:r.status,detail:r.detail});
   }
   // --- Cloudflare WARP ---
