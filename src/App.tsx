@@ -5,6 +5,7 @@ import {useUpdates,UpdateBanner,UpdatesPanel} from './updates';
 import {DesktopPanel,useDesktopView} from './desktop';
 import {MiniView} from './mini';
 import {LogsPage} from './logs';
+import {UsagePage} from './usage';
 import {McpPage} from './mcp';
 import {ChainsPage} from './chains';
 import {Playground} from './playground';
@@ -13,13 +14,13 @@ import {api,at,BASE,hasToken,dropToken} from './api';
 import {Login,NotificationsMenu,WarpPanel,PoolPanel,KeysPanel,SecurityPanel,NotifySettings,HttpsPanel,MetricsPanel,RequestDetail,type Notice} from './panels';
 import type {Model,Settings,LogRow,Provider,Route as NetworkRoute} from '../backend/types';
 
-type Page='Overview'|'Models'|'Chains'|'Providers'|'Proxies'|'Relays'|'Routing'|'MCP'|'Playground'|'Requests'|'Logs'|'Settings'|'Guide';
-const navigation:{name:Page;icon:any}[]=[{name:'Overview',icon:Layers3},{name:'Models',icon:Box},{name:'Chains',icon:ListOrdered},{name:'Providers',icon:Server},{name:'Proxies',icon:Globe},{name:'Relays',icon:Radio},{name:'Routing',icon:Workflow},{name:'MCP',icon:Plug},{name:'Playground',icon:Terminal},{name:'Requests',icon:Activity},{name:'Logs',icon:ScrollText}];
-const descriptions:Record<Page,string>={Overview:'Your models. One local endpoint.',Models:'Discover, check, and prioritize the models your clients can use.',Chains:'Name a list of models. Clients ask for it and Polygate tries them in your order.',Providers:'Choose where model requests are executed.',Proxies:'Find a working route. Keep the good ones.',Relays:'Connect an edge relay using the shared forwarding contract.',Routing:'Control exactly how requests leave this machine.',Playground:'Make a real request through your gateway.',Requests:'Request outcomes and timing. Prompts stay out of the log.',Logs:'Everything the gateway did, searchable and filterable.',MCP:'One MCP address for all your tool servers, through your own routes.',Settings:'Local credentials, limits, and application preferences.',Guide:'A map of your local gateway.'};
+type Page='Overview'|'Models'|'Chains'|'Providers'|'Proxies'|'Relays'|'Routing'|'MCP'|'Playground'|'Requests'|'Usage'|'Logs'|'Settings'|'Guide';
+const navigation:{name:Page;icon:any}[]=[{name:'Overview',icon:Layers3},{name:'Models',icon:Box},{name:'Chains',icon:ListOrdered},{name:'Providers',icon:Server},{name:'Proxies',icon:Globe},{name:'Relays',icon:Radio},{name:'Routing',icon:Workflow},{name:'MCP',icon:Plug},{name:'Playground',icon:Terminal},{name:'Requests',icon:Activity},{name:'Usage',icon:BarChart3},{name:'Logs',icon:ScrollText}];
+const descriptions:Record<Page,string>={Overview:'Your models. One local endpoint.',Models:'Discover, check, and prioritize the models your clients can use.',Chains:'Name a list of models. Clients ask for it and Polygate tries them in your order.',Providers:'Choose where model requests are executed.',Proxies:'Find a working route. Keep the good ones.',Relays:'Connect an edge relay using the shared forwarding contract.',Routing:'Control exactly how requests leave this machine.',Playground:'Make a real request through your gateway.',Requests:'Request outcomes and timing. Prompts stay out of the log.',Usage:'How much you used, day by day, for as long as a year.',Logs:'Everything the gateway did, searchable and filterable.',MCP:'One MCP address for all your tool servers, through your own routes.',Settings:'Local credentials, limits, and application preferences.',Guide:'A map of your local gateway.'};
 import {useConfirm} from './confirm';
 import {ProviderRoutesDialog,providerRouteText,usedByText} from './provider-routes';
 import {ProviderEditDialog} from './provider-edit';
-import {Pencil} from 'lucide-react';
+import {Pencil,BarChart3} from 'lucide-react';
 import {Logo,ms,time,statusState,tickWhileVisible,usePoll,Button,Badge,Empty,Field,Toggle,Select,Logs,type Snapshot} from './ui';
 import {ExitPass,NextInLine,ExitTickets,Stamp,usedUp,exitWhere,type Metrics} from './daypass';
 
@@ -65,6 +66,7 @@ export function App(){
         {(page==='Relays'||page==='Routing')&&<Routes data={data} act={act} action={action} pending={pending} relayOnly={page==='Relays'} notice={setNotice} refresh={refresh} go={setPage}/>}
         {page==='Playground'&&<Playground data={data} apiKey={key} model={selectedModel} setModel={setSelectedModel} refresh={refresh} notice={setNotice}/>}
         {page==='Requests'&&<RequestPage data={data} act={act}/>}
+        {page==='Usage'&&<UsagePage/>}
         {page==='Logs'&&<LogsPage/>}
         {page==='MCP'&&<McpPage data={data} copy={copy} notice={setNotice}/>}
         {page==='Settings'&&<><UpdatesPanel updates={updates}/><DesktopPanel/><Preferences data={data} act={act} copy={copy} pending={pending} notice={setNotice} refresh={refresh} onSignedOut={signOut}/></>}

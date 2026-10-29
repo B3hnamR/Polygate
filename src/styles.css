@@ -402,3 +402,9 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .batch-row .batch-head{display:flex;gap:8px;align-items:center}.batch-row.done{border-color:var(--green)}.batch-row.failed{border-color:var(--red)}.batch-row.skipped{opacity:.6}
 .batch-state{color:var(--text-secondary)}.batch-row.failed .batch-state{color:var(--red)}.batch-row.done .batch-state{color:var(--green)}.batch-error{margin:0;color:var(--red)}
 .saved-token>div{min-width:0;flex:1}.saved-token .token-row{margin-top:10px;justify-content:flex-start;flex-wrap:wrap}.saved-token+.token-row{margin-top:0}
+.usage-page{display:flex;flex-direction:column;gap:20px}.usage-controls{display:flex;gap:10px}.usage-range{display:flex;gap:6px;flex-wrap:wrap}
+.usage-chart-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:6px 21px 0}
+.usage-bars{height:150px;gap:2px}.usage-axis{display:flex;justify-content:space-between;margin:-10px 21px 18px;font-size:12px;color:var(--text-secondary)}
+.metric-line small{display:block;font-size:12px;color:var(--text-secondary)}
+.share-bar{display:block;width:100%;min-width:80px;height:8px;border-radius:4px;background:var(--surface-raised)}.share-bar i{display:block;height:100%;border-radius:4px;background:var(--accent)}
+.usage-spark{color:var(--accent);width:110px}.spark{display:block}

@@ -11,7 +11,7 @@ import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
 import { deployRelay, inspectVercel } from './relay-deploy';
-import { metrics } from './metrics';
+import { metrics, usage } from './metrics';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig } from './auth';
@@ -104,6 +104,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/updates/check'&&method==='POST'){await readJson(req);return json(res,200,await checkForUpdates(true));}
   if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
+  if(pathname==='/admin/usage'&&method==='GET')return json(res,200,usage(Number(new URL(req.url||'/','http://x').searchParams.get('days'))));
   if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
   if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));
   if(pathname==='/admin/events/export'&&method==='GET'){

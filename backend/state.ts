@@ -66,6 +66,10 @@ db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS models (id TEXT PRI
 if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='fault'))db.exec('ALTER TABLE requests ADD COLUMN fault INTEGER NOT NULL DEFAULT 0; UPDATE requests SET fault=1 WHERE status>=500 OR status=429;');
 // detail is the request-shape record (sizes, counts, header names, upstream answer; no content) described in diagnostics.ts.
 if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='detail'))db.exec('ALTER TABLE requests ADD COLUMN detail TEXT;');
+// The request log keeps a week. This table keeps one row per day, model and route for 400 days, so usage over months stays on the Usage page.
+// Days are UTC days. A new table is filled from the requests that are still in the log.
+db.exec('CREATE TABLE IF NOT EXISTS usage_daily (day INTEGER NOT NULL, model TEXT NOT NULL, route TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0, ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model, route));');
+if (!(db.query('SELECT 1 FROM usage_daily LIMIT 1').get())) db.exec('INSERT INTO usage_daily (day,model,route,requests,errors,input,output,ms) SELECT time/86400000, model, route, COUNT(*), SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END), COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(ms),0) FROM requests GROUP BY time/86400000, model, route');
 export const models = new Map<string, Model>();
 for (const row of db.query('SELECT data FROM models').all() as {data: string}[]) { try { const m = JSON.parse(row.data); models.set(m.id, m); } catch { /* a damaged row is skipped; the next catalog refresh adds the model again */ } }
 export function saveModel(m: Model) { models.set(m.id, m); db.query('INSERT OR REPLACE INTO models VALUES (?,?)').run(m.id, JSON.stringify(m)); }
@@ -73,7 +77,8 @@ export function removeModels(providerId: string) { for (const [id, m] of models)
 let lastPrune = 0;
 export function record(row: LogRow) {
   db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null);
-  if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
+  db.query('INSERT INTO usage_daily (day,model,route,requests,errors,input,output,ms) VALUES (?,?,?,1,?,?,?,?) ON CONFLICT(day,model,route) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 86400000), row.model, row.route || '', row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
+  if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM usage_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
     // A busy gateway can log far more than a week's worth in a day: the newest 100000 rows are the most that are kept.
     db.query('DELETE FROM requests WHERE time <= (SELECT time FROM requests ORDER BY time DESC LIMIT 1 OFFSET 100000)').run();
     // Failures keep their shape record for the whole retention window; successes only the latest 50, as a baseline to compare with.

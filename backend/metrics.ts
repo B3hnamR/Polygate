@@ -41,3 +41,16 @@ export function prometheus() {
   add('polygate_uptime_seconds', 'Process uptime.', 'counter', [['', m.uptimeSeconds]]);
   return lines.join('\n') + '\n';
 }
+// Usage over time from the daily summary (kept 400 days, unlike the request log). Days are UTC days; every day in the range is present, with zeros when idle.
+export function usage(rawDays: number) {
+  const days = [7, 30, 90, 365].includes(rawDays) ? rawDays : 30; const today = Math.floor(Date.now() / 86400000); const first = today - days + 1;
+  const base = rows('SELECT day, COALESCE(SUM(requests),0) n, COALESCE(SUM(errors),0) errors, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output, COALESCE(SUM(ms),0) ms FROM usage_daily WHERE day>=? GROUP BY day', first);
+  const daily = Array.from({ length: days }, (_, i) => { const r = base.find(x => Number(x.day) === first + i); return { day: (first + i) * 86400000, requests: Number(r?.n || 0), errors: Number(r?.errors || 0), input: Number(r?.input || 0), output: Number(r?.output || 0) }; });
+  const group = (column: 'model' | 'route') => {
+    const top = rows(`SELECT ${column} name, SUM(requests) n, SUM(errors) errors, SUM(input+output) tokens, SUM(ms) ms FROM usage_daily WHERE day>=? GROUP BY ${column} ORDER BY n DESC LIMIT 10`, first);
+    return top.map(t => { const per = rows(`SELECT day, SUM(requests) n FROM usage_daily WHERE day>=? AND ${column}=? GROUP BY day`, first, String(t.name)); const n = Number(t.n);
+      return { name: String(t.name) || '—', requests: n, errors: Number(t.errors), tokens: Number(t.tokens), avgMs: n ? Math.round(Number(t.ms) / n) : 0, daily: Array.from({ length: days }, (_, i) => Number(per.find(x => Number(x.day) === first + i)?.n || 0)) }; });
+  };
+  const requests = daily.reduce((s, d) => s + d.requests, 0); const busiest = daily.reduce((b, d) => d.requests > b.requests ? d : b, daily[0]);
+  return { days, daily, models: group('model'), routes: group('route'), totals: { requests, errors: daily.reduce((s, d) => s + d.errors, 0), input: daily.reduce((s, d) => s + d.input, 0), output: daily.reduce((s, d) => s + d.output, 0), activeDays: daily.filter(d => d.requests).length, busiestDay: busiest.requests ? busiest.day : 0, busiestRequests: busiest.requests } };
+}
