@@ -93,3 +93,17 @@ test('the local manager can reset the password of a running gateway; a dashboard
   const login = await fetch(base + '/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: next }) });
   expect(login.status).toBe(200);
 });
+
+test('editing a provider keeps its model prefix and its routes, and replaces or keeps the key as asked', async () => {
+  const made = await call('/admin/providers', { name: 'Editable', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'sk-first', idPrefix: 'editable', routes: { ids: ['direct'] } });
+  expect(made.status).toBe(200);
+  const sent = { id: 'editable', name: 'Renamed', kind: 'openai', enabled: true, baseUrl: 'http://127.0.0.1:9/v1', models: ['a', 'b'], routeId: 'direct', routes: { ids: ['direct'], spread: false, backups: false } };
+  const keep = await call('/admin/providers', { ...sent, apiKey: '••••••••' });
+  expect(keep.status).toBe(200);
+  let p = settings.providers.find(x => x.id === 'editable')!;
+  expect(p.name).toBe('Renamed'); expect(p.apiKey).toBe('sk-first'); expect(p.models).toEqual(['a', 'b']); expect(p.routes!.ids).toEqual(['direct']);
+  const replace = await call('/admin/providers', { ...sent, baseUrl: 'http://127.0.0.1:9/v2', apiKey: 'sk-second' });
+  expect(replace.status).toBe(200);
+  p = settings.providers.find(x => x.id === 'editable')!;
+  expect(p.apiKey).toBe('sk-second'); expect(p.baseUrl).toBe('http://127.0.0.1:9/v2'); expect(p.id).toBe('editable');
+});
