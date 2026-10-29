@@ -50,8 +50,17 @@ try {
     try { [IO.File]::Replace($incoming, $target, $backup, $true); $replaced = $true; break }
     catch { if ($attempt -eq 59) { throw }; Start-Sleep -Milliseconds 500 }
   }
-  [IO.File]::WriteAllText($config.resultPath, (@{ ok=$true; version=$config.version } | ConvertTo-Json -Compress))
-  if (!$NoLaunch) { Start-Process -FilePath $target -WorkingDirectory $targetDir }
+  # A portable build is named after its version (Polygate-0.5.1-Windows-x64.exe). After an update the file carries the new version, so its name does not
+  # claim an old one. Any other name is left alone, and so is a file that already has the new name; a failed rename keeps the old name.
+  $final = $target
+  $named = [regex]::Match([IO.Path]::GetFileName($target), '^(Polygate-)\d+\.\d+\.\d+(-Windows-x64\.exe)$', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($named.Success -and $config.version -match '^\d+\.\d+\.\d+$') {
+    $renamed = Join-Path $targetDir ($named.Groups[1].Value + $config.version + $named.Groups[2].Value)
+    if ($renamed -ne $target -and !(Test-Path -LiteralPath $renamed)) { try { Move-Item -LiteralPath $target -Destination $renamed; $final = $renamed } catch { $final = $target } }
+  }
+  [IO.File]::WriteAllText($config.resultPath, (@{ ok=$true; version=$config.version; path=$final } | ConvertTo-Json -Compress))
+  # The update is already in place; a launch that fails must not roll it back.
+  if (!$NoLaunch) { try { Start-Process -FilePath $final -WorkingDirectory $targetDir } catch { [Console]::Error.WriteLine('The update was installed but the app could not be started: ' + $_.Exception.Message) } }
   Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
   foreach ($file in @($staged, $configFile, (Join-Path $stageDir 'ready'), (Join-Path $stageDir 'launcher-error.log'), $PSCommandPath)) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
   Remove-Item -LiteralPath $stageDir -ErrorAction SilentlyContinue

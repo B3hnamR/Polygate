@@ -408,3 +408,6 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .metric-line small{display:block;font-size:12px;color:var(--text-secondary)}
 .share-bar{display:block;width:100%;min-width:80px;height:8px;border-radius:4px;background:var(--surface-raised)}.share-bar i{display:block;height:100%;border-radius:4px;background:var(--accent)}
 .usage-spark{color:var(--accent);width:110px}.spark{display:block}
+.backup-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:6px}.backup-grid h3{font-size:14px;color:var(--muted);font-weight:550;margin:0 0 8px}.backup-grid form{display:flex;flex-direction:column;gap:12px}.backup-grid input[type=password],.backup-grid input[type=file]{width:100%}
+.backup-panel .check-row input{width:15px;height:15px;flex:none;accent-color:var(--accent)}.backup-panel .dialog-note{margin-top:14px}
+@media(max-width:850px){.backup-grid{grid-template-columns:1fr}}

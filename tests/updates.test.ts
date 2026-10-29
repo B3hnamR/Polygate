@@ -167,6 +167,27 @@ describe('real Windows replacement helper', () => {
   }, 30000);
 });
 
+windowsTest('a portable executable named after its version is renamed to the new version, and any other name is left alone', () => {
+  const run = (name: string, version: string, existing?: string) => {
+    const directory = temporary('polygate-update-rename-'), staging = temporary('polygate-update-');
+    const target = path.join(directory, name), staged = path.join(staging, 'update.exe'), resultPath = path.join(directory, 'result.json'), configPath = path.join(staging, 'update.json');
+    writeFileSync(target, 'old executable'); writeFileSync(staged, bytes); if (existing) writeFileSync(path.join(directory, existing), 'someone else');
+    writeFileSync(configPath, JSON.stringify({ target, staged, expectedHash: sha, parentPid: 0, resultPath, version }));
+    const script = path.join(staging, 'apply-update.ps1'); writeFileSync(script, readFileSync(path.resolve('desktop/apply-update.ps1')));
+    try {
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-ConfigPath', configPath, '-NoLaunch'], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      return { files: readdirSync(directory).filter(f => f !== 'result.json').sort(), result: JSON.parse(readFileSync(resultPath, 'utf8')), directory, content: (f: string) => readFileSync(path.join(directory, f)) };
+    } finally { if (existsSync(staging)) cleanup(staging); }
+  };
+  const renamed = run('Polygate-0.5.0-Windows-x64.exe', '0.5.2');
+  try { expect(renamed.files).toEqual(['Polygate-0.5.2-Windows-x64.exe']); expect(renamed.content('Polygate-0.5.2-Windows-x64.exe')).toEqual(bytes); expect(path.basename(renamed.result.path)).toBe('Polygate-0.5.2-Windows-x64.exe'); } finally { cleanup(renamed.directory); }
+  const other = run('My Polygate.exe', '0.5.2');
+  try { expect(other.files).toEqual(['My Polygate.exe']); expect(path.basename(other.result.path)).toBe('My Polygate.exe'); } finally { cleanup(other.directory); }
+  const taken = run('Polygate-0.5.0-Windows-x64.exe', '0.5.2', 'Polygate-0.5.2-Windows-x64.exe');
+  try { expect(taken.files).toEqual(['Polygate-0.5.0-Windows-x64.exe', 'Polygate-0.5.2-Windows-x64.exe']); expect(taken.content('Polygate-0.5.2-Windows-x64.exe').toString()).toBe('someone else'); } finally { cleanup(taken.directory); }
+}, 90000);
+
 const csc = path.join(process.env.SystemRoot || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
 const restartTest = process.platform === 'win32' && existsSync(csc) ? test : test.skip;
 restartTest('one click downloads, verifies, closes the old process, replaces the file, and launches the replacement', async () => {
@@ -232,8 +253,9 @@ windowsTest('the helper waits for the old app without failing when it has alread
   const gone = spawnSync('cmd.exe', ['/c', 'exit', '0']).pid!;
   const missing = run(`Wait-ForOldApp ${gone} 5; 'finished'`); expect(missing.stdout).toContain('finished'); expect(missing.status).toBe(0);
   expect(run(`Wait-ForOldApp 0 5; 'finished'`).stdout).toContain('finished');
-  const brief = spawn('powershell.exe', ['-NoProfile', '-Command', 'Start-Sleep -Milliseconds 800'], { stdio: 'ignore' });
-  const closes = run(`Wait-ForOldApp ${brief.pid} 20; 'finished'`); expect(closes.stdout).toContain('finished');
+  // A Bun child starts in milliseconds; a PowerShell one can take many seconds on a loaded machine and made this wait time out.
+  const brief = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 800)'], { stdio: 'ignore' });
+  const closes = run(`Wait-ForOldApp ${brief.pid} 60; 'finished'`); expect(closes.stdout).toContain('finished');
   const stays = spawn('powershell.exe', ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
   try { const result = run(`Wait-ForOldApp ${stays.pid} 1; 'finished'`); expect(result.stdout).not.toContain('finished'); expect(result.stderr + result.stdout).toContain('did not close in time'); }
   finally { stays.kill(); brief.kill(); }
