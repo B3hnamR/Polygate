@@ -17,7 +17,10 @@ export function ProxyLists({ select, disabled, notice, onStarted }: { select: bo
   const [lists, setLists] = useState<Sources | null>(null); const [newUrl, setNewUrl] = useState(''); const [newProto, setNewProto] = useState<Proto>('all');
   const [preview, setPreview] = useState<{ url: string; count: number; byProtocol: Record<string, number>; error?: string } | null>(null);
   const files = useRef<HTMLInputElement>(null);
-  useEffect(() => { api('/admin/proxies/sources').then(setLists).catch(() => setLists({ builtin: true, builtinCount: 0, sources: [] })); }, []);
+  // A load that failed is not an empty list: saving from it would replace the links stored on the gateway with nothing.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const loadLists = () => { setLoadFailed(false); api('/admin/proxies/sources').then(setLists).catch(() => { setLists(null); setLoadFailed(true); }); };
+  useEffect(loadLists, []);
   const links = linksIn(text);
   const save = async (next: Partial<Sources>, done: string) => {
     if (!lists) return false; setBusy('save');
@@ -77,7 +80,7 @@ export function ProxyLists({ select, disabled, notice, onStarted }: { select: bo
           <Button variant="primary" disabled={!newUrl.trim() || !!busy} onClick={() => void add()}><Plus size={14} />Add link</Button>
         </div>
         {preview && <div className={`dialog-note ${preview.count ? 'good' : 'warn'}`} role="status">{preview.count ? <Check size={16} /> : <AlertCircle size={16} />}<p>{preview.count ? `${preview.count.toLocaleString()} proxies to try in it (${Object.entries(preview.byProtocol).map(([p, n]) => `${n.toLocaleString()} as ${p}`).join(', ')}).` : preview.error || 'No proxy addresses in it.'} <span className="subtle source-url">{preview.url}</span></p></div>}
-      </> : <p className="subtle"><Loader2 size={14} className="spin" /> Loading…</p>}
+      </> : loadFailed ? <p className="subtle">Could not load your saved links. <button className="text-button" onClick={loadLists}>Try again</button></p> : <p className="subtle"><Loader2 size={14} className="spin" /> Loading…</p>}
     </div>
   </div>;
 }

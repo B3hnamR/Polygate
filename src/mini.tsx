@@ -15,7 +15,8 @@ export function MiniView({ data, base, apiKey, busy, copy, notice, onToggle, onR
   const [working, setWorking] = useState(false);
   const warpPoll = usePoll<WarpInfo>('/admin/warp/status', working ? 2000 : 6000);
   const warp = warpPoll.data; const connected = warp?.state === 'connected'; const connecting = working || !!warp?.busy;
-  const routes = data.settings.routes.filter(r => r.enabled);
+  // The route in use stays in the list even when it has been switched off, so it shows its name and not a raw id.
+  const routes = data.settings.routes.filter(r => r.enabled || r.id === data.settings.routeId);
   const { total, success, latency } = data.stats; const rate = total ? Math.round(100 * success / total) : null;
   const online = data.settings.enabled;
   // Connecting can take a while (it may register first), so the button shows progress and the row polls faster meanwhile.

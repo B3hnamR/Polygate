@@ -80,8 +80,10 @@ const modelOptions = (data: Snapshot) => <>
 function ExportDialog({ request, onClose, notice }: { request: { path: string; body: unknown }; onClose: () => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
   const [tab, setTab] = useState<'curl' | 'python' | 'javascript' | 'body'>('curl');
   const url = location.origin + BASE + '/v1/' + request.path; const json = JSON.stringify(request.body, null, 2);
-  const code = { curl: `curl ${url} \\n  -H "Authorization: Bearer pg_your_key" \\n  -H "Content-Type: application/json" \\n  -d '${json.replace(/'/g, "'\''")}'`,
-    python: `import requests\n\nr = requests.post(\n    "${url}",\n    headers={"Authorization": "Bearer pg_your_key", "Content-Type": "application/json"},\n    data='''${json}''',\n)\nprint(r.text)`,
+  // An apostrophe only occurs inside a JSON string, where its unicode escape (backslash, u, 0027) means the same thing: it keeps shell and Python quoting from breaking on the prompt.
+  const safe = json.replace(/'/g, '\\u0027');
+  const code = { curl: `curl ${url} \\\n  -H "Authorization: Bearer pg_your_key" \\\n  -H "Content-Type: application/json" \\\n  -d '${safe}'`,
+    python: `import requests\n\nr = requests.post(\n    "${url}",\n    headers={"Authorization": "Bearer pg_your_key", "Content-Type": "application/json"},\n    data=r\'\'\'${safe}\'\'\',\n)\nprint(r.text)`,
     javascript: `const r = await fetch("${url}", {\n  method: "POST",\n  headers: { Authorization: "Bearer pg_your_key", "Content-Type": "application/json" },\n  body: JSON.stringify(${json.replace(/\n/g, '\n  ')}),\n});\nconsole.log(await r.text());`, body: json }[tab];
   return <Dialog title="Use this request in code" icon={<Code2 size={18} />} onClose={onClose} wide>
     <div className="seg" role="tablist" aria-label="Format">{(['curl', 'python', 'javascript', 'body'] as const).map(t => <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t === 'body' ? 'JSON body' : t === 'curl' ? 'curl' : t === 'python' ? 'Python' : 'JavaScript'}</button>)}</div>
@@ -135,14 +137,18 @@ export function Playground({ data, apiKey, model, setModel, refresh, notice }: {
       const put = (t: Turn) => { last = t; setTurns(cur => cur.map((list, j) => j === k ? [...list.slice(0, index), t] : list)); };
       put(last);
       try { await execute(req.path, req.body, apiKey, ctl.signal, put); }
-      catch (e: any) { put({ ...last, stats: undefined, error: e.name === 'AbortError' ? 'Cancelled' : e.message }); }
+      catch (e: any) {
+        // New chat aborts the request on purpose and has already emptied the pane: nothing is left to mark as cancelled.
+        if (e.name === 'AbortError' && controller.current !== ctl) return;
+        put({ ...last, stats: undefined, error: e.name === 'AbortError' ? 'Cancelled' : e.message });
+      }
       finally { setRunning(r => r.map((x, j) => j === k ? false : x)); }
     }));
     refresh();
   }
   function send() { const prompt = draft.trim(); if (!prompt || busy) return; setDraft(''); void start(turns.map(list => [...list, { role: 'user' as const, content: prompt }])); }
   function regenerate() { const next = turns.map(list => { const l = [...list]; while (l.length && l[l.length - 1].role === 'assistant') l.pop(); return l; }); if (next[0].length && !busy) void start(next); }
-  function clear() { controller.current?.abort(); setTurns([[], []]); setRunning([false, false]); }
+  function clear() { const ctl = controller.current; controller.current = null; ctl?.abort(); setTurns([[], []]); setRunning([false, false]); }
   function savePrompt() { const name = prompt('Name this prompt', draft.trim().slice(0, 40)); if (!name?.trim() || (!draft.trim() && !system.trim())) return; const list = [...prompts.filter(p => p.name !== name.trim()), { name: name.trim(), system, prompt: draft }]; setPrompts(list); keep(PROMPTS, { list }); setPicked(name.trim()); notice('Prompt saved'); }
   function removePrompt() { const list = prompts.filter(p => p.name !== picked); setPrompts(list); keep(PROMPTS, { list }); setPicked(''); }
   const history = turns[0].filter(t => !t.error && t.content).map(t => ({ role: t.role, content: t.content })); if (draft.trim()) history.push({ role: 'user', content: draft.trim() });

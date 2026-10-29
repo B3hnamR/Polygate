@@ -87,6 +87,8 @@ export function PoolPanel({notice,action,refresh,go,backup}:{notice:Notice;actio
   const params=new URLSearchParams({tab,sort:'best',page:String(page),pageSize:String(pageSize)});if(q)params.set('q',q);if(proto)params.set('proto',proto);
   const {data,reload,error}=usePoll<PoolInfo>('/admin/pool?'+params,3500);
   const [picked,setPicked]=useState<Set<string>>(new Set());const [busy,setBusy]=useState('');const [pendingMain,setPendingMain]=useState(false);
+  // Rows that are no longer on screen must not stay selected: a bulk action would still act on them.
+  useEffect(()=>setPicked(new Set()),[tab,q,proto,page,pageSize]);
   const [adding,setAdding]=useState(false);
   const [cfg,setCfg]=useState<PoolConfig|null>(null);useEffect(()=>{if(data&&!cfg)setCfg(data.config);},[data,cfg]);
   const rows=data?.entries||[];const counts=data?.counts;
@@ -149,7 +151,9 @@ export function PoolPanel({notice,action,refresh,go,backup}:{notice:Notice;actio
 // ---------- scoped API keys ----------
 type KeyInfo=Snapshot['settings']['keys'][number];
 type Draft={name:string;limit:string;rpm:string;tpm:string;budget:string;expires:string;models:string};
-const toDraft=(k?:KeyInfo):Draft=>({name:k?.name||'',limit:String(k?.limit??4),rpm:k?.rpm?String(k.rpm):'',tpm:k?.tpm?String(k.tpm):'',budget:k?.budget?String(k.budget):'',expires:k?.expiresAt?new Date(k.expiresAt).toISOString().slice(0,10):'',models:(k?.models||[]).join(', ')});
+// The expiry is saved as the end of a local day, so it is read back as a local day too (the UTC date can be the next day west of Greenwich).
+const localDate=(t:number)=>{const d=new Date(t);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+const toDraft=(k?:KeyInfo):Draft=>({name:k?.name||'',limit:String(k?.limit??4),rpm:k?.rpm?String(k.rpm):'',tpm:k?.tpm?String(k.tpm):'',budget:k?.budget?String(k.budget):'',expires:k?.expiresAt?localDate(k.expiresAt):'',models:(k?.models||[]).join(', ')});
 const draftBody=(d:Draft)=>({name:d.name,limit:d.limit||4,rpm:d.rpm||0,tpm:d.tpm||0,budget:d.budget||0,expiresAt:d.expires?new Date(d.expires+'T23:59:59').getTime():0,models:d.models.split(',').map(x=>x.trim()).filter(Boolean)});
 function KeyForm({initial,models,onSave,onCancel,saving,submit}:{initial?:KeyInfo;models:string[];onSave:(d:Draft)=>void;onCancel:()=>void;saving:boolean;submit:string}){
   const [d,setD]=useState(toDraft(initial));const set=(p:Partial<Draft>)=>setD(x=>({...x,...p}));const listId='key-models-'+(initial?.id||'new');
@@ -174,7 +178,7 @@ export function KeysPanel({data,copy,notice,refresh}:{data:Snapshot;copy:(s:stri
       {editing===k.id&&<>
         <KeyForm initial={k} models={modelIds} saving={busy} submit="Save changes" onCancel={()=>setEditing(null)} onSave={async d=>{if(await send('/admin/keys/update',{id:k.id,...draftBody(d)},'Key saved'))setEditing(null);}}/>
         <div className="key-tools"><Toggle checked={k.enabled} onChange={v=>send('/admin/keys/update',{id:k.id,enabled:v},v?'Key enabled':'Key disabled')} label="Key enabled"/>
-          <Button onClick={()=>send('/admin/keys/update',{id:k.id,resetUsage:true},'Usage reset')}>Reset usage</Button><Button onClick={()=>{if(confirm('Create a new secret for this key? Clients using the old one stop working.'))void send('/admin/keys/update',{id:k.id,regenerate:true},'New secret created');}}><RefreshCw size={14}/>New secret</Button>
+          <Button onClick={()=>{if(confirm('Reset the usage counters of this key? A key that reached its budget can spend it again.'))void send('/admin/keys/update',{id:k.id,resetUsage:true},'Usage reset');}}>Reset usage</Button><Button onClick={()=>{if(confirm('Create a new secret for this key? Clients using the old one stop working.'))void send('/admin/keys/update',{id:k.id,regenerate:true},'New secret created');}}><RefreshCw size={14}/>New secret</Button>
           <Button disabled={data.settings.keys.length===1} onClick={()=>{if(confirm(`Delete key "${k.name}"?`))void send('/admin/keys/delete',{id:k.id},'Key deleted');}}><Trash2 size={14}/>Delete</Button></div></>}
     </div>;})}</div>
     {adding?<><h3 className="subhead">New key</h3><KeyForm models={modelIds} saving={busy} submit="Create key" onCancel={()=>setAdding(false)} onSave={async d=>{if(await send('/admin/keys',draftBody(d),'API key created'))setAdding(false);}}/></>:<div className="form-actions left"><Button onClick={()=>setAdding(true)}><Plus size={15}/>New key</Button></div>}
@@ -190,7 +194,7 @@ export function SecurityPanel({serverMode,notice,onSignedOut}:{serverMode:boolea
     {managed?<p className="muted">The dashboard password is set by the <code>POLYGATE_ADMIN_PASSWORD</code> environment variable. Change it there and restart the service.</p>
       :<form onSubmit={change}><div className="form-grid three"><Field label="Current password"><input type="password" autoComplete="current-password" value={form.current} onChange={e=>setForm({...form,current:e.target.value})}/></Field><Field label="New password" hint="At least 12 characters."><input type="password" autoComplete="new-password" minLength={12} value={form.next} onChange={e=>setForm({...form,next:e.target.value})}/></Field><Field label="Repeat new password"><input type="password" autoComplete="new-password" value={form.again} onChange={e=>setForm({...form,again:e.target.value})}/></Field></div>
         <div className="form-actions"><Button type="submit" variant="primary" disabled={busy||!form.current||form.next.length<12}>Change password</Button></div></form>}
-    <div className="form-actions left"><Button onClick={async()=>{try{await api('/admin/signout-all',{});onSignedOut();}catch(e){notice(errorOf(e),'error');}}}><LogOut size={14}/>Sign out everywhere</Button></div></section>;
+    <div className="form-actions left"><Button onClick={async()=>{if(!confirm('Sign out every browser and every window of the dashboard, including this one?'))return;try{await api('/admin/signout-all',{});onSignedOut();}catch(e){notice(errorOf(e),'error');}}}><LogOut size={14}/>Sign out everywhere</Button></div></section>;
 }
 export function NotifySettings({data,notice,refresh}:{data:Snapshot;notice:Notice;refresh:()=>void}){
   const [url,setUrl]=useState(data.settings.notify?.webhookUrl||'');const [level,setLevel]=useState(data.settings.notify?.minLevel||'warning');const [busy,setBusy]=useState(false);
@@ -234,7 +238,7 @@ export function MetricsPanel(){
   const hours=Array.from({length:24},(_,i)=>{const h=Math.floor(Date.now()/3600000)-23+i;return m.hourly.find(x=>x.hour===h*3600000)||{hour:h*3600000,requests:0,errors:0,tokens:0};});const peak=Math.max(1,...hours.map(h=>h.requests));
   return <section className="section-block metrics-panel"><div className="section-top"><div className="section-title"><Gauge size={19}/><h2>Performance</h2></div><span className="subtle">Last 24 hours</span></div>
     <div className="metric-line"><div><span>Requests / min</span><strong>{m.rpm}</strong></div><div><span>Tokens / min</span><strong>{compact(m.tpm)}</strong></div><div><span>Median latency</span><strong>{ms(m.p50)}</strong></div><div><span>95th percentile</span><strong>{ms(m.p95)}</strong></div><div><span>Output speed</span><strong>{m.tokensPerSecond?`${m.tokensPerSecond} tok/s`:'—'}</strong></div></div>
-    <div className="hour-bars" aria-label="Requests per hour">{hours.map(h=><div key={h.hour} title={`${new Date(h.hour).getHours()}:00 · ${h.requests} requests, ${h.errors} failed`}><i className={h.errors?'bad':''} style={{height:Math.max(4,h.requests/peak*100)+'%'}}/></div>)}</div>
+    <div className="hour-bars" aria-label="Requests per hour">{hours.map(h=><div key={h.hour} title={`${new Date(h.hour).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false})} · ${h.requests} requests, ${h.errors} failed`}><i className={h.errors?'bad':''} style={{height:Math.max(4,h.requests/peak*100)+'%'}}/></div>)}</div>
     <div className="metric-tables"><div><h3>Busiest models</h3>{m.byModel.length?<table><tbody>{m.byModel.slice(0,6).map(r=><tr key={r.model}><td className="truncate" title={r.model}>{r.model}</td><td className="numeric">{r.requests}</td><td className="numeric mono">{ms(r.avgMs)}</td><td className="numeric">{r.errors?<span className="red">{r.errors} failed</span>:<span className="muted">ok</span>}</td></tr>)}</tbody></table>:<p className="muted">No traffic yet.</p>}</div>
       <div><h3>Routes used</h3>{m.byRoute.length?<table><tbody>{m.byRoute.slice(0,6).map(r=><tr key={r.route}><td className="truncate">{r.route}</td><td className="numeric">{r.requests}</td><td className="numeric mono">{ms(r.avgMs)}</td><td className="numeric">{r.errors?<span className="red">{r.errors} failed</span>:<span className="muted">ok</span>}</td></tr>)}</tbody></table>:<p className="muted">No traffic yet.</p>}</div></div></section>;
 }

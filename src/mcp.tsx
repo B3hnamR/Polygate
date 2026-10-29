@@ -88,7 +88,7 @@ function ServerDialog({ initial, hub, data, onClose, onSaved }: { initial: Draft
       <Field label="Display name (optional)"><input value={d.title} maxLength={80} placeholder="Team documentation" onChange={e => set({ title: e.target.value })} /></Field>
     </div>
     {!local ? <>
-      <Field label="Address" hint="The server's MCP address, usually ending in /mcp (or /sse for older servers)."><input value={d.url} placeholder="https://example.com/mcp" inputMode="url" onChange={e => set({ url: e.target.value, transport: /\/sse\/?(\?|$)/.test(e.target.value) ? 'sse' : d.transport })} /></Field>
+      <Field label="Address" hint="The server's MCP address, usually ending in /mcp (or /sse for older servers)."><input value={d.url} placeholder="https://example.com/mcp" inputMode="url" onChange={e => set({ url: e.target.value, transport: /\/sse\/?(\?|$)/.test(e.target.value) ? 'sse' : /\/sse\/?(\?|$)/.test(d.url) && d.transport === 'sse' ? 'http' : d.transport })} /></Field>
       <div className="form-grid">
         <Field label="Connection type"><Select aria-label="Connection type" value={d.transport} onChange={v => set({ transport: v as Draft['transport'] })}><option value="http">Streamable HTTP (current servers)</option><option value="sse">HTTP + SSE (older servers)</option></Select></Field>
         <Field label="Network route" hint="How Polygate reaches this server. Relays only carry OpenCode and Kilo."><Select aria-label="Network route" value={d.routeId} onChange={v => set({ routeId: v })}>{routes.map(r => <option key={r.id} value={r.id}>{r.name}{r.enabled ? '' : ' (off)'}</option>)}</Select></Field>

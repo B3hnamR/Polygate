@@ -27,7 +27,12 @@ export function coreOnly(chat: any): { chat: any; dropped: string[] } | undefine
   return { chat: next, dropped: tools.map(nameOf).filter(n => !kept.has(n)) };
 }
 
-export const learnTrim = (providerId: string, chat: any) => { if (Array.isArray(chat?.tools) && chat.tools.length) learned.set(keyOf(providerId, chat.tools), Date.now()); };
+export const learnTrim = (providerId: string, chat: any) => {
+  if (!Array.isArray(chat?.tools) || !chat.tools.length) return;
+  learned.set(keyOf(providerId, chat.tools), Date.now());
+  // Lists that are never seen again would otherwise stay for good.
+  if (learned.size > 200) for (const [k, at] of learned) if (Date.now() - at > REMEMBER_MS || learned.size > 200) learned.delete(k);
+};
 export function knownTrim(providerId: string, chat: any): boolean {
   if (!Array.isArray(chat?.tools) || !chat.tools.length) return false;
   const k = keyOf(providerId, chat.tools); const at = learned.get(k);

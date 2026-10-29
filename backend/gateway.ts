@@ -74,7 +74,10 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     release=await queue.acquire(k.id,k.limit,controller.signal,settings.queueWaitMs||0);
     let upstream:Response|undefined;
     const limited=new Set<string>();
-    for(const m of candidates){if(limited.has(m.providerId))continue;used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
+    for(const m of candidates){if(limited.has(m.providerId))continue;
+      // A trimmed tool list was chosen for the provider that refused the full one; the next candidate starts from what the client sent.
+      if(trimmed.length){chat=askedChat;trimmed=[];}
+      used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
       let r=routeFor(m.id,p.routeId,p.kind);route=r.name;
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
@@ -114,6 +117,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
         }catch(e){
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&!settings.rotate&&attempt<attempts&&!controller.signal.aborted){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;upstream=undefined;break;}
           if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
           if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}}
       }
@@ -121,6 +125,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status)))break;
     }
     if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
+    // A later attempt or candidate answered, so the failures before it are not recorded against this request or its model.
+    if(upstream?.ok){fault=false;message='';}
     // A trimmed list that is refused too was not the cause: forget it, so the next request starts from the full list again.
     if(trimmed.length&&!upstream?.ok)forgetTrim(trimmedFor,askedChat);
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
@@ -136,7 +142,12 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(body.stream){
       status=200;await stream(req,res,wrapped,protocol,used.id);
       if(!controller.signal.aborted&&!ended){status=502;fault=true;message='Upstream stream ended before a terminal event';}
-    }else{const data=await collect(wrapped);input=data.usage?.prompt_tokens||0;output=data.usage?.completion_tokens||0;status=200;json(res,200,fromChat(data,protocol,used.id));}
+    }else{
+      const data=await collect(wrapped);input=data.usage?.prompt_tokens||0;output=data.usage?.completion_tokens||0;
+      // The upstream stream ended without a finish or [DONE]: the answer is cut short, so the client gets an error instead of a partial 200.
+      if(!controller.signal.aborted&&!ended)throw new GatewayError('Upstream stream ended before a terminal event',502,'upstream_error');
+      status=200;json(res,200,fromChat(data,protocol,used.id));
+    }
     if(controller.signal.aborted){const reason:any=controller.signal.reason;status=reason instanceof GatewayError?reason.status:499;message=reason?.message||'Request cancelled';fault=false;}
     else classifyModel(used,status,message,firstAt?firstAt-t0:Date.now()-t0);
   }catch(e:any){

@@ -8,6 +8,8 @@ const utc=(t:number)=>new Date(t).toISOString().slice(11,16)+' UTC';
 const left=(until:number)=>{const m=Math.max(1,Math.round((until-Date.now())/60000));return m>=60?`${Math.floor(m/60)} h ${m%60} m`:`${m} min`;};
 export const usedUp=(r?:Route)=>!!r?.exhaustedUntil&&r.exhaustedUntil>Date.now();
 const sentence=(t:string)=>t?t[0].toUpperCase()+t.slice(1):t;
+// The hourly buckets start on UTC hours, which are not whole local hours in every time zone (Tehran, India), so the minutes are shown too.
+const hourLabel=(t:number)=>new Date(t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false});
 const host=(url:string)=>{try{return new URL(url).host;}catch{return url;}};
 export const exitWhere=(r:Route)=>r.kind==='direct'?'Your own network connection':r.kind==='warp'?'Cloudflare WARP on this computer':r.id==='proxy-pool'?'Verified proxies, swapped as they wear out':host(r.url);
 const kind=(r:Route)=>r.id==='proxy-pool'?'Proxy pool':r.kind==='direct'?'Direct':r.kind==='warp'?'WARP':r.kind==='relay'?'Relay':'Proxy';
@@ -29,7 +31,7 @@ export function ExitPass({data,metrics,onManage}:{data:Snapshot;metrics?:Metrics
     <div className="pass-body">
       <h2 className="pass-name">{r.name}</h2>
       <p className="pass-where">{kind(r)} · {exitWhere(r)}</p>
-      <div className="punches" role="img" aria-label="Requests per hour over the last 24 hours">{hours.map((h,i)=>{const size=h.requests?Math.round(40+60*h.requests/peak):0;return <i key={h.hour} className={i===23?'now':''} title={`${new Date(h.hour).getHours().toString().padStart(2,'0')}:00 · ${h.requests} requests${h.errors?`, ${h.errors} failed`:''}`}>{size?<b className={h.errors?'bad':''} style={{width:size+'%',height:size+'%'}}/>:null}</i>;})}</div>
+      <div className="punches" role="img" aria-label="Requests per hour over the last 24 hours">{hours.map((h,i)=>{const size=h.requests?Math.round(40+60*h.requests/peak):0;return <i key={h.hour} className={i===23?'now':''} title={`${hourLabel(h.hour)} · ${h.requests} requests${h.errors?`, ${h.errors} failed`:''}`}>{size?<b className={h.errors?'bad':''} style={{width:size+'%',height:size+'%'}}/>:null}</i>;})}</div>
       <div className="punch-hours" aria-hidden="true">{hours.map((h,i)=><span key={h.hour}>{i%6===0?new Date(h.hour).getHours().toString().padStart(2,'0'):''}</span>)}</div>
       <div className="pass-facts"><span>Last answer <b>{last?time(last.time):'—'}</b></span><span>Average <b>{ms(s.latency)}</b></span><span>Answered <b>{total?`${Math.round((s.success||0)/total*100)}%`:'—'}</b></span></div>
     </div>
