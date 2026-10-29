@@ -4,7 +4,7 @@ import { authenticate, modelAllowed, recordUsage } from './keys';
 import { AdmissionQueue, GatewayError } from './queue';
 import { toChat, fromChat, collect, stream, observeSse, type Protocol } from './protocols';
 import { rankedModels, providerChat, sessionFor } from './providers';
-import { routeFor, failoverRoutes, networkFetch, exhaustedAlternative } from './transport';
+import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
 import { logEvent } from './logbook';
@@ -78,11 +78,11 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       // A trimmed tool list was chosen for the provider that refused the full one; the next candidate starts from what the client sent.
       if(trimmed.length){chat=askedChat;trimmed=[];}
       used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
-      let r=routeFor(m.id,p.routeId,p.kind);route=r.name;
+      let r=routeForProvider(p,m.id);route=r.name;
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
-        if(attempt>0&&settings.rotate){r=routeFor(m.id,p.routeId,p.kind);route=r.name;}
+        if(attempt>0&&providerPicksAgain(p)){r=routeForProvider(p,m.id);route=r.name;}
         tried=true;t0=Date.now();
         // A tool list OpenCode refused earlier goes out already trimmed.
         if(!trimmed.length&&settings.trimTools!==false&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
@@ -102,7 +102,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
           if(ex){
             exhausted=ex;notify(ex.refused?'Network exit refused':'Network exit used up',ex.refused?`${r.name} was refused by the Free tier; it is skipped until ${resetTime(ex.until)}.`:`${r.name} has used its daily Free allowance (resets ${resetTime(ex.until)}).`,'warning','exhausted|'+r.id,3600000);
-            const alt=switches<3?exhaustedAlternative(r):undefined;
+            const alt=switches<3?exhaustedRouteAfter(p,r):undefined;
             if(alt){switches++;notify('Switched network exit',`Requests moved from ${r.name} to ${alt.name}.`,'info','switched|'+alt.id,600000);r=alt;route=r.name;attempts++;exhausted=undefined;continue;}
             break;
           }
@@ -113,13 +113,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // A chain moves past a model that refuses it (blocked, or no longer offered) to the next step; the last step's refusal is the answer.
           if(blocked){if(chain&&m!==candidates[candidates.length-1]&&!controller.signal.aborted)break;throw new GatewayError(message,status,'upstream_error');}
           if(final)break;
-          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}
+          if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}
         }catch(e){
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
-          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&!settings.rotate&&attempt<attempts&&!controller.signal.aborted){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&!controller.signal.aborted){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;continue;}}
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;upstream=undefined;break;}
           if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
-          if(settings.failover!==false&&!settings.rotate){const alt=failoverRoutes(r,p.kind)[0];if(alt){r=alt;route=r.name;}}}
+          if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}}
       }
       if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);
       if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status)))break;
@@ -176,7 +176,7 @@ export function readiness(){
 export async function probeModel(id:string){
   const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);
   const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)throw new GatewayError('Provider is disabled',400);
-  const route=routeFor(id,p.routeId,p.kind);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
+  const route=routeForProvider(p,id);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
   try{
     release=await queue.acquire('availability-probe',1,c.signal);
     const r=await providerChat(p,m,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:16,stream:true},c.signal,route.id,'probe-'+crypto.randomUUID());

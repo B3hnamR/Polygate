@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { stateDir, settings, models, saveModel, usagePenalties } from './state';
-import { networkFetch, routeContext } from './transport';
+import { networkFetch, routeContext, routeForProvider, providerRoutes } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
 import { kiloCatalog, kiloChat } from './kilo';
@@ -33,12 +33,12 @@ export async function discover(){
         let found:any[]=[];let authoritative=true;
         if(p.kind==='free'){await bridge.discoverModels();found=bridge.__getDiscoveryState().activeModels.map((x:any)=>typeof x==='string'?{id:x}:x);}
         else if(p.kind==='openai'){
-          try{const r=await networkFetch(p.baseUrl.replace(/\/$/,'')+'/models',{headers:p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{},signal:AbortSignal.timeout(15000)},p.routeId||settings.routeId);if(!r.ok)throw new Error(`Catalog HTTP ${r.status}`);const data:any=await r.json();const list=data.data||data.models;if(!Array.isArray(list))throw new Error('Catalog response has no model list');found=list;}
+          try{const r=await networkFetch(p.baseUrl.replace(/\/$/,'')+'/models',{headers:p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{},signal:AbortSignal.timeout(15000)},catalogRoute(p));if(!r.ok)throw new Error(`Catalog HTTP ${r.status}`);const data:any=await r.json();const list=data.data||data.models;if(!Array.isArray(list))throw new Error('Catalog response has no model list');found=list;}
           catch(e){if(!p.models.length)throw e;authoritative=false;}
           const listed=new Set(found.map(x=>x?.id??x));found=[...found,...p.models.filter(id=>!listed.has(id)).map(id=>({id}))];
         }
         // A failed fetch leaves the catalog and the models already listed untouched (the error is reported below).
-        else if(p.kind==='kilo')found=await kiloCatalog(p,p.routeId||settings.routeId);
+        else if(p.kind==='kilo')found=await kiloCatalog(p,catalogRoute(p));
         else found=p.models.map(id=>({id}));
         if(!found.length&&p.models.length)found=p.models.map(id=>({id}));
         if(!found.length)throw new Error(p.kind==='opencode'?'List this OpenCode server\'s provider/model IDs in Model IDs':'Provider returned an empty catalog; existing models were kept');
@@ -58,6 +58,8 @@ export async function discover(){
     if(errors.length)throw new GatewayError(errors.join('; '),502,'catalog_error');
   })().finally(()=>{discovery=undefined;});return discovery;
 }
+// The route a provider's model list is read through: the one its chat would use, or the first in its list when none can be used right now.
+const catalogRoute=(p:Provider)=>{try{return routeForProvider(p,'').id;}catch{return providerRoutes(p)?.ids[0]||settings.routeId;}};
 export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId=''):Promise<Response>{
   if(p.kind==='free')return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
   if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined},()=>realOpenCode(p,model,body,signal,routeId));

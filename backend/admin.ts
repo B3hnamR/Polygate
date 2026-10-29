@@ -5,7 +5,7 @@ import { json, readJson, queue, probeModel, readiness } from './gateway';
 import { discover, identityState, syncIdentity, rankedModels } from './providers';
 import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
 import { PROXY_SOURCES } from './proxy-sources';
-import { testRoute, describeRoutes, backupChain } from './transport';
+import { testRoute, describeRoutes, backupChain, providerRoutes } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
@@ -59,10 +59,30 @@ async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
   }
   throw new GatewayError('Endpoint not found',404);
 }
-import type { Provider, Route, Settings } from './types';
+import type { Provider, ProviderRoutes, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
+// The routes a provider may use, from what a client sent: `routes` ({ids, spread, backups}), null for "follow the route in use", or the single routeId older
+// clients send. Nothing sent keeps what the provider has. Relays only forward to OpenCode and Kilo over HTTPS, so a provider on its own server cannot have one.
+function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
+  let raw: any;
+  if (b.routes === null) raw = null;
+  else if (b.routes !== undefined) raw = b.routes;
+  else if (typeof b.routeId === 'string') raw = b.routeId ? { ids: [b.routeId], backups: !old?.routes } : null; // a provider pinned the old way keeps the backup exits of OpenCode Free
+  else return old?.routes;
+  if (raw === null || (Array.isArray(raw.ids) && !raw.ids.length)) return undefined;
+  if (typeof raw !== 'object' || !Array.isArray(raw.ids)) throw new GatewayError('Choose the routes as a list of route ids', 400);
+  const ids = [...new Set<string>(raw.ids.map(String))]; if (ids.length > 50) throw new GatewayError('At most 50 routes', 400);
+  for (const id of ids) {
+    const route = settings.routes.find(r => r.id === id);
+    if (!route) throw new GatewayError('Provider route does not exist', 400);
+    if (route.kind === 'relay' && b.kind !== 'free' && b.kind !== 'kilo') throw new GatewayError('Relays only carry OpenCode and Kilo traffic. Choose Direct, a proxy or WARP for this provider.', 400);
+  }
+  return { ids, spread: raw.spread === true, backups: b.kind === 'free' && raw.backups === true };
+}
+// Providers for which this route is the last enabled one in their list: switching it off or deleting it would leave them nowhere to go.
+const soleRouteOf = (routeId: string) => settings.providers.filter(p => { const set = providerRoutes(p); return !!set && set.ids.includes(routeId) && !set.ids.some(id => id !== routeId && settings.routes.some(r => r.id === id && r.enabled)); });
 // The text before the slash in every model of a provider ("test1/gpt-4"). The user picks it; without one it comes from the provider's name.
 const PREFIX_RESERVED = new Set(['opencode', 'kilo', 'free', 'auto', 'chain']);
 function providerPrefix(b: any): string {
@@ -124,13 +144,11 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/providers'&&method==='POST'){
     const b=await readJson(req);const old=settings.providers.find(p=>p.id===b.id);
     if(!['free','openai','opencode','kilo'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
-    if(b.routeId&&!settings.routes.some(r=>r.id===b.routeId))throw new GatewayError('Provider route does not exist',400);
-    // Relays forward to OpenCode and Kilo over HTTPS only, so a provider on any other server cannot be pinned to one.
-    if(b.kind!=='free'&&b.kind!=='kilo'&&settings.routes.find(r=>r.id===b.routeId)?.kind==='relay')throw new GatewayError('Relays only carry OpenCode and Kilo traffic. Choose Direct, a proxy or WARP for this provider.',400);
+    const routes=chosenRoutes(b,old);
     if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
-    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:String(b.routeId||'')};
+    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:routes?.ids[0]||'',...(routes?{routes}:{})};
     if(p.kind==='free'&&settings.providers.some(x=>x.kind==='free'&&x.id!==p.id))throw new GatewayError('Only one adaptive Free provider is supported',400);
-    if(old)Object.assign(old,p);else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
+    if(old){if(!routes)delete old.routes;Object.assign(old,p);}else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
   }
   if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode'||b.id===KILO_ID)throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
   if(pathname==='/admin/routes'&&method==='POST'){
@@ -142,12 +160,13 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/routes/toggle'&&method==='POST'){
     const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(!route)throw new GatewayError('Route not found',404);
     if(typeof b.enabled!=='boolean')throw new GatewayError('Expected a boolean',400);
-    if(!b.enabled&&(route.id===settings.routeId||settings.providers.some(p=>p.routeId===route.id)))throw new GatewayError('Select another route before disabling this one',409);
+    if(!b.enabled&&route.id===settings.routeId)throw new GatewayError('Select another route before disabling this one',409);
+    if(!b.enabled){const only=soleRouteOf(route.id);if(only.length)throw new GatewayError(`Select another route before disabling this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}. Add another route to that provider first.`,409);}
     // Direct can be switched off so requests never leave from this network's own address, but only while another route is on to carry them.
     if(!b.enabled&&route.id==='direct'&&!settings.routes.some(r=>r.id!=='direct'&&r.enabled))throw new GatewayError('Turn on another route first (a proxy, a relay or WARP): with Direct off, requests need somewhere else to go',409);
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
-  if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId||settings.providers.some(p=>p.routeId===b.id))throw new GatewayError('Select another route before deleting this one',409);if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);persist();return json(res,200,{ok:true});}
+  if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(String(b.id));if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);for(const p of settings.providers)if(p.routes?.ids.includes(String(b.id))){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==b.id)};p.routeId=p.routes.ids[0]||'';}persist();return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
   // Reads the plan of a Vercel account (Hobby allows one function region per project; Pro up to five) before anything is deployed. The token is not kept.
   if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(String(b.token||''),b.teamId?String(b.teamId):undefined));}

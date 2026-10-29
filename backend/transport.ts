@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { settings, persist, redactError } from './state';
 import { GatewayError } from './queue';
-import type { Route, Provider } from './types';
+import type { Route, Provider, ProviderRoutes } from './types';
 import { socksBridge, parseSocksUrl } from './socks-bridge';
 import { warpTarget, warpFailure, warpSuccess } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
@@ -20,6 +20,8 @@ const coolingDown=(r:Route)=>(!!r.cooldownUntil&&r.cooldownUntil>now())||(!!r.ex
 // "Used up today" is OpenCode Free's allowance for an exit address. A provider on its own server (or Kilo, which has its own limit) is not affected by it,
 // so a route that is used up for OpenCode is still the right one for them.
 const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
+// The verified proxy pool is public proxies: a provider on its own server (its key and prompts) never falls back to it unless it is chosen for that provider.
+const publicPool=(r:Route,kind?:string)=>r.id==='proxy-pool'&&!!kind&&kind!=='free'&&kind!=='kilo';
 const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
 export function routeExhausted(route:Route,ex:Exhaustion){route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
@@ -123,7 +125,7 @@ export function routeFor(model='', explicit='', kind?: string): Route {
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
   if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt)return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
-  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
+  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
     const last=current&&isExhausted(current)&&exhaustionApplies(kind)?exhaustedAlternative(current):undefined;if(last)return last;
@@ -135,9 +137,56 @@ export function routeFor(model='', explicit='', kind?: string): Route {
   if(settings.strategy==='fastest')return pool.find(r=>r.latency==null)||pool.reduce((best,r)=>r.latency!<best.latency!?r:best);
   return pool.find(x=>x.id===selected)||pool[0];
 }
+// ---- the routes a provider may use
+// No list: the provider follows the route in use, with the global rotation, failover and backup switches. A list: only those routes, never any other.
+// The old single route of a provider reads as a list of one.
+export function providerRoutes(p: Provider): ProviderRoutes | undefined {
+  if (p.routes?.ids?.length) return p.routes;
+  // A provider pinned the old way keeps what a pinned OpenCode Free provider always had: the backup exits when its route is used up.
+  return p.routeId ? { ids: [p.routeId], backups: p.kind === 'free' } : undefined;
+}
+const spreadAt = new Map<string, number>();
+const routeUsable = (r: Route | undefined, kind?: string): r is Route => !!r && r.enabled && carries(r, kind) && !coolingDownFor(r, kind) && (r.kind !== 'warp' || !!warpTarget());
+function whyNot(id: string, kind?: string): string {
+  const r = settings.routes.find(x => x.id === id);
+  if (!r) return `${id} was deleted`;
+  if (!r.enabled) return `${r.name} is switched off`;
+  if (!carries(r, kind)) return `${r.name} cannot carry this provider`;
+  if (exhaustionApplies(kind) && isExhausted(r)) return `${r.name} is used up until ${resetTime(r.exhaustedUntil!)}`;
+  if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
+  return `${r.name} is resting after errors`;
+}
+export function routeForProvider(p: Provider, model: string): Route {
+  const set = providerRoutes(p);
+  if (!set) return routeFor(model, '', p.kind);
+  const usable = set.ids.map(id => findRoute(id)).filter((r): r is Route => routeUsable(r, p.kind));
+  if (usable.length) {
+    if (set.spread && usable.length > 1) { const at = spreadAt.get(p.id) || 0; spreadAt.set(p.id, at + 1); return usable[at % usable.length]; }
+    return usable[0];
+  }
+  // Nothing in the list can take it. OpenCode Free may be allowed the backup exits; every other provider stays inside its list.
+  if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from); if (alt) return alt; }
+  throw new GatewayError(`None of the routes chosen for ${p.name} can take this request right now: ${set.ids.map(id => whyNot(id, p.kind)).join('; ')}. Change them on the Providers page.`, 503, 'route_unavailable');
+}
+// The route to move to after a connection failure: the next one in the provider's list, never one outside it. A provider that follows the route
+// in use uses the global fallback order.
+export function routeAfter(p: Provider, current: Route): Route | undefined {
+  const set = providerRoutes(p);
+  if (!set) return failoverRoutes(current, p.kind)[0];
+  return set.ids.map(id => findRoute(id)).find((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id);
+}
+// The route to move to when the one in use has used up its allowance (OpenCode Free).
+export function exhaustedRouteAfter(p: Provider, current: Route): Route | undefined {
+  const set = providerRoutes(p);
+  if (!set) return exhaustedAlternative(current);
+  return routeAfter(p, current) || (set.backups ? exhaustedAlternative(current) : undefined);
+}
+// Spread: every attempt picks again. Otherwise a failed connection moves on to the next route.
+export const providerPicksAgain = (p: Provider) => { const set = providerRoutes(p); return set ? !!set.spread : settings.rotate; };
+export const providerSwitches = (p: Provider) => !providerPicksAgain(p);
 // Deterministic order used when a connection fails: WARP first, then the other routes in the order they were added, direct only if allowed.
 export function failoverRoutes(current: Route, kind?: string): Route[] {
-  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!coolingDownFor(r,kind)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
+  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!publicPool(r,kind)&&!coolingDownFor(r,kind)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
   return [...usable.filter(r=>r.kind==='warp'),...usable.filter(r=>r.kind!=='warp'&&r.kind!=='direct'),...usable.filter(r=>r.kind==='direct')];
 }
 // One description of every route, used by the Routing page and the Proxies page so they cannot disagree.

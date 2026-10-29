@@ -1,4 +1,7 @@
-export type Provider = { id: string; name: string; kind: 'free' | 'openai' | 'opencode' | 'kilo'; enabled: boolean; baseUrl: string; apiKey: string; models: string[]; routeId: string };
+// The routes a provider is allowed to use, and only those: in order (the next one when a connection fails) or spread over all of them.
+// backups: OpenCode Free only, also use the backup exits when every route in the list is used up. No list means the provider follows the route in use.
+export type ProviderRoutes = { ids: string[]; spread?: boolean; backups?: boolean };
+export type Provider = { id: string; name: string; kind: 'free' | 'openai' | 'opencode' | 'kilo'; enabled: boolean; baseUrl: string; apiKey: string; models: string[]; routeId: string; routes?: ProviderRoutes };
 export type Route = { id: string; name: string; kind: 'direct' | 'proxy' | 'relay' | 'warp'; url: string; token?: string; enabled: boolean; models: string[]; status?: string; latency?: number; cooldownUntil?: number; failures?: number; buffered?: boolean; poolUrls?: string[]; poolCount?: number; managed?: boolean; openUntil?: number; opened?: number; exhaustedUntil?: number; recheckedAt?: number; only?: Provider['kind'] };
 export type Model = { id: string; upstreamId: string; providerId: string; name: string; context: number; output: number; reasoning: boolean; tools: boolean; state: 'unchecked' | 'available' | 'cooldown' | 'unavailable'; latency: number; score: number; priority: number; failCount: number; cooldownUntil: number; checkedAt: number; error: string };
 export type WarpSettings = { engine: 'embedded' | 'disabled'; autoStart: boolean; pool: number; rotateMinutes: number; helperPath: string; endpoint: string; split?: 'auto' | 'off' | 'on' };

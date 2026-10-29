@@ -289,7 +289,7 @@ test('With the pool as the route, chat requests use a proxy while catalog reads 
   });
 });
 test('A used-up direct exit sends requests to a clean pool proxy, and keeps doing so until the reset',async()=>{
-  await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct'}],async()=>{
+  await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct',routes:{ids:['direct'],backups:true}}],async()=>{
     freshModel('remote','drained');poolReport(entries[0].url,'ok',10);
     const r=await chat('remote/drained');expect(r.status).toBe(200);await r.text();expect(hits).toEqual([1]);
     const direct=settings.routes.find(x=>x.id==='direct')!;expect(direct.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(direct.status).toContain('Daily Free allowance used');
