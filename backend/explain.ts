@@ -35,6 +35,11 @@ export function explainError(c: ErrorContext): Explained | undefined {
     return { code: 'request_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },
       message: `OpenCode Free refused this request (HTTP 429). ${c.confirmedClean ? 'A small test request through the same network exit was accepted, so the exit still has allowance and this request itself was refused.' : 'It did not give a reset time, so this does not look like a used-up daily allowance.'} The usual causes are the shape of the request (tools, session, system prompt) or the TLS client in use. Open Requests in Polygate, select this request and read "Request shape" to see what was sent${up.logId ? ` (provider log id ${up.logId})` : ''}.` };
   }
+  // The relay's own answer to a wrong access token: nothing to do with the exit address or with OpenCode.
+  if (c.status === 401 && /Unauthorized relay request/i.test(up.text || '')) {
+    return { code: 'relay_unauthorized', extra: { route: c.route, upstream: { status: c.status, ...up } },
+      message: `The relay "${c.route || 'relay'}" rejected the access token Polygate sent (HTTP 401), so nothing can pass through it. The token saved here does not match the one set on the relay. Open the Relays page and correct its token, or deploy the relay again.` };
+  }
   if (c.status === 403 || c.status === 401) {
     return { code: 'exit_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },
       message: `The provider refused this connection (HTTP ${c.status}) from the network exit "${c.route || 'direct'}". The exit address may be blocked; try another route or proxy. ${up.text ? 'Provider said: ' + up.text.slice(0, 200) : ''}`.trim() };
