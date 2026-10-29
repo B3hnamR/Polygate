@@ -4,22 +4,20 @@ const { createHash } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createReleaseChecker, MAX_DOWNLOAD, readLimited } = require('./releases.cjs');
 
-// Follow only GitHub's release-asset redirects, without forwarding cookies or application credentials.
+// Only GitHub's release-asset hosts may serve an update, and no cookies or application credentials are sent.
+const GITHUB_HOSTS = ['github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com', 'github-releases.githubusercontent.com'];
+function assertGitHub(value) {
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || !GITHUB_HOSTS.includes(parsed.hostname)) throw new Error('The update download left GitHub. Nothing was installed.');
+}
+// Electron's net.fetch cannot hand redirects back one at a time ("Redirect was cancelled"), and GitHub redirects every release asset to its
+// download host, so the fetch follows them and the host it ended on is checked before a single byte is read.
 async function fetchAsset(url, fetcher, signal) {
-  for (let redirects = 0; redirects < 6; redirects++) {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || !['github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com', 'github-releases.githubusercontent.com'].includes(parsed.hostname)) throw new Error('The update download left GitHub. Nothing was installed.');
-    const response = await fetcher(url, { redirect: 'manual', signal, credentials: 'omit' });
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get('location');
-      await response.body?.cancel();
-      if (!location) throw new Error('GitHub returned an incomplete update download.');
-      url = new URL(location, url).href; continue;
-    }
-    if (!response.ok) throw new Error(`The update download failed (${response.status}). Try again.`);
-    return response;
-  }
-  throw new Error('Too many redirects while downloading the update.');
+  assertGitHub(url);
+  const response = await fetcher(url, { redirect: 'follow', signal, credentials: 'omit' });
+  try { assertGitHub(response.url || url); } catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
+  if (!response.ok) { await response.body?.cancel().catch(() => {}); throw new Error(`The update download failed (${response.status}). Try again.`); }
+  return response;
 }
 async function downloadRelease(release, directory, fetcher, onProgress = () => {}) {
   const name = `Polygate-${release.version}-Windows-x64.exe`;

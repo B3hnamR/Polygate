@@ -78,11 +78,24 @@ describe('Windows portable downloads', () => {
     expect(portableTarget('C:\\Apps\\Polygate.exe', true, 'linux')).toBe('');
     expect(portableTarget(undefined, true, 'win32')).toBe('');
   });
-  test('rejects a redirect off GitHub without sending a second request', async () => {
-    let calls = 0;
-    const fetcher = async () => { calls++; return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/update.exe' } }); };
+  // The fetch follows GitHub's redirects itself; the host it ended on is what is checked.
+  const landedOn = (url: string, body = 'ok') => { const response = new Response(body); Object.defineProperty(response, 'url', { value: url }); return response; };
+  test('rejects a download that was redirected off GitHub before reading it', async () => {
+    let calls = 0, cancelled = false;
+    const fetcher = async () => { calls++; const response = landedOn('http://127.0.0.1/update.exe'); return new Proxy(response, { get: (target, key) => key === 'body' ? { cancel: async () => { cancelled = true; } } : (target as any)[key] }); };
     await expect(fetchAsset(releaseInfo(releaseData()).assets[0].url, fetcher, AbortSignal.timeout(1000))).rejects.toThrow('left GitHub');
-    expect(calls).toBe(1);
+    expect(calls).toBe(1); expect(cancelled).toBe(true);
+  });
+  test("accepts GitHub's own redirect to its release download host, and asks for redirects to be followed without credentials", async () => {
+    let seen: any;
+    const fetcher = async (_url: unknown, init: any) => { seen = init; return landedOn('https://release-assets.githubusercontent.com/github-production-release-asset/1/update.exe'); };
+    const response = await fetchAsset(releaseInfo(releaseData()).assets[0].url, fetcher, AbortSignal.timeout(1000));
+    expect(await response.text()).toBe('ok'); expect(seen.redirect).toBe('follow'); expect(seen.credentials).toBe('omit');
+  });
+  test('refuses to start a download that is not on GitHub at all', async () => {
+    let calls = 0;
+    await expect(fetchAsset('https://example.com/update.exe', async () => { calls++; return new Response('x'); }, AbortSignal.timeout(1000))).rejects.toThrow('left GitHub');
+    expect(calls).toBe(0);
   });
   test('downloads verified executable bytes and reports progress', async () => {
     const directory = temporary('polygate-update-download-');
