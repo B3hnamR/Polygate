@@ -125,14 +125,16 @@ export function routeFor(model='', explicit='', kind?: string): Route {
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
   if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt)return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
-  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
+  // Direct is left out of the spread unless the user includes it.
+  const pool=settings.routes.filter(r=>r.enabled&&(r.kind!=='direct'||settings.spreadDirect===true)&&carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
     const last=current&&isExhausted(current)&&exhaustionApplies(kind)?exhaustedAlternative(current):undefined;if(last)return last;
     throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
   }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
-  if(settings.strategy==='round_robin')return pool[cursor++%pool.length];
+  // "Selected route" used to be an order here, but with the selected route outside the spread it just stuck to the first exit; it now takes turns.
+  if(settings.strategy==='round_robin'||settings.strategy==='single')return pool[cursor++%pool.length];
   // Unmeasured routes are tried first so every route gets a latency before the fastest one is locked in.
   if(settings.strategy==='fastest')return pool.find(r=>r.latency==null)||pool.reduce((best,r)=>r.latency!<best.latency!?r:best);
   return pool.find(x=>x.id===selected)||pool[0];

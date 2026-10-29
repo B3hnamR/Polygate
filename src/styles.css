@@ -39,7 +39,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent-line);box-shad
 
 /* Request shape detail */
 tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}tr.clickable:hover td,tr.selected td{background:var(--surface-raised)}
-.table-hint{margin:10px 0 0}
+.table-hint{margin:10px 0 0}.section-block>.table-hint{margin:0;padding:13px 18px;border-top:1px solid var(--line)}.policy-intro{margin:-4px 0 14px;max-width:70ch}
 .request-detail .detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px;margin-top:14px}
 .detail-facts h3{margin:0 0 8px;font-size:14px;font-weight:600;letter-spacing:.02em;color:var(--muted);text-transform:uppercase;overflow-wrap:anywhere}
 .detail-facts dl{margin:0;display:grid;gap:6px}.detail-facts dl>div{display:grid;grid-template-columns:minmax(120px,40%) 1fr;gap:10px}
