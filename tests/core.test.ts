@@ -7,6 +7,7 @@ process.env.POLYGATE_ADMIN_TOKEN='test-admin-secret';
 const {startGateway}=await import('../backend/main');
 const {settings,models,saveModel,redactError,logs,db,record,usagePenalties}=await import('../backend/state');
 const {AdmissionQueue}=await import('../backend/queue');
+const {__resetToolTrim}=await import('../backend/tooltrim');
 const {relayRequest,routeFor,networkFetch,routeFailed,__setExitVerifier,__setCanarySender,checkChat}=await import('../backend/transport');
 const {discover,sessionFor}=await import('../backend/providers');
 const {queue,probeModel}=await import('../backend/gateway');
@@ -114,7 +115,7 @@ test('Route selection and rotation strategies',()=>{
 // The remote mock listens on 127.0.0.2 because 127.0.0.1 traffic bypasses route accounting in networkFetch.
 let catalog:string[]=['a','b'];
 const sse=(sep:string)=>[{id:'c',choices:[{index:0,delta:{role:'assistant',content:'ok'},finish_reason:null}]},{choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1}}].map(x=>'data: '+JSON.stringify(x)+sep).join('')+'data: [DONE]'+sep;
-const CRLFLESS=String.fromCharCode(10,10);let relayInstance=1;const relayCalls:string[]=[];const relayAvoid:string[]=[];
+const CRLFLESS=String.fromCharCode(10,10);const toolgateSeen:string[][]=[];let relayInstance=1;const relayCalls:string[]=[];const relayAvoid:string[]=[];
 const remote=Bun.serve({port:0,hostname:'127.0.0.2',async fetch(req){
   const u=new URL(req.url);
   if(u.pathname.startsWith('/nocatalog'))return new Response('missing',{status:404});
@@ -133,6 +134,8 @@ const remote=Bun.serve({port:0,hostname:'127.0.0.2',async fetch(req){
     if(runtime&&relayInstance>=Number(req.headers.get('x-test-good-from')||Infinity))return new Response(sse(CRLFLESS),{headers:{'content-type':'text/event-stream',...relayHeaders}});
     return new Response(FREE_LIMIT,{status:429,headers:{'content-type':'application/json','retry-after':'7200',...relayHeaders}});
   }
+  // OpenCode refuses this pair of tools together, wording it like a usage limit; any other list is answered.
+  if(body.model==='toolgate'){const names=(body.tools||[]).map((t:any)=>t.function?.name);toolgateSeen.push(names);if(names.includes('agent_manager_models')&&names.includes('background_process'))return new Response(FREE_LIMIT,{status:429,headers:{'content-type':'application/json','retry-after':'7200'}});return new Response(sse(CRLFLESS),{headers:{'content-type':'text/event-stream'}});}
   if(body.model==='shape')return new Response(FREE_LIMIT,{status:429,headers:{'content-type':'application/json'}});
   if(body.model==='boom')return Response.json({error:{message:'upstream exploded'}},{status:503});
   if(body.model==='slow')await Bun.sleep(4000);
@@ -297,6 +300,23 @@ test('A 429 without a reset time is explained as a refused request and still pau
   expect(r.status).toBe(429);expect(x.error.code).toBe('request_refused');expect(x.error.message).toContain('did not give a reset time');expect(x.error.message).toContain('Request shape');
   expect(models.get('remote/shape')!.state).toBe('cooldown');
   const again=await chat('remote/shape',{stream:false});const y:any=await again.json();expect(again.status).toBe(429);expect(y.error.type).toBe('model_paused');expect(y.error.message).toContain('paused');expect(Number(again.headers.get('retry-after'))).toBeGreaterThan(0);
+});});
+const tool=(name:string)=>({type:'function',function:{name,description:'x',parameters:{type:'object',properties:{}}}});
+test('A request OpenCode refuses only because of its tool list is retried with the standard tools, remembered, and can be switched off',async()=>{await scoped([remoteProvider()],async()=>{
+  freshModel('remote','toolgate');__resetToolTrim();toolgateSeen.length=0;__setExitVerifier(async()=>'refused');
+  const tools=['bash','read','edit','agent_manager_models','background_process','suggest'].map(tool);
+  try{
+    const first=await chat('remote/toolgate',{tools,tool_choice:'auto'});await first.text();
+    expect(first.status).toBe(200);expect(first.headers.get('x-polygate-tools-trimmed')).toBe('3');
+    expect(toolgateSeen.length).toBe(2);expect(toolgateSeen[1]).toEqual(['bash','read','edit']);
+    const again=await chat('remote/toolgate',{tools});await again.text();
+    expect(again.status).toBe(200);expect(toolgateSeen.length).toBe(3);expect(toolgateSeen[2]).toEqual(['bash','read','edit']);
+    // A list with no standard tool at all has nothing to fall back to and keeps its refusal.
+    const noCore=await chat('remote/toolgate',{tools:['agent_manager_models','background_process'].map(tool)});await noCore.text();
+    expect(noCore.status).toBe(429);expect(noCore.headers.get('x-polygate-tools-trimmed')).toBeNull();
+    settings.trimTools=false;__resetToolTrim();
+    const off=await chat('remote/toolgate',{tools});await off.text();expect(off.status).toBe(429);
+  }finally{settings.trimTools=undefined;__setExitVerifier();settings.routes.find(z=>z.id==='direct')!.exhaustedUntil=0;models.get('remote/toolgate')!.cooldownUntil=0;}
 });});
 // A 429 with a countdown is also what a wrong request shape or a non-Bun TLS client gets, so it is confirmed first.
 test('A 429 countdown is only a suspicion: when a known-good request through the same exit passes, the exit is kept and the model is not paused to midnight',async()=>{await scoped([remoteProvider()],async()=>{

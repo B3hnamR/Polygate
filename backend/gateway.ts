@@ -12,6 +12,7 @@ import { KILO_ID, KILO_LIMIT_PAUSE_MS, KILO_MODEL_PAUSE_MS, isAddressLimit, paus
 import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
 import { chainFor, modelFor, AUTO_STEPS } from './chains';
+import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
 import type { Model, ApiKey, Chain } from './types';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
 export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
@@ -62,13 +63,13 @@ export function classifyModel(m:Model,status:number,message:string,latency:numbe
 }
 export async function inference(req:IncomingMessage,res:ServerResponse,protocol:Protocol){
   const k=authenticate(req,true);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
-  const requestId=crypto.randomUUID();const body=await readJson(req);const chat=toChat(body,protocol);
+  const requestId=crypto.randomUUID();const body=await readJson(req);let chat=toChat(body,protocol);const askedChat=chat;
   // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
   const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const chain=chainFor(chat.model);const hops:string[]=[];const controller=new AbortController();(req as any).signal=controller.signal;
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
-  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';
+  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
   try{
     release=await queue.acquire(k.id,k.limit,controller.signal,settings.queueWaitMs||0);
     let upstream:Response|undefined;
@@ -80,6 +81,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       for(let attempt=0;attempt<=attempts;attempt++){
         if(attempt>0&&settings.rotate){r=routeFor(m.id,p.routeId,p.kind);route=r.name;}
         tried=true;t0=Date.now();
+        // A tool list OpenCode refused earlier goes out already trimmed.
+        if(!trimmed.length&&settings.trimTools!==false&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
         try{
           upstream=await providerChat(p,m,chat,controller.signal,r.id,sessionFor(k.id,chat.messages,req.headers),requestId);status=upstream.status;
           if(upstream.ok)break;
@@ -89,7 +92,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
             const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from this one. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
             notify('Kilo free limit reached',plain,'warning','kilo-limit',3600000);message=plain;break;}
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
-          const refused=takeRefused(requestId);if(refused)confirmedClean=true;const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
+          const refused=takeRefused(requestId);if(refused)confirmedClean=true;
+          // The exit is fine, so the refusal belongs to this request. When it carries tools OpenCode may object to, ask again with the standard ones only.
+          if(refused&&settings.trimTools!==false&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
           const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
           if(ex){
@@ -116,8 +121,11 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status)))break;
     }
     if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
+    // A trimmed list that is refused too was not the cause: forget it, so the next request starts from the full list again.
+    if(trimmed.length&&!upstream?.ok)forgetTrim(trimmedFor,askedChat);
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
     if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
+    if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
     res.setHeader('x-polygate-model',used.id);if(chain){res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));}res.setHeader('x-polygate-route',encodeURIComponent(route));
     let ended=false;let firstAt=0;
     const observed=upstream.body!.pipeThrough(observeSse(raw=>{
