@@ -146,6 +146,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/providers'&&method==='POST'){
     const b=await readJson(req);const old=settings.providers.find(p=>p.id===b.id);
     if(!['free','openai','opencode','kilo'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
+    if(old&&b.kind!==old.kind)throw new GatewayError("A provider's type cannot be changed. Add a new provider instead.",400);
     const routes=chosenRoutes(b,old);
     if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
     const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:routes?.ids[0]||'',...(routes?{routes}:{})};
@@ -158,6 +159,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     const b=await readJson(req);if(!['proxy','relay','warp'].includes(b.kind))throw new GatewayError('Choose proxy, relay, or WARP',400);
     const old=settings.routes.find(r=>r.id===b.id);if(old&&(old.id==='direct'||old.id==='proxy-pool'||old.managed))throw new GatewayError('This route is managed by Polygate and cannot be edited',409);
     const route:Route={id:old?.id||'r-'+randomBytes(4).toString('hex'),name:String(b.name||'New route').slice(0,80),kind:b.kind,url:b.kind==='warp'?(b.url?url(b.url,['http:','https:','socks5:']):`socks5://127.0.0.1:${settings.warpProxyPort}`):url(b.url,b.kind==='proxy'?['http:','https:','socks4:','socks5:']:['https:','http:']),token:b.token===mask?old?.token:String(b.token||''),enabled:b.enabled!==false,models:Array.isArray(b.models)?b.models.map(String).slice(0,100):[],buffered:!!b.buffered};
+    // A relay holds an access token that every request sends; over plain http it would cross the network readable, so http is only for a relay on this computer.
+    if(route.kind==='relay'&&route.url.startsWith('http:')&&!['127.0.0.1','localhost','[::1]'].includes(new URL(route.url).hostname))throw new GatewayError('A relay must use https://, because its access token is sent with every request. Plain http:// is only allowed for a relay on this computer.',400);
     if(old&&b.token===mask&&old.token&&!sameServer(route.url,old.url))throw new GatewayError('You changed the address. Enter the access token again so the saved token is not sent to the new server.',400);
     if(old&&!route.enabled&&old.enabled){if(old.id===settings.routeId)throw new GatewayError('Select another route before disabling this one',409);const only=soleRouteOf(old.id);if(only.length)throw new GatewayError(`Select another route before disabling this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}. Add another route to that provider first.`,409);}
     if(old)Object.assign(old,route);else settings.routes.push(route);persist();return json(res,200,{ok:true,id:route.id});

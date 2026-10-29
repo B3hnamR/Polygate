@@ -1813,8 +1813,9 @@ async function* sseChunks(upstreamRes) {
     }
     if (buf.trim()) yield buf
   } finally {
+    // cancel() returns a promise that rejects with the abort reason when the stream was cut short; left alone it is an unhandled rejection.
     try {
-      reader.cancel()
+      reader.cancel().catch(() => {})
     } catch {}
   }
 }

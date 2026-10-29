@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { settings, models, stateDir, redactError } from './state';
+import { settings, models, stateDir, redactError, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
 import { logEvent } from './logbook';
 export type Notice = { id: string; title: string; message: string; type: 'info' | 'success' | 'warning' | 'error'; time: number; read: boolean };
 const file = path.join(stateDir, 'notifications.json');
 let items: Notice[] = [];
 try { if (existsSync(file)) items = JSON.parse(readFileSync(file, 'utf8')); } catch { items = []; }
-const save = () => { try { writeFileSync(file, JSON.stringify(items.slice(0, 100))); } catch { /* the in-memory list still works */ } };
+const save = () => { try { writeFileAtomic(file, JSON.stringify(items.slice(0, 100))); } catch { /* the in-memory list still works */ } };
 const recent = new Map<string, number>();
 // Repeats of the same event inside the quiet period are dropped so a flapping route cannot flood the list or the webhook.
 export function notify(title: string, message: string, type: Notice['type'] = 'info', key = title + '|' + message, quietMs = 10 * 60000) {

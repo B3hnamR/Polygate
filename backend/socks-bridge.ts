@@ -5,6 +5,14 @@ import dns from 'node:dns/promises';
 export type SocksUpstream = { host: string; port: number; username?: string; password?: string; version?: 4 | 5 };
 const bridges = new Map<string, Promise<string>>();
 const servers = new Set<net.Server>();
+// Each distinct SOCKS upstream gets its own local listener. Pool tests and warm-up touch thousands of them over days, so the number is capped and
+// listeners nobody has used for a while are closed (a new one starts on demand).
+type Bridge = { key: string; server: net.Server; active: number; last: number };
+const meta = new Map<string, Bridge>(); const MAX_BRIDGES = 64; const IDLE_MS = 10 * 60000;
+let sweeper: ReturnType<typeof setInterval> | undefined;
+export const bridgeCount = () => meta.size;
+function dropBridge(b: Bridge) { b.server.close(); servers.delete(b.server); bridges.delete(b.key); meta.delete(b.key); }
+function sweep(idleFor: number) { const now = Date.now(); for (const b of [...meta.values()]) if (b.active === 0 && now - b.last >= idleFor) dropBridge(b); }
 const HEADER_LIMIT = 16 * 1024;
 const keyOf = (u: SocksUpstream) => `${u.version || 5}|${u.username || ''}:${u.password || ''}@${u.host}:${u.port}`;
 const socksReply = ['succeeded', 'general failure', 'connection not allowed', 'network unreachable', 'host unreachable', 'connection refused', 'TTL expired', 'command not supported', 'address type not supported'];
@@ -80,12 +88,15 @@ function handle(client: net.Socket, up: SocksUpstream) {
       if (method === 'CONNECT') {
         const i = target.lastIndexOf(':'); const host = target.slice(0, i).replace(/^\[|\]$/g, ''); const port = Number(target.slice(i + 1));
         if (!host || !(port > 0)) return refuse('400 Bad Request');
-        const upstream = await socksConnect(up, host, port); client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        const upstream = await socksConnect(up, host, port);
+        if (client.destroyed) { upstream.destroy(); return; } // the client left while the tunnel was being made
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (rest.length) upstream.write(rest); link(client, upstream); return;
       }
       const url = new URL(target); const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80);
       if (url.protocol !== 'http:') return refuse('400 Bad Request');
       const upstream = await socksConnect(up, url.hostname.replace(/^\[|\]$/g, ''), port);
+      if (client.destroyed) { upstream.destroy(); return; }
       // One request per connection: a kept-alive client connection could otherwise send its next request (to another host) down this tunnel.
       const headers = [...lines.slice(1).filter(l => !/^(proxy-|connection:|keep-alive:)/i.test(l)), 'Connection: close'];
       upstream.write(Buffer.concat([Buffer.from(`${method} ${url.pathname}${url.search} ${version}\r\n${headers.join('\r\n')}\r\n\r\n`, 'latin1'), rest])); link(client, upstream);
@@ -101,12 +112,16 @@ function link(a: net.Socket, b: net.Socket) {
 export function socksBridge(up: SocksUpstream): Promise<string> {
   const key = keyOf(up); const existing = bridges.get(key); if (existing) return existing;
   const started = new Promise<string>((resolve, reject) => {
-    const server = net.createServer(client => handle(client, up)); servers.add(server);
+    if (meta.size >= MAX_BRIDGES) { const idle = [...meta.values()].filter(b => b.active === 0).sort((a, b) => a.last - b.last)[0]; if (idle) dropBridge(idle); }
+    const entry: Bridge = { key, server: undefined as unknown as net.Server, active: 0, last: Date.now() };
+    const server = net.createServer(client => { entry.active++; client.once('close', () => { entry.active--; entry.last = Date.now(); }); handle(client, up); }); servers.add(server);
+    entry.server = server; meta.set(key, entry);
+    if (!sweeper) { sweeper = setInterval(() => sweep(IDLE_MS), 5 * 60000); sweeper.unref?.(); }
     server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`));
   });
   bridges.set(key, started); started.catch(() => bridges.delete(key)); return started;
 }
-export function closeSocksBridges() { for (const s of servers) s.close(); servers.clear(); bridges.clear(); }
+export function closeSocksBridges() { for (const s of servers) s.close(); servers.clear(); bridges.clear(); meta.clear(); if (sweeper) { clearInterval(sweeper); sweeper = undefined; } }
 export function parseSocksUrl(raw: string): SocksUpstream | null {
   try { const u = new URL(raw); if (!/^socks(4a?|5h?):$/.test(u.protocol)) return null; return { version: u.protocol.startsWith('socks4') ? 4 as const : 5 as const, host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 1080, username: decodeURIComponent(u.username) || undefined, password: decodeURIComponent(u.password) || undefined }; } catch { return null; }
 }

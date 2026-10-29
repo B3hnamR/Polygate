@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { settings, stateDir, redactError, persist } from './state';
+import { settings, stateDir, redactError, persist, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
 import { storedProxies, verify, engineJob, type Candidate } from './proxy-engine';
 import { notify } from './notifications';
@@ -19,7 +19,7 @@ const healthFile = path.join(stateDir, 'pool-health.json');
 const health = new Map<string, PoolHealth>();
 try { if (existsSync(healthFile)) for (const h of JSON.parse(readFileSync(healthFile, 'utf8')) as PoolHealth[]) health.set(h.url, h); } catch { /* start with no history */ }
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
-const save = () => { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = undefined; try { writeFileSync(healthFile, JSON.stringify([...health.values()])); } catch { /* history is a convenience */ } }, 1500); saveTimer.unref?.(); };
+const save = () => { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = undefined; try { writeFileAtomic(healthFile, JSON.stringify([...health.values()])); } catch { /* history is a convenience */ } }, 1500); saveTimer.unref?.(); };
 let entries: PoolEntry[] = []; let byUrl = new Map<string, PoolEntry>(); let source: unknown;
 // The saved list is replaced as a whole when it changes, so the rows are rebuilt only then.
 export async function poolEntries(_force = false): Promise<PoolEntry[]> {
@@ -65,12 +65,14 @@ export function poolReport(url: string, outcome: 'ok' | 'blocked' | 'bad' | 'unr
 }
 let cursor = 0; let lastPick = '';
 // One proxy for one request, chosen from the proxies that passed the model test (or the saved selection) and are not cooling down.
-export async function pickPoolProxy(route: Route): Promise<{ url: string; proxy: string } | null> {
+// skip: proxies that already failed for this request, so a retry goes to a different one instead of the same dead proxy.
+export async function pickPoolProxy(route: Route, skip?: Set<string>): Promise<{ url: string; proxy: string } | null> {
   const all = await poolEntries(); const cfg = poolConfig();
   const wanted = cfg.mode === 'selected' && route.poolUrls?.length ? all.filter(e => route.poolUrls!.includes(e.url)) : all;
   // A hand-picked selection prefers proxies that passed the model test, but still works before any test has run.
   const usable = wanted.filter(e => isUsable(health.get(e.url)));
-  const ready = usable.length ? usable : cfg.mode === 'selected' ? wanted.filter(e => entryHealth(e.url).coolUntil < Date.now()) : [];
+  const allReady = usable.length ? usable : cfg.mode === 'selected' ? wanted.filter(e => entryHealth(e.url).coolUntil < Date.now()) : [];
+  const ready = skip?.size ? allReady.filter(e => !skip.has(e.url)) : allReady;
   if (!ready.length) return null;
   const order = settings.strategy === 'fastest' ? [...ready].sort((a, b) => (health.get(a.url)?.latency || a.latencyMs || 1e9) - (health.get(b.url)?.latency || b.latencyMs || 1e9)) : ready;
   // "Fastest" means the fastest, not a rotation over the list sorted by speed.
@@ -158,6 +160,10 @@ export async function scanApi(list: PoolEntry[], onProgress?: (done: number, tot
 // Tests the whole pool (not one proxy): the OpenCode API for every proxy first, then a real model request for the fast survivors.
 // attach: when the run finishes with model-ready proxies, put them in the pool route (select: also make it the active route).
 export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: boolean; attach?: { select: boolean } } = {}) {
+  if (job.running) return poolJob();
+  // A background scan shares the API scan and the stop flag with a test: wait for it to finish instead of running both at once.
+  for (let i = 0; i < 40 && standbyBusy; i++) await Bun.sleep(500);
+  if (standbyBusy) { job = { ...job, message: 'A background check of the pool is still running. Try again in a moment.' }; return poolJob(); }
   if (job.running) return poolJob(); const cfg = poolConfig(); const deep = opts.deep ?? cfg.deepTest; stopRequested = false;
   const all = await poolEntries(true); const picked = !!opts.urls?.length; let list = picked ? all.filter(e => opts.urls!.includes(e.url)) : all;
   if (!list.length) { job = { ...job, running: false, phase: 'done', finishedAt: Date.now(), total: 0, done: 0, message: 'The pool is empty. Scan or import proxies first.' }; return poolJob(); }
@@ -284,6 +290,7 @@ export async function warmTick(count = 3) {
 }
 // Re-tests the pool on a schedule so proxies that died (or recovered) are noticed without anyone pressing a button.
 export function startPoolMaintenance() {
+  void poolEntries().catch(() => {}); // load the saved list now, so the pool counts as ready for a failover before anything else has asked for it
   const standby = setInterval(() => { void standbyTick(); }, 45000); standby.unref?.();
   const warm = setInterval(() => { void warmTick(); }, 20000); warm.unref?.();
   const timer = setInterval(() => {

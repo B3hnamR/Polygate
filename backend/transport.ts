@@ -284,9 +284,9 @@ export async function usableProxy(proxy:string):Promise<string>{
   return proxy;
 }
 async function viaPool(route:Route,url:string,init:any):Promise<Response>{
-  const attempts=Math.max(1,settings.pool?.retries??3);let last:unknown;let exhausted:Response|undefined;const rid=routeContext.getStore()?.requestId;
+  const attempts=Math.max(1,settings.pool?.retries??3);let last:unknown;let exhausted:Response|undefined;const rid=routeContext.getStore()?.requestId;const failedProxies=new Set<string>();
   for(let i=0;i<attempts;i++){
-    const pick=await pickPoolProxy(route);
+    const pick=await pickPoolProxy(route,failedProxies);
     if(!pick){if(exhausted)return exhausted;throw new GatewayError('No model-ready proxy is available in the pool. Test the pool with models on the Proxies page, or add proxies.',503,'route_unavailable');}
     const started=now();
     try{
@@ -295,7 +295,7 @@ async function viaPool(route:Route,url:string,init:any):Promise<Response>{
       if(response.status===429){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion('pool:'+pick.url,false,response,seen,rid);if(ex){poolExhausted(pick.url,ex);noteExhaustion(rid,ex);exhausted?.body?.cancel().catch(()=>{});exhausted=response;continue;}noteRefused(rid);}}
       // 403 is how the free tier answers an IP it dislikes; the proxy is rotated out instead of blamed on the model.
       poolReport(pick.url,response.status===403?'blocked':response.status<500?'ok':'bad',now()-started,false);return response;
-    }catch(e){if(callerCancelled(init))throw e;poolReport(pick.url,'unreachable',0);last=e;}
+    }catch(e){if(callerCancelled(init))throw e;poolReport(pick.url,'unreachable',0);failedProxies.add(pick.url);last=e;}
   }
   if(exhausted)return exhausted;
   throw last;

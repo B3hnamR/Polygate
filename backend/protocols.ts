@@ -12,12 +12,12 @@ export function toChat(body: any, protocol: Protocol) {
 }
 export function fromChat(chat: any, protocol: Protocol, model: string) { return protocol==='anthropic' ? adapters.chatToAnthropic(chat,model,model) : protocol==='responses' ? adapters.chatToResponses(chat,model,model) : {...chat,model}; }
 // Passes bytes through untouched while reporting each SSE `data:` payload. Handles CRLF framing and an unterminated final event.
-export function observeSse(onData: (raw: string) => void, onFirstChunk?: () => void) {
+export function observeSse(onData: (raw: string) => void, onFirstChunk?: () => void, onEveryChunk?: () => void) {
   let scan = ''; let first = false; const decoder = new TextDecoder();
   const consume = (block: string) => { for (const line of block.split('\n')) if (line.startsWith('data:')) onData(line.slice(5).trim()); };
   return new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      controller.enqueue(chunk); if (!first) { first = true; onFirstChunk?.(); }
+      controller.enqueue(chunk); if (!first) { first = true; onFirstChunk?.(); } onEveryChunk?.();
       scan = (scan + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, '\n');
       let i; while ((i = scan.indexOf('\n\n')) >= 0) { consume(scan.slice(0, i)); scan = scan.slice(i + 2); }
     },

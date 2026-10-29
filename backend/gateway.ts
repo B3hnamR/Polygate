@@ -67,6 +67,11 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
   const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const chain=chainFor(chat.model);const hops:string[]=[];const controller=new AbortController();(req as any).signal=controller.signal;
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
+  // The deadline covers the wait for the first byte. Once an answer is streaming, only silence counts, so a long answer that is still arriving is
+  // not cut off; a stream that never stops is ended after an hour.
+  let idle:ReturnType<typeof setTimeout>|undefined,ceiling:ReturnType<typeof setTimeout>|undefined;
+  const armIdle=()=>{clearTimeout(idle);idle=setTimeout(()=>controller.abort(new GatewayError('The upstream stopped sending data',504,'timeout')),settings.timeoutMs);};
+  const streaming=()=>{clearTimeout(timer);armIdle();ceiling||=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),3600000);};
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
   let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
@@ -83,7 +88,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
         if(attempt>0&&providerPicksAgain(p)){r=routeForProvider(p,m.id);route=r.name;}
-        tried=true;t0=Date.now();
+        tried=true;t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
         // A tool list OpenCode refused earlier goes out already trimmed.
         if(!trimmed.length&&settings.trimTools!==false&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
         try{
@@ -122,7 +127,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}}
       }
       if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);
-      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status)))break;
+      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status))&&!(candidates.length>1&&[404,410].includes(status)))break; // "auto" also moves on from a model the provider says is gone
     }
     if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
     // A later attempt or candidate answered, so the failures before it are not recorded against this request or its model.
@@ -134,10 +139,12 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
     res.setHeader('x-polygate-model',used.id);if(chain){res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));}res.setHeader('x-polygate-route',encodeURIComponent(route));
     let ended=false;let firstAt=0;
-    const observed=upstream.body!.pipeThrough(observeSse(raw=>{
+    const observer=observeSse(raw=>{
       if(raw==='[DONE]'){ended=true;return;}
       try{const d=JSON.parse(raw);if(d.choices?.some((x:any)=>x.finish_reason))ended=true;if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
-    },()=>{firstAt=Date.now();}));
+    },()=>{firstAt=Date.now();streaming();},()=>{if(firstAt)armIdle();});
+    // pipeTo rather than pipeThrough: an abort in the middle of the stream rejects the pipe, and that is handled here instead of surfacing as an unhandled rejection.
+    upstream.body!.pipeTo(observer.writable).catch(()=>{});const observed=observer.readable;
     const wrapped=new Response(observed,{headers:upstream.headers,status:upstream.status});
     if(body.stream){
       status=200;await stream(req,res,wrapped,protocol,used.id);
@@ -158,7 +165,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(nice)message=nice.message;
     if(!res.headersSent){const wait=nice?.retryAfter||e.retryAfter;if(retryAfter&&!nice?.retryAfter)res.setHeader('Retry-After',retryAfter);else if(wait)res.setHeader('Retry-After',String(wait));const type=gateway?.type||e.type;const body={type:nice?.code||type||(protocol==='anthropic'?'api_error':'gateway_error'),message,...(nice?{code:nice.code,...nice.extra}:{})};json(res,status,protocol==='anthropic'?{type:'error',error:body}:{error:body});}else if(!res.writableEnded)res.end();
   }
-  finally{clearTimeout(timer);res.removeListener('close',cancel);release?.();if(input+output>0)recordUsage(k.id,input+output);
+  finally{clearTimeout(timer);clearTimeout(idle);clearTimeout(ceiling);res.removeListener('close',cancel);release?.();if(input+output>0)recordUsage(k.id,input+output);
     let detail:string|undefined;
     if(tried){try{
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;

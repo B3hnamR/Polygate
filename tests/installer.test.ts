@@ -12,7 +12,8 @@ const installer = read('install.sh'), command = read('install/polygate');
 
 shellTest('the installer and the polygate command are valid bash', () => {
   for (const file of ['install.sh', 'install/polygate']) {
-    const r = spawnSync('bash', ['-n', path.join(root, file).replace(/\\/g, '/')], { encoding: 'utf8' });
+    // A relative path from the project folder: on Windows the bash on PATH can be WSL's, which cannot open a C:/ path.
+    const r = spawnSync('bash', ['-n', file], { encoding: 'utf8', cwd: root });
     expect({ file, status: r.status, error: r.stderr }).toEqual({ file, status: 0, error: '' });
   }
 });

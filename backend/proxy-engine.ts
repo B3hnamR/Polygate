@@ -1,8 +1,9 @@
 import net from 'node:net';
+import { lookup } from 'node:dns/promises';
 import tls from 'node:tls';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { stateDir, settings, persist } from './state';
+import { stateDir, settings, persist, writeFileAtomic } from './state';
 import type { ProxySource } from './types';
 import { socksConnect } from './socks-bridge';
 import { PROXY_SOURCES } from './proxy-sources';
@@ -169,7 +170,7 @@ const dir = path.join(stateDir, 'proxies'); const file = path.join(dir, 'polygat
 const valid = (s: any): s is StoredProxy => !!s && typeof s.url === 'string' && typeof s.proxy === 'string' && ['http', 'socks4', 'socks5'].includes(s.proto) && typeof s.host === 'string' && Number(s.port) > 0;
 function load(): StoredProxy[] { try { if (existsSync(file)) { const j = JSON.parse(readFileSync(file, 'utf8')); if (Array.isArray(j)) return j.filter(valid); } } catch { /* start empty */ } return []; }
 let stored: StoredProxy[] = load();
-const save = () => { try { mkdirSync(dir, { recursive: true }); writeFileSync(file, JSON.stringify(stored), { mode: 0o600 }); } catch { /* the pool is rebuilt by the next scan */ } };
+const save = () => { try { mkdirSync(dir, { recursive: true }); writeFileAtomic(file, JSON.stringify(stored)); } catch { /* the pool is rebuilt by the next scan */ } };
 export const storedProxies = () => stored;
 export function addVerified(list: Candidate[], found: Map<string, ApiResult>) {
   const byUrl = new Map(stored.map(s => [s.url, s])); const now = Date.now();
@@ -190,12 +191,27 @@ function shuffle<T>(list: T[]) { for (let i = list.length - 1; i > 0; i--) { con
 // A list with more than this many addresses is junk (or not a proxy list) and is refused, as in ProxyHive.
 const MAX_PER_LIST = 150000;
 export const proxyLists = () => (settings.proxyLists ||= { builtin: true, sources: [] });
+// Fetches an address that must lead to the public internet. A name is resolved first and every address it gives must be public, and a redirect is
+// followed by hand so its target is checked the same way; otherwise a name or a redirect could point this machine at its own network.
+async function publicGet(start: URL, signal: AbortSignal): Promise<Response> {
+  let u = start;
+  for (let hop = 0; hop < 4; hop++) {
+    if (!['http:', 'https:'].includes(u.protocol) || !isPublicHost(u.hostname)) throw new Error('Only public http(s) addresses can be downloaded');
+    const bare = u.hostname.replace(/^\[|\]$/g, '');
+    if (!net.isIP(bare)) { const addresses = await lookup(bare, { all: true }).catch(() => []); if (!addresses.length || addresses.some(a => !isPublicHost(a.address))) throw new Error('That name does not lead to a public address'); }
+    const r = await fetch(u, { signal, redirect: 'manual', headers: { 'user-agent': 'polygate' } });
+    const next = r.status >= 300 && r.status < 400 ? r.headers.get('location') : null;
+    if (!next) return r;
+    await r.body?.cancel().catch(() => {}); u = new URL(next, u);
+  }
+  throw new Error('Too many redirects');
+}
 // Downloads one list. Links come from the user or the built-in table, so only public web addresses are fetched.
 export async function fetchList(url: string, hint: Hint): Promise<{ found: Candidate[]; error?: string }> {
   let u: URL; try { u = new URL(url); } catch { return { found: [], error: 'Not a web address' }; }
   if (!['http:', 'https:'].includes(u.protocol) || !isPublicHost(u.hostname)) return { found: [], error: 'Only public http(s) addresses can be downloaded' };
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(25000), headers: { 'user-agent': 'polygate' } });
+    const r = await publicGet(u, AbortSignal.timeout(25000));
     if (!r.ok) { await r.body?.cancel().catch(() => {}); return { found: [], error: `HTTP ${r.status}` }; }
     const found = parseProxyText((await r.text()).slice(0, 8_000_000), hint, true);
     // Counted by address: "any type" tries each address three ways, which must not make a normal list look too big.

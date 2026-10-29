@@ -52,9 +52,10 @@ const row = (r: any): LogEntry => ({ ...r, detail: r.detail ? (() => { try { ret
 // Newest first. "before" pages back through older entries; "after" returns only entries newer than the last one seen (live view).
 export function queryEvents(f: LogQuery) {
   const w = where(f); const limit = Math.max(1, Math.min(MAX_PAGE, f.limit || 200));
-  const page = (cond: string, value?: number) => { const sql = 'SELECT id,time,level,source,message,detail FROM events' + (w.sql ? w.sql + (cond ? ' AND ' + cond : '') : cond ? ' WHERE ' + cond : '') + ' ORDER BY id DESC LIMIT ?'; return (db.query(sql).all(...w.args, ...(value === undefined ? [] : [value]), limit + 1) as any[]); };
-  const rows = f.after ? page('id > ?', f.after) : f.before ? page('id < ?', f.before) : page('');
-  const more = rows.length > limit; const entries = rows.slice(0, limit).map(row);
+  const page = (cond: string, value?: number, asc = false) => { const sql = 'SELECT id,time,level,source,message,detail FROM events' + (w.sql ? w.sql + (cond ? ' AND ' + cond : '') : cond ? ' WHERE ' + cond : '') + (asc ? ' ORDER BY id ASC LIMIT ?' : ' ORDER BY id DESC LIMIT ?'); return (db.query(sql).all(...w.args, ...(value === undefined ? [] : [value]), limit + 1) as any[]); };
+  // "after" takes the oldest rows newer than the last one seen, so a burst larger than one page is read in order over the next polls instead of skipping the gap.
+  const rows = f.after ? page('id > ?', f.after, true) : f.before ? page('id < ?', f.before) : page('');
+  const more = rows.length > limit; const entries = (f.after ? rows.slice(0, limit).reverse() : rows.slice(0, limit)).map(row);
   // Counts ignore the level and source filters, so each filter chip shows what choosing it would add.
   const scope = where({ ...f, levels: undefined, sources: undefined }, false);
   const levels = Object.fromEntries((db.query('SELECT level, COUNT(*) n FROM events' + scope.sql + ' GROUP BY level').all(...scope.args) as any[]).map(x => [x.level, x.n]));

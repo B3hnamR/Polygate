@@ -12,6 +12,12 @@ mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 const masterPath = path.join(stateDir, 'vault.key');
 if (!existsSync(masterPath)) writeFileSync(masterPath, randomBytes(32), { mode: 0o600, flag: 'wx' });
 const master = readFileSync(masterPath);
+// Written to a temporary file, flushed, then renamed over the old one: a crash leaves the old file or the new one, never half of one.
+export function writeFileAtomic(file: string, data: string | Buffer, mode = 0o600) {
+  const tmp = file + '.tmp'; const fd = openSync(tmp, 'w', mode);
+  try { writeSync(fd, typeof data === 'string' ? Buffer.from(data) : data); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, file);
+}
 export const deriveKey = (label: string) => createHmac('sha256', master).update(label).digest();
 const configPath = path.join(stateDir, 'settings.vault');
 // Built-in providers: present in every install, switched off instead of deleted. Kilo's catalog is the same free tier the dashboard lists.
@@ -29,9 +35,18 @@ export const initialSettings = (): Settings => ({
 });
 function load(): Settings {
   if (!existsSync(configPath)) return initialSettings();
-  const raw = readFileSync(configPath); const iv = raw.subarray(0, 12); const tag = raw.subarray(12, 28);
-  const d = createDecipheriv('aes-256-gcm', master, iv); d.setAuthTag(tag);
-  return withBuiltIns({ ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) });
+  try {
+    const raw = readFileSync(configPath); const iv = raw.subarray(0, 12); const tag = raw.subarray(12, 28);
+    const d = createDecipheriv('aes-256-gcm', master, iv); d.setAuthTag(tag);
+    return withBuiltIns({ ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) });
+  } catch (e: any) {
+    // The vault key and the vault no longer belong together (one was replaced or deleted) or the file is damaged. Starting with a clear message and a
+    // copy kept aside is better than failing on every launch with a raw crypto error.
+    const kept = configPath + '.unreadable-' + Date.now();
+    try { renameSync(configPath, kept); } catch { /* it stays where it is */ }
+    console.error(`[settings] Polygate could not open its saved settings (${e?.message || e}). The file was kept as ${kept}. Starting with default settings; if vault.key was replaced, put the original back and restore that file.`);
+    return initialSettings();
+  }
 }
 export let settings = load();
 export function persist() {
@@ -52,7 +67,7 @@ if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c
 // detail is the request-shape record (sizes, counts, header names, upstream answer; no content) described in diagnostics.ts.
 if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='detail'))db.exec('ALTER TABLE requests ADD COLUMN detail TEXT;');
 export const models = new Map<string, Model>();
-for (const row of db.query('SELECT data FROM models').all() as {data: string}[]) { const m = JSON.parse(row.data); models.set(m.id, m); }
+for (const row of db.query('SELECT data FROM models').all() as {data: string}[]) { try { const m = JSON.parse(row.data); models.set(m.id, m); } catch { /* a damaged row is skipped; the next catalog refresh adds the model again */ } }
 export function saveModel(m: Model) { models.set(m.id, m); db.query('INSERT OR REPLACE INTO models VALUES (?,?)').run(m.id, JSON.stringify(m)); }
 export function removeModels(providerId: string) { for (const [id, m] of models) if (m.providerId === providerId) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); } }
 let lastPrune = 0;

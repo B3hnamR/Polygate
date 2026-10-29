@@ -329,12 +329,13 @@ async function readBody(req: IncomingMessage) {
   for await (const c of req) { size += c.length; if (size > 4 * 1024 * 1024) throw new GatewayError('Request exceeds 4 MiB', 413, 'request_too_large'); chunks.push(Buffer.from(c)); }
   try { return JSON.parse(Buffer.concat(chunks).toString() || 'null'); } catch { return undefined; }
 }
+const decodePath = (text: string) => { try { return decodeURIComponent(text); } catch { throw new GatewayError('That MCP address is not valid', 400); } };
 export async function handleMcp(req: IncomingMessage, res: ServerResponse, p: string) {
   res.setHeader('access-control-allow-origin', '*'); res.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key, mcp-session-id, mcp-protocol-version, last-event-id'); res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS'); res.setHeader('access-control-expose-headers', 'mcp-session-id');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   const cfg = mcpConfig();
   if (!cfg.enabled) throw new GatewayError('The MCP hub is turned off. Turn it on in Polygate, on the MCP page.', 404, 'mcp_disabled');
-  const scope = p === '/mcp' || p === '/mcp/' ? '' : decodeURIComponent(p.slice(5)).replace(/\/$/, '');
+  const scope = p === '/mcp' || p === '/mcp/' ? '' : decodePath(p.slice(5)).replace(/\/$/, '');
   if (scope && scope !== 'polygate' && !cfg.servers.some(s => s.name === scope)) throw new GatewayError(`No MCP server named "${scope}" on this hub`, 404, 'not_found');
   let key: ApiKey;
   try { key = authenticate(req, false); }
