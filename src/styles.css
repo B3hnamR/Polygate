@@ -411,3 +411,8 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .backup-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:6px}.backup-grid h3{font-size:14px;color:var(--muted);font-weight:550;margin:0 0 8px}.backup-grid form{display:flex;flex-direction:column;gap:12px}.backup-grid input[type=password],.backup-grid input[type=file]{width:100%}
 .backup-panel .check-row input{width:15px;height:15px;flex:none;accent-color:var(--accent)}.backup-panel .dialog-note{margin-top:14px}
 @media(max-width:850px){.backup-grid{grid-template-columns:1fr}}
+.relay-results .table-wrap{margin:0 0 4px}.verdict{font-size:13px}.verdict.good{color:var(--green)}.verdict.warn{color:var(--amber)}.verdict.bad{color:var(--red)}.verdict.neutral{color:var(--text-secondary)}
+.relay-results td .button{margin-left:6px;padding:3px 9px;font-size:12px}
+.usage-page .metric-line>div:nth-child(2) strong{color:var(--red)}
+.relay-cell{display:flex;flex-direction:column;gap:2px;min-width:200px}.relay-cell .truncate{max-width:360px}
+.relay-results td.relay-cell{white-space:normal;width:44%}.relay-results .relay-cell .verdict{white-space:normal}

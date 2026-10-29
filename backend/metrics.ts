@@ -54,3 +54,22 @@ export function usage(rawDays: number) {
   const requests = daily.reduce((s, d) => s + d.requests, 0); const busiest = daily.reduce((b, d) => d.requests > b.requests ? d : b, daily[0]);
   return { days, daily, models: group('model'), routes: group('route'), totals: { requests, errors: daily.reduce((s, d) => s + d.errors, 0), input: daily.reduce((s, d) => s + d.input, 0), output: daily.reduce((s, d) => s + d.output, 0), activeDays: daily.filter(d => d.requests).length, busiestDay: busiest.requests ? busiest.day : 0, busiestRequests: busiest.requests } };
 }
+// How each relay has done lately, from the per-day outcome counters (route_outcomes). A relay that has never worked while being refused, redirected or failing
+// over several days is flagged, so a region OpenCode does not accept from can be replaced by one it does.
+export function relayReport(days: number) {
+  const first = Math.floor(Date.now() / 86400000) - days + 1;
+  const counts = rows('SELECT route, outcome, SUM(n) n FROM route_outcomes WHERE day>=? GROUP BY route, outcome', first);
+  const seen = rows('SELECT route, COUNT(DISTINCT day) d FROM route_outcomes WHERE day>=? GROUP BY route', first);
+  const relays = settings.routes.filter(r => r.kind === 'relay').map(r => {
+    const n = (outcome: string) => Number(counts.find(c => c.route === r.id && c.outcome === outcome)?.n || 0);
+    const ok = n('ok'), refused = n('refused'), usedUp = n('used_up'), redirected = n('redirected'), failed = n('failed'); const bad = refused + redirected + failed; const total = ok + usedUp + bad; const activeDays = Number(seen.find(s => s.route === r.id)?.d || 0);
+    const region = r.deployed?.region || /^\w+ relay ([a-z]{3}\d) /.exec(r.name)?.[1] || '';
+    let tone: 'good' | 'warn' | 'bad' | 'neutral' = 'good'; let advice = 'Working.';
+    if (!total) { tone = 'neutral'; advice = 'Nothing has gone through it in this period.'; }
+    else if (!ok && bad >= 5 && activeDays >= 2) { tone = 'bad'; advice = `It has never worked in this period (${bad} refused, redirected or failed over ${activeDays} days). Another region may be accepted.`; }
+    else if (!ok && bad >= 3) { tone = 'warn'; advice = 'Nothing has worked through it yet. Give it a little longer, or try another region.'; }
+    else if (bad > ok) { tone = 'warn'; advice = 'It fails more often than it works.'; }
+    return { id: r.id, name: r.name, region, platform: r.deployed?.platform || '', enabled: r.enabled, ok, refused, usedUp, redirected, failed, activeDays, tone, advice };
+  });
+  return { days, relays };
+}

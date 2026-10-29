@@ -223,7 +223,7 @@ A *route* is the path a request takes to the provider. Pick one on the Routing p
 - **Direct**: your own connection.
 - **HTTP / SOCKS proxy**: your own proxy, or the **verified proxy pool**: Polygate downloads public lists, tests them with real model requests, and keeps the ones that work. Under **My proxies and lists** you can paste proxies and links to lists (plain `ip:port`, `socks5://…`, `user:pass@ip:port`, `ip:port:user:pass`, web-page tables, JSON), or save list links that every search downloads before (or instead of) the public lists.
 - **Cloudflare WARP**: a built-in MASQUE tunnel over HTTP/2, using a bundled helper built from usque (MIT). It changes nothing on the machine: no network interface, route, DNS or firewall rule, only a local SOCKS port on `127.0.0.1` that Polygate's own requests use. If another program already uses that port (Cloudflare's own `warp-cli` and some xray setups use 40000), Polygate picks the next free one and never touches the other program. It needs outbound TCP 443 and normal DNS access, and splits the first part of the TLS handshake on networks that reset it (names inside the tunnel are looked up through `8.8.8.8` and `9.9.9.9`, not Cloudflare's own resolver; the helper program can be changed only in the Windows app, or on a server with the admin token), so it works where WireGuard/UDP is blocked. Cloudflare's WARP exit addresses are shared, so a service can still rate-limit an exit while the tunnel itself is healthy.
-- **Relays**: one click on the Relays page deploys a small forwarding function to your own Vercel, Netlify or Cloudflare account. The platform token is used once and is not stored.
+- **Relays**: one click on the Relays page deploys a small forwarding function to your own Vercel, Netlify or Cloudflare account. The platform token is used for the deploy and is kept only if you tick **Remember this token** (encrypted with your other settings, never shown again; the dialog can forget it). On Vercel you can tick several regions and deploy them one after another. A relay Polygate deployed can be **updated** to the current relay code from its row, and deleting it can remove its project, site or Worker from the platform as well. A table on the Relays page shows how each relay has done (worked, refused, redirected, failed), so a region that never works can be replaced.
 
 | Relay | OpenCode Free | Kilo |
 |---|---|---|
@@ -255,6 +255,12 @@ sudo polygate https status
 Certificates come from Let's Encrypt, renew by themselves, and need the validation request to reach **port 80**. Polygate keeps ports 80 and 443 while this is on,
 so use *behind my web server* (`POLYGATE_TRUST_PROXY=1`, `POLYGATE_COOKIE_SECURE=1`, `POLYGATE_ALLOWED_HOSTS=your.domain`) if something else needs them.
 The installer writes a ready nginx and Caddy snippet to `/etc/polygate/proxy-example.conf`.
+
+## Backup and usage
+
+**Settings → Backup and restore** saves your providers and keys, routes and relay tokens, client keys, chains, MCP servers and preferences in one passphrase-protected file that restores on another computer. The dashboard password, HTTPS certificates, WARP registration and request history are not included, and a restore keeps the current dashboard password and a copy of the previous settings.
+
+The **Usage** page shows requests, tokens and failures per day for 7 days up to a year, and the busiest models and routes. The request log keeps a week; a daily summary keeps 400 days.
 
 ## Updates
 

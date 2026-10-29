@@ -10,7 +10,8 @@ import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWa
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
-import { deployRelay, inspectVercel } from './relay-deploy';
+import { deployRelay, inspectVercel, removeFromPlatform } from './relay-deploy';
+import { relayReport } from './metrics';
 import { metrics, usage } from './metrics';
 import { createBackup, restoreBackup } from './backup';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
@@ -60,7 +61,7 @@ async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
   }
   throw new GatewayError('Endpoint not found',404);
 }
-import type { Provider, ProviderRoutes, Route, Settings } from './types';
+import type { Deployed, Provider, ProviderRoutes, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
 // A saved secret shown as dots must not follow an edited address to another server: whoever changes the host has to type the secret again.
@@ -179,22 +180,62 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(!b.enabled&&route.id==='direct'&&!settings.routes.some(r=>r.id!=='direct'&&r.enabled))throw new GatewayError('Turn on another route first (a proxy, a relay or WARP): with Direct off, requests need somewhere else to go',409);
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
-  if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(b.id==='direct'||b.id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(String(b.id));if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);settings.routes=settings.routes.filter(r=>r.id!==b.id);for(const p of settings.providers)if(p.routes?.ids.includes(String(b.id))){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==b.id)};p.routeId=p.routes.ids[0]||'';}persist();return json(res,200,{ok:true});}
+  // Deleting a route is refused while a provider or the main selection depends on it; the checks are shared with removing a relay from its platform.
+  const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
+  const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id)};p.routeId=p.routes.ids[0]||'';}persist();};
+  if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);assertRouteDeletable(String(b.id));deleteRoute(String(b.id));return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
-  // Reads the plan of a Vercel account (Hobby allows one function region per project; Pro up to five) before anything is deployed. The token is not kept.
-  // A Vercel token the user chose to remember (b.useSaved) is read from the encrypted settings here and never sent to the dashboard.
-  const deployToken=(b:any)=>{if(b.useSaved!==true||b.platform!=='vercel')return String(b.token||'');const saved=settings.deployTokens?.vercel;if(!saved)throw new GatewayError('No Vercel token is saved. Paste a token to continue.',400);return saved;};
+  // Platform tokens: a token the user chose to remember (b.useSaved) is read from the encrypted settings here and never sent to the dashboard.
+  // Without that choice a token is used for the one call and dropped.
+  const labels={netlify:'Netlify',cloudflare:'Cloudflare',vercel:'Vercel'} as const;
+  const platformOf=(raw:unknown)=>{if(raw!=='vercel'&&raw!=='netlify'&&raw!=='cloudflare')throw new GatewayError('Choose Vercel, Netlify or Cloudflare',400);return raw;};
+  const deployToken=(b:any)=>{if(b.useSaved!==true)return String(b.token||'');const platform=platformOf(b.platform);const saved=settings.deployTokens?.[platform];if(!saved)throw new GatewayError(`No ${labels[platform]} token is saved. Paste a token to continue.`,400);return saved;};
+  const deployAccount=(b:any)=>String(b.accountId||'').trim()||(b.useSaved===true?settings.deployAccounts?.cloudflare||'':'');
+  const remember=(platform:'vercel'|'netlify'|'cloudflare',token:string,account?:string)=>{settings.deployTokens={...settings.deployTokens,[platform]:token.trim()};if(platform==='cloudflare'&&account)settings.deployAccounts={...settings.deployAccounts,cloudflare:account.trim().toLowerCase()};};
+  // What a deployed relay is called on its platform: stored when Polygate deployed it, or read from the route's name ("Vercel relay fra1 (polygate-relay-fra1-a2d9)") for relays deployed by earlier versions.
+  const deployedOf=(route:Route):Deployed|undefined=>{
+    if(route.kind!=='relay')return undefined;if(route.deployed)return route.deployed;
+    const m=/^(Vercel|Netlify|Cloudflare) relay(?: ([a-z]{3}\d))? \(([a-z0-9][a-z0-9-]*)\)$/.exec(route.name);if(!m)return undefined;
+    return {platform:m[1].toLowerCase() as Deployed['platform'],name:m[3],...(m[2]?{region:m[2]}:{})};
+  };
+  const relayRoute=(id:unknown)=>{const route=settings.routes.find(r=>r.id===id);if(!route||route.kind!=='relay')throw new GatewayError('Relay not found',404);return route;};
+  // Reads the plan of a Vercel account (Hobby allows one function region per project; Pro up to five) before anything is deployed.
   if(pathname==='/admin/relays/inspect'&&method==='POST'){const b=await readJson(req);if(b.platform!=='vercel')throw new GatewayError('Only Vercel accounts can be inspected',400);return json(res,200,await inspectVercel(deployToken(b),b.teamId?String(b.teamId):undefined));}
-  if(pathname==='/admin/relays/token/forget'&&method==='POST'){delete settings.deployTokens;persist();return json(res,200,{ok:true});}
-  // One-click relay: deploys the bundled template with the platform's API token, then saves the relay as a route.
-  // The token is used for this call only and not saved, unless the user ticked "remember": then a Vercel token that was just accepted is kept in the encrypted settings.
+  if(pathname==='/admin/relays/token/forget'&&method==='POST'){const b=await readJson(req);if(b.platform){const p=platformOf(b.platform);if(settings.deployTokens)delete settings.deployTokens[p];if(p==='cloudflare')delete settings.deployAccounts;}else{delete settings.deployTokens;delete settings.deployAccounts;}if(settings.deployTokens&&!Object.keys(settings.deployTokens).length)delete settings.deployTokens;persist();return json(res,200,{ok:true});}
+  // One-click relay: deploys the bundled template with the platform's API token, then saves the relay as a route (with what the platform calls it, for updating or removing it later).
   if(pathname==='/admin/relays/deploy'&&method==='POST'){
-    const b=await readJson(req);const token=deployToken(b);const r=await deployRelay({platform:b.platform,token,name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:b.accountId?String(b.accountId):undefined});
-    const label={netlify:'Netlify',cloudflare:'Cloudflare',vercel:'Vercel'}[r.platform];
-    const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${label} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{}),...(r.only?{only:r.only}:{})};
-    settings.routes.push(route);if(b.remember===true&&r.platform==='vercel')settings.deployTokens={...settings.deployTokens,vercel:token.trim()};persist();
+    const b=await readJson(req);const platform=platformOf(b.platform);const token=deployToken(b);const accountId=deployAccount(b);
+    const r=await deployRelay({platform,token,name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:accountId||undefined});
+    const deployed:Deployed={platform,name:r.name,...(r.region?{region:r.region}:{}),...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{}),...(platform==='vercel'?{runtime:b.runtime==='node'?'node' as const:'bun' as const}:{})};
+    const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${labels[platform]} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{}),...(r.only?{only:r.only}:{}),deployed};
+    settings.routes.push(route);if(b.remember===true&&b.useSaved!==true)remember(platform,token,r.account);persist();
     return json(res,200,{ok:true,id:route.id,name:r.name,url:r.url,platform:r.platform,runtime:r.runtime,region:r.region,only:r.only,reachable:r.reachable,status:r.status,detail:r.detail});
   }
+  // Deploys the current relay code again under the same name, address and access token, so a relay deployed by an older version gets what newer versions changed.
+  if(pathname==='/admin/relays/update'&&method==='POST'){
+    const b=await readJson(req);const route=relayRoute(b.id);const d=deployedOf(route);
+    if(!d)throw new GatewayError('Polygate did not deploy this relay, so it cannot update it. Deploy a new one instead.',400);
+    if(!route.token)throw new GatewayError('This relay has no access token saved, so it cannot be updated',400);
+    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account||'';
+    const r=await deployRelay({platform:d.platform,token,name:d.name,region:d.region,runtime:d.runtime,accountId:accountId||undefined,update:{access:route.token,siteId:d.siteId}});
+    route.url=r.url;if(r.buffered)route.buffered=true;else delete route.buffered;route.deployed={...d,name:r.name,...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{})};if(r.reachable)route.status='healthy';
+    if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,r.account);persist();
+    logEvent('info','relays',`${route.name} updated to the current relay code${r.reachable?'':' (not answering yet)'}`);
+    return json(res,200,{ok:true,id:route.id,url:r.url,reachable:r.reachable,status:r.status,detail:r.detail});
+  }
+  // Removes the relay's project, site or Worker from its platform, then the route here. Nothing is removed from the platform while the route cannot be deleted.
+  if(pathname==='/admin/relays/remove'&&method==='POST'){
+    const b=await readJson(req);const route=relayRoute(b.id);const d=deployedOf(route);
+    if(!d)throw new GatewayError('Polygate did not deploy this relay, so there is nothing for it to remove on a platform. Delete the route instead.',400);
+    assertRouteDeletable(route.id);
+    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account;
+    await removeFromPlatform({platform:d.platform,token,name:d.name,siteId:d.siteId,accountId});
+    if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,accountId);
+    deleteRoute(route.id);logEvent('info','relays',`${route.name} removed from ${labels[d.platform]} and from Polygate`);
+    return json(res,200,{ok:true});
+  }
+  // How each relay has done: what came back through it, per day, for the last 7 or 30 days.
+  if(pathname==='/admin/relays/report'&&method==='GET'){const days=new URL(req.url||'/','http://x').searchParams.get('days')==='30'?30:7;return json(res,200,relayReport(days));}
   // --- Cloudflare WARP ---
   // The dashboard shows the helper field read-only when this session may not change it (see checkHelperPath).
   const local=canManageLocal(req);

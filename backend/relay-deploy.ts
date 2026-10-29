@@ -12,8 +12,9 @@ const sources = { vercel: vercelModule as unknown as string, netlify: netlifyMod
 export type Platform = 'vercel' | 'netlify' | 'cloudflare';
 // runtime (Vercel only): 'bun' (default) or 'node' (the same relay with Bun's cipher list set explicitly).
 // accountId (Cloudflare only): the account the Worker is created in.
-export type DeployInput = { platform: Platform; token: string; name?: string; region?: string; teamId?: string; runtime?: 'bun' | 'node'; accountId?: string };
-export type DeployResult = { platform: Platform; name: string; url: string; accessToken: string; buffered: boolean; runtime: 'bun' | 'node-bun-ciphers' | 'cloudflare-worker'; region?: string; only?: 'kilo'; reachable: boolean; status: number; detail: string };
+// update: redeploys the relay Polygate made earlier under the same name and access token (siteId: the Netlify site, when known).
+export type DeployInput = { platform: Platform; token: string; name?: string; region?: string; teamId?: string; runtime?: 'bun' | 'node'; accountId?: string; update?: { access: string; siteId?: string } };
+export type DeployResult = { platform: Platform; name: string; url: string; accessToken: string; buffered: boolean; runtime: 'bun' | 'node-bun-ciphers' | 'cloudflare-worker'; region?: string; only?: 'kilo'; siteId?: string; account?: string; reachable: boolean; status: number; detail: string };
 export const PLATFORMS: Platform[] = ['vercel', 'netlify', 'cloudflare'];
 const fail = (message: string, status = 502) => new GatewayError(message, status, 'deploy_failed');
 const slug = (value: string | undefined, fallback: string) => { const s = String(value || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40); return s || fallback + '-' + randomBytes(2).toString('hex'); };
@@ -62,10 +63,11 @@ async function deployVercel(i: DeployInput, access: string): Promise<{ name: str
   const alias: string = (d.alias || []).find((a: string) => a.endsWith('.vercel.app') && !/-[a-z0-9]{9}-/.test(a)) || (d.alias || [])[0] || d.url;
   return { name, url: 'https://' + alias, buffered: false, runtime: node ? 'node-bun-ciphers' : 'bun', region };
 }
-async function deployNetlify(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'node-bun-ciphers' }> {
+async function deployNetlify(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'node-bun-ciphers'; siteId: string }> {
   const secrets = [i.token, access]; const auth = json(i.token); const base = 'https://api.netlify.com/api/v1';
   let site: any; let name = slug(i.name, 'polygate-relay');
-  for (let tries = 0; tries < 3 && !site?.id; tries++) {
+  if (i.update) { site = await api('Netlify', `${base}/sites/${encodeURIComponent(i.update.siteId || name + '.netlify.app')}`, { headers: auth }, secrets); name = String(site?.name || name); }
+  else for (let tries = 0; tries < 3 && !site?.id; tries++) {
     const r = await fetch(`${base}/sites`, { method: 'POST', headers: auth, body: JSON.stringify({ name }), signal: AbortSignal.timeout(60000) });
     const text = await r.text(); let data: any; try { data = JSON.parse(text); } catch { data = {}; }
     if (r.ok) site = data; else if (r.status === 422) name = slug(i.name, 'polygate-relay') + '-' + randomBytes(2).toString('hex'); else throw fail(`Netlify refused the request (HTTP ${r.status}${r.status === 401 ? ', check the token' : ''}): ${reason(data, text, secrets)}`, r.status === 401 ? 400 : 502);
@@ -73,10 +75,13 @@ async function deployNetlify(i: DeployInput, access: string): Promise<{ name: st
   if (!site?.id) throw fail('Netlify did not accept any site name; try a different one.');
   // A new site starts behind Netlify's team login, which would answer the relay's callers with a login page; the relay has its own access token.
   // If anything after this point fails, the half-made site is removed so a retry does not leave stray sites behind.
+  // An update keeps the site, its public setting and its access token as they are, and only publishes the current relay code again.
   try {
-    await api('Netlify', `${base}/sites/${site.id}`, { method: 'PATCH', headers: auth, body: JSON.stringify({ sso_login: false }) }, secrets);
-    // The access token must exist before the function is deployed, or the function would start without it.
-    await api('Netlify', `${base}/accounts/${site.account_id || site.account_slug}/env?site_id=${site.id}`, { method: 'POST', headers: auth, body: JSON.stringify([{ key: 'POLYGATE_RELAY_TOKEN', values: [{ value: access, context: 'all' }] }]) }, secrets);
+    if (!i.update) {
+      await api('Netlify', `${base}/sites/${site.id}`, { method: 'PATCH', headers: auth, body: JSON.stringify({ sso_login: false }) }, secrets);
+      // The access token must exist before the function is deployed, or the function would start without it.
+      await api('Netlify', `${base}/accounts/${site.account_id || site.account_slug}/env?site_id=${site.id}`, { method: 'POST', headers: auth, body: JSON.stringify([{ key: 'POLYGATE_RELAY_TOKEN', values: [{ value: access, context: 'all' }] }]) }, secrets);
+    }
     const html = '<!doctype html><title>Polygate relay</title>'; const fn = __zip({ 'relay.js': sources.netlify });
     const deploy = await api('Netlify', `${base}/sites/${site.id}/deploys`, { method: 'POST', headers: auth, body: JSON.stringify({ files: { '/index.html': createHash('sha1').update(html).digest('hex') }, functions: { relay: createHash('sha256').update(fn).digest('hex') } }) }, secrets);
     const octet = { authorization: 'Bearer ' + i.token, 'content-type': 'application/octet-stream' };
@@ -88,12 +93,12 @@ async function deployNetlify(i: DeployInput, access: string): Promise<{ name: st
       await sleep(__timing.poll); d = await api('Netlify', `${base}/deploys/${deploy.id}`, { headers: auth }, secrets);
     }
     if (d.state !== 'ready') throw fail('Netlify did not finish the deployment within two minutes. Check the site in the Netlify dashboard.');
-  } catch (e) { await fetch(`${base}/sites/${site.id}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
+  } catch (e) { if (!i.update) await fetch(`${base}/sites/${site.id}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
   const host = String(site.default_domain || site.ssl_url?.replace(/^https:\/\//, '') || `${name}.netlify.app`);
-  return { name, url: `https://${host}/.netlify/functions/relay`, buffered: true, runtime: 'node-bun-ciphers' };
+  return { name, url: `https://${host}/.netlify/functions/relay`, buffered: true, runtime: 'node-bun-ciphers', siteId: String(site.id) };
 }
 // A Worker needs the account's workers.dev address to be reachable; creating that address would rename the whole account's subdomain, so it is only asked for.
-async function deployCloudflare(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'cloudflare-worker'; only: 'kilo' }> {
+async function deployCloudflare(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'cloudflare-worker'; only: 'kilo'; account: string }> {
   const account = String(i.accountId || '').trim().toLowerCase();
   if (!/^[a-f0-9]{32}$/.test(account)) throw new GatewayError('Enter the Cloudflare Account ID: 32 letters and digits, shown in the dashboard under Workers & Pages', 400);
   const secrets = [i.token, access]; const auth = { authorization: 'Bearer ' + i.token }; const base = `https://api.cloudflare.com/client/v4/accounts/${account}`;
@@ -106,8 +111,8 @@ async function deployCloudflare(i: DeployInput, access: string): Promise<{ name:
   await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'PUT', headers: auth, body: form }, secrets);
   // If anything after the upload fails, the half-made Worker is removed so a retry does not leave stray Workers behind.
   try { await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}/subdomain`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true }) }, secrets); }
-  catch (e) { await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
-  return { name, url: `https://${name}.${subdomain}.workers.dev`, buffered: false, runtime: 'cloudflare-worker', only: 'kilo' };
+  catch (e) { if (!i.update) await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
+  return { name, url: `https://${name}.${subdomain}.workers.dev`, buffered: false, runtime: 'cloudflare-worker', only: 'kilo', account };
 }
 // What the Vercel account allows. Limits are the published ones (vercel.com/docs/limits and /docs/functions/configuring-functions/region, read 26 October 2026).
 const PLAN_LIMITS: Record<string, { regionsPerProject: number; deploymentsPerDay: number; projects: number | null }> = {
@@ -145,8 +150,21 @@ export async function verifyRelay(url: string, token: string): Promise<{ reachab
 export async function deployRelay(input: DeployInput): Promise<DeployResult> {
   if (!PLATFORMS.includes(input.platform)) throw new GatewayError('Choose Vercel, Netlify or Cloudflare', 400);
   const token = String(input.token || '').trim(); if (token.length < 8) throw new GatewayError('Enter the platform API token', 400);
-  const i = { ...input, token }; const access = accessToken();
+  const i = { ...input, token }; const access = input.update?.access || accessToken();
   const made = i.platform === 'netlify' ? await deployNetlify(i, access) : i.platform === 'cloudflare' ? await deployCloudflare(i, access) : await deployVercel(i, access);
   const check = i.platform === 'cloudflare' ? await verifyWorker(made.url, access) : await verifyRelay(made.url, access);
   return { platform: i.platform, ...made, accessToken: access, ...check, detail: check.reachable ? (i.platform === 'cloudflare' ? 'The Worker answered its status check several times in a row through its access token. It forwards to Kilo only.' : 'The relay answered a catalog request through its access token.') : `The relay was deployed but did not answer yet (HTTP ${check.status || 'no answer'}). Give it a minute and use Test.` };
+}
+// Removes what deployRelay made on the platform, so deleting a relay in Polygate does not leave a project, site or Worker running (and counting toward a plan's limits).
+// A project that is already gone counts as removed.
+export async function removeFromPlatform(input: { platform: Platform; token: string; name: string; siteId?: string; accountId?: string }): Promise<void> {
+  if (!PLATFORMS.includes(input.platform)) throw new GatewayError('Choose Vercel, Netlify or Cloudflare', 400);
+  const token = String(input.token || '').trim(); if (token.length < 8) throw new GatewayError('Enter the platform API token', 400);
+  const name = String(input.name || ''); if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw new GatewayError('This relay has no usable platform name to remove', 400);
+  const secrets = [token]; const gone = [404];
+  if (input.platform === 'vercel') { await api('Vercel', `https://api.vercel.com/v9/projects/${encodeURIComponent(name)}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone); return; }
+  if (input.platform === 'netlify') { await api('Netlify', `https://api.netlify.com/api/v1/sites/${encodeURIComponent(input.siteId || name + '.netlify.app')}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone); return; }
+  const account = String(input.accountId || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(account)) throw new GatewayError('Enter the Cloudflare Account ID: 32 letters and digits, shown in the dashboard under Workers & Pages', 400);
+  await api('Cloudflare', `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone);
 }

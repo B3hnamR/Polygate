@@ -8,13 +8,14 @@ const { createBackup, openBackup } = await import('../backend/backup');
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = '';
 const admin = { authorization: 'Bearer backup-test-secret', 'content-type': 'application/json' };
 const call = async (p: string, body: unknown) => { const r = await fetch(base + p, { method: 'POST', headers: admin, body: JSON.stringify(body) }); return { status: r.status, body: (await r.json().catch(() => ({}))) as any }; };
-const saved = { providers: settings.providers, routes: settings.routes, keys: settings.keys, admin: settings.admin, mcp: settings.mcp };
+// Copies, because a restore replaces these arrays and other test files share this process's settings.
+const saved = { providers: settings.providers.slice(), routes: settings.routes.slice(), keys: settings.keys.slice(), admin: settings.admin, mcp: settings.mcp };
 beforeAll(async () => { gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`; });
-afterAll(async () => { Object.assign(settings, saved); await gateway?.close(); });
+afterAll(async () => { Object.assign(settings, { providers: saved.providers.slice(), routes: saved.routes.slice(), keys: saved.keys.slice() }); settings.admin = saved.admin; settings.mcp = saved.mcp; if (!saved.admin) delete settings.admin; if (!saved.mcp) delete settings.mcp; await gateway?.close(); });
 
 test('a backup holds the settings, is unreadable without the passphrase and leaves the dashboard password out', () => {
   settings.admin = { password: { salt: 'SALT-VALUE', hash: 'HASH-VALUE' }, epoch: 3 };
-  settings.routes.push({ id: 'r-bk', name: 'Backed-up relay', kind: 'relay', url: 'https://relay.example.com', token: 'relay-secret-token-1234', enabled: true, models: [] } as any);
+  settings.routes = [...settings.routes, { id: 'r-bk', name: 'Backed-up relay', kind: 'relay', url: 'https://relay.example.com', token: 'relay-secret-token-1234', enabled: true, models: [] } as any];
   const out = createBackup('correct horse battery');
   expect(out.filename).toMatch(/^polygate-backup-\d{4}-\d{2}-\d{2}\.pgbackup$/);
   for (const secret of ['relay-secret-token-1234', 'HASH-VALUE', 'Backed-up relay', settings.keys[0].value]) expect(out.content).not.toContain(secret);
@@ -31,9 +32,9 @@ test('a backup holds the settings, is unreadable without the passphrase and leav
 
 test('restoring replaces the settings, keeps the current dashboard password and keeps a copy of what was there', async () => {
   settings.admin = { password: { salt: 'KEEP-SALT', hash: 'KEEP-HASH' }, epoch: 1 };
-  settings.routes.push({ id: 'r-was', name: 'Relay that was backed up', kind: 'relay', url: 'https://was.example.com', token: 'was-token-123456', enabled: true, models: [] } as any);
+  settings.routes = [...settings.routes, { id: 'r-was', name: 'Relay that was backed up', kind: 'relay', url: 'https://was.example.com', token: 'was-token-123456', enabled: true, models: [] } as any];
   const exported = await call('/admin/backup/export', { passphrase: 'a long passphrase' }); expect(exported.status).toBe(200);
-  settings.routes = settings.routes.filter(r => r.id !== 'r-was'); settings.routes.push({ id: 'r-later', name: 'Added after the backup', kind: 'relay', url: 'https://later.example.com', token: 'later-token-123456', enabled: true, models: [] } as any);
+  settings.routes = settings.routes.filter(r => r.id !== 'r-was'); settings.routes = [...settings.routes, { id: 'r-later', name: 'Added after the backup', kind: 'relay', url: 'https://later.example.com', token: 'later-token-123456', enabled: true, models: [] } as any];
   settings.admin = { password: { salt: 'NEW-SALT', hash: 'NEW-HASH' }, epoch: 2 };
   const bad = await call('/admin/backup/restore', { content: exported.body.content, passphrase: 'not the passphrase' });
   expect(bad.status).toBe(400); expect(settings.routes.some(r => r.id === 'r-later')).toBe(true); // a failed restore changes nothing

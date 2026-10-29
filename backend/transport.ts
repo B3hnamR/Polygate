@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { settings, persist, redactError } from './state';
+import { settings, persist, redactError, tallyRoute } from './state';
 import { GatewayError } from './queue';
 import type { Route, Provider, ProviderRoutes } from './types';
 import { socksBridge, parseSocksUrl } from './socks-bridge';
@@ -24,7 +24,7 @@ const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
 const publicPool=(r:Route,kind?:string)=>r.id==='proxy-pool'&&!!kind&&kind!=='free'&&kind!=='kilo';
 const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
-export function routeExhausted(route:Route,ex:Exhaustion){route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
+export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay')tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
 // A relay is judged like a direct connection only when it says its TLS handshake is Bun's: it runs on Bun, or on Node with Bun's cipher list (relays/netlify-relay.js).
 const trustedRuntime=(v:string|null)=>/^(bun|node-bun-ciphers)/i.test(v||'');
 // A 429 with a countdown is only a suspicion of a used-up exit: a wrong request shape or a TLS client other than Bun's gets the same answer.
@@ -280,6 +280,7 @@ export function plainRouteError(raw:string,kind?:string):string{
 }
 export function routeFailed(route:Route,reason:string,immediate=false){
   const raw=redactError(reason);route.status=plainRouteError(raw,route.kind);route.failures=(route.failures||0)+1;
+  if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');
   if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;
     logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,raw:raw===route.status?undefined:raw,pausedUntil:route.cooldownUntil});}
 }
@@ -367,7 +368,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}
     // The relay's own refusal of a wrong access token is not delivery: the relay answered, but nothing it is sent will ever get through.
     else if(route.kind==='relay'&&response.status===401&&await relayRejectedKey(response))routeFailed(route,'The relay rejected its access token (HTTP 401). Check the token on the Relays page.',true);
-    else if(response.status<500&&!exhausted){routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
+    else if(response.status<500&&!exhausted){if(route.kind==='relay'&&response.status<400)tallyRoute(route.id,'ok');routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
     else if(route.kind==='relay'&&(response.status===502||response.status===504))routeFailed(route,`HTTP ${response.status}`);
     return response;
   }catch(e){
@@ -426,5 +427,5 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
       :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request through it.`
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
     return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary,provider:'OpenCode Free'});
-  }catch(e){const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
+  }catch(e){const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }
