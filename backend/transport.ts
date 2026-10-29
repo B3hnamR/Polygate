@@ -200,7 +200,7 @@ export function describeRoutes(): Record<string, RouteInfo> {
     const role: RouteInfo['role'] = !r.enabled ? 'off' : r.id === settings.routeId ? 'active' : backupOn && (r.id === 'proxy-pool' || r.kind !== 'direct' || settings.allowDirect === true) ? 'backup' : 'off';
     let label = r.status || 'Not tested'; let tone: RouteInfo['tone'] = 'neutral'; let detail = '';
     if (!r.enabled) { label = 'Disabled'; }
-    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'Refused by Free tier' : 'Used up today'; tone = 'cooldown'; detail = refused ? `Skipped until ${resetTime(r.exhaustedUntil!)}` : rerolling.has(r.id) ? 'Asking again for a fresh address…' : `Resets ${resetTime(r.exhaustedUntil!)}` + (r.recheckedAt ? ` · asked again ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
+    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'Refused by Free tier' : 'Used up today'; tone = 'cooldown'; detail = refused ? `Not the daily allowance: the Free tier refused chat from this exit. Skipped until ${resetTime(r.exhaustedUntil!)}, then tried again` : rerolling.has(r.id) ? 'Asking again for a fresh address…' : `Resets ${resetTime(r.exhaustedUntil!)}` + (r.recheckedAt ? ` · asked again ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
     else if (r.id === 'proxy-pool') { const s = poolSummary(); label = s.clean ? `${s.clean} clean exit${s.clean > 1 ? 's' : ''} ready` : s.ready ? `${s.ready} model-ready` : 'No clean proxy yet'; tone = s.clean || s.ready ? 'healthy' : 'cooldown'; detail = `${s.exhausted} used up today · keeps ${s.target} ready`; }
     else if (r.kind === 'warp') { const up = !!warpTarget(); label = up ? 'Connected' : 'Not connected'; tone = up ? 'healthy' : 'neutral'; detail = up ? '' : 'Connect it in the WARP panel below'; }
     else if (coolingDown(r)) { label = 'Cooling down'; tone = 'cooldown'; detail = `Until ${new Date(r.cooldownUntil!).toISOString().slice(11, 16)} UTC`; }
@@ -253,13 +253,24 @@ export function relayRequest(url: string, init: RequestInit, route: Route) {
   headers.set('x-relay-target',target.origin);headers.set('x-relay-path',target.pathname+target.search);
   if(route.token)headers.set('x-relay-key',route.token);
   headers.delete('host');headers.delete('content-length');
-  return {url:route.url,init:{...init,headers,redirect:'error' as RequestRedirect}};
+  // 'manual': the relay passes the site's own answer through, a redirect included. It is never followed (the access token header must not reach another host)
+  // and is reported by relayRedirect instead of the bare "UnexpectedRedirect" the runtime used to throw.
+  return {url:route.url,init:{...init,headers,redirect:'manual' as RequestRedirect}};
+}
+// A 3xx that came back through a relay: the site (or the platform in front of the relay) sent the request somewhere else instead of answering it.
+export function relayRedirect(response:Response):Error|undefined{
+  const location=response.headers.get('location')||'';
+  if(response.status<300||response.status>=400||!location)return undefined;let where='another address';
+  try{const u=new URL(location,'https://relay.invalid');where=(u.host==='relay.invalid'?'a path on the same address':u.host)+(u.host==='relay.invalid'?'':u.pathname.slice(0,40));}catch{/* keep the generic text */}
+  return new Error(`redirected (HTTP ${response.status}) to ${where}`);
 }
 // Circuit breaker: three consecutive connection failures open the route for 30s, doubling on each re-open up to 5 minutes. One success closes it.
 const BREAKER_THRESHOLD=3;
 // What a failed route shows in the dashboard: the network's verdict in a few plain words. The raw text stays in the log.
 export function plainRouteError(raw:string,kind?:string):string{
   const t=String(raw);
+  const moved=/redirected \(HTTP (\d+)\) to ([^\s]+)/i.exec(t);
+  if(moved)return `The site sent the request to ${moved[2]} (HTTP ${moved[1]}) instead of answering it${kind==='relay'?'. This exit address may be blocked; another exit or region may work':''}`;
   if(/ECONNRESET|socket connection was closed|connection (was )?reset|forcibly closed|closed unexpectedly/i.test(t))return kind==='relay'?'Connection reset: the network or the relay host closed it (a network that blocks the site looks like this)':'Connection reset: the network closed it';
   if(/ETIMEDOUT|timed? ?out|TimeoutError|deadline/i.test(t))return 'No answer in time';
   if(/ENOTFOUND|EAI_AGAIN|getaddrinfo|no such host|could not resolve/i.test(t))return "Name not found: check the address and this computer's DNS";
@@ -318,7 +329,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
       for(let spin=0;;spin++){
         const r=relayRequest(url,init,route);const avoid=spentList(route.id);if(avoid.length&&bunRelays.has(route.id))(r.init.headers as Headers).set('x-relay-avoid',avoid.join(','));
         // A relay that is known to run Bun is a pool of instances: when one cannot be reached, take another before giving the route up.
-        try{response=await fetch(r.url,r.init);}
+        try{response=await fetch(r.url,r.init);const moved=relayRedirect(response);if(moved){await response.body?.cancel().catch(()=>{});throw moved;}}
         catch(e){if(callerCancelled(init)||!bunRelays.has(route.id)||isCanary(rid0)||spin>=max||!await rotateRelay(route))throw e;continue;}
         const egress=response.headers.get('x-relay-egress');// A relay that reports its egress address can be rotated (relays/vercel-bun); the Netlify relay trusts the same handshake but has no instances.
       const bun=!!response.headers.get('x-relay-egress')&&trustedRuntime(response.headers.get('x-relay-runtime'));
