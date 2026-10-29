@@ -17,6 +17,10 @@ let cursor=0;
 const now=()=>Date.now();
 // A route is out of play while it cools down after connection failures, or while its exit address has used up its daily Free allowance.
 const coolingDown=(r:Route)=>(!!r.cooldownUntil&&r.cooldownUntil>now())||(!!r.exhaustedUntil&&r.exhaustedUntil>now());
+// "Used up today" is OpenCode Free's allowance for an exit address. A provider on its own server (or Kilo, which has its own limit) is not affected by it,
+// so a route that is used up for OpenCode is still the right one for them.
+const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
+const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
 export function routeExhausted(route:Route,ex:Exhaustion){route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
 // A relay is judged like a direct connection only when it says its TLS handshake is Bun's: it runs on Bun, or on Node with Bun's cipher list (relays/netlify-relay.js).
@@ -98,7 +102,9 @@ async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response
 }
 // Where a request goes when its route's exit is used up: a pool proxy that just proved itself clean, else the next healthy route.
 // Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
-const carries=(r:Route,kind?:string)=>!r.only||r.only===kind;
+// Relays forward to OpenCode and Kilo hosts only, over HTTPS (their allowlist), so a provider on any other server cannot use one.
+const relayCarries=(kind?:string)=>!kind||kind==='free'||kind==='kilo';
+const carries=(r:Route,kind?:string)=>(!r.only||r.only===kind)&&(r.kind!=='relay'||relayCarries(kind));
 export function exhaustedAlternative(current:Route):Route|undefined{
   if(settings.exhaustedFailover===false)return;
   const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!coolingDown(r));
@@ -109,16 +115,18 @@ export function exhaustedAlternative(current:Route):Route|undefined{
 export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id&&r.enabled);
 export function routeFor(model='', explicit='', kind?: string): Route {
   const selected=explicit||settings.routeId;
-  const current=findRoute(selected);
+  let current=findRoute(selected);
+  // A provider on its own server is reached directly when the route in use is a relay: a relay would refuse the host.
+  if(current?.kind==='relay'&&!relayCarries(kind)){const direct=settings.routes.find(r=>r.id==='direct'&&r.enabled);if(!direct)throw new GatewayError('This provider is on its own server, and relay routes only carry OpenCode and Kilo traffic. Switch Direct on or give the provider another route.',503,'route_unavailable');current=direct;}
   const rotating=settings.rotate&&!explicit;
   // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
-  if(!rotating&&current&&isExhausted(current)){const alt=exhaustedAlternative(current);if(alt)return alt;}
+  if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt)return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
-  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDown(r));
+  const pool=settings.routes.filter(r=>r.enabled&&r.kind!=='direct'&&carries(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
-    const last=current&&isExhausted(current)?exhaustedAlternative(current):undefined;if(last)return last;
+    const last=current&&isExhausted(current)&&exhaustionApplies(kind)?exhaustedAlternative(current):undefined;if(last)return last;
     throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
   }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
@@ -129,7 +137,7 @@ export function routeFor(model='', explicit='', kind?: string): Route {
 }
 // Deterministic order used when a connection fails: WARP first, then the other routes in the order they were added, direct only if allowed.
 export function failoverRoutes(current: Route, kind?: string): Route[] {
-  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
+  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!coolingDownFor(r,kind)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
   return [...usable.filter(r=>r.kind==='warp'),...usable.filter(r=>r.kind!=='warp'&&r.kind!=='direct'),...usable.filter(r=>r.kind==='direct')];
 }
 // One description of every route, used by the Routing page and the Proxies page so they cannot disagree.

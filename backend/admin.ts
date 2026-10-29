@@ -63,6 +63,19 @@ import type { Provider, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
+// The text before the slash in every model of a provider ("test1/gpt-4"). The user picks it; without one it comes from the provider's name.
+const PREFIX_RESERVED = new Set(['opencode', 'kilo', 'free', 'auto', 'chain']);
+function providerPrefix(b: any): string {
+  const typed = String(b.idPrefix ?? '').trim().toLowerCase();
+  if (typed) {
+    if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(typed)) throw new GatewayError('The model prefix can use lowercase letters, numbers and dashes, up to 30 characters.', 400);
+    if (PREFIX_RESERVED.has(typed) || settings.providers.some(x => x.id === typed)) throw new GatewayError(`The prefix "${typed}" is already used. Choose another.`, 400);
+    return typed;
+  }
+  const base = String(b.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+  if (base && !PREFIX_RESERVED.has(base) && !settings.providers.some(x => x.id === base)) return base;
+  return (base || 'p') + '-' + randomBytes(3).toString('hex');
+}
 export async function admin(req:IncomingMessage,res:ServerResponse,pathname:string){
   const method=req.method;
   if(pathname==='/admin/updates'&&method==='GET')return json(res,200,await checkForUpdates());
@@ -112,8 +125,10 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     const b=await readJson(req);const old=settings.providers.find(p=>p.id===b.id);
     if(!['free','openai','opencode','kilo'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
     if(b.routeId&&!settings.routes.some(r=>r.id===b.routeId))throw new GatewayError('Provider route does not exist',400);
+    // Relays forward to OpenCode and Kilo over HTTPS only, so a provider on any other server cannot be pinned to one.
+    if(b.kind!=='free'&&b.kind!=='kilo'&&settings.routes.find(r=>r.id===b.routeId)?.kind==='relay')throw new GatewayError('Relays only carry OpenCode and Kilo traffic. Choose Direct, a proxy or WARP for this provider.',400);
     if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
-    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:'p-'+randomBytes(4).toString('hex')),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:String(b.routeId||'')};
+    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:String(b.routeId||'')};
     if(p.kind==='free'&&settings.providers.some(x=>x.kind==='free'&&x.id!==p.id))throw new GatewayError('Only one adaptive Free provider is supported',400);
     if(old)Object.assign(old,p);else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
   }
