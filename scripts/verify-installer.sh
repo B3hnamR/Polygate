@@ -56,7 +56,8 @@ r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:4318/admin/log
 assert r.status==200 and 'HttpOnly' in r.headers['Set-Cookie']
 PY
 polygate uninstall --yes >/dev/null
-[ -f /var/lib/polygate/keep.txt ] && [ ! -e /opt/polygate ]
+[ -f /var/lib/polygate/keep.txt ]
+[ ! -e /opt/polygate ]
 echo 'PASS: checksummed install, dedicated user, file permissions, real gateway startup, update preservation, password reset/login, and data-preserving uninstall. systemd commands were simulated.'
 SH
 docker run --name "$name" --user root --entrypoint bash -v "$PWD/release:/input-assets:ro" -v "$PWD/install.sh:/input/install.sh:ro" -v "$PWD/release/polygate-linux-amd64.tar.gz:/input/polygate-linux-amd64.tar.gz:ro" -v "$PWD/release/polygate-linux-amd64.tar.gz.sha256:/input/polygate-linux-amd64.tar.gz.sha256:ro" -v "$work:/fixture:ro" "$image" /fixture/test.sh

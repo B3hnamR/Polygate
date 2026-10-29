@@ -20,8 +20,10 @@ async function run(){
     const supplied=process.argv.includes('--stdin')?(await Bun.stdin.text()).trim():'';
     const password=supplied||randomBytes(18).toString('base64url');
     if(password.length<12)throw new Error('Password must contain at least 12 characters');
-    const salt=randomBytes(16).toString('hex');
-    settings.admin={password:{salt,hash:scryptSync(password,salt,32).toString('hex')},epoch:(settings.admin?.epoch||0)+1};persist();
+    // A running gateway holds the settings in memory and would write its old password back, so it is asked to change it; only a stopped one is edited on disk.
+    let running=false;
+    try{const r=await call('/admin/reset-password',{password});if(!r.ok)throw new Error(`The running gateway refused the reset (${r.status}): ${r.text.slice(0,200)}`);running=true;}catch(e:any){if(/refused the reset/.test(String(e.message)))throw e;}
+    if(!running){const salt=randomBytes(16).toString('hex');settings.admin={password:{salt,hash:scryptSync(password,salt,32).toString('hex')},epoch:(settings.admin?.epoch||0)+1};persist();}
     writeFileSync(path.join(stateDir,'admin-password.txt'),password+'\n',{mode:0o600});
     console.log('Password reset. Saved to '+path.join(stateDir,'admin-password.txt'));return;
   }

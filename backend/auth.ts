@@ -36,7 +36,8 @@ export const hostAllowed = (hostHeader: string) => {
 // to the left of them came from the client and can be forged. The left-most entry used to be taken, which reset lockouts on every request.
 export function clientIp(req: IncomingMessage) {
   const cfg = serverConfig();
-  if (cfg.trustProxy) { const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean); const f = chain[Math.max(0, chain.length - cfg.proxyHops)]; if (f) return f; }
+  // A chain shorter than the number of trusted proxies means a request skipped one of them, so nothing in it can be believed: use the connection's own address.
+  if (cfg.trustProxy) { const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean); const f = chain.length >= cfg.proxyHops ? chain[chain.length - cfg.proxyHops] : ''; if (f) return f; }
   return String((req as any).socket?.remoteAddress || 'unknown');
 }
 export const isHttps = (req: IncomingMessage) => {
@@ -95,6 +96,12 @@ export function changePassword(current: string, next: string, adminToken: string
   if (next.length < 12) throw new GatewayError('Use a password of at least 12 characters', 400);
   settings.admin = { password: hashPassword(next), epoch: (settings.admin?.epoch || 0) + 1 }; persist();
   try { if (existsSync(passwordFile)) unlinkSync(passwordFile); } catch { /* best effort */ }
+}
+// The local manager's reset (the admin token proves it is on this machine): no current password needed, every signed-in session ends.
+export function resetPassword(next: string) {
+  if (passwordManagedByEnv()) throw new GatewayError('The dashboard password is set by POLYGATE_ADMIN_PASSWORD; change it there.', 409);
+  if (next.length < 12) throw new GatewayError('Use a password of at least 12 characters', 400);
+  settings.admin = { password: hashPassword(next), epoch: (settings.admin?.epoch || 0) + 1 }; persist();
 }
 export function signOutEverywhere() { settings.admin = { ...settings.admin, epoch: (settings.admin?.epoch || 0) + 1 }; persist(); }
 // --- signed session cookie (stateless, survives restarts, revoked by bumping the epoch) ---

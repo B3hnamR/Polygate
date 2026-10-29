@@ -53,6 +53,16 @@ async function downloadRelease(release, directory, fetcher, onProgress = () => {
 function portableTarget(file, packaged, platform = process.platform) {
   return packaged && platform === 'win32' && typeof file === 'string' && path.win32.isAbsolute(file) && file.toLowerCase().endsWith('.exe') ? path.resolve(file) : '';
 }
+// Staging folders (a downloaded installer each) left by an update that was interrupted are removed after a day; the one in use is always newer.
+function removeStaleStaging(tempDir) {
+  try {
+    for (const name of fs.readdirSync(tempDir)) {
+      if (!name.startsWith('polygate-update-')) continue;
+      const folder = path.join(tempDir, name);
+      try { if (Date.now() - fs.statSync(folder).mtimeMs > 86400000) fs.rmSync(folder, { recursive: true, force: true }); } catch { /* in use or locked: leave it */ }
+    }
+  } catch { /* temp folder unreadable: nothing to clean */ }
+}
 function createPortableUpdater({ version, target, tempDir, resultPath, fetcher = fetch, onState = () => {}, onReady = () => {}, launchHelper = startHelper }) {
   let state, busy = false;
   const canInstall = !!target;
@@ -75,6 +85,7 @@ function createPortableUpdater({ version, target, tempDir, resultPath, fetcher =
         if (!stat.isFile()) throw new Error('The portable executable could not be found. Download the release to update this copy.');
         fs.accessSync(target, fs.constants.W_OK); fs.accessSync(path.dirname(target), fs.constants.W_OK);
         emit({ ...checked, status: 'downloading', progress: 0, error: '' });
+        removeStaleStaging(tempDir);
         directory = fs.mkdtempSync(path.join(tempDir, 'polygate-update-'));
         const downloaded = await downloadRelease(checker.getRelease(), directory, fetcher, progress => emit({ progress }));
         const script = path.join(directory, 'apply-update.ps1'), configPath = path.join(directory, 'update.json');
@@ -110,6 +121,7 @@ async function startHelper(script, configPath, directory) {
     if (fs.existsSync(ready)) { helper.unref(); return; }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  helper.kill(); throw new Error('The Windows update helper did not start. Your app is still running.');
+  try { helper.kill(); } catch { /* already gone */ }
+  throw new Error('The Windows update helper did not start. Your app is still running.');
 }
 module.exports = { fetchAsset, downloadRelease, portableTarget, createPortableUpdater, startHelper };

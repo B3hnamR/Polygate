@@ -59,6 +59,8 @@ let lastPrune = 0;
 export function record(row: LogRow) {
   db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null);
   if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
+    // A busy gateway can log far more than a week's worth in a day: the newest 100000 rows are the most that are kept.
+    db.query('DELETE FROM requests WHERE time <= (SELECT time FROM requests ORDER BY time DESC LIMIT 1 OFFSET 100000)').run();
     // Failures keep their shape record for the whole retention window; successes only the latest 50, as a baseline to compare with.
     db.exec('UPDATE requests SET detail=NULL WHERE detail IS NOT NULL AND status<400 AND id NOT IN (SELECT id FROM requests WHERE detail IS NOT NULL AND status<400 ORDER BY time DESC LIMIT 50)'); }
 }

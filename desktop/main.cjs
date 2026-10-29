@@ -26,7 +26,10 @@ app.whenReady().then(async()=>{
   const root=app.isPackaged?process.resourcesPath:path.resolve(__dirname,'..');
   const exe=app.isPackaged?path.join(root,'bin','bun.exe'):(process.env.BUN_EXE||path.join(process.env.USERPROFILE,'.bun','bin','bun.exe'));
   const entry=app.isPackaged?path.join(root,'gateway.js'):path.join(root,'backend','main.ts');
-  const logDir=app.getPath('userData');fs.mkdirSync(logDir,{recursive:true});const log=fs.openSync(path.join(logDir,'gateway.log'),'a');
+  const logDir=app.getPath('userData');fs.mkdirSync(logDir,{recursive:true});const logFile=path.join(logDir,'gateway.log');
+  // The gateway's output is appended for as long as the app is installed; past 5 MB the old part is set aside (one previous file is kept).
+  try{if(fs.statSync(logFile).size>5*1024*1024)fs.renameSync(logFile,logFile+'.1');}catch{/* no log yet, or it is in use: keep appending */}
+  const log=fs.openSync(logFile,'a');
   // Desktop preferences: the API port (clients are set up with it, so it must not change between launches) and what closing the window does.
   const prefsFile=path.join(logDir,'desktop.json');let prefs={};
   try{const saved=JSON.parse(fs.readFileSync(prefsFile,'utf8'));if(saved&&typeof saved==='object')prefs=saved;}catch{/* first launch or an unreadable file: use the defaults */}
@@ -86,8 +89,8 @@ app.whenReady().then(async()=>{
     const ses=win.webContents.session,ok=p=>p==='clipboard-sanitized-write';ses.setPermissionRequestHandler((_,p,cb)=>cb(ok(p)));ses.setPermissionCheckHandler((_,p)=>ok(p));
     const pin=e=>{let o;try{o=new URL(e.url).origin;}catch{}if(o!==`http://127.0.0.1:${port}`)e.preventDefault();};
     win.webContents.on('will-navigate',pin);win.webContents.on('will-redirect',pin);
-    const home=`http://127.0.0.1:${port}/#token=${token}`;let gone=0;
-    win.webContents.on('render-process-gone',(_,d)=>{fs.writeSync(log,`[desktop] renderer gone: ${d.reason} (${d.exitCode})\n`);if(quitting||d.reason==='clean-exit')return;if(gone++){dialog.showErrorBox('Polygate window crashed',`The window crashed twice. Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}else win.loadURL(home);});
+    const home=`http://127.0.0.1:${port}/#token=${token}`;let lastGone=0;
+    win.webContents.on('render-process-gone',(_,d)=>{fs.writeSync(log,`[desktop] renderer gone: ${d.reason} (${d.exitCode})\n`);if(quitting||d.reason==='clean-exit')return;const soon=lastGone&&Date.now()-lastGone<120000;lastGone=Date.now();if(soon){dialog.showErrorBox('Polygate window crashed',`The window crashed twice in a row. Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}else win.loadURL(home);});
     initView();
     await win.loadURL(home);if(process.env.POLYGATE_DESKTOP_SMOKE!=='1')win.show();
     if(fs.existsSync(resultPath)){try{const result=JSON.parse(fs.readFileSync(resultPath,'utf8'));fs.unlinkSync(resultPath);if(!result.ok)dialog.showErrorBox('Update could not finish',String(result.error||'Your previous app was kept. Download the latest release to try again.'));}catch{/* An interrupted result file must not prevent startup. */}}

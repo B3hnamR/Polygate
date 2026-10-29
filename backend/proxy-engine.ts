@@ -14,11 +14,28 @@ export type StoredProxy = Candidate & { latencyMs?: number; addedAt: number };
 export type ApiResult = { latency: number; status: number };
 const MAX_CANDIDATES = 12000; const MAX_STORED = 5000;
 // A list found on the internet must not make this machine knock on its own network.
+// The 16 bytes of an IPv6 address written in any form (compressed, full, or with a dotted IPv4 tail).
+function ipv6Bytes(host: string): number[] | undefined {
+  let text = host.split('%')[0]; const tail = text.match(/(\d+\.\d+\.\d+\.\d+)$/);
+  if (tail) { const o = tail[1].split('.').map(Number); text = text.slice(0, -tail[1].length) + ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16); }
+  const [head, rest] = text.split('::'); const left = head ? head.split(':') : []; const right = rest ? rest.split(':') : [];
+  const groups = text.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
+  if (groups.length !== 8) return undefined;
+  return groups.flatMap(g => { const n = parseInt(g || '0', 16); return [n >> 8, n & 255]; });
+}
 export function isPublicHost(raw: string) {
   const host = raw.toLowerCase().replace(/^\[|\]$/g, '');
   if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) return false;
   if (net.isIPv4(host)) { const [a, b] = host.split('.').map(Number); return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)); }
-  if (net.isIPv6(host)) return !(host === '::1' || host === '::' || /^(fc|fd|fe80)/.test(host));
+  if (net.isIPv6(host)) {
+    const v = ipv6Bytes(host); if (!v) return false;
+    if (v.every(x => x === 0) || v.slice(0, 15).every(x => x === 0) && v[15] === 1) return false; // :: and ::1
+    if ((v[0] & 0xfe) === 0xfc || v[0] === 0xff || (v[0] === 0xfe && (v[1] & 0xc0) === 0x80)) return false; // fc00::/7, multicast, fe80::/10 (fe80 to febf)
+    // An IPv4 address written inside an IPv6 one (::ffff:127.0.0.1, ::127.0.0.1, 64:ff9b::10.0.0.1) is judged as that IPv4 address.
+    const mapped = v.slice(0, 10).every(x => x === 0) && v[10] === 255 && v[11] === 255, compat = v.slice(0, 12).every(x => x === 0), nat64 = v[0] === 0 && v[1] === 0x64 && v[2] === 0xff && v[3] === 0x9b && v.slice(4, 12).every(x => x === 0);
+    if (mapped || compat || nat64) return isPublicHost(v.slice(12).join('.'));
+    return true;
+  }
   return true;
 }
 const LINE = /^(?:(https?|socks4a?|socks5h?):\/\/)?(?:([^:@\s/]+):([^@\s/]*)@)?(\[[0-9a-f:]+\]|[a-z0-9][a-z0-9.-]*):(\d{1,5})(?![\w.-])/i;
@@ -33,7 +50,7 @@ const HOST_KEYS = ['ip', 'host', 'address', 'ip_address', 'ipAddress', 'proxy_ip
 const MIN_RANGE = 24;
 const validIp = (host: string, port: number) => port > 0 && port < 65536 && host.split('.').every(o => Number(o) <= 255) && isPublicHost(host);
 function rangeHosts(host: string, prefix: number) {
-  if (prefix < MIN_RANGE || prefix > 32) return [];
+  if (prefix < MIN_RANGE || prefix > 32 || host.split('.').some(o => Number(o) > 255)) return [];
   const n = host.split('.').reduce((a, o) => a * 256 + Number(o), 0); const size = 2 ** (32 - prefix); const start = n - (n % size);
   const first = prefix >= 31 ? start : start + 1, last = prefix >= 31 ? start + size - 1 : start + size - 2;
   return Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => [24, 16, 8, 0].map(s => ((first + i) >>> s) & 255).join('.'));
@@ -46,6 +63,7 @@ export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false)
   const fallback = (): Proto[] => hint === 'all' ? ['http', 'socks5', 'socks4'] : [hint === 'https' ? 'http' : hint];
   const add = (protos: Proto[], host: string, port: number, login?: [string, string]) => {
     for (const proto of protos) {
+      if (seen.size >= MAX_CANDIDATES) return;
       const url = `${proto}://${host}:${port}`;
       // The first login listed for a proxy wins; a later bare mention does not drop it.
       if (!seen.has(url) || (login && !seen.get(url)!.proxy.includes('@'))) seen.set(url, { url, proxy: login ? `${proto}://${login[0]}:${login[1]}@${host}:${port}` : url, proto, host, port });
@@ -53,6 +71,7 @@ export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false)
   };
   const scan = (body: string) => {
     for (const m of body.matchAll(ANY_IP)) {
+      if (seen.size >= MAX_CANDIDATES) return; // a hostile list of many ranges stops here, not after millions of addresses
       const [, scheme, user, pass, host, range, portText, u2, p2] = m; const port = Number(portText);
       const proto = scheme ? SCHEME[scheme.toLowerCase()] : undefined; if (scheme && !proto) continue;
       const trailing = u2 && (scheme || !(/^[A-Za-z]{2}$/.test(u2) || NOT_A_LOGIN.has(u2.toLowerCase()) || NOT_A_LOGIN.has(p2.toLowerCase()))) ? [u2, p2] as [string, string] : undefined;

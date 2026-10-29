@@ -115,6 +115,8 @@ class StdioChannel implements Channel {
     const proc = win ? spawn([this.s.command!, ...args].map(quote).join(' '), [], { shell: true, cwd: this.s.cwd || undefined, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
       : spawn(this.s.command!, args, { cwd: this.s.cwd || undefined, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     this.proc = proc;
+    // Writing to a program that has just exited raises EPIPE on this stream; without a listener that would take the whole gateway down.
+    proc.stdin!.on('error', e => this.onClose?.(`The program closed its input (${(e as NodeJS.ErrnoException).code || e.message})`));
     proc.stdout!.on('data', (chunk: Buffer) => {
       this.buffer += chunk.toString('utf8'); let i;
       while ((i = this.buffer.indexOf('\n')) >= 0) {
@@ -127,7 +129,7 @@ class StdioChannel implements Channel {
     await new Promise<void>((resolve, reject) => { proc.once('spawn', () => resolve()); proc.once('error', e => reject(new Error(`Could not start "${this.s.command}": ${e.message}`))); });
   }
   private noisy(line: string) { const now = Date.now(); if (now - this.noise.at > 60000) this.noise = { at: now, n: 0 }; if (++this.noise.n <= 20) logEvent('info', 'mcp', `${this.s.name}: ${line.slice(0, 500)}`, { server: this.s.name, stream: 'output' }); }
-  async send(m: Msg) { if (!this.proc?.stdin?.writable) throw new Error('The program is not running'); this.proc.stdin.write(JSON.stringify(m) + '\n'); }
+  async send(m: Msg) { if (!this.proc?.stdin?.writable) throw new Error('The program is not running'); await new Promise<void>((resolve, reject) => this.proc!.stdin!.write(JSON.stringify(m) + '\n', e => e ? reject(new Error(`The program is not running (${e.message})`)) : resolve())); }
   close() {
     const p = this.proc; this.proc = undefined; if (!p || p.exitCode !== null || !p.pid) return;
     if (process.platform === 'win32') { const r = spawnSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'), ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 }); if (r.error || r.status) p.kill(); }
@@ -242,6 +244,17 @@ export function stopMcp() { for (const l of live.values()) { l.client?.close(); 
 // ------------------------------------------------------------------------------------------------------------------- tools
 // Tool names may hold letters, digits, _ and - and at most 64 characters (what Claude, OpenAI and Cursor accept).
 const hubName = (server: string, tool: string) => { const n = `${server}__${tool}`.replace(/[^A-Za-z0-9_-]/g, '_'); return n.length <= 64 ? n : n.slice(0, 57) + '_' + createHash('sha1').update(n).digest('hex').slice(0, 6); };
+// Two tools can end up with the same name once odd characters are replaced or a long name is cut. The later one gets a short suffix from its own
+// real name, so both stay callable; the map is built the same way for listing and calling, whatever key asks.
+function hubMap() {
+  const names = new Map<string, { server: McpServer; tool: string }>();
+  for (const s of mcpConfig().servers) for (const t of live.get(s.id)?.tools || []) {
+    let n = hubName(s.name, t.name);
+    if (names.has(n)) n = n.slice(0, 57) + '_' + createHash('sha1').update(`${s.id}/${t.name}`).digest('hex').slice(0, 6);
+    names.set(n, { server: s, tool: t.name });
+  }
+  return names;
+}
 const asResult = (data: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data && typeof data === 'object' && !Array.isArray(data) ? data : { items: data } });
 const since = (minutes: unknown, fallback: number) => Date.now() - Math.max(1, Math.min(10080, Number(minutes) || fallback)) * 60000;
 const limitOf = (v: unknown, fallback: number, max: number) => Math.max(1, Math.min(max, Math.floor(Number(v) || fallback)));
@@ -271,7 +284,8 @@ async function hubTools(key: ApiKey | undefined, scope: string) {
   if ((!scope || scope === 'polygate') && cfg.builtin && allowed(key, cfg.builtinKeys)) for (const t of BUILTIN) out.push({ ...t.def, name: scope ? t.def.name : `polygate__${t.def.name}` });
   const servers = cfg.servers.filter(s => s.enabled && (!scope || s.name === scope) && allowed(key, s.keys));
   await Promise.all(servers.map(s => ready(s, 15000).catch(() => {})));
-  for (const s of servers) { const l = live.get(s.id); if (l?.state !== 'ready') continue; for (const t of l.tools) if (!s.disabledTools?.includes(t.name)) out.push({ ...t, name: scope ? t.name : hubName(s.name, t.name) }); }
+  const named = scope ? undefined : hubMap(); const nameOf = (s: McpServer, t: McpTool) => [...named!].find(([, v]) => v.server.id === s.id && v.tool === t.name)?.[0] || hubName(s.name, t.name);
+  for (const s of servers) { const l = live.get(s.id); if (l?.state !== 'ready') continue; for (const t of l.tools) if (!s.disabledTools?.includes(t.name)) out.push({ ...t, name: scope ? t.name : nameOf(s, t) }); }
   return out;
 }
 // Runs one tool. A failure inside the tool is reported to the model as a tool error (isError), so it can react; an unknown tool is a protocol error.
@@ -287,7 +301,7 @@ export async function callTool(name: string, args: any, key: ApiKey | undefined,
   }
   let server: McpServer | undefined, tool = name;
   if (scope) server = cfg.servers.find(s => s.name === scope);
-  else for (const s of cfg.servers) { const l = live.get(s.id); const t = l?.tools.find(x => hubName(s.name, x.name) === name); if (t) { server = s; tool = t.name; break; } if (name.startsWith(s.name + '__')) { server = s; tool = name.slice(s.name.length + 2); } }
+  else { const hit = hubMap().get(name); if (hit) { server = hit.server; tool = hit.tool; } else for (const s of cfg.servers) if (name.startsWith(s.name + '__')) { server = s; tool = name.slice(s.name.length + 2); } }
   if (!server || !server.enabled || !allowed(key, server.keys) || server.disabledTools?.includes(tool)) throw new RpcError(`Unknown tool: ${name}`, -32602);
   const s = server; const timeout = timeoutOf(s);
   const finish = (ok: boolean, result: any, error?: string) => {
@@ -377,7 +391,10 @@ function secrets(input: unknown, saved: Record<string, string> | undefined, kind
   for (const [k, v] of Object.entries(input as Record<string, unknown>).slice(0, 50)) {
     const name = k.trim(); if (!name) continue;
     if (kind === 'header' ? !/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name) : !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new GatewayError(`"${name}" is not a valid ${kind === 'header' ? 'header' : 'variable'} name`, 400);
-    const value = String(v ?? ''); out[name] = value === MASK ? saved?.[name] ?? '' : value;
+    const value = String(v ?? '');
+    // A masked value stands for the saved secret of that same name; a renamed one has nothing saved, so it must be typed again instead of silently becoming empty.
+    if (value === MASK && saved?.[name] === undefined) throw new GatewayError(`Enter the value of "${name}" again: it has no saved value under this name`, 400);
+    out[name] = value === MASK ? saved![name] : value;
   }
   return Object.keys(out).length ? out : undefined;
 }
@@ -402,6 +419,12 @@ export function cleanServer(input: any, saved: McpServer | undefined, local: boo
     return { ...base, command, args, env, cwd };
   }
   let url = String(input.url ?? saved?.url ?? '').trim(); if (saved?.url && url === maskUrl(saved.url)) url = saved.url;
+  // An edited address that still has masked parts keeps those secrets only on the same server; on another one they must be typed again.
+  if (saved?.url && url.includes(MASK)) {
+    let u: URL | undefined, old: URL | undefined; try { u = new URL(url); old = new URL(saved.url); } catch { /* reported below */ }
+    if (u && old) { for (const [k, v] of [...u.searchParams]) if (v === MASK) { const had = old.searchParams.get(k); if (had === null || u.origin !== old.origin) throw new GatewayError(`Enter the value of "${k}" in the address again`, 400); u.searchParams.set(k, had); } url = u.toString(); }
+  }
+  if (saved?.url && input.headers && Object.values(input.headers as Record<string, unknown>).includes(MASK)) { try { if (new URL(url).origin !== new URL(saved.url).origin) throw new GatewayError('You changed the server address. Enter its header values again so the saved ones are not sent to the new server.', 400); } catch (e) { if (e instanceof GatewayError) throw e; } }
   try { const u = new URL(url); if (!['http:', 'https:'].includes(u.protocol)) throw new Error(); } catch { throw new GatewayError('Enter the server\'s full address, starting with https://', 400); }
   const routeId = String(input.routeId ?? saved?.routeId ?? mcpDefaultRoute());
   if (!settings.routes.some(r => r.id === routeId)) throw new GatewayError('That route does not exist', 400);

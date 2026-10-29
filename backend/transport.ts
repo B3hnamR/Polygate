@@ -270,6 +270,8 @@ export function routeFailed(route:Route,reason:string,immediate=false){
   if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;
     logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,raw:raw===route.status?undefined:raw,pausedUntil:route.cooldownUntil});}
 }
+// The bundled relays answer a wrong or missing x-relay-key with this exact message; an upstream 401 passing through a relay looks different.
+const relayRejectedKey=async(r:Response)=>/Unauthorized relay request/i.test(await r.clone().text().catch(()=>''));
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
 // A caller-side abort (client disconnect, request deadline) says nothing about the route; a timeout the caller set on the route itself does.
 const callerCancelled=(init:any)=>{const s=init?.signal as AbortSignal|undefined;return !!s?.aborted&&(s.reason as any)?.name!=='TimeoutError';};
@@ -350,6 +352,8 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     // Route health follows delivery, not the model's verdict: a 429 or 500 from the provider means the route worked.
     if(quiet){/* diagnostic lookup: leave route health alone */}
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}
+    // The relay's own refusal of a wrong access token is not delivery: the relay answered, but nothing it is sent will ever get through.
+    else if(route.kind==='relay'&&response.status===401&&await relayRejectedKey(response))routeFailed(route,'The relay rejected its access token (HTTP 401). Check the token on the Relays page.',true);
     else if(response.status<500&&!exhausted){routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
     else if(route.kind==='relay'&&(response.status===502||response.status===504))routeFailed(route,`HTTP ${response.status}`);
     return response;

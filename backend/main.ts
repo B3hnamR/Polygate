@@ -9,7 +9,7 @@ import { inference, clientKey, readJson, json, probeModel, queue, readiness } fr
 import { initBridge, discover, stopBridge } from './providers';
 import { KILO_ID } from './kilo';
 import { serve } from './serve';
-import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, signOutEverywhere, passwordManagedByEnv } from './auth';
+import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, resetPassword, signOutEverywhere, passwordManagedByEnv } from './auth';
 import { startWarp, stopWarp } from './warp';
 import { startNotifier } from './notifications';
 import { startPoolMaintenance } from './pool';
@@ -74,6 +74,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
         const action=req.method==='POST'?adminAction(p):undefined;
         try{
           if(p==='/admin/password'&&req.method==='POST'){const b=await readJson(req);changePassword(String(b.current||''),String(b.next||''),token);res.setHeader('set-cookie',sessionCookie(createSession(),isHttps(req)));json(res,200,{ok:true});}
+          else if(p==='/admin/reset-password'&&req.method==='POST'){if(!(req as any).polygateManager)throw new GatewayError('Only the local manager can reset the password',403);const b=await readJson(req);resetPassword(String(b.password||''));json(res,200,{ok:true});}
           else if(p==='/admin/signout-all'&&req.method==='POST'){signOutEverywhere();res.setHeader('set-cookie',sessionCookie('',isHttps(req),0));json(res,200,{ok:true});}
           else if(p==='/admin/shutdown'&&req.method==='POST'){json(res,200,{ok:true});setTimeout(()=>close().then(()=>process.exit(0)),100);}
           else await admin(req,res,p);

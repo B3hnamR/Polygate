@@ -196,8 +196,8 @@ async function startTunnel(port: number, index: number, preferredEndpoint: strin
       if (spawnError) throw new GatewayError(`WARP helper could not be started (${helper}): ${spawnError}`, 503, 'warp_not_installed');
       const egress = alive ? await tunnelUp(port, () => output, () => exited) : null;
       if (egress?.ip) {
-        const tunnel: Tunnel = { port, index, proc, identity, endpoint, split: !!split, startedAt: Date.now(), egressIp: egress.ip, egress, failures: 0, cooldownUntil: 0, restarts: 0 };
-        proc.once('exit', code => { if (tunnels.get(port)?.proc !== proc) return; tunnels.delete(port); if (!stopping) { notify('WARP tunnel stopped', `Tunnel on port ${port} exited (${code}).`, 'warning', 'warp-tunnel-' + port); setTimeout(() => void restartTunnel(port, index, tunnel.restarts + 1), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref(); } });
+        const epochAtStart = epoch; const tunnel: Tunnel = { port, index, proc, identity, endpoint, split: !!split, startedAt: Date.now(), egressIp: egress.ip, egress, failures: 0, cooldownUntil: 0, restarts: 0 };
+        proc.once('exit', code => { if (tunnels.get(port)?.proc !== proc) return; tunnels.delete(port); if (!stopping) { notify('WARP tunnel stopped', `Tunnel on port ${port} exited (${code}).`, 'warning', 'warp-tunnel-' + port); setTimeout(() => void restartTunnel(port, index, tunnel.restarts + 1, epochAtStart), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref(); } });
         if (split && mode === 'auto' && workingSplit !== split) notify('WARP splits its handshake', 'This network resets a plain connection to Cloudflare, so WARP sends the first part of its secure handshake in small pieces.', 'info', 'warp-split', 3600000);
         workingSplit = split; return tunnel;
       }
@@ -208,9 +208,18 @@ async function startTunnel(port: number, index: number, preferredEndpoint: strin
   }
   throw new GatewayError(explainTunnelFailure(tried), 502, 'warp_error');
 }
-async function restartTunnel(port: number, index: number, restarts: number) {
-  if (stopping || [...tunnels.values()].some(t => t.index === index) || engineMode() !== 'embedded') return;
-  try { if (!await portFree(port)) port = await freePort(port + 1, new Set(tunnels.keys())); const t = await startTunnel(port, index, warpConfig().endpoint); t.restarts = restarts; tunnels.set(port, t); ensureRoute(); } catch { if (restarts < 6) setTimeout(() => void restartTunnel(port, index, restarts + 1), Math.min(120000, 5000 * 2 ** restarts)).unref(); }
+// Every stop, disconnect or rotation starts a new epoch: a restart that was scheduled before it belongs to a connection the user already ended.
+let epoch = 0; const restarting = new Set<number>();
+async function restartTunnel(port: number, index: number, restarts: number, scheduled = epoch) {
+  if (scheduled !== epoch || stopping || status.busy || restarting.has(index) || [...tunnels.values()].some(t => t.index === index) || engineMode() !== 'embedded') return;
+  restarting.add(index);
+  try {
+    if (!await portFree(port)) port = await freePort(port + 1, new Set(tunnels.keys()));
+    const t = await startTunnel(port, index, warpConfig().endpoint);
+    if (scheduled !== epoch || stopping) { stopProcess(t.proc); return; } // disconnected while it was starting
+    t.restarts = restarts; tunnels.set(port, t); ensureRoute();
+  } catch { if (scheduled === epoch && restarts < 6) setTimeout(() => void restartTunnel(port, index, restarts + 1, scheduled), Math.min(120000, 5000 * 2 ** restarts)).unref(); }
+  finally { restarting.delete(index); }
 }
 async function embeddedConnect(fresh = false) {
   // Without the helper nothing can start, so do not register identities (or wait out the registration pause) first.
@@ -231,7 +240,7 @@ async function embeddedConnect(fresh = false) {
   }
   if (!tunnels.size) throw new GatewayError('No WARP tunnel could be started.', 502, 'warp_error');
 }
-async function stopTunnels() { for (const [, t] of tunnels) stopProcess(t.proc); tunnels.clear(); await Bun.sleep(150); }
+async function stopTunnels() { epoch++; for (const [, t] of tunnels) stopProcess(t.proc); tunnels.clear(); await Bun.sleep(150); }
 // --- public API ---
 export type WarpTarget = { host: string; port: number };
 export function warpTarget(): WarpTarget | null {
@@ -311,6 +320,8 @@ export async function warpConnect() {
 }
 export async function warpDisconnect() {
   if (status.busy) throw new GatewayError('WARP setup is running', 409); stopping = true;
+  // The automatic rotation timer goes too: it would otherwise reconnect WARP a user just disconnected. Connecting starts it again.
+  if (rotateTimer) { clearInterval(rotateTimer); rotateTimer = undefined; }
   try { await stopTunnels(); clearExhausted(); } catch (e: any) { throw new GatewayError(redactError(String(e.message || e)), 502, 'warp_error'); } finally { stopping = false; }
   status.checkedAt = 0; status.egress = undefined; progress(0, 'idle', 'WARP is disconnected'); await refreshStatus(true); return warpStatus();
 }
@@ -361,7 +372,7 @@ function startTimers() {
   if (!monitor) { monitor = setInterval(() => void refreshStatus(true, true).catch(() => {}), 20000); monitor.unref?.(); }
   if (rotateTimer) { clearInterval(rotateTimer); rotateTimer = undefined; }
   const minutes = warpConfig().rotateMinutes;
-  if (minutes > 0) { rotateTimer = setInterval(() => void warpRotate().catch(() => {}), minutes * 60000); rotateTimer.unref?.(); }
+  if (minutes > 0) { rotateTimer = setInterval(() => { if (tunnels.size) void warpRotate().catch(() => {}); }, minutes * 60000); rotateTimer.unref?.(); }
 }
 export async function startWarp() {
   startTimers(); const engine = engineMode(); if (engine === 'disabled') return;

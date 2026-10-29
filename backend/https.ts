@@ -129,7 +129,10 @@ export async function startChallengeServer() {
       const url = new URL(req.url); const token = url.pathname.startsWith('/.well-known/acme-challenge/') ? url.pathname.slice('/.well-known/acme-challenge/'.length) : '';
       if (token && challenges.has(token)) return new Response(challenges.get(token), { headers: { 'content-type': 'text/plain' } });
       const current = httpsConfig(); if (!current.redirect || current.mode === 'off') return new Response('Not found', { status: 404 });
-      const host = (req.headers.get('host') || current.domain || current.ip || '').replace(/:\d+$/, ''); const port = current.port || 443;
+      // Only this server's own name is redirected to: a forged Host header must not turn this port into an open redirect.
+      const asked = (req.headers.get('host') || '').replace(/:\d+$/, '').toLowerCase(); const own = [current.domain, current.ip].filter((x): x is string => !!x);
+      const host = own.find(x => x.toLowerCase() === asked) || own[0] || ''; const port = current.port || 443;
+      if (!host) return new Response('Not found', { status: 404 });
       return Response.redirect(`https://${host}${port === 443 ? '' : ':' + port}${url.pathname}${url.search}`, 301);
     },
   });
@@ -153,7 +156,15 @@ export async function httpsStatus() {
   };
 }
 const hostnameOk = (h: string) => h.length <= 253 && /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(h);
+// The checks at the start of a request (looking up the public address, reading a pasted certificate) take time before the job is marked as
+// running, so a second click in that time would start a second request. This flag is taken at once.
+let applying = false;
 export async function httpsApply(b: any) {
+  if (job.running || applying) throw new GatewayError('A certificate request is already running', 409);
+  applying = true;
+  try { return await applyHttps(b); } finally { applying = false; }
+}
+async function applyHttps(b: any) {
   if (job.running) throw new GatewayError('A certificate request is already running', 409);
   const mode = String(b.mode || ''); if (!['domain', 'ip', 'custom'].includes(mode)) throw new GatewayError('Choose domain, ip or custom', 400);
   const next: HttpsSettings = { ...httpsConfig(), mode: mode as HttpsSettings['mode'], port: Number(b.port) || 443, httpPort: Number(b.httpPort) || 80, redirect: b.redirect !== false, staging: !!b.staging, email: b.email ? String(b.email).trim() : undefined, lastError: '' };

@@ -28,7 +28,8 @@ try {
     Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -WorkingDirectory $tempRoot -WindowStyle Hidden
     exit 0
   }
-  $config = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+  # The config is UTF-8; Windows PowerShell 5.1 would read it as ANSI and garble a user name with non-English letters.
+  $config = Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
   $target = [IO.Path]::GetFullPath($config.target)
   $staged = [IO.Path]::GetFullPath($config.staged)
   $targetDir = [IO.Path]::GetDirectoryName($target)

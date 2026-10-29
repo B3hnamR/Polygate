@@ -62,6 +62,8 @@ async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
 import type { Provider, ProviderRoutes, Route, Settings } from './types';
 const mask='••••••••';
 function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof v==='string'&&v.trim()!=='')?Number(v):NaN;if(!Number.isFinite(n)||n<lo||n>hi)throw new GatewayError(`Expected a number between ${lo} and ${hi}`,400);return Math.floor(n);}
+// A saved secret shown as dots must not follow an edited address to another server: whoever changes the host has to type the secret again.
+const sameServer=(a:string,b:string)=>{try{return new URL(a).origin===new URL(b).origin;}catch{return a===b;}};
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
 // The routes a provider may use, from what a client sent: `routes` ({ids, spread, backups}), null for "follow the route in use", or the single routeId older
 // clients send. Nothing sent keeps what the provider has. Relays only forward to OpenCode and Kilo over HTTPS, so a provider on its own server cannot have one.
@@ -148,6 +150,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
     const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:routes?.ids[0]||'',...(routes?{routes}:{})};
     if(p.kind==='free'&&settings.providers.some(x=>x.kind==='free'&&x.id!==p.id))throw new GatewayError('Only one adaptive Free provider is supported',400);
+    if(old&&b.apiKey===mask&&old.apiKey&&p.baseUrl&&old.baseUrl&&!sameServer(p.baseUrl,old.baseUrl))throw new GatewayError('You changed the server address. Enter the API key again so the saved key is not sent to the new server.',400);
     if(old){if(!routes)delete old.routes;Object.assign(old,p);}else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
   }
   if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode'||b.id===KILO_ID)throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
@@ -155,6 +158,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     const b=await readJson(req);if(!['proxy','relay','warp'].includes(b.kind))throw new GatewayError('Choose proxy, relay, or WARP',400);
     const old=settings.routes.find(r=>r.id===b.id);if(old&&(old.id==='direct'||old.id==='proxy-pool'||old.managed))throw new GatewayError('This route is managed by Polygate and cannot be edited',409);
     const route:Route={id:old?.id||'r-'+randomBytes(4).toString('hex'),name:String(b.name||'New route').slice(0,80),kind:b.kind,url:b.kind==='warp'?(b.url?url(b.url,['http:','https:','socks5:']):`socks5://127.0.0.1:${settings.warpProxyPort}`):url(b.url,b.kind==='proxy'?['http:','https:','socks4:','socks5:']:['https:','http:']),token:b.token===mask?old?.token:String(b.token||''),enabled:b.enabled!==false,models:Array.isArray(b.models)?b.models.map(String).slice(0,100):[],buffered:!!b.buffered};
+    if(old&&b.token===mask&&old.token&&!sameServer(route.url,old.url))throw new GatewayError('You changed the address. Enter the access token again so the saved token is not sent to the new server.',400);
+    if(old&&!route.enabled&&old.enabled){if(old.id===settings.routeId)throw new GatewayError('Select another route before disabling this one',409);const only=soleRouteOf(old.id);if(only.length)throw new GatewayError(`Select another route before disabling this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}. Add another route to that provider first.`,409);}
     if(old)Object.assign(old,route);else settings.routes.push(route);persist();return json(res,200,{ok:true,id:route.id});
   }
   if(pathname==='/admin/routes/toggle'&&method==='POST'){
@@ -191,7 +196,12 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // --- scoped client keys ---
   if(pathname==='/admin/keys'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:createKey(b)});}
   if(pathname==='/admin/keys/update'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:updateKey(String(b.id),b)});}
-  if(pathname==='/admin/keys/delete'&&method==='POST'){const b=await readJson(req);if(!settings.keys.some(k=>k.id===b.id))throw new GatewayError('Key not found',404);if(settings.keys.length<=1)throw new GatewayError('Keep at least one API key',409);settings.keys=settings.keys.filter(k=>k.id!==b.id);persist();return json(res,200,{ok:true});}
+  if(pathname==='/admin/keys/delete'&&method==='POST'){const b=await readJson(req);if(!settings.keys.some(k=>k.id===b.id))throw new GatewayError('Key not found',404);if(settings.keys.length<=1)throw new GatewayError('Keep at least one API key',409);settings.keys=settings.keys.filter(k=>k.id!==b.id);
+    // A deleted key leaves the MCP lists it was in. A server or the built-in tools that only that key could use are switched off rather than opened to every key.
+    const gone=(list?:string[])=>{const next=list?.filter(id=>id!==b.id);return {next:next?.length?next:undefined,emptied:!!list?.length&&!next?.length};};
+    const cfg=mcpConfig();const own=gone(cfg.builtinKeys);cfg.builtinKeys=own.next;if(own.emptied)cfg.builtin=false;
+    for(const s of cfg.servers){const r=gone(s.keys);s.keys=r.next;if(r.emptied)s.enabled=false;}
+    persist();syncMcp();return json(res,200,{ok:true});}
   if(pathname==='/admin/logs/clear'&&method==='POST'){const {db}=await import('./state');db.exec('DELETE FROM requests');return json(res,200,{ok:true});}
   // --- notifications ---
   if(pathname==='/admin/notifications'&&method==='GET')return json(res,200,notices());
