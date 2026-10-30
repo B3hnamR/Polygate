@@ -1,6 +1,6 @@
 {
   "name": "polygate",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
