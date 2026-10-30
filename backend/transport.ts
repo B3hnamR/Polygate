@@ -105,9 +105,8 @@ async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response
 }
 // Where a request goes when its route's exit is used up: a pool proxy that just proved itself clean, else the next healthy route.
 // Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
-// Relays forward to OpenCode and Kilo hosts only, over HTTPS (their allowlist), so a provider on any other server cannot use one.
-const relayCarries=(kind?:string)=>!kind||kind==='free'||kind==='kilo';
-const carries=(r:Route,kind?:string)=>(!r.only||r.only===kind)&&(r.kind!=='relay'||relayCarries(kind));
+// A relay forwards to any public HTTPS host. The one limit is a relay marked `only`: a Cloudflare Worker is refused by OpenCode Free, so it carries Kilo and the providers the user added, not OpenCode.
+const carries=(r:Route,kind?:string)=>!r.only||r.only===kind||(r.only==='kilo'&&kind==='openai');
 export function exhaustedAlternative(current:Route):Route|undefined{
   if(settings.exhaustedFailover===false)return;
   const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!coolingDown(r));
@@ -119,8 +118,6 @@ export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtu
 export function routeFor(model='', explicit='', kind?: string): Route {
   const selected=explicit||settings.routeId;
   let current=findRoute(selected);
-  // A provider on its own server is reached directly when the route in use is a relay: a relay would refuse the host.
-  if(current?.kind==='relay'&&!relayCarries(kind)){const direct=settings.routes.find(r=>r.id==='direct'&&r.enabled);if(!direct)throw new GatewayError('This provider is on its own server, and relay routes only carry OpenCode and Kilo traffic. Switch Direct on or give the provider another route.',503,'route_unavailable');current=direct;}
   const rotating=settings.rotate&&!explicit;
   // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
@@ -286,11 +283,15 @@ export function routeFailed(route:Route,reason:string,immediate=false){
     logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,raw:raw===route.status?undefined:raw,pausedUntil:route.cooldownUntil});}
 }
 // The bundled relays answer a wrong or missing x-relay-key with this exact message; an upstream 401 passing through a relay looks different.
+// A relay deployed before relays could reach any host answers a host outside OpenCode and Kilo with this refusal (Netlify words it differently).
+const relayRefusedHost=async(r:Response)=>/Target (host not allowed|is not in the HTTPS host allowlist)/i.test(await r.clone().text().catch(()=>''));
 const relayRejectedKey=async(r:Response)=>/Unauthorized relay request/i.test(await r.clone().text().catch(()=>''));
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
 // A caller-side abort (client disconnect, request deadline) says nothing about the route; a timeout the caller set on the route itself does.
 const callerCancelled=(init:any)=>{const s=init?.signal as AbortSignal|undefined;return !!s?.aborted&&(s.reason as any)?.name!=='TimeoutError';};
 const LOOPBACK=['127.0.0.1','localhost','[::1]'];
+// What a relay can reach: public HTTPS hosts. A provider on a local address or plain http is reached directly, whichever route is in use.
+export const relayReaches=(u:URL)=>{const h=u.hostname.toLowerCase();return u.protocol==='https:'&&!(/^[\d.]+$/.test(h)||h.includes(':')||h==='localhost'||/\.(localhost|local|internal|lan)$/.test(h));};
 // Turns any proxy URL into one Bun's fetch can use: HTTP(S) proxies pass through, SOCKS5 goes through the native bridge, SOCKS4 and SOCKS5 through the local bridge (backend/socks-bridge.ts).
 export async function usableProxy(proxy:string):Promise<string>{
   const socks=parseSocksUrl(proxy);if(socks)return socksBridge(socks);
@@ -320,6 +321,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   const id=explicit||routeContext.getStore()?.routeId||settings.routeId;
   const route=findRoute(id);
   if(!route)throw new GatewayError('Network route is disabled or missing',503,'route_unavailable');
+  if(route.kind==='relay'&&!relayReaches(local))return fetch(url,init);
   const started=now();let warpPort=0;let judged:{seen?:Exhaustion;ex?:Exhaustion}|undefined;
   // Diagnostic lookups (egress identity) must not move a route's health or open its breaker.
   const quiet=!!init?.polygateQuiet;if(quiet){init={...init};delete init.polygateQuiet;}
@@ -360,6 +362,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
       else response=await fetch(url,{...init,proxy:await usableProxy(route.url||'')});
     }
     else response=await fetch(url,init);
+    if(route.kind==='relay'&&response.status===403&&await relayRefusedHost(response)){await response.body?.cancel().catch(()=>{});response=new Response(JSON.stringify({error:{message:`This relay (${route.name}) is an older version that only forwards to OpenCode and Kilo. Press Update on the Relays page so it can reach any host.`,type:'relay_host_not_allowed'}}),{status:400,headers:{'content-type':'application/json'}});}
     finishAttempt(attempt,response);
     // A 429 with a Retry-After that counts down to the daily reset is probably this exit's allowance, but is confirmed first (judgeExhaustion); the gateway learns of it by request id.
     let exhausted=false;const rid=routeContext.getStore()?.requestId;

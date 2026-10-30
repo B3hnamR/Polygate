@@ -231,7 +231,7 @@ A *route* is the path a request takes to the provider. Pick one on the Routing p
 | Netlify | yes, answers arrive in one piece (30 s limit) | yes |
 | Cloudflare Worker | no (OpenCode refuses its TLS handshake) | yes, streams |
 
-Every relay has its own access token and forwards only to the hosts it is allowed to (`opencode.ai`, `models.opencode.ai`, `api.kilo.ai`; the Cloudflare one only Kilo).
+Every relay has its own access token and forwards to any public HTTPS host, so it carries OpenCode, Kilo and the providers you add yourself (the Cloudflare one carries Kilo and your providers, not OpenCode, which refuses it). Set `POLYGATE_ALLOWED_HOSTS` on a relay to narrow the hosts. An older relay only knows the OpenCode and Kilo hosts: press **Update** on the Relays page.
 Press **Test** on any route to send a real request through it with the provider of your choice.
 When a route's exit is used up, Polygate moves to another healthy exit if you allow it. Rotation is off by default. A relay that is used up is not written off for the day: relays can come back on a fresh address, so Polygate asks it again once or twice a few seconds apart (recycling it first when it runs the Polygate template), and then leaves it until the next check, which runs every 10 minutes. Requests keep using other exits meanwhile. Switch this off with **Ask a used-up relay again for a fresh address** under Routing policy.
 

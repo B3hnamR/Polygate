@@ -68,7 +68,7 @@ function bounded(v:any,lo:number,hi:number){const n=typeof v==='number'||(typeof
 const sameServer=(a:string,b:string)=>{try{return new URL(a).origin===new URL(b).origin;}catch{return a===b;}};
 function url(v:any,schemes=['http:','https:']){let u:URL;try{u=new URL(String(v));}catch{throw new GatewayError('Enter a complete URL including its protocol',400);}if(!schemes.includes(u.protocol))throw new GatewayError('Unsupported URL protocol',400);return u.toString().replace(/\/$/,'');}
 // The routes a provider may use, from what a client sent: `routes` ({ids, spread, backups}), null for "follow the route in use", or the single routeId older
-// clients send. Nothing sent keeps what the provider has. Relays only forward to OpenCode and Kilo over HTTPS, so a provider on its own server cannot have one.
+// clients send. Nothing sent keeps what the provider has. A relay reaches public HTTPS hosts; a provider on a local address is reached directly whichever route it has.
 function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
   let raw: any;
   if (b.routes === null) raw = null;
@@ -81,7 +81,7 @@ function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
   for (const id of ids) {
     const route = settings.routes.find(r => r.id === id);
     if (!route) throw new GatewayError('Provider route does not exist', 400);
-    if (route.kind === 'relay' && b.kind !== 'free' && b.kind !== 'kilo') throw new GatewayError('Relays only carry OpenCode and Kilo traffic. Choose Direct, a proxy or WARP for this provider.', 400);
+    if (route.only && route.only !== b.kind && !(route.only === 'kilo' && b.kind === 'openai')) throw new GatewayError('This relay cannot carry that provider: OpenCode refuses a Cloudflare Worker. Choose a Vercel or Netlify relay, Direct, a proxy or WARP.', 400);
   }
   return { ids, spread: raw.spread === true, backups: b.kind === 'free' && raw.backups === true };
 }

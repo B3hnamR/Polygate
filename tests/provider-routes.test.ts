@@ -98,14 +98,14 @@ test('used-up marks only move OpenCode Free, and only to a backup when the list 
   expect(routeForProvider(own({ ids: ['direct'] }), 'own/x').id).toBe('direct'); // not Free: the mark does not apply
 });
 
-test('the dashboard saves a list, refuses relays for a server of your own and unknown routes, and clears it', async () => {
+test('the dashboard saves a list (a relay may be in it for a server of your own), refuses unknown routes, and clears it', async () => {
   proxy('prs-a'); const r = relay();
   const ok = await call('/admin/providers', { name: 'Listed', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', idPrefix: 'listed', routes: { ids: ['prs-a', 'direct'], spread: true } });
   expect(ok.status).toBe(200);
   const saved1 = settings.providers.find(p => p.id === 'listed')!;
   expect(saved1.routes).toEqual({ ids: ['prs-a', 'direct'], spread: true, backups: false }); expect(saved1.routeId).toBe('prs-a');
   const relayed = await call('/admin/providers', { name: 'Bad', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', idPrefix: 'bad1', routes: { ids: [r.id] } });
-  expect(relayed.status).toBe(400); expect(relayed.body.error.message).toContain('Relays only carry');
+  expect(relayed.status).toBe(200);
   const unknown = await call('/admin/providers', { name: 'Bad', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', idPrefix: 'bad2', routes: { ids: ['nope'] } });
   expect(unknown.status).toBe(400);
   const free = await call('/admin/providers', { id: 'listed', name: 'Listed', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', routes: null });

@@ -26,7 +26,7 @@ test('Direct joins the spread when asked, and is skipped while it is used up for
   expect(new Set(picks(6))).toEqual(new Set(['direct', 'sp-a']));
   settings.routes.find(r => r.id === 'direct')!.exhaustedUntil = Date.now() + 3600e3;
   expect(new Set(picks(6))).toEqual(new Set(['sp-a'])); // used up: skipped
-  expect(new Set(picks(6, 'own/x', 'openai'))).toEqual(new Set(['direct'])); // a server of your own ignores OpenCode's mark, and a relay cannot carry it
+  expect(new Set(picks(6, 'own/x', 'openai'))).toEqual(new Set(['direct', 'sp-a'])); // a server of your own ignores OpenCode's mark, and a relay carries it
 });
 
 test('a used-up relay is skipped while spreading, and the rest keep taking turns', () => {

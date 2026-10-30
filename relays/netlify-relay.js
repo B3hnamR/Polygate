@@ -1,7 +1,7 @@
 // Polygate relay for Netlify Functions (Node runtime). Deployed by the Relays page; also usable by hand.
 // OpenCode Free accepts a TLS client only if its ClientHello lists Bun's 17 cipher suites in Bun's order.
 // Node's default list is refused, so this relay calls node:https with that exact list instead of fetch. Nothing else in the handshake matters.
-// Needs the environment variable POLYGATE_RELAY_TOKEN. POLYGATE_ALLOWED_HOSTS (comma separated) defaults to the OpenCode and Kilo hosts.
+// Needs the environment variable POLYGATE_RELAY_TOKEN. POLYGATE_ALLOWED_HOSTS (comma separated) can narrow the hosts it forwards to; by default any public HTTPS host is allowed.
 const crypto = require("node:crypto");
 const https = require("node:https");
 
@@ -28,11 +28,14 @@ exports.handler = async (event) => {
   const target = headers["x-relay-target"];
   const relayPath = headers["x-relay-path"] || "/";
   if (!target) return json(400, { error: "Missing x-relay-target header" });
-  const allowed = (process.env.POLYGATE_ALLOWED_HOSTS || "opencode.ai,models.opencode.ai,api.kilo.ai").split(",").map((x) => x.trim());
+  const allowed = (process.env.POLYGATE_ALLOWED_HOSTS || "*").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  // Addresses and local names are never allowed, so the relay cannot be pointed at a private network; "*.example.com" matches subdomains.
+  const hostAllowed = (h) => !(/^[\d.]+$/.test(h) || h.includes(":") || h === "localhost" || /\.(localhost|local|internal|lan)$/.test(h))
+    && allowed.some((a) => a === "*" || a === h || (a.startsWith("*.") && h.endsWith(a.slice(1))));
   let url;
   try {
     const origin = new URL(target);
-    if (origin.protocol !== "https:" || origin.username || origin.password || !relayPath.startsWith("/") || relayPath.startsWith("//") || !allowed.includes(origin.hostname)) throw new Error();
+    if (origin.protocol !== "https:" || origin.username || origin.password || !relayPath.startsWith("/") || relayPath.startsWith("//") || !hostAllowed(origin.hostname.toLowerCase())) throw new Error();
     url = new URL(origin.origin + relayPath);
   } catch {
     return json(403, { error: "Target is not in the HTTPS host allowlist" });

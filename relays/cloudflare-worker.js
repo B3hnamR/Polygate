@@ -1,8 +1,11 @@
 // Polygate relay for Cloudflare Workers. Deployed by the Relays page; also usable by hand (wrangler deploy, with the secret RELAY_TOKEN).
-// Kilo Gateway does not look at the caller's TLS handshake, so a Worker can carry its requests. OpenCode Free does, and refused a Worker, so
-// only api.kilo.ai is allowed by default (the variable POLYGATE_ALLOWED_HOSTS, comma separated, can change that). RELAY_TOKEN is required,
-// so this is not an open proxy.
-const DEFAULT_HOSTS = 'api.kilo.ai';
+// Kilo Gateway does not look at the caller's TLS handshake, so a Worker can carry its requests. OpenCode Free does, and refused a Worker, so Polygate never sends it OpenCode Free
+// traffic through one. Any public HTTPS host can be reached (the variable POLYGATE_ALLOWED_HOSTS, comma separated, can narrow that).
+// RELAY_TOKEN is required, so this is not an open proxy.
+const DEFAULT_HOSTS = '*';
+// Addresses and local names are never allowed, so the Worker cannot be pointed at a private network; "*.example.com" matches subdomains.
+const hostAllowed = (allowed, h) => !(/^[\d.]+$/.test(h) || h.includes(':') || h === 'localhost' || /\.(localhost|local|internal|lan)$/.test(h))
+  && allowed.some((a) => a === '*' || a === h || (a.startsWith('*.') && h.endsWith(a.slice(1))));
 // Headers the platform adds about the caller (their address, location, Cloudflare ray) and the relay's own control headers: none of them
 // reach the provider.
 const IDENTITY = /^(forwarded|x-forwarded-.*|x-real-ip|true-client-ip|client-ip|cf-.*|cdn-loop|x-vercel-.*|x-nf-.*|x-amzn-.*|x-middleware-subrequest|x-invocation-id|logs-url|via|x-envoy-.*|fly-.*|x-country|x-azure-.*)$/i;
@@ -25,11 +28,11 @@ export default {
     }
     const target = req.headers.get('x-relay-target'); const path = req.headers.get('x-relay-path') || '/';
     if (!target) return json(400, { error: 'Missing x-relay-target header' });
-    const allowed = String(env.POLYGATE_ALLOWED_HOSTS || DEFAULT_HOSTS).split(',').map((x) => x.trim().toLowerCase());
+    const allowed = String(env.POLYGATE_ALLOWED_HOSTS || DEFAULT_HOSTS).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
     let url;
     try {
       const origin = new URL(target);
-      if (origin.protocol !== 'https:' || origin.username || origin.password || !path.startsWith('/') || path.startsWith('//') || !allowed.includes(origin.hostname.toLowerCase())) throw new Error();
+      if (origin.protocol !== 'https:' || origin.username || origin.password || !path.startsWith('/') || path.startsWith('//') || !hostAllowed(allowed, origin.hostname.toLowerCase())) throw new Error();
       url = new URL(origin.origin + path);
     } catch { return json(403, { error: 'Target host not allowed' }); }
     const headers = new Headers();

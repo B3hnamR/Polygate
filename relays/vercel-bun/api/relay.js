@@ -1,7 +1,7 @@
 // Polygate relay for Vercel Functions. The OpenCode Free tier checks the TLS ClientHello of whoever connects: it accepts a client whose cipher-suite
 // list is Bun's, in Bun's order. On the Bun runtime (vercel.json: bunVersion) fetch already sends that list. On
-// Node the call is made with node:https and that list set explicitly, and the answer still streams. Only OpenCode and Kilo hosts are allowed and
-// POLYGATE_RELAY_TOKEN is required, so this is not an open proxy.
+// Node the call is made with node:https and that list set explicitly, and the answer still streams. Any public HTTPS host can be reached (POLYGATE_ALLOWED_HOSTS can
+// narrow that) and POLYGATE_RELAY_TOKEN is required, so this is not an open proxy.
 import crypto from 'node:crypto';
 import https from 'node:https';
 import { Readable } from 'node:stream';
@@ -18,7 +18,11 @@ const nodeSend = (url, { method, headers, body }) => new Promise((resolve, rejec
   if (body) Readable.fromWeb(body).on('error', e => out.destroy(e)).pipe(out); else out.end();
 });
 const send = (url, init) => isBun ? fetch(url, init) : nodeSend(url, init);
-const ALLOWED = (process.env.POLYGATE_ALLOWED_HOSTS || 'opencode.ai,models.opencode.ai,api.kilo.ai').split(',').map(s => s.trim().toLowerCase());
+const ALLOWED = (process.env.POLYGATE_ALLOWED_HOSTS || '*').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+// Any public HTTPS host is allowed unless POLYGATE_ALLOWED_HOSTS narrows it (comma separated; "*.example.com" matches its subdomains).
+// Addresses and local names never are, so the relay cannot be pointed at a private network.
+const hostAllowed = (h) => !(/^[\d.]+$/.test(h) || h.includes(':') || h === 'localhost' || /\.(localhost|local|internal|lan)$/.test(h))
+  && ALLOWED.some((a) => a === '*' || a === h || (a.startsWith('*.') && h.endsWith(a.slice(1))));
 // Headers the platform adds about the caller; dropping them keeps the caller's address, location and account token away from the provider.
 const IDENTITY = /^(forwarded|x-forwarded-.*|x-real-ip|true-client-ip|client-ip|cf-.*|cdn-loop|x-vercel-.*|x-nf-.*|x-amzn-.*|x-middleware-subrequest|x-invocation-id|logs-url|via|x-envoy-.*|fly-.*|x-country|x-azure-.*|x-relay-.*|host|connection|content-length)$/i;
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -58,7 +62,7 @@ export default {
     const target = req.headers.get('x-relay-target'); const path = req.headers.get('x-relay-path') || '/';
     if (!target) return json(400, { error: 'Missing x-relay-target header' });
     let url; try { url = new URL(target.replace(/\/$/, '') + path); } catch { return json(400, { error: 'Bad target' }); }
-    if (url.protocol !== 'https:' || !ALLOWED.includes(url.hostname.toLowerCase())) return json(403, { error: 'Target host not allowed' });
+    if (url.protocol !== 'https:' || !hostAllowed(url.hostname.toLowerCase())) return json(403, { error: 'Target host not allowed' });
     const headers = new Headers(); for (const [k, v] of req.headers) if (!IDENTITY.test(k)) headers.set(k, v);
     inflight++; let handedOver = false;
     try {

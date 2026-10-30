@@ -7,7 +7,7 @@ import cloudflareModule from '../relays/cloudflare-worker.js' with { type: 'text
 // The relay's own access token is generated here, stored as a secret on the platform, and returned once to be saved in the Polygate route.
 // A relay is the TLS client OpenCode Free sees, and the Free tier accepts a client only if its handshake lists Bun's 17 cipher suites in Bun's order
 //. Vercel runs the relay on Bun. Netlify runs it on Node with that cipher list. Cloudflare Workers and Deno Deploy
-// give a function no control over the cipher list, and OpenCode Free refused a Cloudflare Worker, so a Worker relay forwards to Kilo only (Kilo does not check the handshake).
+// give a function no control over the cipher list, and OpenCode Free refused a Cloudflare Worker, so Polygate never sends OpenCode Free through a Worker relay (Kilo does not check the handshake, and any other provider is fine).
 const sources = { vercel: vercelModule as unknown as string, netlify: netlifyModule as unknown as string, cloudflare: cloudflareModule as unknown as string };
 export type Platform = 'vercel' | 'netlify' | 'cloudflare';
 // runtime (Vercel only): 'bun' (default) or 'node' (the same relay with Bun's cipher list set explicitly).
@@ -159,7 +159,7 @@ export async function deployRelay(input: DeployInput): Promise<DeployResult> {
   const i = { ...input, token }; const access = input.update?.access || accessToken();
   const made = i.platform === 'netlify' ? await deployNetlify(i, access) : i.platform === 'cloudflare' ? await deployCloudflare(i, access) : await deployVercel(i, access);
   const check = i.platform === 'cloudflare' ? await verifyWorker(made.url, access) : await verifyRelay(made.url, access);
-  return { platform: i.platform, ...made, accessToken: access, ...check, detail: check.reachable ? (i.platform === 'cloudflare' ? 'The Worker answered its status check several times in a row through its access token. It forwards to Kilo only.' : 'The relay answered a catalog request through its access token.') : `The relay was deployed but did not answer yet (HTTP ${check.status || 'no answer'}). Give it a minute and use Test.` };
+  return { platform: i.platform, ...made, accessToken: access, ...check, detail: check.reachable ? (i.platform === 'cloudflare' ? 'The Worker answered its status check several times in a row through its access token. It forwards to any public HTTPS host except OpenCode traffic, which Polygate does not send it.' : 'The relay answered a catalog request through its access token.') : `The relay was deployed but did not answer yet (HTTP ${check.status || 'no answer'}). Give it a minute and use Test.` };
 }
 // Removes what deployRelay made on the platform, so deleting a relay in Polygate does not leave a project, site or Worker running (and counting toward a plan's limits).
 // A project that is already gone counts as removed.

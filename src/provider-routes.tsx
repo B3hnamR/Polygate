@@ -31,7 +31,8 @@ export function ProviderRoutesDialog({provider:p,data,onClose,onSave}:{provider:
   const [ids,setIds]=useState<string[]>(start?.ids.filter(id=>all.some(r=>r.id===id))||[]);
   const [spread,setSpread]=useState(!!start?.spread);const [backups,setBackups]=useState(!!start?.backups);
   const [busy,setBusy]=useState(false);
-  const refuse=(r:Route)=>r.kind==='relay'&&!takesRelay(p)?'Relays only carry OpenCode and Kilo traffic':'';
+  // A relay reaches any public HTTPS host; the Cloudflare Worker (marked only) is refused by OpenCode, so it does not carry OpenCode providers.
+  const refuse=(r:Route)=>r.only&&r.only!==p.kind&&!(r.only==='kilo'&&p.kind==='openai')?'This relay cannot carry OpenCode':'';
   const move=(i:number,by:number)=>setIds(l=>{const n=l.slice();const j=i+by;if(j<0||j>=n.length)return l;[n[i],n[j]]=[n[j],n[i]];return n;});
   const toggle=(id:string,on:boolean)=>setIds(l=>on?[...l,id]:l.filter(x=>x!==id));
   const row=(r:Route,i:number)=>{

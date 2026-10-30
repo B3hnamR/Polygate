@@ -22,10 +22,10 @@ test('A header that only looks similar is not dropped', async () => {
   process.env.POLYGATE_RELAY_TOKEN = 'secret'; await (await (await import('../relays/vercel-bun/api/relay.js')).default.fetch(req)).text();
   expect(seen!.headers.get('x-opencode-project')).toBe('global'); expect(seen!.headers.get('x-forwarding-note')).toBe('keep'); expect(seen!.headers.get('cfg-mode')).toBe('keep');
 });
-test('The Vercel Bun template needs the token, allows only OpenCode hosts, drops identity headers and reports its runtime', async () => {
+test('The Vercel Bun template needs the token, reaches any public HTTPS host but nothing local, drops identity headers and reports its runtime', async () => {
   process.env.POLYGATE_RELAY_TOKEN = 'secret'; const { default: relay } = await import('../relays/vercel-bun/api/relay.js');
   expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...RELAY, 'x-relay-key': 'wrong' }, body: '{}' }))).status).toBe(401);
-  expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...RELAY, 'x-relay-target': 'https://example.com' }, body: '{}' }))).status).toBe(403);
+  expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...RELAY, 'x-relay-target': 'http://example.com' }, body: '{}' }))).status).toBe(403);
   // The relay looks up its own outbound address once (opencode.ai/cdn-cgi/trace) and reports it on every answer.
   globalThis.fetch = (async (url: any, init: any) => { if (String(url).endsWith('/cdn-cgi/trace')) return new Response(['fl=1', 'ip=203.0.113.7', 'loc=DE', ''].join(String.fromCharCode(10))); seen ={ url: String(url), headers: new Headers(init?.headers) }; return new Response('ok'); }) as any;
   const r = await relay.fetch(request()); check(); expect(r.headers.get('x-relay-runtime')).toMatch(/^bun /);
@@ -58,7 +58,7 @@ test('The Netlify relay calls OpenCode over Node with Bun\'s cipher list, drops 
     expect(opts.host).toBe('opencode.ai'); expect(opts.path).toBe('/inference/openai/v1/chat/completions'); expect(opts.headers.host).toBe('opencode.ai'); expect(String(sent)).toBe('{}'); expect(opts.headers['content-length']).toBe('2');
     for (const [k, v] of Object.entries(KEEP)) expect(opts.headers[k]).toBe(v);
     for (const k of [...Object.keys(PLATFORM), ...Object.keys(RELAY), 'accept-encoding']) expect(k in opts.headers).toBe(false);
-    calls = 0; expect((await handler(event('wrong'))).statusCode).toBe(401); expect((await handler(event('secret', { 'x-relay-target': 'https://example.com' }))).statusCode).toBe(403); expect(calls).toBe(0);
+    calls = 0; expect((await handler(event('wrong'))).statusCode).toBe(401); expect((await handler(event('secret', { 'x-relay-target': 'http://example.com' }))).statusCode).toBe(403); expect(calls).toBe(0);
   } finally { https.request = real; }
 });
 
@@ -107,34 +107,39 @@ test('The Netlify relay compares the access key as equal-length digests and neve
     expect(opts.headers['x-relayed-by']).toBe('keep');
   } finally { https.request = real; }
 });
-test('Both templates forward to Kilo\'s gateway and still refuse every other host', async () => {
+test('Both templates forward to Kilo\'s gateway, and refuse plain http, addresses and local names', async () => {
   process.env.POLYGATE_RELAY_TOKEN = 'secret';
   const kilo = { 'x-relay-target': 'https://api.kilo.ai', 'x-relay-path': '/api/gateway/chat/completions', 'x-relay-key': 'secret' };
   const { default: relay } = await import('../relays/vercel-bun/api/relay.js');
   globalThis.fetch = (async (url: any, init: any) => { seen = { url: String(url), headers: new Headers(init?.headers) }; return new Response('ok'); }) as any;
   seen = undefined; expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: kilo, body: '{}' }))).status).toBe(200);
   expect(seen!.url).toBe('https://api.kilo.ai/api/gateway/chat/completions');
-  for (const host of ['https://api.kilo.ai.evil.example', 'https://kilo.ai', 'https://example.com']) expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...kilo, 'x-relay-target': host }, body: '{}' }))).status).toBe(403);
+  const refused = ['http://api.kilo.ai', 'https://127.0.0.1', 'https://10.0.0.5', 'https://[::1]', 'https://localhost', 'https://db.internal', 'https://printer.local'];
+  for (const host of refused) expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...kilo, 'x-relay-target': host }, body: '{}' }))).status).toBe(403);
   const { handler } = (await import('node:module')).createRequire(import.meta.url)('../relays/netlify-relay.js?kilo');
   const event = (target: string) => ({ httpMethod: 'POST', body: '{}', isBase64Encoded: false, headers: { ...kilo, 'x-relay-target': target } });
-  for (const host of ['https://api.kilo.ai.evil.example', 'https://kilo.ai', 'https://example.com']) expect((await handler(event(host))).statusCode).toBe(403);
+  for (const host of refused) expect((await handler(event(host))).statusCode).toBe(403);
+  seen = undefined; expect((await relay.fetch(new Request('https://relay.example/', { method: 'POST', headers: { ...kilo, 'x-relay-target': 'https://models.example.org' }, body: '{}' }))).status).toBe(200); expect(seen!.url).toBe('https://models.example.org/api/gateway/chat/completions'); // any other public host is carried too
   const https = (await import('node:https')).default as any; const { EventEmitter } = await import('node:events'); const real = https.request; let opts: any;
   https.request = (o: any, cb: any) => { opts = o; const req: any = new EventEmitter(); req.destroy = () => {}; req.end = () => { const res: any = new EventEmitter(); res.statusCode = 200; res.headers = { 'content-type': 'application/json' }; cb(res); res.emit('data', Buffer.from('{}')); res.emit('end'); }; return req; };
   try { expect((await handler(event('https://api.kilo.ai'))).statusCode).toBe(200); expect(opts.host).toBe('api.kilo.ai'); expect(opts.path).toBe('/api/gateway/chat/completions'); } finally { https.request = real; }
 });
 
-test('The Cloudflare Worker needs the token, forwards to Kilo only, drops identity headers and streams the answer', async () => {
+test('The Cloudflare Worker needs the token, reaches any public HTTPS host, drops identity headers and streams the answer', async () => {
   const { default: worker } = await import('../relays/cloudflare-worker.js');
   const env = { RELAY_TOKEN: 'secret' }; const kilo = { 'x-relay-target': 'https://api.kilo.ai', 'x-relay-path': '/api/gateway/chat/completions?x=1', 'x-relay-key': 'secret' };
   const call = (headers: Record<string, string>, e: any = env) => worker.fetch(new Request('https://relay.example/', { method: 'POST', headers, body: '{}' }), e);
   let seen: { url: string; headers: Headers } | undefined;
   globalThis.fetch = (async (url: any, init: any) => { seen = { url: String(url), headers: new Headers(init?.headers) }; return new Response('data: hi\n\n', { status: 200, headers: { 'content-type': 'text/event-stream', 'content-encoding': 'gzip', 'content-length': '999', 'x-up': '1' } }); }) as any;
   expect((await call({ ...kilo, 'x-relay-key': 'wrong' })).status).toBe(401); expect((await call(kilo, {})).status).toBe(401); expect((await call({ ...kilo, 'x-relay-key': '' })).status).toBe(401);
-  for (const target of ['https://opencode.ai', 'https://api.kilo.ai.evil.example', 'https://kilo.ai', 'http://api.kilo.ai', 'https://user:pw@api.kilo.ai']) expect((await call({ ...kilo, 'x-relay-target': target })).status).toBe(403);
+  for (const target of ['http://api.kilo.ai', 'https://user:pw@api.kilo.ai', 'https://127.0.0.1', 'https://localhost', 'https://db.internal']) expect((await call({ ...kilo, 'x-relay-target': target })).status).toBe(403);
   expect((await call({ ...kilo, 'x-relay-path': '//evil.example/x' })).status).toBe(403);
   expect(seen).toBeUndefined(); // nothing was forwarded for any refused request
   const other = { ...kilo, 'x-relay-target': 'https://example.com' };
-  expect((await call(other)).status).toBe(403); expect((await call(other, { ...env, POLYGATE_ALLOWED_HOSTS: 'api.kilo.ai, example.com' })).status).toBe(200);
+  expect((await call(other)).status).toBe(200); // any public host by default
+  expect((await call(other, { ...env, POLYGATE_ALLOWED_HOSTS: 'api.kilo.ai' })).status).toBe(403); // narrowed by the variable
+  expect((await call({ ...other, 'x-relay-target': 'https://a.example.org' }, { ...env, POLYGATE_ALLOWED_HOSTS: 'api.kilo.ai, *.example.org' })).status).toBe(200); // a suffix pattern matches subdomains
+  expect((await call({ ...other, 'x-relay-target': 'https://example.org' }, { ...env, POLYGATE_ALLOWED_HOSTS: '*.example.org' })).status).toBe(403);
   seen = undefined;
   const r = await call({ ...kilo, ...PLATFORM, 'content-type': 'application/json', 'x-session-id': 'ses_abc' });
   expect(r.status).toBe(200); expect(await r.text()).toBe('data: hi\n\n'); expect(r.headers.get('x-relay-runtime')).toBe('cloudflare-worker'); expect(r.headers.get('x-up')).toBe('1'); expect(r.headers.has('content-encoding')).toBe(false); expect(r.headers.has('content-length')).toBe(false);

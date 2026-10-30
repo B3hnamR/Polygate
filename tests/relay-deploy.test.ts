@@ -94,7 +94,7 @@ test('Cloudflare: uploads the Worker with the access token as a secret, turns on
   const put = calls.find(c => c.method === 'PUT')!; expect(put.url).toBe(`${CF}/workers/scripts/my-worker`); expect(put.headers.get('authorization')).toBe('Bearer ' + API_TOKEN);
   const form = put.body as FormData; const meta = JSON.parse(await (form.get('metadata') as Blob).text());
   expect(meta.main_module).toBe('worker.js'); expect(meta.bindings).toEqual([{ type: 'secret_text', name: 'RELAY_TOKEN', text: r.accessToken }]);
-  const code = await (form.get('worker.js') as Blob).text(); expect(code).toContain("'api.kilo.ai'"); expect(code).not.toContain(r.accessToken);
+  const code = await (form.get('worker.js') as Blob).text(); expect(code).toContain("DEFAULT_HOSTS = '*'"); expect(code).not.toContain(r.accessToken);
   expect(calls.find(c => c.url.endsWith('/workers/scripts/my-worker/subdomain'))!.method).toBe('POST');
   expect(calls.filter(c => !isApi(c.url)).length).toBeGreaterThanOrEqual(4); // the status check has to pass several times in a row
   expect(calls.some(c => c.url.includes(API_TOKEN))).toBe(false);

@@ -7,6 +7,8 @@ const { routeFor } = await import('../backend/transport');
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = '';
 const saved = { routes: settings.routes.slice(), routeId: settings.routeId, providers: settings.providers.slice(), rotate: settings.rotate };
 const post = async (path: string, body: unknown) => { const r = await fetch(base + path, { method: 'POST', headers: { authorization: 'Bearer provider-route-secret', 'content-type': 'application/json' }, body: JSON.stringify(body) }); return { status: r.status, body: (await r.json()) as any }; };
+// A Cloudflare Worker relay: OpenCode refuses it, so it is marked as carrying Kilo and the user's own providers only.
+const worker = () => { const r: any = { id: 'pr-worker', name: 'A Worker', kind: 'relay', url: 'https://w.example.workers.dev', enabled: true, models: [], only: 'kilo' }; settings.routes.push(r); settings.routeId = r.id; return r; };
 const relay = () => { const r: any = { id: 'pr-relay', name: 'A relay', kind: 'relay', url: 'https://example-relay.vercel.app', enabled: true, models: [] }; settings.routes.push(r); settings.routeId = r.id; return r; };
 beforeAll(async () => { gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`; });
 afterAll(async () => { await gateway?.close(); });
@@ -26,28 +28,33 @@ test('a new provider takes the model prefix the user typed, or one made from its
   expect(settings.providers.some(p => p.id.startsWith('p-'))).toBe(false);
 });
 
-test('a provider on its own server cannot be pinned to a relay, which only carries OpenCode and Kilo traffic', async () => {
+test('a provider of your own can be pinned to a relay, but not to a Cloudflare Worker when it is an OpenCode provider', async () => {
   const r = relay();
-  const own = await post('/admin/providers', { name: 'Own', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', routeId: r.id });
-  expect(own.status).toBe(400); expect(own.body.error.message).toContain('Relays only carry OpenCode and Kilo');
+  const own = await post('/admin/providers', { name: 'Own', kind: 'openai', baseUrl: 'https://models.example.org/v1', routeId: r.id });
+  expect(own.status).toBe(200);
+  const w = worker();
+  const mine = await post('/admin/providers', { name: 'Own2', kind: 'openai', baseUrl: 'https://models.example.org/v1', routeId: w.id });
+  expect(mine.status).toBe(200); // a Worker carries the providers you add
+  const zen = await post('/admin/providers', { name: 'Zen', kind: 'opencode', baseUrl: 'https://opencode.ai/zen/v1', routeId: w.id });
+  expect(zen.status).toBe(400); expect(zen.body.error.message).toContain('cannot carry that provider');
   const free = await post('/admin/providers', { name: 'Kilo extra', kind: 'openai', baseUrl: 'http://127.0.0.1:9/v1', routeId: 'direct' });
   expect(free.status).toBe(200);
 });
 
-test('when a relay is the route in use, a provider on its own server is reached directly, and OpenCode still uses the relay', () => {
+test('when a relay is the route in use, a provider of your own uses it too, and so do OpenCode and Kilo', () => {
   const r = relay();
-  expect(routeFor('own/model', '', 'openai').id).toBe('direct');
+  expect(routeFor('own/model', '', 'openai').id).toBe(r.id);
   expect(routeFor('opencode/x', '', 'free').id).toBe(r.id);
   expect(routeFor('kilo/x', '', 'kilo').id).toBe(r.id);
-  settings.routes.find(x => x.id === 'direct')!.enabled = false;
-  expect(() => routeFor('own/model', '', 'openai')).toThrow(/relay routes only carry/);
+  const w = worker();
+  expect(routeFor('own/model', '', 'openai').id).toBe(w.id); expect(routeFor('kilo/x', '', 'kilo').id).toBe(w.id); // a Worker carries Kilo and your providers
 });
 
-test('rotation never offers a relay to a provider on its own server', () => {
+test('rotation offers a relay to a provider of your own as it does to the others', () => {
   const r = relay(); settings.rotate = true; settings.strategy = 'round_robin';
   const proxy: any = { id: 'pr-proxy', name: 'A proxy', kind: 'proxy', url: 'socks5://127.0.0.1:1', enabled: true, models: [] }; settings.routes.push(proxy);
   const seen = new Set(Array.from({ length: 6 }, () => routeFor('own/model', '', 'openai').id));
-  expect(seen.has(r.id)).toBe(false); expect(seen.has('pr-proxy')).toBe(true);
+  expect(seen.has(r.id)).toBe(true); expect(seen.has('pr-proxy')).toBe(true);
   const free = new Set(Array.from({ length: 6 }, () => routeFor('opencode/x', '', 'free').id));
   expect(free.has(r.id)).toBe(true);
 });
