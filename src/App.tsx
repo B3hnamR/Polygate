@@ -71,7 +71,7 @@ export function App(){
         {page==='Usage'&&<UsagePage/>}
         {page==='Logs'&&<LogsPage/>}
         {page==='MCP'&&<McpPage data={data} copy={copy} notice={setNotice}/>}
-        {page==='Settings'&&<><UpdatesPanel updates={updates}/><DesktopPanel/><Preferences data={data} act={act} copy={copy} pending={pending} notice={setNotice} refresh={refresh} onSignedOut={signOut}/><BackupPanel notice={setNotice} refresh={refresh}/></>}
+        {page==='Settings'&&<><UpdatesPanel updates={updates}/><DesktopPanel/><Preferences data={data} act={act} copy={copy} pending={pending} notice={setNotice} refresh={refresh} onSignedOut={signOut}/><BackupPanel notice={setNotice} refresh={refresh} needsPassword={data.server?.mode==='server'}/></>}
         {page==='Guide'&&<Guide/>}
       </div>}
       <footer className="app-footer"><span><Shield size={12}/> Local-first. No request content in activity logs.</span><span>Bun {data?.runtime||'—'} <span className="footer-separator">/</span> OpenCode Free provider</span></footer>

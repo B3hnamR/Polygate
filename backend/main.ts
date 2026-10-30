@@ -9,7 +9,7 @@ import { inference, clientKey, readJson, json, probeModel, queue, readiness } fr
 import { initBridge, discover, stopBridge } from './providers';
 import { KILO_ID } from './kilo';
 import { serve } from './serve';
-import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, resetPassword, signOutEverywhere, passwordManagedByEnv } from './auth';
+import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, resetPassword, signOutEverywhere, passwordManagedByEnv, rememberAdminToken } from './auth';
 import { startWarp, stopWarp } from './warp';
 import { startNotifier } from './notifications';
 import { startPoolMaintenance } from './pool';
@@ -23,7 +23,7 @@ import { logEvent, captureConsole, adminAction } from './logbook';
 import { handleMcp, syncMcp, stopMcp } from './mcp';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
-  const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');
+  const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');rememberAdminToken(token);
   if(!process.env.POLYGATE_ADMIN_TOKEN)writeFileSync(path.join(stateDir,'admin-token'),token,{mode:0o600});
   const password=ensureAdminPassword(token);
   await initBridge();

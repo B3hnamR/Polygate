@@ -24,7 +24,7 @@ test('a backup holds the settings, is unreadable without the passphrase and leav
   const opened = openBackup(out.content, 'correct horse battery');
   expect(opened.routes.find(r => r.id === 'r-bk')!.token).toBe('relay-secret-token-1234'); expect(opened.admin).toBeUndefined();
   expect(() => openBackup('not json', 'correct horse battery')).toThrow('not a Polygate backup');
-  const tampered = JSON.parse(out.content); tampered.data = Buffer.from('x' + Buffer.from(tampered.data, 'base64').toString('latin1').slice(1), 'latin1').toString('base64');
+  const tampered = JSON.parse(out.content); const bytes = Buffer.from(tampered.data, 'base64'); bytes[0] ^= 1; tampered.data = bytes.toString('base64'); // flipping a bit always changes the ciphertext
   expect(() => openBackup(JSON.stringify(tampered), 'correct horse battery')).toThrow('damaged');
   const heavy = JSON.parse(out.content); heavy.kdf.N = 1 << 24; expect(() => openBackup(JSON.stringify(heavy), 'correct horse battery')).toThrow('does not support');
   settings.routes = settings.routes.filter(r => r.id !== 'r-bk');
@@ -67,4 +67,17 @@ test('a restore from a session that cannot manage this machine keeps the current
     restoreBackup(planted, 'a long passphrase', false); expect(settings.warp!.helperPath).toBe('C:\mine\helper.exe');
     restoreBackup(planted, 'a long passphrase', true); expect(settings.warp!.helperPath).toBe('C:\planted\evil.exe');
   } finally { settings.warp = before; }
+});
+
+test('on a server, a signed-in dashboard session must type the dashboard password again to export or restore', async () => {
+  const keep = settings.admin; delete settings.admin; // no stored password: the admin token doubles as the dashboard password
+  try {
+    const login = await fetch(base + '/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'backup-test-secret' }) });
+    expect(login.status).toBe(200); const cookie = (login.headers.get('set-cookie') || '').split(';')[0]; expect(cookie).toContain('=');
+    const session = async (p: string, body: unknown) => { const r = await fetch(base + p, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body) }); return { status: r.status, body: (await r.json().catch(() => ({}))) as any }; };
+    const none = await session('/admin/backup/export', { passphrase: 'a long passphrase' }); expect(none.status).toBe(403); expect(none.body.error.message).toContain('dashboard password');
+    expect((await session('/admin/backup/export', { passphrase: 'a long passphrase', password: 'not it' })).status).toBe(403);
+    const ok = await session('/admin/backup/export', { passphrase: 'a long passphrase', password: 'backup-test-secret' }); expect(ok.status).toBe(200); expect(ok.body.content).toContain('polygate-backup');
+    expect((await session('/admin/backup/restore', { content: ok.body.content, passphrase: 'a long passphrase' })).status).toBe(403); // restoring is asked too
+  } finally { if (keep) settings.admin = keep; }
 });

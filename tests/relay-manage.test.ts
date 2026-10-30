@@ -112,3 +112,23 @@ test('the results table counts what came back through each relay and flags one t
   expect(bad).toMatchObject({ ok: 0, refused: 4, redirected: 2, failed: 3, region: 'iad1', activeDays: 2, tone: 'bad' }); expect(bad.advice).toContain('never worked');
   expect(relayReport(30).days).toBe(30);
 });
+
+test('the used-up count moves once per used-up spell, not with every re-ask, and a relay that is only used up is not called working', async () => {
+  const { routeExhausted } = await import('../backend/transport');
+  db.exec('DELETE FROM route_outcomes');
+  const relay: any = { id: 'r-spell', name: 'Vercel relay cdg1 (spell)', kind: 'relay', url: 'https://s', token: 't', enabled: true, models: [] };
+  settings.routes = [...settings.routes, relay];
+  const until = Date.now() + 3600e3;
+  routeExhausted(relay, { until, seconds: 3600 }); routeExhausted(relay, { until, seconds: 3600 }); routeExhausted(relay, { until, seconds: 3600 }); // the periodic re-asks while it stays used up
+  const row = relayReport(7).relays.find(r => r.id === 'r-spell')!; expect(row.usedUp).toBe(1);
+  expect(row.tone).toBe('neutral'); expect(row.advice).toContain('used up');
+  relay.exhaustedUntil = 0; routeExhausted(relay, { until, seconds: 3600 }); // a new spell after it recovered
+  expect(relayReport(7).relays.find(r => r.id === 'r-spell')!.usedUp).toBe(2);
+});
+
+test('updating uses the platform name exactly, even a long one, and never makes a second project', async () => {
+  const long = 'polygate-relay-' + 'a'.repeat(45); expect(long.length).toBeGreaterThan(40);
+  settings.routes = [...settings.routes, { id: 'r-long', name: `Vercel relay iad1 (${long})`, kind: 'relay', url: `https://${long}.vercel.app`, token: 'long-token-12345', enabled: true, models: [] } as any];
+  seen = []; const up = await call('/admin/relays/update', { id: 'r-long', token: 'vercel-token-123456' }); expect(up.status).toBe(200);
+  expect(seen.find(s => s.method === 'POST')!.body.name).toBe(long);
+});

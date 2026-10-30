@@ -16,7 +16,7 @@ import { metrics, usage } from './metrics';
 import { createBackup, restoreBackup } from './backup';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
-import { serverConfig } from './auth';
+import { serverConfig, requirePassword } from './auth';
 import { GatewayError } from './queue';
 import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
@@ -107,8 +107,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
-  if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
-  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();return json(res,200,{ok:true,...out});}
+  if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
+  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();return json(res,200,{ok:true,...out});}
   if(pathname==='/admin/usage'&&method==='GET')return json(res,200,usage(Number(new URL(req.url||'/','http://x').searchParams.get('days'))));
   if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
   if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));

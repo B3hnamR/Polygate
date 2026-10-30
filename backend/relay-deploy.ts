@@ -18,6 +18,12 @@ export type DeployResult = { platform: Platform; name: string; url: string; acce
 export const PLATFORMS: Platform[] = ['vercel', 'netlify', 'cloudflare'];
 const fail = (message: string, status = 502) => new GatewayError(message, status, 'deploy_failed');
 const slug = (value: string | undefined, fallback: string) => { const s = String(value || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40); return s || fallback + '-' + randomBytes(2).toString('hex'); };
+// An update must reach the project, site or Worker that exists: its name is used as it is, never shortened or replaced by a generated one (that would create a second one).
+const named = (i: DeployInput, fallback: string) => {
+  if (!i.update) return slug(i.name, fallback);
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(String(i.name || ''))) throw new GatewayError('This relay has no usable platform name, so it cannot be updated. Deploy a new one instead.', 400);
+  return String(i.name);
+};
 const accessToken = () => randomBytes(24).toString('base64url');
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // Waits between status checks; tests shorten them.
@@ -48,7 +54,7 @@ export function __zip(files: Record<string, string>) {
 }
 async function deployVercel(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'bun' | 'node-bun-ciphers'; region: string }> {
   const region = /^[a-z]{3}\d$/.test(String(i.region || '')) ? String(i.region) : 'fra1';
-  const name = slug(i.name, `polygate-relay-${region}`); const secrets = [i.token, access]; const team = i.teamId ? `&teamId=${encodeURIComponent(i.teamId)}` : '';
+  const name = named(i, `polygate-relay-${region}`); const secrets = [i.token, access]; const team = i.teamId ? `&teamId=${encodeURIComponent(i.teamId)}` : '';
   const node = i.runtime === 'node';
   const config = JSON.stringify({ ...(node ? {} : { bunVersion: '1.x' }), regions: [region], rewrites: [{ source: '/(.*)', destination: '/api/relay' }], functions: { 'api/relay.js': { maxDuration: 300 } } });
   const created = await api('Vercel', `https://api.vercel.com/v13/deployments?skipAutoDetectionConfirmation=1${team}`, { method: 'POST', headers: json(i.token), body: JSON.stringify({
@@ -65,7 +71,7 @@ async function deployVercel(i: DeployInput, access: string): Promise<{ name: str
 }
 async function deployNetlify(i: DeployInput, access: string): Promise<{ name: string; url: string; buffered: boolean; runtime: 'node-bun-ciphers'; siteId: string }> {
   const secrets = [i.token, access]; const auth = json(i.token); const base = 'https://api.netlify.com/api/v1';
-  let site: any; let name = slug(i.name, 'polygate-relay');
+  let site: any; let name = named(i, 'polygate-relay');
   if (i.update) { site = await api('Netlify', `${base}/sites/${encodeURIComponent(i.update.siteId || name + '.netlify.app')}`, { headers: auth }, secrets); name = String(site?.name || name); }
   else for (let tries = 0; tries < 3 && !site?.id; tries++) {
     const r = await fetch(`${base}/sites`, { method: 'POST', headers: auth, body: JSON.stringify({ name }), signal: AbortSignal.timeout(60000) });
@@ -102,7 +108,7 @@ async function deployCloudflare(i: DeployInput, access: string): Promise<{ name:
   const account = String(i.accountId || '').trim().toLowerCase();
   if (!/^[a-f0-9]{32}$/.test(account)) throw new GatewayError('Enter the Cloudflare Account ID: 32 letters and digits, shown in the dashboard under Workers & Pages', 400);
   const secrets = [i.token, access]; const auth = { authorization: 'Bearer ' + i.token }; const base = `https://api.cloudflare.com/client/v4/accounts/${account}`;
-  const name = slug(i.name, 'polygate-relay');
+  const name = named(i, 'polygate-relay');
   const subdomain = (await api('Cloudflare', `${base}/workers/subdomain`, { headers: auth }, secrets))?.result?.subdomain;
   if (!subdomain) throw fail('This Cloudflare account has no workers.dev address yet. Open Workers & Pages in the Cloudflare dashboard once to create it, then deploy again.', 400);
   const form = new FormData();

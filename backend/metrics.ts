@@ -68,6 +68,7 @@ export function relayReport(days: number) {
     if (!total) { tone = 'neutral'; advice = 'Nothing has gone through it in this period.'; }
     else if (!ok && bad >= 5 && activeDays >= 2) { tone = 'bad'; advice = `It has never worked in this period (${bad} refused, redirected or failed over ${activeDays} days). Another region may be accepted.`; }
     else if (!ok && bad >= 3) { tone = 'warn'; advice = 'Nothing has worked through it yet. Give it a little longer, or try another region.'; }
+    else if (!ok && usedUp && !bad) { tone = 'neutral'; advice = 'Its daily allowance is used up. It resets at 00:00 UTC.'; }
     else if (bad > ok) { tone = 'warn'; advice = 'It fails more often than it works.'; }
     return { id: r.id, name: r.name, region, platform: r.deployed?.platform || '', enabled: r.enabled, ok, refused, usedUp, redirected, failed, activeDays, tone, advice };
   });

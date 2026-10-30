@@ -116,3 +116,13 @@ export function sessionValid(value: string) {
 const sessionName = 'polygate_session';
 export const sessionCookie = (value: string, secure: boolean, maxAgeSeconds = 7 * 86400) => `${sessionName}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`;
 export function readSession(req: IncomingMessage) { return String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(sessionName + '='))?.slice(sessionName.length + 1) || ''; }
+// Actions that hand every stored secret out, or replace all settings, ask for the dashboard password again in server mode: a stolen session cookie is not enough.
+// The desktop app (loopback, no password) and the local manager (it holds the admin token) are not asked.
+let knownAdminToken = '';
+export const rememberAdminToken = (value: string) => { knownAdminToken = value; };
+export function requirePassword(req: IncomingMessage, password: unknown) {
+  if (serverConfig().desktop || (req as any).polygateManager === true) return;
+  const ip = clientIp(req); const wait = loginGate.retryAfter(ip);
+  if (wait) throw new GatewayError(`Too many attempts. Try again in ${Math.ceil(wait / 60)} minute(s).`, 429, 'rate_limit_error');
+  if (!verifyPassword(String(password || ''), knownAdminToken)) { loginGate.fail(ip); throw new GatewayError('Enter the dashboard password to confirm this.', 403, 'authentication_error'); }
+}

@@ -24,7 +24,8 @@ const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
 const publicPool=(r:Route,kind?:string)=>r.id==='proxy-pool'&&!!kind&&kind!=='free'&&kind!=='kilo';
 const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
-export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay')tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
+// Counted once, when the mark is first set: the periodic re-asks of an exit that is still used up renew the mark without being new events.
+export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
 // A relay is judged like a direct connection only when it says its TLS handshake is Bun's: it runs on Bun, or on Node with Bun's cipher list (relays/netlify-relay.js).
 const trustedRuntime=(v:string|null)=>/^(bun|node-bun-ciphers)/i.test(v||'');
 // A 429 with a countdown is only a suspicion of a used-up exit: a wrong request shape or a TLS client other than Bun's gets the same answer.
@@ -269,7 +270,7 @@ const BREAKER_THRESHOLD=3;
 // What a failed route shows in the dashboard: the network's verdict in a few plain words. The raw text stays in the log.
 export function plainRouteError(raw:string,kind?:string):string{
   const t=String(raw);
-  const moved=/redirected \(HTTP (\d+)\) to ([^\s]+)/i.exec(t);
+  const moved=/redirected \(HTTP (\d+)\) to (.+)$/i.exec(t);
   if(moved)return `The site sent the request to ${moved[2]} (HTTP ${moved[1]}) instead of answering it${kind==='relay'?'. This exit address may be blocked; another exit or region may work':''}`;
   if(/ECONNRESET|socket connection was closed|connection (was )?reset|forcibly closed|closed unexpectedly/i.test(t))return kind==='relay'?'Connection reset: the network or the relay host closed it (a network that blocks the site looks like this)':'Connection reset: the network closed it';
   if(/ETIMEDOUT|timed? ?out|TimeoutError|deadline/i.test(t))return 'No answer in time';
