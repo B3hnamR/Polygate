@@ -31,7 +31,10 @@ export function useDesktopView() {
     if (!available) return;
     let alive = true; bridge!.getView!().then(v => { if (alive) setView(v); }).catch(() => {});
     const off = bridge!.onView?.(v => { if (alive) setView(v); });
-    return () => { alive = false; off?.(); };
+    // A window shown again after sitting in the tray asks once more, in case the change was made while it was hidden.
+    const again = () => { if (!document.hidden) bridge!.getView!().then(v => { if (alive) setView(v); }).catch(() => {}); };
+    document.addEventListener('visibilitychange', again); window.addEventListener('focus', again);
+    return () => { alive = false; off?.(); document.removeEventListener('visibilitychange', again); window.removeEventListener('focus', again); };
   }, [available, bridge]);
   return { available, compact: available && view.compact, pinned: view.pinned,
     setCompact: (value: boolean) => bridge?.setCompact?.(value).then(setView).catch(() => {}),

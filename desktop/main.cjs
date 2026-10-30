@@ -60,7 +60,7 @@ app.whenReady().then(async()=>{
     const viewState=()=>({compact,pinned});
     const areas=()=>screen.getAllDisplays().map(d=>d.workArea);
     const sendView=()=>{if(!win.isDestroyed())win.webContents.send('polygate:desktop:view',viewState());};
-    const refreshTray=()=>{if(tray&&!tray.isDestroyed())tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Polygate',click:showWindow},{label:'Compact view',type:'checkbox',checked:compact,click:()=>setCompact(!compact)},{type:'separator'},{label:'Exit',click:()=>app.quit()}]));};
+    const refreshTray=()=>{if(tray&&!tray.isDestroyed())tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Polygate',click:showWindow},{label:'Compact view',type:'checkbox',checked:compact,click:()=>{setCompact(!compact);showWindow();}},{type:'separator'},{label:'Exit',click:()=>app.quit()}]));};
     // Where the window is now is remembered for the view it is in; a maximized full window is remembered as maximized, with its normal size.
     const rememberBounds=()=>{if(win.isDestroyed()||win.isMinimized()||!win.isVisible())return;if(compact)savePrefs({compactBounds:win.getBounds()});else if(!win.isFullScreen())savePrefs({fullMaximized:win.isMaximized(),fullBounds:win.getNormalBounds()});};
     let remember;const rememberSoon=()=>{clearTimeout(remember);remember=setTimeout(rememberBounds,600);};
@@ -71,6 +71,8 @@ app.whenReady().then(async()=>{
     const setCompact=value=>{if(value===compact)return viewState();rememberBounds();compact=value;savePrefs({compact});placeWindow();refreshTray();sendView();return viewState();};
     const setPinned=value=>{pinned=value;savePrefs({pinned});if(compact)win.setAlwaysOnTop(pinned,'floating');sendView();return viewState();};
     const initView=()=>{if(compact)placeWindow();else{const b=placeFull(prefs.fullBounds,areas());if(b)win.setBounds(b);if(prefs.fullMaximized)win.maximize();}};
+    // The page is told which view it is in whenever the window comes back, so a change made while it was hidden in the tray cannot leave it showing the other layout.
+    win.on('show',sendView);win.on('restore',sendView);
     win.on('resized',rememberSoon);win.on('moved',rememberSoon);win.on('maximize',rememberSoon);win.on('unmaximize',rememberSoon);
     // Ctrl+Shift+M switches between the two views from inside the window.
     win.webContents.on('before-input-event',(e,input)=>{if(input.type==='keyDown'&&input.control&&input.shift&&!input.alt&&!input.meta&&String(input.key).toLowerCase()==='m'){e.preventDefault();setCompact(!compact);}});
