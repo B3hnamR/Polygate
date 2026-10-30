@@ -415,4 +415,4 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .relay-results td .button{margin-left:6px;padding:3px 9px;font-size:12px}
 .usage-page .metric-line>div:nth-child(2) strong{color:var(--red)}
 .relay-cell{display:flex;flex-direction:column;gap:2px;min-width:200px}.relay-cell .truncate{max-width:360px}
-.relay-results td.relay-cell{white-space:normal;width:44%}.relay-results .relay-cell .verdict{white-space:normal}
+.relay-results td.relay-main{white-space:normal;width:44%}.relay-results .relay-cell .verdict{white-space:normal}
