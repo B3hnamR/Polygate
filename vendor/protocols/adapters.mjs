@@ -2052,15 +2052,22 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   // Canceling the chunks generator makes the loop below end cleanly and reach
   // the same mid-reply handling, where the stall is named for what it is.
   ctrl.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
+  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
+  let timer
+  const rearm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      stalled = true
+      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+    }, config.timeoutMs)
+  }
+  rearm()
   const cleanup = () => clearTimeout(timer)
 
   const pump = async () => {
     try {
       for await (const chunkText of chunks) {
+        rearm()
         if (chatBlockTerminal(chunkText)) st.finished = true
         {
           for (const line of chunkText.split("\n")) {
@@ -2323,10 +2330,16 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
+  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
+  let timer
+  const rearm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      stalled = true
+      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+    }, config.timeoutMs)
+  }
+  rearm()
   const cleanup = () => clearTimeout(timer)
   const midReplyError = (message) => {
     // The 200 line is already on the wire — an in-band error chunk plus the
@@ -2342,6 +2355,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
     try {
       for (;;) {
         const { done, value } = await reader.read()
+        if (!done) rearm()
         if (done) {
           if (buffer.trim()) res.write(buffer)
           // Upstream closed without delivering a finish chunk or [DONE]: the
@@ -2503,10 +2517,16 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
+  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
+  let timer
+  const rearm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      stalled = true
+      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+    }, config.timeoutMs)
+  }
+  rearm()
   const cleanup = () => clearTimeout(timer)
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
@@ -2515,6 +2535,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
     try {
       for (;;) {
         const { done, value } = await reader.read()
+        if (!done) rearm()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
         let idx
@@ -2656,15 +2677,22 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
   const wall = new AbortController()
   let stalled = false
   wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
-  const wallTimer = setTimeout(() => {
-    stalled = true
-    wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
+  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
+  let wallTimer
+  const rearm = () => {
+    clearTimeout(wallTimer)
+    wallTimer = setTimeout(() => {
+      stalled = true
+      wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+    }, config.timeoutMs)
+  }
+  rearm()
   const cleanup = () => clearTimeout(wallTimer)
 
   const pump = async () => {
     try {
       for await (const chunk of chunksIter) {
+        rearm()
         if (chatBlockTerminal(chunk)) st.finished = true
         let raw = ""
         for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
@@ -2831,10 +2859,16 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
+  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
+  let timer
+  const rearm = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      stalled = true
+      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+    }, config.timeoutMs)
+  }
+  rearm()
   const cleanup = () => clearTimeout(timer)
   const parseBlock = (block) => {
     let event = ""
@@ -2854,6 +2888,7 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
     try {
       for (;;) {
         const { done, value } = await reader.read()
+        if (!done) rearm()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
         let idx
