@@ -16,9 +16,17 @@ describe('compact window placement', () => {
     expect(tiny.width).toBe(COMPACT.minWidth); expect(tiny.height).toBe(COMPACT.minHeight);
   });
   test('a saved position is used while it is on a connected display, and replaced when its display is gone', () => {
-    const saved = { x: 2400, y: 100, width: 380, height: 700 };
+    const saved = { x: 2400, y: 100, width: COMPACT.width, height: COMPACT.height };
     expect(placeCompact(saved, [screen, second], screen)).toEqual(saved);
     expect(placeCompact(saved, [screen], screen)).toEqual(defaultCompact(screen));
+  });
+  test('the compact window always has the same size, whatever size was saved', () => {
+    for (const size of [{ width: 330, height: 600 }, { width: 900, height: 900 }, { width: 380, height: 700 }]) {
+      const b = placeCompact({ x: 2400, y: 100, ...size }, [screen, second], screen);
+      expect(b).toEqual({ x: 2400, y: 100, width: COMPACT.width, height: COMPACT.height });
+    }
+    const small = { x: 0, y: 0, width: 800, height: 700 };
+    expect(placeCompact({ x: 100, y: 20, width: 900, height: 900 }, [small], small).height).toBe(700 - 32);
   });
   test('nonsense saved values are ignored', () => {
     for (const bad of [undefined, null, 'x', {}, { x: 1, y: 1, width: NaN, height: 500 }, { x: 1, y: 1, width: 380, height: 10 }, { x: 1e9, y: 0, width: 380, height: 700 }]) expect(placeCompact(bad, [screen], screen)).toEqual(defaultCompact(screen));
