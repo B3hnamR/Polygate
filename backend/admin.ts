@@ -180,6 +180,11 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(!b.enabled&&route.id==='direct'&&!settings.routes.some(r=>r.id!=='direct'&&r.enabled))throw new GatewayError('Turn on another route first (a proxy, a relay or WARP): with Direct off, requests need somewhere else to go',409);
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
+  // A route the breaker paused after failures (a dropped connection) is tried again at once instead of waiting out the pause.
+  if(pathname==='/admin/routes/resume'&&method==='POST'){
+    const b=await readJson(req);const route=settings.routes.find(r=>r.id===b.id);if(!route)throw new GatewayError('Route not found',404);
+    route.cooldownUntil=0;route.failures=0;route.opened=0;persist();logEvent('info','routes',`${route.name} was resumed by hand`,{route:route.id});return json(res,200,{ok:true});
+  }
   // Deleting a route is refused while a provider or the main selection depends on it; the checks are shared with removing a relay from its platform.
   const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
   const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id)};p.routeId=p.routes.ids[0]||'';}persist();};

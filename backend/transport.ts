@@ -157,7 +157,7 @@ function whyNot(id: string, kind?: string): string {
   if (!carries(r, kind)) return `${r.name} cannot carry this provider`;
   if (exhaustionApplies(kind) && isExhausted(r)) return `${r.name} is used up until ${resetTime(r.exhaustedUntil!)}`;
   if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
-  return `${r.name} is resting after errors`;
+  return `${r.name} is resting after errors${r.cooldownUntil && r.cooldownUntil > now() ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. Resume it on the Routes page if the connection is back` : ''}`;
 }
 export function routeForProvider(p: Provider, model: string): Route {
   const set = providerRoutes(p);

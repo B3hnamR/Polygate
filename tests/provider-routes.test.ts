@@ -33,6 +33,18 @@ test('with every route in its list unavailable, a provider is refused with the r
   expect(direct.enabled).toBe(true); // Direct was available, and was still not used
 });
 
+test('a route paused after failures says when it is tried again, and can be resumed at once', async () => {
+  const direct = settings.routes.find(r => r.id === 'direct')!; settings.routeId = 'direct';
+  const p = own({ ids: ['direct'] });
+  direct.cooldownUntil = Date.now() + 120000; direct.failures = 0; direct.opened = 3;
+  let err: any; try { routeForProvider(p, 'own/x'); } catch (e) { err = e; }
+  expect(String(err.message)).toMatch(/Direct connection is resting after errors until \d/); expect(String(err.message)).toContain('Resume it on the Routes page');
+  expect((await call('/admin/routes/resume', { id: 'direct' })).status).toBe(200);
+  expect(direct.cooldownUntil).toBe(0); expect(direct.opened).toBe(0);
+  expect(routeForProvider(p, 'own/x').id).toBe('direct');
+  expect((await call('/admin/routes/resume', { id: 'nope' })).status).toBe(404);
+});
+
 test('a pinned provider never falls back to the public proxy pool', () => {
   const pool = settings.routes.find(r => r.id === 'proxy-pool');
   if (!pool) return; // the pool route only exists once it has been set up
