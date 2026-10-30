@@ -4,6 +4,7 @@ $config = $null
 $replaced = $false
 $incoming = $null
 $backup = $null
+$final = $null
 function Get-UpdateHash([string]$File) {
   $stream = [IO.File]::OpenRead($File)
   $algorithm = [Security.Cryptography.SHA256]::Create()
@@ -67,6 +68,8 @@ try {
 } catch {
   $message = $_.Exception.Message
   [Console]::Error.WriteLine($message)
+  # A failure after the rename: put the new name back first, so the rollback below finds the file where it replaced it.
+  if ($replaced -and $final -and $final -ne $target -and (Test-Path -LiteralPath $final) -and !(Test-Path -LiteralPath $target)) { try { Move-Item -LiteralPath $final -Destination $target } catch {} }
   if ($replaced -and $backup -and (Test-Path -LiteralPath $backup)) {
     try { [IO.File]::Replace($backup, $target, $null, $true) } catch { $message += ' The previous executable is saved at ' + $backup }
   }

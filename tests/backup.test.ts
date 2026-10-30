@@ -56,3 +56,15 @@ test('a restore from a session that cannot manage this machine does not bring in
   restoreBackup(fromBackup.content, 'a long passphrase', true);
   expect(settings.mcp!.servers.map(s => s.id).sort()).toEqual(['planted', 'remote']); // a session that manages this machine restores everything
 });
+
+test('a restore from a session that cannot manage this machine keeps the current WARP helper program', async () => {
+  const { restoreBackup } = await import('../backend/backup');
+  const warp = (helperPath: string) => ({ engine: 'embedded', autoStart: false, pool: 2, rotateMinutes: 0, helperPath, endpoint: '', split: 'auto' }) as any;
+  const before = settings.warp;
+  try {
+    settings.warp = warp('C:\planted\evil.exe'); const planted = createBackup('a long passphrase').content;
+    settings.warp = warp('C:\mine\helper.exe');
+    restoreBackup(planted, 'a long passphrase', false); expect(settings.warp!.helperPath).toBe('C:\mine\helper.exe');
+    restoreBackup(planted, 'a long passphrase', true); expect(settings.warp!.helperPath).toBe('C:\planted\evil.exe');
+  } finally { settings.warp = before; }
+});

@@ -9,10 +9,13 @@ type Platform='vercel'|'netlify'|'cloudflare';
 const LABEL:Record<Platform,string>={vercel:'Vercel',netlify:'Netlify',cloudflare:'Cloudflare'};
 const KIND:Record<Platform,string>={vercel:'project',netlify:'site',cloudflare:'Worker'};
 // Mirrors the gateway: a relay Polygate deployed carries what its platform calls it; older ones are recognised by their name.
+const NAMED=/^(Vercel|Netlify|Cloudflare) relay(?: [a-z]{3}\d)? \(([a-z0-9][a-z0-9-]*)\)$/;
 export function platformOf(route:Route):Platform|null{
   if(route.kind!=='relay')return null;if(route.deployed)return route.deployed.platform;
-  const m=/^(Vercel|Netlify|Cloudflare) relay(?: [a-z]{3}\d)? \([a-z0-9][a-z0-9-]*\)$/.exec(route.name);return m?m[1].toLowerCase() as Platform:null;
+  const m=NAMED.exec(route.name);return m?m[1].toLowerCase() as Platform:null;
 }
+// What the platform calls it: shown before anything is changed or deleted there, so it is clear which project is meant.
+const platformName=(route:Route)=>route.deployed?.name||NAMED.exec(route.name)?.[2]||'';
 function Shell({title,onClose,busy,children}:{title:string;onClose:()=>void;busy:boolean;children:ReactNode}){
   useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.key==='Escape'&&!busy&&!e.defaultPrevented)onClose();};document.addEventListener('keydown',key);return()=>document.removeEventListener('keydown',key);},[busy,onClose]);
   return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose();}}><div className="dialog" role="dialog" aria-modal="true" aria-label={title}><header className="dialog-head"><h2>{title}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>{children}</div></div>;
@@ -37,7 +40,7 @@ export function RelayUpdateDialog({route,settings,onClose,onDone,notice}:{route:
   const platform=platformOf(route)!;const t=useToken(platform,settings);const [busy,setBusy]=useState(false);const [error,setError]=useState('');
   async function run(){setBusy(true);setError('');try{const r=await api('/admin/relays/update',{id:route.id,...t.credentials()});notice(r.reachable?`${route.name} updated`:`${route.name} updated, not answering yet`);onDone();onClose();}catch(e:any){setError(e.message||'The update failed');}finally{setBusy(false);}}
   return <Shell title="Update relay" onClose={onClose} busy={busy}><form className="dialog-body" autoComplete="off" onSubmit={e=>{e.preventDefault();if(t.ready&&!busy)void run();}}>
-    <p className="subtle">Deploys the current relay code to <strong>{route.name}</strong> on {LABEL[platform]} again. Its address and access token stay the same, so nothing else needs changing. Use this after a Polygate update that changes the relay.</p>
+    <p className="subtle">Deploys the current relay code to the {KIND[platform]} <strong>{platformName(route)}</strong> on {LABEL[platform]} again. Its address and access token stay the same, so nothing else needs changing. Use this after a Polygate update that changes the relay.</p>
     {t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
     <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!t.ready||busy}><RefreshCw size={14}/>{busy?'Updating…':'Update relay'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
@@ -52,7 +55,7 @@ export function RelayRemoveDialog({route,settings,onClose,onDone,notice}:{route:
   }
   return <Shell title="Delete relay" onClose={onClose} busy={busy}><form className="dialog-body" autoComplete="off" onSubmit={e=>{e.preventDefault();if((!both||t.ready)&&!busy)void run();}}>
     <p className="subtle">Delete <strong>{route.name}</strong>? Requests can no longer use it.</p>
-    <div className="check-row"><input id="remove-both" type="checkbox" checked={both} onChange={e=>setBoth(e.target.checked)}/><label htmlFor="remove-both">Also remove the {KIND[platform]} from {LABEL[platform]}<small>Otherwise it keeps running on your {LABEL[platform]} account and counts toward its limits.</small></label></div>
+    <div className="check-row"><input id="remove-both" type="checkbox" checked={both} onChange={e=>setBoth(e.target.checked)}/><label htmlFor="remove-both">Also delete the {KIND[platform]} <strong>{platformName(route)}</strong> from {LABEL[platform]}<small>This deletes that whole {KIND[platform]}, so check the name is the relay's own. Otherwise it keeps running on your {LABEL[platform]} account and counts toward its limits.</small></label></div>
     {both&&t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
     <div className="dialog-actions"><Button variant="primary" type="submit" disabled={(both&&!t.ready)||busy}><Trash2 size={14}/>{busy?'Deleting…':'Delete relay'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>

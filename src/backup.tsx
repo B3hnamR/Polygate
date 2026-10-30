@@ -14,7 +14,7 @@ export function BackupPanel({notice,refresh}:{notice:(s:string)=>void;refresh:()
   }
   async function restore(){
     if(!file)return;setBusy('restore');setError('');
-    try{const out=await api('/admin/backup/restore',{content:file.text,passphrase:restorePass});setFile(null);setRestorePass('');setSure(false);if(input.current)input.current.value='';notice(`Settings restored (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);refresh();}
+    try{const out=await api('/admin/backup/restore',{content:file.text,passphrase:restorePass});setFile(null);setRestorePass('');setSure(false);if(input.current)input.current.value='';notice(`Settings restored (${out.providers} providers, ${out.routes} routes, ${out.keys} keys). Restart Polygate so every part uses them.`);refresh();}
     catch(e:any){setError(e.message||'Could not restore the backup');}finally{setBusy('');}
   }
   const canSave=pass.length>=8&&pass===again;

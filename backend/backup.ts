@@ -46,9 +46,11 @@ export function openBackup(raw: unknown, rawPassphrase: unknown): Settings {
 }
 
 // Replaces the running settings with the backup's. The dashboard password stays as it is, so a restore cannot lock anyone out.
-// A session that cannot manage this machine (a remote dashboard) does not bring in local programs the backup lists: it could otherwise start commands here.
+// A session that cannot manage this machine (a remote dashboard) does not bring in local programs the backup lists (MCP programs, the WARP helper): it could otherwise start commands here.
 export function restoreBackup(raw: unknown, passphrase: unknown, canRunLocal: boolean) {
   const next = openBackup(raw, passphrase);
+  // The WARP helper is a program the gateway starts: only a session that manages this machine may change which one (see checkHelperPath).
+  if (!canRunLocal && next.warp) next.warp = { ...next.warp, helperPath: settings.warp?.helperPath || '' };
   if (!canRunLocal && next.mcp) next.mcp = { ...next.mcp, servers: [...next.mcp.servers.filter(s => s.transport !== 'stdio'), ...(settings.mcp?.servers || []).filter(s => s.transport === 'stdio')] };
   const before = path.join(stateDir, 'settings.vault.before-restore-' + Date.now());
   const vault = path.join(stateDir, 'settings.vault'); if (existsSync(vault)) copyFileSync(vault, before);
