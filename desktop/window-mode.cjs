@@ -35,7 +35,12 @@ function defaultCompact(area) {
   const height = Math.min(COMPACT.height, Math.max(COMPACT.minHeight, area.height - 2 * MARGIN));
   return { x: area.x + area.width - width - MARGIN, y: area.y + Math.round((area.height - height) / 2), width, height };
 }
-const placeCompact = (saved, areas, primary) => { const b = cleanBounds(saved, COMPACT.minWidth, COMPACT.minHeight); return b && reachable(b, areas) ? fitToArea(b, areas) : defaultCompact(primary); };
+// The compact window has one fixed size (shrunk only to fit a small display); only where it sits is remembered.
+const placeCompact = (saved, areas, primary) => {
+  const b = cleanBounds(saved, COMPACT.minWidth, COMPACT.minHeight), size = defaultCompact(primary);
+  const fixed = b && { x: b.x, y: b.y, width: size.width, height: size.height };
+  return fixed && reachable(fixed, areas) ? fitToArea(fixed, areas) : size;
+};
 // null means "no usable saved position": the caller keeps the window where it is.
 const placeFull = (saved, areas) => { const b = cleanBounds(saved, FULL_MIN.width, FULL_MIN.height); return b && reachable(b, areas) ? fitToArea(b, areas) : null; };
 module.exports = { COMPACT, FULL, FULL_MIN, cleanBounds, reachable, defaultFull, fitToArea, defaultCompact, placeCompact, placeFull };

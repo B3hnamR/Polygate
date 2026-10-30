@@ -64,11 +64,15 @@ app.whenReady().then(async()=>{
     // Where the window is now is remembered for the view it is in; a maximized full window is remembered as maximized, with its normal size.
     const rememberBounds=()=>{if(win.isDestroyed()||win.isMinimized()||!win.isVisible())return;if(compact)savePrefs({compactBounds:win.getBounds()});else if(!win.isFullScreen())savePrefs({fullMaximized:win.isMaximized(),fullBounds:win.getNormalBounds()});};
     let remember;const rememberSoon=()=>{clearTimeout(remember);remember=setTimeout(rememberBounds,600);};
+    // Windows can ignore a resize made while the window is minimized or still settling from maximized, so the size is checked once more shortly after.
+    const apply=(b,mode)=>{win.setBounds(b);setTimeout(()=>{if(win.isDestroyed()||compact!==mode||win.isMaximized())return;const c=win.getBounds();if(c.width!==b.width||c.height!==b.height)win.setBounds(b);},250);};
     const placeWindow=()=>{
-      if(compact){if(win.isMaximized())win.unmaximize();win.setMinimumSize(COMPACT.minWidth,COMPACT.minHeight);win.setBounds(placeCompact(prefs.compactBounds,areas(),screen.getPrimaryDisplay().workArea));win.setAlwaysOnTop(pinned,'floating');}
-      else{win.setAlwaysOnTop(false);const wa=screen.getPrimaryDisplay().workArea;win.setMinimumSize(Math.min(FULL_MIN.width,wa.width),Math.min(FULL_MIN.height,wa.height));const b=placeFull(prefs.fullBounds,areas());win.setBounds(b||defaultFull(wa));if(prefs.fullMaximized)win.maximize();}
+      // The compact view has one fixed size: it cannot be resized or maximized, only moved.
+      if(compact){if(win.isMaximized())win.unmaximize();win.setResizable(true);win.setMinimumSize(COMPACT.minWidth,COMPACT.minHeight);apply(placeCompact(prefs.compactBounds,areas(),screen.getPrimaryDisplay().workArea),true);win.setMaximizable(false);win.setResizable(false);win.setAlwaysOnTop(pinned,'floating');}
+      else{win.setResizable(true);win.setMaximizable(true);win.setAlwaysOnTop(false);const wa=screen.getPrimaryDisplay().workArea;win.setMinimumSize(Math.min(FULL_MIN.width,wa.width),Math.min(FULL_MIN.height,wa.height));const b=placeFull(prefs.fullBounds,areas());apply(b||defaultFull(wa),false);if(prefs.fullMaximized)win.maximize();}
     };
-    const setCompact=value=>{if(value===compact)return viewState();rememberBounds();compact=value;savePrefs({compact});placeWindow();refreshTray();sendView();return viewState();};
+    // A window sitting in the tray or minimized is brought back first: the view is switched with the window in front of the user, never behind their back.
+    const setCompact=value=>{if(value===compact)return viewState();if(win.isMinimized()||!win.isVisible())showWindow();rememberBounds();compact=value;savePrefs({compact});placeWindow();refreshTray();sendView();return viewState();};
     const setPinned=value=>{pinned=value;savePrefs({pinned});if(compact)win.setAlwaysOnTop(pinned,'floating');sendView();return viewState();};
     const initView=()=>{if(compact)placeWindow();else{const b=placeFull(prefs.fullBounds,areas());if(b)win.setBounds(b);if(prefs.fullMaximized)win.maximize();}};
     // The page is told which view it is in whenever the window comes back, so a change made while it was hidden in the tray cannot leave it showing the other layout.
