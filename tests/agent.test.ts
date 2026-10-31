@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the desktop-only API the Agent page uses, in front of the engine. A stand-in engine
@@ -168,7 +168,7 @@ test('each turn\'s changes are recorded, with every file the engine says the tur
     [{ file: 'src/a.js', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-original\n+agent v1\n' }], ['src/a.js', 'src/b.js']);
   const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
   expect(turns).toHaveLength(1); expect(turns[0].message).toBe(`msg_${a}_0`);
-  expect(turns[0].files.map((f: any) => [f.file, f.status])).toEqual([['src/a.js', 'modified'], ['src/b.js', 'modified']]);
+  expect(turns[0].files.map((f: any) => [f.file, f.status])).toEqual([['src/a.js', 'added'], ['src/b.js', 'added']]);
   expect(ui.events.find(e => e.type === 'agent.changes').data.turn.files[0].patch).toContain('+agent v1');
   ui.stop();
 });
@@ -189,6 +189,74 @@ test('undo restores a turn when its files are exactly as the agent left them', a
   ui.stop();
 });
 
+test('undo and the changes card use actual CRLF bytes, not the engine normalized snapshot', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  const original = 'export const first = 1;\r\nexport const second = 2;\r\n';
+  const edited = '// comment\r\n' + original;
+  put('src/crlf.js', original);
+  await turn(a, ui, 'add a comment', () => put('src/crlf.js', edited), [{ file: 'src/crlf.js', status: 'modified', additions: 3, deletions: 2,
+    patch: '-export const first = 1;\n-export const second = 2;\n+// comment\r\n+export const first = 1;\r\n+export const second = 2;\r\n' }]);
+  await fake('/test/session', { sessionID: a, stage: [{ file: 'src/crlf.js', status: 'modified' }], revert: [{ file: 'src/crlf.js', content: original.replace(/\r\n/g, '\n') }] });
+  const changes = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+  expect(changes[0].files[0]).toMatchObject({ additions: 1, deletions: 0 });
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(200);
+  expect(readFileSync(inFolder('src/crlf.js'))).toEqual(Buffer.from(original));
+  const stage = (await calls()).find(c => c.path === `/api/session/${a}/revert/stage`)!;
+  expect(stage.body.files).toBe(false); // Engine history only: its snapshot must never overwrite working files.
+  ui.stop();
+});
+
+test('undo restores deleted binary bytes and all turns from the selected turn onward', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/repeated.js', 'before\r\n');
+  mkdirSync(path.dirname(inFolder('src/raw.bin')), { recursive: true });
+  const binary = Buffer.from([0, 255, 13, 10, 128, 0]); writeFileSync(inFolder('src/raw.bin'), binary);
+  await turn(a, ui, 'first', () => put('src/repeated.js', 'first\r\n'), [{ file: 'src/repeated.js', status: 'modified', patch: '' }]);
+  await turn(a, ui, 'second', () => { put('src/repeated.js', 'second\r\n'); unlinkSync(inFolder('src/raw.bin')); },
+    [{ file: 'src/repeated.js', status: 'modified', patch: '' }, { file: 'src/raw.bin', status: 'deleted', patch: '' }]);
+  const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
+  expect(r.status).toBe(200);
+  expect(readFileSync(inFolder('src/repeated.js'), 'utf8')).toBe('before\r\n');
+  expect(readFileSync(inFolder('src/raw.bin'))).toEqual(binary);
+  ui.stop();
+});
+
+test('a failed history commit restores the exact post-agent files and retains the turn record', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/rollback.js', 'original\r\n');
+  await turn(a, ui, 'change', () => put('src/rollback.js', 'agent\r\n'), [{ file: 'src/rollback.js', status: 'modified', patch: '' }]);
+  await fake('/test/session', { sessionID: a, commitFails: true });
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(502);
+  expect(readFileSync(inFolder('src/rollback.js'))).toEqual(Buffer.from('agent\r\n'));
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toHaveLength(1);
+  ui.stop();
+});
+
+test('undoing multiple turns refuses to remove a user change made between those turns', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/between.js', 'original\r\n');
+  await turn(a, ui, 'first', () => put('src/between.js', 'agent one\r\n'), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
+  put('src/between.js', 'agent one\r\nuser line\r\n');
+  await turn(a, ui, 'second', () => put('src/between.js', 'agent two\r\nuser line\r\n'), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
+  const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
+  expect(r.status).toBe(409); expect(r.body.error.message).toContain('between agent turns');
+  expect(readFileSync(inFolder('src/between.js'), 'utf8')).toContain('user line');
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_1` })).status).toBe(200);
+  expect(readFileSync(inFolder('src/between.js'), 'utf8')).toBe('agent one\r\nuser line\r\n');
+  ui.stop();
+});
+
+test('a file excluded from pre-turn backup cannot be mistaken for a newly created file during undo', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('node_modules/example.js', 'user data');
+  await turn(a, ui, 'change dependency', () => put('node_modules/example.js', 'agent data'), [{ file: 'node_modules/example.js', status: 'modified', patch: '' }]);
+  const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
+  expect(r.status).toBe(409); expect(r.body.error.message).toContain('No exact backup');
+  expect(readFileSync(inFolder('node_modules/example.js'), 'utf8')).toBe('agent data');
+  expect((await calls()).filter(c => c.path === `/api/session/${a}/revert/stage`)).toHaveLength(0);
+  ui.stop();
+});
+
 test('undo refuses, and changes nothing, when a file changed after the agent left it, was never recorded, or the agent is busy', async () => {
   const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
   put('src/c.js', 'original');
@@ -197,10 +265,10 @@ test('undo refuses, and changes nothing, when a file changed after the agent lef
   await fake('/test/session', { sessionID: a, stage: [{ file: 'src/c.js', status: 'modified' }, { file: 'src/unseen.js', status: 'modified' }], revert: [{ file: 'src/c.js', content: 'original' }] });
   const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
   expect(r.status).toBe(409); expect(r.body.error.type).toBe('agent_undo_conflict');
-  expect(r.body.conflicts.map((c: any) => c.file)).toEqual(['src/c.js', 'src/unseen.js']);
+  expect(r.body.conflicts.map((c: any) => c.file)).toEqual(['src/c.js']);
   expect(readFileSync(inFolder('src/c.js'), 'utf8')).toBe('agent\nmy own line\n');
   const mine = (await calls()).filter(c => c.path.startsWith(`/api/session/${a}/revert`)).map(c => `${c.method} ${c.path.split('/').slice(4).join('/')}`);
-  expect(mine).toEqual(['POST revert/stage', 'DELETE revert']);
+  expect(mine).toEqual([]);
   expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toHaveLength(1);
   const started = ui.events.filter(e => e.type === 'session.execution.started').length;
   await emit('session.execution.started', { sessionID: a }); await until(() => ui.events.filter(e => e.type === 'session.execution.started').length > started);

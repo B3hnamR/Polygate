@@ -48,7 +48,7 @@ function EngineBar({engine,busy,problem,act}:{engine:Engine;busy:string;problem:
     {s==='installed'&&<p className="subtle">Start the engine to work with the agent. Other clients are not affected by it.</p>}
     {engine.message&&!running&&<p className={s==='failed'?'agent-error-text':'subtle'}>{engine.message}</p>}
     {engine.problems?.length>0&&<ul className="agent-problems">{engine.problems.map(p=><li key={p}>{p}</li>)}</ul>}
-    {running&&engine.snapshots&&!engine.snapshots.ok&&<p className="agent-warn"><TriangleAlert size={15}/>Undo is unavailable: {engine.snapshots.reason}</p>}
+    {running&&engine.snapshots&&!engine.snapshots.ok&&<p className="agent-warn"><TriangleAlert size={15}/>Engine snapshots are unavailable: {engine.snapshots.reason} Polygate uses its own exact file backups for recorded turns.</p>}
     {running&&engine.freeIdentity&&!engine.freeIdentity.usable&&<p className="agent-warn"><TriangleAlert size={15}/>OpenCode Free models are unavailable to the agent: OpenCode Free now expects OpenCode {engine.freeIdentity.presented}, and the agent runs {engine.freeIdentity.engine}.</p>}
     {problem&&<div className="pg-error">{problem}</div>}
   </div></section>;

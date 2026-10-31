@@ -16,7 +16,7 @@ const expected = 'Basic ' + Buffer.from('opencode:' + (process.env.OPENCODE_PASS
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const calls: { method: string; path: string; body: any }[] = [];
 const sessions = new Map<string, any>(); const prompts = new Map<string, string[]>(); let next = 0;
-const scripted = new Map<string, { diff?: any[]; stage?: any[]; revert?: { file: string; content: string | null }[] }>();
+const scripted = new Map<string, { diff?: any[]; stage?: any[]; revert?: { file: string; content: string | null }[]; commitFails?: boolean }>();
 const staged = new Map<string, { file: string; content: string | null }[]>();
 let saved = process.env.FAKE_OPENCODE_SAVED === '1' ? [{ id: 'psv_planted', projectID: 'p', action: 'shell', resource: 'node *' }] : [];
 const streams = new Set<{ directory: string; send: (text: string) => void }>();
@@ -62,7 +62,7 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
     if (rest === 'diff') return json({ data: scripted.get(id)?.diff || [] });
     if (rest === 'revert/stage') {
       const kept: { file: string; content: string | null }[] = [];
-      for (const f of scripted.get(id)?.revert || []) {
+      for (const f of body.files === false ? [] : scripted.get(id)?.revert || []) {
         const file = path.join(folderOf(id), f.file); kept.push({ file, content: existsSync(file) ? readFileSync(file, 'utf8') : null });
         if (f.content === null) rmSync(file, { force: true }); else { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, f.content); }
       }
@@ -70,7 +70,7 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
       return json({ data: { messageID: body.messageID, snapshot: 'snap', files: scripted.get(id)?.stage || [] } });
     }
     if (rest === 'revert' && req.method === 'DELETE') { for (const k of staged.get(id) || []) { if (k.content === null) rmSync(k.file, { force: true }); else writeFileSync(k.file, k.content); } staged.delete(id); return new Response(null, { status: 204 }); }
-    if (rest === 'revert/commit') { staged.delete(id); return new Response(null, { status: 204 }); }
+    if (rest === 'revert/commit') { if (scripted.get(id)?.commitFails) return json({ error: 'commit failed' }, 500); staged.delete(id); return new Response(null, { status: 204 }); }
     if (rest === 'context') return json({ data: (prompts.get(id) || []).map((text, i) => ({ id: `msg_${id}_${i}`, type: 'user', text })) });
     if (rest === 'prompt') { prompts.set(id, [...(prompts.get(id) || []), body.text]); broadcast({ type: 'session.execution.started', data: { sessionID: id } }, folderOf(id)); return json({ data: { id: 'msg_' + ++next } }); }
     if (rest === 'interrupt') { broadcast({ type: 'session.execution.interrupted', data: { sessionID: id } }, folderOf(id)); return json({ data: { interrupted: true } }); }
