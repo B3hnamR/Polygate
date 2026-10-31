@@ -1,10 +1,10 @@
 // The Agent page's transcript: a session's history (from /admin/agent/session) and its live events (from /admin/agent/events), turned
 // into the items the page draws. No React here, so tests/agent-logic.test.ts can check it on its own.
 
-export type Mode = 'ask' | 'accept-edits' | 'plan';
-export const MODES: { id: Mode; label: string }[] = [{ id: 'ask', label: 'Ask for approval' }, { id: 'accept-edits', label: 'Accept edits' }, { id: 'plan', label: 'Plan' }];
+export type Mode = 'ask' | 'accept-edits' | 'plan' | 'rules' | 'full';
+export const MODES: { id: Mode; label: string }[] = [{ id: 'ask', label: 'Ask for approval' }, { id: 'accept-edits', label: 'Accept edits' }, { id: 'plan', label: 'Plan' }, { id: 'rules', label: 'Rules-based approvals' }, { id: 'full', label: 'Full access' }];
 export const modeLabel = (id: string) => MODES.find(m => m.id === id)?.label || id;
-const AGENT_MODES: Record<string, Mode> = { 'polygate-ask': 'ask', 'polygate-accept-edits': 'accept-edits', 'polygate-plan': 'plan' };
+const AGENT_MODES: Record<string, Mode> = { 'polygate-ask': 'ask', 'polygate-accept-edits': 'accept-edits', 'polygate-plan': 'plan', 'polygate-rules': 'rules', 'polygate-full': 'full' };
 
 export type ToolStatus = 'preparing' | 'running' | 'done' | 'failed';
 export type Item =
@@ -74,7 +74,9 @@ export function applyEvent(items: Item[], e: any): Item[] {
     case 'session.tool.called': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'running' as ToolStatus }), x => ({ ...x, input: d.input, status: 'running' }));
     case 'session.tool.success': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'done' as ToolStatus }), x => ({ ...x, status: 'done', output: textOf(d.content) }));
     case 'session.tool.failed': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'failed' as ToolStatus }), x => ({ ...x, status: 'failed', error: d.error?.message || 'Failed' }));
-    case 'agent.approval.auto': return [...items, { kind: 'note', key: `auto:${d.requestID}`, tone: 'info', text: `Allowed for this session: ${(d.resources || []).join(', ')}` }];
+    case 'agent.approval.auto': return [...items, { kind: 'note', key: `auto:${d.requestID}`, tone: 'info', text: `${d.reason || 'Allowed for this session'}: ${(d.resources || []).join(', ')}` }];
+    case 'agent.approval.blocked': return [...items, { kind: 'note', key: `blocked:${d.requestID}`, tone: 'bad', text: `Blocked by permission rules: ${(d.resources || []).join(', ')}` }];
+    case 'agent.mode': return [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: d.mode === 'full' ? 'warn' : 'info', text: d.reason || `Mode: ${modeLabel(d.mode)}` }];
     // One note per turn for model retries, updated in place rather than one line per attempt.
     case 'session.retry.scheduled': return upsert('retry', () => ({ kind: 'note', key: 'retry', tone: 'warn', text: '' }), x => ({ ...x, text: `The model request failed (${d.error?.message || 'no reason given'}). Trying again (attempt ${d.attempt ?? '?'}).` }));
     case 'session.execution.started': return items.filter(x => x.key !== 'retry');

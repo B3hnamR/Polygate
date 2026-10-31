@@ -111,7 +111,7 @@ function NewSession({folder,data,onCreated}:{folder:string;data:Models;onCreated
         <Select value={current?.id} onChange={setModel} aria-label="Model">{usable.map(m=><option key={m.id} value={m.id}>{`${m.name} · ${m.provider}`}</option>)}</Select>
       </Field>
       {current&&current.efforts.length>0&&<Field label="Effort"><Select value={effort} onChange={setEffort} aria-label="Reasoning effort"><option value="">Default</option>{current.efforts.map(x=><option key={x} value={x}>{cap(x)}</option>)}</Select></Field>}
-      <Field label="Mode" hint={data.modes[mode]}><Select value={mode} onChange={v=>setMode(v as Mode)} aria-label="Mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select></Field>
+      <Field label="Mode" hint={data.modes[mode]}><Select value={mode} onChange={v=>setMode(v as Mode)} aria-label="Mode">{MODES.filter(m=>m.id!=='full').map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select></Field>
       <Button variant="primary" onClick={start} disabled={busy||!current}>{busy?<Loader2 className="spin" size={15}/>:<Plus size={15}/>}Start session</Button>
     </>:<p className="subtle">No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
     {blocked.length>0&&<p className="subtle agent-blocked" title={blocked[0].reason}>{blocked.length} OpenCode Free model{blocked.length>1?'s are':' is'} unavailable to the agent right now.</p>}
@@ -124,9 +124,10 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>();
   const [error,setError]=useState('');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
   const [text,setText]=useState('');const [sending,setSending]=useState(false);
+  const [fullUntil,setFullUntil]=useState(0);
   const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;
   const load=useCallback(async()=>{
-    try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);setInfo(s.session);setItems(withChanges(fromHistory(s.messages),changes.turns||[]));setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);setError('');}
+    try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);setInfo(s.session);setFullUntil(s.fullUntil||0);setItems(withChanges(fromHistory(s.messages),changes.turns||[]));setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);setError('');}
     catch(e:any){setError(e.message);}
   },[id]);
   // History first, then the live stream. After a dropped connection the history is read again, so nothing missed meanwhile is lost.
@@ -140,6 +141,7 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
       if(e.type==='agent.approval.auto')setPending(p=>p.filter(x=>x.id!==d.requestID));
       if(e.type==='agent.paused'){setPaused(d.message||'The model kept failing.');setBusy(false);return;}
       if(e.type==='agent.undone'){load();return;}
+      if(e.type==='agent.mode'){setInfo(i=>i&&{...i,mode:d.mode});setFullUntil(d.fullUntil||0);}
       if(e.type==='session.execution.started'){setBusy(true);setPaused('');}
       if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();api('/admin/agent/session?id='+encodeURIComponent(id)).then(s=>setRequests(s.usage||null),()=>{});}
       if(e.type==='session.usage.updated'&&d.tokens)setUsage(d.tokens);
@@ -158,7 +160,10 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   useEffect(()=>{const el=thread.current;if(el&&el.scrollHeight-el.scrollTop-el.clientHeight<160)el.scrollTop=el.scrollHeight;},[items,pending,busy]);
   const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{await api('/admin/agent/session/prompt',{id,text:t});setText('');}catch(e:any){setError(e.message);}finally{setSending(false);}};
   const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
-  const changeMode=async(mode:Mode)=>{try{await api('/admin/agent/session/mode',{id,mode});setInfo(i=>i&&{...i,mode});}catch(e:any){setError(e.message);}};
+  const changeMode=async(mode:Mode)=>{
+    if(mode==='full'&&!await confirm(<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access ends after this turn, after 30 minutes, or when the app or engine restarts.</>,{title:'Enable Full access',confirm:'Enable Full access'}))return;
+    try{const r=await api('/admin/agent/session/mode',{id,mode,confirmFull:mode==='full'});setInfo(i=>i&&{...i,mode});setFullUntil(r.fullUntil||0);}catch(e:any){setError(e.message);}
+  };
   const {confirm,dialog}=useConfirm();const [notice,setNotice]=useState('');
   // Undo goes back to just before this turn's message: this turn and every later one are undone, and their messages leave the conversation.
   const undo=async(message:string)=>{
@@ -170,7 +175,8 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   };
   const [nextModel,setNextModel]=useState('');const switchModel=async()=>{if(!nextModel)return;try{await api('/admin/agent/session/model',{id,model:nextModel});setInfo(i=>i&&{...i,model:nextModel,effort:''});setPaused('');setNotice('Model changed. Send a message to carry on.');}catch(e:any){setError(e.message);}};
   const [naming,setNaming]=useState<string|null>(null);const rename=async()=>{const title=(naming||'').trim();if(!title){setNaming(null);return;}try{await api('/admin/agent/session/rename',{id,title});setInfo(i=>i&&{...i,title});changed.current();}catch(e:any){setError(e.message);}setNaming(null);};
-  const answer=async(p:Approval,decision:'once'|'session'|'deny')=>{
+  const answer=async(p:Approval,decision:'once'|'session'|'project'|'deny')=>{
+    if(decision==='project'&&!await confirm(<>Save this exact {p.action} request for this working folder? It will be allowed in future sessions without asking. It does not match broader command prefixes. Remove it under Project rules.</>,{title:'Save project rule',confirm:'Save and allow'}))return;
     setPending(list=>list.filter(x=>x.id!==p.id));
     try{await api('/admin/agent/session/approve',{id,request:p.id,decision});}catch(e:any){setError(e.message);load();}
   };
@@ -184,9 +190,11 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
       {tokens>0&&<span className="pg-stat" title="Tokens this session has used, as the engine counts them">{compact(tokens)} tokens</span>}
       {requests&&requests.requests>0&&<span className={`pg-stat${requests.errors?' warn':''}`} title={`Model requests this session made through Polygate, by route:\n${requests.routes.map(r=>`${r.route||'—'}: ${r.requests}`).join('\n')}`}>
         {requests.requests} request{requests.requests===1?'':'s'}{requests.errors?`, ${requests.errors} failed`:''}{requests.routes[0]?` · ${requests.routes[0].route}`:''}</span>}
-      <Select value={info?.mode||'ask'} onChange={v=>changeMode(v as Mode)} aria-label="Mode" className="agent-mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select>
+      <Select value={info?.mode||'ask'} onChange={v=>changeMode(v as Mode)} disabled={busy||pending.length>0} aria-label="Mode" className="agent-mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select>
       <span className={`agent-live ${live}`}>{live==='live'?'Live':live==='lost'?'Reconnecting…':'Connecting…'}</span>
     </header>
+    {info?.mode==='full'&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Full access.</strong> Commands run with your account's access without asking. Ends after this turn or at {new Date(fullUntil).toLocaleTimeString()}. No sandbox.</div></div>}
+    <ProjectRules id={id} mode={info?.mode||'ask'}/>
     <div className="agent-thread" ref={thread} aria-live="polite">
       {items.length?items.map(i=><Row key={i.key} item={i} folder={folder} busy={busy} onUndo={undo}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {info?.mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':info?.mode==='accept-edits'?'It changes files without asking and asks before running commands.':'It reads freely and asks before changing files or running commands.'}</p>}
       {busy&&!pending.length&&<div className="agent-working"><Loader2 className="spin" size={15}/>Working…</div>}
@@ -238,7 +246,7 @@ function Diff({patch}:{patch:string}){
   return <pre className="agent-diff">{lines.map((l,i)=><span key={i} className={l.startsWith('+')?'add':l.startsWith('-')?'del':l.startsWith('@@')?'hunk':''}>{l||' '}{'\n'}</span>)}</pre>;
 }
 
-function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,decision:'once'|'session'|'deny')=>void}){
+function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,decision:'once'|'session'|'project'|'deny')=>void}){
   return <div className="agent-approval" role="alert">
     <div className="agent-approval-head"><ShieldCheck size={18}/><strong>{approvalTitle(p.action)}</strong></div>
     {p.resources.map(r=><code key={r} className="agent-approval-target">{r}</code>)}
@@ -246,8 +254,22 @@ function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,de
     <div className="agent-approval-actions">
       <Button variant="primary" onClick={()=>answer(p,'once')}>Allow once</Button>
       <Button onClick={()=>answer(p,'session')}>Allow for this session</Button>
+      {['shell','edit','read','webfetch','websearch','external_directory','subagent'].includes(p.action)&&<Button onClick={()=>answer(p,'project')}>Save project rule</Button>}
       <Button onClick={()=>answer(p,'deny')}>Deny</Button>
     </div>
     <p className="subtle">Allow for this session: this exact request goes ahead without asking again until the session ends. Deny stops this turn, together with anything else the agent asked to do at the same time.</p>
   </div>;
+}
+
+type SavedRule={id:string;action:string;resources:string[];effect:'allow'|'deny';created:number};
+function ProjectRules({id,mode}:{id:string;mode:Mode|''}){
+  const [open,setOpen]=useState(false);const [data,setData]=useState<{rules:SavedRule[];inspections:string[]}|null>(null);const [error,setError]=useState('');
+  const load=async()=>{try{setData(await api('/admin/agent/rules?id='+encodeURIComponent(id)));setError('');}catch(e:any){setError(e.message);}};
+  const remove=async(rule:string)=>{try{await api('/admin/agent/rules/remove',{id,rule});await load();}catch(e:any){setError(e.message);}};
+  return <details className="agent-project-rules" open={open} onToggle={e=>{const next=e.currentTarget.open;setOpen(next);if(next)void load();}}><summary>Project rules{mode==='rules'?' and automatic inspections':''}</summary>
+    <p className="subtle">Saved by Polygate for this working folder. Only the exact action and targets match; Plan still blocks commands and edits. Full access bypasses these rules for its current turn.</p>
+    {error&&<p className="pg-error">{error}</p>}
+    {data?.rules.length?<ul>{data.rules.map(r=><li key={r.id}><div><strong>{r.effect==='allow'?'Allow':'Deny'} {r.action}</strong>{r.resources.map((x,i)=><code key={i} className="agent-approval-target">{x}</code>)}</div><Button onClick={()=>remove(r.id)} aria-label={`Remove ${r.action} rule`}>Remove</Button></li>)}</ul>:<p className="subtle">No saved rules. Save one from an approval card.</p>}
+    {mode==='rules'&&data&&<><p className="subtle">Only these exact hardened inspections are automatically approved. Ordinary git commands, scripts and unrecognized arguments still ask.</p>{data.inspections.map(x=><code className="agent-approval-target" key={x}>{x}</code>)}</>}
+  </details>;
 }

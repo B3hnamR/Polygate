@@ -102,7 +102,7 @@ test('the engine configuration holds Polygate as the only provider, the ask-firs
 test('each mode is an engine agent with its own rules, and Polygate\'s folders stay closed to file tools in every mode', () => {
   const state = path.join(tmpdir(), 'Polygate', 'state'); const folder = path.resolve(state).replace(/\\/g, '/');
   const cfg = engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [], protect: [state, state + path.sep] });
-  expect(Object.keys(cfg.agents).sort()).toEqual(['polygate-accept-edits', 'polygate-ask', 'polygate-plan']);
+  expect(Object.keys(cfg.agents).sort()).toEqual(['polygate-accept-edits', 'polygate-ask', 'polygate-full', 'polygate-plan', 'polygate-rules']);
   const last = (rules: any[], action: string) => rules.filter(r => r.action === action && r.resource === '*').at(-1)?.effect;
   const rulesOf = (agent: string) => [...cfg.permissions, ...cfg.agents[agent].permissions];
   expect(['edit', 'shell', 'external_directory'].map(a => last(rulesOf('polygate-ask'), a))).toEqual(['ask', 'ask', 'ask']);
@@ -111,7 +111,9 @@ test('each mode is an engine agent with its own rules, and Polygate\'s folders s
   // The folder rules close every list, after a mode's own rules, and a folder named twice is written once.
   const guard = ['external_directory', 'read', 'edit'].map(action => ({ action, resource: `${folder}/*`, effect: 'deny' }));
   expect(cfg.permissions.slice(-3)).toEqual(guard);
-  for (const agent of Object.keys(cfg.agents)) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
+  for (const agent of Object.keys(cfg.agents).filter(id => id !== 'polygate-full')) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
+  expect(cfg.agents['polygate-full'].permissions).toEqual([{ action: '*', resource: '*', effect: 'ask' }]);
+  expect(['edit', 'shell'].map(a => last(rulesOf('polygate-rules'), a))).toEqual(['allow', 'ask']);
 });
 
 test('the agent\'s shell is chosen by Polygate: PowerShell 7 when it is installed, Windows PowerShell otherwise, and written to the configuration', () => {

@@ -8,6 +8,7 @@ import { logEvent } from './logbook';
 import { ENGINE_MODES, engineConnection, enginePaths, freeIdentityProblem } from './agent-engine';
 import { presentedOpenCodeVersion } from './providers';
 import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, restoreFile, saveBytes, type Backup, type FileBackup } from './agent-backup';
+import { inspectionCommands, permissionDecision, projectRules, removeProjectRule, saveProjectRule } from './agent-permissions';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the only part of Polygate that talks to the agent's engine. The Agent page uses it
 // through the desktop-only admin API (admin.ts); the engine's password never reaches the page. It keeps one event stream per working
 // folder open to the engine (opened again after an engine restart), hands each session's events to the page, and answers approvals:
@@ -17,7 +18,7 @@ import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, restoreFile
 const MAX_RETRIES = 3;
 type Mode = keyof typeof ENGINE_MODES;
 type Pending = { id: string; action: string; resources: string[]; note: string };
-type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; turns?: Turn[]; backup?: Backup; recording?: Promise<void>; undoing?: boolean; sending?: boolean };
+type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; turns?: Turn[]; backup?: Backup; recording?: Promise<void>; undoing?: boolean; sending?: boolean; mode?: Mode; fullUntil?: number; fullEngine?: string; fullTimer?: ReturnType<typeof setTimeout> };
 const sessions = new Map<string, Session>();
 const listeners = new Map<string, Set<ServerResponse>>();
 const folders = new Map<string, { abort: AbortController; ready: Promise<void> }>();
@@ -94,9 +95,18 @@ function onEvent(e: any, folder: string) {
   const s = session(sid, folder);
   if (e.type === 'permission.asked') {
     const resources = Array.isArray(d.resources) ? d.resources.map(String) : []; const key = keyOf(d.action, resources);
-    if (s.allowed.has(key)) {
+    const full = s.mode === 'full' && !!s.fullUntil && s.fullUntil > Date.now() && s.fullEngine === engineConnection()?.url;
+    if (s.mode === 'full' && !full) { expireFull(s); }
+    let decision: 'allow' | 'deny' | 'ask' = 'ask';
+    try { decision = permissionDecision(full ? 'full' : s.mode || 'ask', d.action, resources, projectRules(s.folder)); }
+    catch (err: any) { s.paused = err.message; engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused } }); reply(sid, d.id, 'reject').catch(() => {}); return; }
+    if (decision === 'deny') {
+      reply(sid, d.id, 'reject', 'Blocked by the current permission mode or a saved project rule.').catch(err => logEvent('warn', 'agent', String(err)));
+      publish(sid, { type: 'agent.approval.blocked', data: { sessionID: sid, requestID: d.id, action: d.action, resources } }); return;
+    }
+    if (decision === 'allow' || s.allowed.has(key)) {
       reply(sid, d.id, 'once').catch(err => logEvent('warn', 'agent', `An approval for this session could not be applied: ${err?.message || err}`));
-      publish(sid, { type: 'agent.approval.auto', data: { sessionID: sid, requestID: d.id, action: d.action, resources } }); return;
+      publish(sid, { type: 'agent.approval.auto', data: { sessionID: sid, requestID: d.id, action: d.action, resources, reason: full ? 'Full access' : decision === 'allow' ? 'Permission rule' : 'Allowed for this session' } }); return;
     }
     const pending = { id: String(d.id), action: String(d.action), resources, note: noteFor(d.action, resources) };
     s.pending.set(pending.id, pending);
@@ -108,6 +118,8 @@ function onEvent(e: any, folder: string) {
   if (e.type === 'session.step.ended' && Array.isArray(d.files)) for (const f of d.files) if (typeof f === 'string' && f) s.stepFiles.add(f);
   if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) {
     s.busy = false;
+    s.pending.clear();
+    if (s.mode === 'full') expireFull(s);
     s.recording = recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`));
   }
   publish(sid, e);
@@ -119,6 +131,13 @@ function onEvent(e: any, folder: string) {
     publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused, status: d.error?.status } });
     logEvent('warn', 'agent', `Agent session paused after ${s.retries} failed model requests: ${s.paused}`);
   }
+}
+
+function expireFull(s: Session) {
+  if (s.fullTimer) clearTimeout(s.fullTimer);
+  s.fullTimer = undefined; s.fullUntil = undefined; s.fullEngine = undefined; s.mode = 'ask'; s.allowed.clear();
+  engine('POST', `/api/session/${enc(s.id)}/agent`, { agent: ENGINE_MODES.ask.agent }).catch(err => logEvent('warn', 'agent', `Full access expired; resetting the engine agent failed: ${err?.message || err}`));
+  publish(s.id, { type: 'agent.mode', data: { sessionID: s.id, mode: 'ask', fullUntil: 0, reason: 'Full access ended. Ask for approval is active.' } });
 }
 
 // --- Changes and undo ---
@@ -246,6 +265,7 @@ function checkEffort(entry: ReturnType<typeof agentModels>[number] | undefined, 
 async function createSession(b: any) {
   if (!engineConnection()) throw new GatewayError('Start the agent engine first.', 409, 'agent_engine_not_running');
   const folder = checkFolder(b.folder); const mode = checkMode(b.mode); const model = String(b.model || '');
+  if (mode === 'full') throw new GatewayError('Start in Ask mode, then explicitly enable Full access for this session.', 400, 'agent_full_consent');
   const list = await engine('GET', `/api/model${q(folder)}`); const known = (Array.isArray(list) ? list : []).some((m: any) => m.providerID === 'polygate' && m.id === model);
   if (!known) throw new GatewayError('The agent engine does not have that model. Pick one from the list, or start the engine again after the catalog changed.', 400, 'agent_model');
   const entry = agentModels().find(m => m.id === model); if (entry?.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
@@ -254,15 +274,17 @@ async function createSession(b: any) {
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
   const info = await engine('POST', '/api/session', { title, agent: ENGINE_MODES[mode].agent, model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) }, location: { directory: folder } });
-  session(info.id, folder);
+  session(info.id, folder).mode = mode;
   return summary(info);
 }
 // A session this process has not seen yet (Polygate restarted): its folder comes from the engine.
 async function known(id: unknown) {
   const sid = String(id || ''); if (!sid) throw new GatewayError('Which session?', 400);
-  const s = sessions.get(sid); if (s?.folder) { await watchFolder(s.folder); return s; }
+  const s = sessions.get(sid); if (s?.folder) { if (s.mode === 'full' && (!s.fullUntil || s.fullUntil <= Date.now() || s.fullEngine !== engineConnection()?.url)) expireFull(s); await watchFolder(s.folder); return s; }
   const info = await engine('GET', `/api/session/${encodeURIComponent(sid)}`);
-  const folder = info?.location?.directory || ''; const out = session(sid, folder); if (folder) await watchFolder(folder);
+  const folder = info?.location?.directory || ''; const out = session(sid, folder); out.mode = modeOf(info?.agent || '') || 'ask';
+  if (out.mode === 'full') { out.mode = 'ask'; await engine('POST', `/api/session/${enc(sid)}/agent`, { agent: ENGINE_MODES.ask.agent }); }
+  if (folder) await watchFolder(folder);
   return out;
 }
 
@@ -278,7 +300,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session' && method === 'GET') {
     const s = await known(url.searchParams.get('id'));
     const [info, messages] = await Promise.all([engine('GET', `/api/session/${encodeURIComponent(s.id)}`), engine('GET', `/api/session/${encodeURIComponent(s.id)}/context`)]);
-    return json(res, 200, { session: summary(info), messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy, usage: sessionUsage(s.id) });
+    return json(res, 200, { session: { ...summary(info), mode: s.mode || modeOf(info?.agent || '') }, fullUntil: s.fullUntil || 0, messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy, usage: sessionUsage(s.id) });
   }
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
     const b = await readJson(req, 1024 * 1024); const s = await known(b.id); const text = String(b.text || '');
@@ -298,11 +320,13 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   }
   if (pathname === '/admin/agent/session/approve' && method === 'POST') {
     const b = await readJson(req); const s = await known(b.id); const decision = String(b.decision || '');
-    if (!['once', 'session', 'deny'].includes(decision)) throw new GatewayError('Answer once, session or deny.', 400, 'agent_decision');
+    if (!['once', 'session', 'project', 'deny'].includes(decision)) throw new GatewayError('Answer once, session, project or deny.', 400, 'agent_decision');
     const p = s.pending.get(String(b.request || '')); if (!p) throw new GatewayError('That request is no longer waiting for an answer.', 404, 'agent_request_gone');
-    s.pending.delete(p.id);
-    if (decision === 'deny') { await reply(s.id, p.id, 'reject', typeof b.message === 'string' ? b.message.slice(0, 2000) : undefined); return json(res, 200, { ok: true }); }
+    if (s.mode === 'plan' && ['shell', 'edit', 'execute', 'subagent'].includes(p.action) && decision !== 'deny') throw new GatewayError('Leave Plan mode before approving changes or commands.', 409, 'agent_plan');
+    if (decision === 'project') saveProjectRule(s.folder, p.action, p.resources, 'allow');
+    if (decision === 'deny') { await reply(s.id, p.id, 'reject', typeof b.message === 'string' ? b.message.slice(0, 2000) : undefined); s.pending.delete(p.id); return json(res, 200, { ok: true }); }
     await reply(s.id, p.id, 'once');
+    s.pending.delete(p.id);
     if (decision === 'session') {
       // Allowed again in this session without asking, for exactly this action and target; other requests of the same kind waiting now go too.
       const key = keyOf(p.action, p.resources); s.allowed.add(key);
@@ -336,8 +360,19 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/cancel' && method === 'POST') { const s = await known((await readJson(req)).id); await engine('POST', `/api/session/${encodeURIComponent(s.id)}/interrupt`); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/session/mode' && method === 'POST') {
     const b = await readJson(req); const mode = checkMode(b.mode); const s = await known(b.id);
-    await engine('POST', `/api/session/${encodeURIComponent(s.id)}/agent`, { agent: ENGINE_MODES[mode].agent }); return json(res, 200, { ok: true, mode });
+    if (s.busy || s.sending || s.undoing || s.pending.size) throw new GatewayError('Stop the turn and resolve pending approvals before changing mode.', 409, 'agent_busy');
+    if (mode === 'full' && b.confirmFull !== true) throw new GatewayError('Full access needs explicit confirmation: commands can access your files, network and Polygate data with your account access.', 400, 'agent_full_consent');
+    await engine('POST', `/api/session/${encodeURIComponent(s.id)}/agent`, { agent: ENGINE_MODES[mode].agent });
+    if (s.fullTimer) clearTimeout(s.fullTimer); s.fullUntil = undefined; s.fullEngine = undefined; s.allowed.clear(); s.mode = mode;
+    if (mode === 'full') {
+      s.fullUntil = Date.now() + 30 * 60000; s.fullEngine = engineConnection()?.url;
+      s.fullTimer = setTimeout(() => { if (s.mode !== 'full') return; engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); expireFull(s); }, 30 * 60000); s.fullTimer.unref?.();
+    }
+    publish(s.id, { type: 'agent.mode', data: { sessionID: s.id, mode, fullUntil: s.fullUntil || 0 } });
+    return json(res, 200, { ok: true, mode, fullUntil: s.fullUntil || 0 });
   }
+  if (pathname === '/admin/agent/rules' && method === 'GET') { const s = await known(url.searchParams.get('id')); return json(res, 200, { rules: projectRules(s.folder), inspections: inspectionCommands() }); }
+  if (pathname === '/admin/agent/rules/remove' && method === 'POST') { const b = await readJson(req), s = await known(b.id); removeProjectRule(s.folder, String(b.rule || '')); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/events' && method === 'GET') {
     const s = await known(url.searchParams.get('id'));
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
@@ -351,4 +386,4 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   throw new GatewayError('Admin endpoint not found', 404);
 }
 // Called when the gateway stops: the folder streams end with it.
-export function stopAgent() { for (const f of folders.values()) f.abort.abort(); folders.clear(); }
+export function stopAgent() { for (const s of sessions.values()) { if (s.fullTimer) clearTimeout(s.fullTimer); if (s.mode === 'full') { s.mode = 'ask'; s.fullUntil = undefined; s.fullEngine = undefined; } s.allowed.clear(); } for (const f of folders.values()) f.abort.abort(); folders.clear(); }

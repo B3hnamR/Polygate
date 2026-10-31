@@ -75,3 +75,11 @@ test('approval cards and tool lines say what a request is about', () => {
   expect(toolSubject('read', { path: 'C:\\Users\\me\\other\\x.js' }, folder)).toBe('C:\\Users\\me\\other\\x.js');
   expect(toolSubject('shell', { command: 'C:\\Users\\me\\پروژه test\\app\\run.cmd' }, folder)).toBe('C:\\Users\\me\\پروژه test\\app\\run.cmd');
 });
+
+test('the transcript distinguishes saved rules, blocks, and Full access from session approvals', () => {
+  let items = applyEvent([], { type: 'agent.approval.auto', data: { requestID: 'r', reason: 'Permission rule', resources: ['npm test'] } });
+  items = applyEvent(items, { type: 'agent.approval.blocked', data: { requestID: 'b', resources: ['pwsh -enc x'] } });
+  items = applyEvent(items, { type: 'agent.mode', data: { mode: 'full' } });
+  expect(items.map(i => (i as any).text)).toEqual(['Permission rule: npm test', 'Blocked by permission rules: pwsh -enc x', 'Mode: Full access']);
+  expect(items[2]).toMatchObject({ tone: 'warn' });
+});

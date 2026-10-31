@@ -190,12 +190,17 @@ export const ENGINE_PERMISSIONS = [
 type Rule = { action: string; resource: string; effect: 'allow' | 'ask' | 'deny' };
 // The Phase 1 modes (docs/agent/PERMISSIONS.md), one engine agent each; a session runs as the agent of its mode. Each agent's rules come
 // after the shared ones above. Rules-based approvals and Full access come in Phase 3.
-export const ENGINE_MODES: Record<'ask' | 'accept-edits' | 'plan', { agent: string; description: string; permissions: Rule[] }> = {
+export const ENGINE_MODES: Record<'ask' | 'accept-edits' | 'plan' | 'rules' | 'full', { agent: string; description: string; permissions: Rule[] }> = {
   ask: { agent: 'polygate-ask', description: 'Ask for approval: reading is allowed; edits, commands and anything outside the working folder ask first.', permissions: [] },
   'accept-edits': { agent: 'polygate-accept-edits', description: 'Accept edits: reading and edits are allowed; commands and anything outside the working folder ask first.',
     permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
   plan: { agent: 'polygate-plan', description: 'Plan: reading only; no edits and no commands until the plan is approved.',
     permissions: [{ action: 'edit', resource: '*', effect: 'deny' }, { action: 'shell', resource: '*', effect: 'deny' }, { action: 'execute', resource: '*', effect: 'deny' }, { action: 'subagent', resource: '*', effect: 'deny' }] },
+  rules: { agent: 'polygate-rules', description: 'Rules-based approvals: project edits are allowed; exact hardened inspections and project rules are checked by Polygate. Unknown commands ask.',
+    permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
+  // The engine still asks: only the live controller can grant Full access, so persisted engine sessions cannot retain it after restart.
+  full: { agent: 'polygate-full', description: 'Full access: no ordinary approval prompts for this turn, at most 30 minutes. Commands have your account access. Requires explicit consent.',
+    permissions: [{ action: '*', resource: '*', effect: 'ask' }] },
 };
 const PLUGIN = 'polygate-scrub';
 // Commands the agent runs inherit the engine's environment; this engine plugin drops the engine password and the agent key from it.
@@ -235,7 +240,7 @@ export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; pro
     providers: { polygate: { name: 'Polygate', package: '@ai-sdk/openai-compatible', env: ['POLYGATE_AGENT_KEY'], settings: { baseURL: o.gatewayUrl.replace(/\/+$/, '') + '/v1', apiKey: '{env:POLYGATE_AGENT_KEY}' }, models: Object.fromEntries(entries) } },
     policies: [{ action: 'provider.use', resource: '*', effect: 'deny' }, { action: 'provider.use', resource: 'polygate', effect: 'allow' }],
     permissions: [...ENGINE_PERMISSIONS, ...guard].map(r => ({ ...r })),
-    agents: Object.fromEntries(Object.values(ENGINE_MODES).map(m => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...guard].map(r => ({ ...r })) }])),
+    agents: Object.fromEntries(Object.entries(ENGINE_MODES).map(([mode, m]) => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...(mode === 'full' ? [] : guard)].map(r => ({ ...r })) }])),
     plugins: [`./${PLUGIN}`],
   } as any;
 }

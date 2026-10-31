@@ -149,6 +149,66 @@ test('the mode switches to that mode\'s engine agent, and cancel interrupts the 
   expect((await admin('/admin/agent/session/cancel', { id: 'ses_unknown' })).status).toBe(404);
 });
 
+test('rules mode auto-answers only hardened inspection and rejects prohibited commands', async () => {
+  const a = await create('rules'); const ui = listen(a); await ui.ready();
+  const list = (await admin('/admin/agent/rules?id=' + a)).body;
+  expect(list.inspections.length).toBeGreaterThan(0);
+  await emit('permission.asked', { id: 'per_safe', sessionID: a, action: 'shell', resources: [list.inspections[0]] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_safe/reply')));
+  expect((await calls()).find(c => c.path.endsWith('/permission/per_safe/reply'))!.body.decision).toBe('once');
+  await emit('permission.asked', { id: 'per_bad', sessionID: a, action: 'shell', resources: ['pwsh -enc Zg=='] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_bad/reply')));
+  expect((await calls()).find(c => c.path.endsWith('/permission/per_bad/reply'))!.body.decision).toBe('reject');
+  await emit('permission.asked', { id: 'per_script', sessionID: a, action: 'shell', resources: ['npm test'] });
+  await until(() => ui.events.some(e => e.type === 'permission.asked' && e.data.id === 'per_script'));
+  expect((await calls()).some(c => c.path.endsWith('/permission/per_script/reply'))).toBe(false);
+  ui.stop();
+});
+
+test('saving an exact project approval survives in another session and can be removed', async () => {
+  const a = await create(); const ui = listen(a); await ui.ready();
+  await emit('permission.asked', { id: 'per_project', sessionID: a, action: 'shell', resources: ['npm run lint'] });
+  await until(() => ui.events.some(e => e.type === 'permission.asked'));
+  expect((await admin('/admin/agent/session/approve', { id: a, request: 'per_project', decision: 'project' })).status).toBe(200);
+  const rules = (await admin('/admin/agent/rules?id=' + a)).body.rules;
+  expect(rules).toHaveLength(1); expect(rules[0].resources).toEqual(['npm run lint']);
+  const b = await create();
+  await emit('permission.asked', { id: 'per_next_session', sessionID: b, action: 'shell', resources: ['npm run lint'] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_next_session/reply')));
+  expect((await admin('/admin/agent/rules/remove', { id: a, rule: rules[0].id })).status).toBe(200);
+  expect((await admin('/admin/agent/rules?id=' + a)).body.rules).toEqual([]);
+  ui.stop();
+});
+
+test('Full access requires explicit consent, is owned by the controller, and ends after the turn', async () => {
+  const a = await create(); const ui = listen(a); await ui.ready();
+  expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full' })).status).toBe(400);
+  expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'full' })).status).toBe(400);
+  expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full', confirmFull: true })).status).toBe(200);
+  const info = (await admin('/admin/agent/session?id=' + a)).body;
+  expect(info.session.mode).toBe('full'); expect(info.fullUntil).toBeGreaterThan(Date.now());
+  await emit('permission.asked', { id: 'per_full', sessionID: a, action: 'shell', resources: ['npm test'] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full/reply')));
+  expect((await calls()).find(c => c.path.endsWith('/permission/per_full/reply'))!.body.decision).toBe('once');
+  await emit('session.execution.succeeded', { sessionID: a });
+  await until(async () => (await admin('/admin/agent/session?id=' + a)).body.session.mode === 'ask');
+  expect((await admin('/admin/agent/session?id=' + a)).body.fullUntil).toBe(0);
+  expect((await calls()).filter(c => c.path.endsWith('/reply')).every(c => c.body.decision !== 'always')).toBe(true);
+  ui.stop();
+});
+
+test('Full access does not survive the controller stopping, even when the engine agent is still persisted as full', async () => {
+  const a = await create();
+  expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full', confirmFull: true })).status).toBe(200);
+  const { stopAgent } = await import('../backend/agent'); stopAgent();
+  const ui = listen(a); await ui.ready();
+  expect((await admin('/admin/agent/session?id=' + a)).body.session.mode).toBe('ask');
+  await emit('permission.asked', { id: 'per_after_stop', sessionID: a, action: 'shell', resources: ['npm test'] });
+  await until(() => ui.events.some(e => e.type === 'permission.asked' && e.data.id === 'per_after_stop'));
+  expect((await calls()).some(c => c.path.endsWith('/permission/per_after_stop/reply'))).toBe(false);
+  ui.stop();
+});
+
 // Phase 2c: what each turn changed, and undo that never overwrites a change made after the agent's.
 const inFolder = (rel: string) => path.join(FOLDER, rel);
 const put = (rel: string, text: string) => { mkdirSync(path.dirname(inFolder(rel)), { recursive: true }); writeFileSync(inFolder(rel), text); };
