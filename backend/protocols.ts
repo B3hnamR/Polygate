@@ -24,8 +24,30 @@ export function observeSse(onData: (raw: string) => void, onFirstChunk?: () => v
     flush() { scan += decoder.decode(); if (scan.trim()) consume(scan); }
   });
 }
-export async function collect(response: Response) { return await adapters.collectChatCompletion(response); }
-export async function stream(req: IncomingMessage, res: ServerResponse, response: Response, protocol: Protocol, model: string) {
+// Providers may end SSE lines with CRLF (events then end in \r\n\r\n) or a lone CR. The adapters split events on "\n\n", so the body is turned into LF
+// framing before they see it. A CR at the end of a chunk waits for the next one, so a CRLF split between two chunks is still one line end.
+function lfFraming() {
+  let heldCr = false;
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const out = new Uint8Array(chunk.length + 1); let n = 0;
+      for (const b of chunk) {
+        if (heldCr) { heldCr = false; out[n++] = 10; if (b === 10) continue; }
+        if (b === 13) { heldCr = true; continue; }
+        out[n++] = b;
+      }
+      if (n) controller.enqueue(out.subarray(0, n));
+    },
+    flush(controller) { if (heldCr) controller.enqueue(new Uint8Array([10])); }
+  });
+}
+export function lfBody(response: Response): Response {
+  if (!response.body || !/text\/event-stream/i.test(response.headers.get('content-type') || '')) return response;
+  return new Response(response.body.pipeThrough(lfFraming()), { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+export async function collect(response: Response) { return await adapters.collectChatCompletion(lfBody(response)); }
+export async function stream(req: IncomingMessage, res: ServerResponse, raw: Response, protocol: Protocol, model: string) {
+  const response = lfBody(raw);
   if(protocol==='anthropic') return await adapters.relayAnthropicStream(req,res,adapters.sseChunks(response),model,model);
   if(protocol==='responses') return await adapters.relayChatAsResponsesStream(req,res,response,model);
   return await adapters.relayStream(req,res,response,model);
