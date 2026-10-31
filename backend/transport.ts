@@ -128,7 +128,10 @@ export function routeFor(model='', explicit='', kind?: string): Route {
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
     const last=current&&isExhausted(current)&&exhaustionApplies(kind)?exhaustedAlternative(current):undefined;if(last)return last;
-    throw new GatewayError('All configured routes are unavailable or cooling down. Direct fallback is disabled.',503,'route_unavailable');
+    // Say why, so a spread that has nothing to spread over does not read as a broken connection.
+    const direct=settings.routes.find(r=>r.id==='direct'&&r.enabled);
+    const why=direct&&settings.spreadDirect!==true?' Direct is on but left out of the spread: turn on "Include Direct in the spread" on the Routing page, or turn spreading off.':'';
+    throw new GatewayError(`All configured routes are unavailable or cooling down. Direct fallback is disabled.${why}`,503,'route_unavailable');
   }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
   // "Selected route" used to be an order here, but with the selected route outside the spread it just stuck to the first exit; it now takes turns.

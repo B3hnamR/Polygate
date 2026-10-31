@@ -47,3 +47,11 @@ test('the dashboard can switch Direct in and out of the spread', async () => {
   expect((await send({ spreadDirect: false })).status).toBe(200); expect(settings.spreadDirect).toBe(false);
   expect((await send({ spreadDirect: 'yes' })).status).toBe(400);
 });
+
+test('with spreading on and nothing but Direct left, the refusal says Direct is left out of the spread', () => {
+  settings.routes.length = 0; settings.routes.push(...saved.routes.filter(r => r.id === 'direct'));
+  settings.routeId = 'direct'; settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false;
+  let err: any; try { routeFor('opencode/x', '', 'free'); } catch (e) { err = e; }
+  expect(err.status).toBe(503); expect(String(err.message)).toContain('Include Direct in the spread');
+  settings.spreadDirect = true; expect(routeFor('opencode/x', '', 'free').id).toBe('direct'); // included: it carries the request
+});
