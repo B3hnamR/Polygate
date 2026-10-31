@@ -16,13 +16,13 @@ const model = (id: string, providerId: string, priority: number) => saveModel({ 
 const prov = (id: string, name: string, path: string, extra: any = {}) => ({ id, name, kind: 'openai', enabled: true, baseUrl: `http://127.0.0.1:${up.port}/${path}/v1`, apiKey: '', models: [], routeId: 'direct', ...extra });
 const saved: any = {};
 beforeAll(async () => {
-  Object.assign(saved, { providers: settings.providers, routes: settings.routes.slice(), retries: settings.retries });
+  Object.assign(saved, { providers: settings.providers, routes: settings.routes.slice(), retries: settings.retries, warp: settings.warp });
   settings.retries = 0; settings.warp = { engine: 'disabled', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '' } as any;
   settings.routes.push({ id: 'r-cool', name: 'Cooling route', kind: 'proxy', url: 'socks5://127.0.0.1:1', enabled: true, models: [], cooldownUntil: Date.now() + 600000 } as any);
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterEach(() => { __setExitVerifier(); for (const r of settings.routes) if (r.id === 'direct') r.exhaustedUntil = 0; });
-afterAll(async () => { await gateway?.close(); up.stop(true); settings.providers = saved.providers; settings.routes.length = 0; settings.routes.push(...saved.routes); settings.retries = saved.retries; });
+afterAll(async () => { await gateway?.close(); up.stop(true); settings.providers = saved.providers; settings.routes.length = 0; settings.routes.push(...saved.routes); settings.retries = saved.retries; settings.warp = saved.warp; });
 const ask = async () => { const r = await fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer ' + settings.keys[0].value, 'content-type': 'application/json' }, body: JSON.stringify({ model: 'auto', stream: false, messages: [{ role: 'user', content: 'hi' }] }) }); return { status: r.status, model: r.headers.get('x-polygate-model'), body: await r.json() as any }; };
 
 test('a provider whose chosen route is resting does not stop the next provider from answering', async () => {

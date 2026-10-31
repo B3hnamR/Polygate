@@ -1,9 +1,12 @@
-import { test, expect } from 'bun:test';
+import { test, expect, afterAll } from 'bun:test';
 import { spawn } from 'node:child_process';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 const { settings } = await import('../backend/state');
 const warp = await import('../backend/warp');
 const { __tunnels, __tunnelExited, refreshStatus } = warp;
+// Everything this file changes in the shared settings is put back afterwards: other test files run in the same process and must not see a WARP engine or a warp route.
+const saved = { warp: settings.warp, routes: settings.routes.slice() };
+afterAll(() => { settings.warp = saved.warp; settings.routes.length = 0; settings.routes.push(...saved.routes); __tunnels.clear(); });
 settings.warp = { engine: 'embedded', autoStart: false, pool: 1, rotateMinutes: 0, helperPath: '', endpoint: '', split: 'auto' } as any;
 // A stand-in for the helper: a live process whose SOCKS port never answers.
 const fakeTunnel = (port: number) => { const proc = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' }); return { port, index: 0, proc, identity: 'x', endpoint: '', split: false, startedAt: Date.now(), egressIp: '1.2.3.4', egress: undefined, failures: 0, cooldownUntil: 0, restarts: 0 } as any; };
