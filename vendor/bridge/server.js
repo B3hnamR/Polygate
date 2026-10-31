@@ -855,16 +855,26 @@ function resolveIpThrottleStatus(upstreamStatus, freeTierMsg) {
   return upstreamStatus;
 }
 
+// OpenCode's `shell` description names the machine it runs on, `Commands run
+// on ${OS} using ${shell}.`, and leaves the sentence out when the shell is
+// unknown. The profile renders it for Linux and bash, while the real CLI on
+// Windows says "Commands run on Windows using pwsh." That sentence is the
+// user's platform, not a different tool, so it is left out of the comparison.
+const PLATFORM_SENTENCE = / ?Commands run on .+? using .+?\.(?= |$)/;
+function withoutPlatform(description) {
+  return typeof description === "string" ? description.replace(PLATFORM_SENTENCE, "").trim() : description;
+}
+
 /**
- * Is this client-supplied tool already byte-identical to the fingerprint we
- * would inject? If so it can be passed through untouched.
+ * Is this client-supplied tool the fingerprint we would inject, as the real
+ * CLI sends it on any platform? If so it can be passed through untouched.
  */
 function isExactFingerprintDef(tool, key) {
   const want = identity.getTools()[key];
   if (!want || !tool || typeof tool !== "object") return false;
   const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
   return (
-    def.description === want.description &&
+    withoutPlatform(def.description) === withoutPlatform(want.description) &&
     getParamSig(def.parameters) === getParamSig(want.parameters)
   );
 }
