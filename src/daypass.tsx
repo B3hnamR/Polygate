@@ -3,7 +3,7 @@ import {ms,time,type Snapshot} from './ui';
 import type {Route} from '../backend/types';
 
 // The "day pass" pieces of the dashboard: every exit is shown as a ticket, and a used-up exit carries a stamp with the time it is valid again.
-export type Metrics={hourly:{hour:number;requests:number;errors:number}[];byRoute:{route:string;requests:number;errors:number;avgMs:number}[]};
+export type Metrics={hourly:{hour:number;requests:number;errors:number}[];hourlyByRoute?:{route:string;hour:number;requests:number;errors:number}[];byRoute:{route:string;requests:number;errors:number;avgMs:number}[]};
 const utc=(t:number)=>new Date(t).toISOString().slice(11,16)+' UTC';
 const left=(until:number)=>{const m=Math.max(1,Math.round((until-Date.now())/60000));return m>=60?`${Math.floor(m/60)} h ${m%60} m`:`${m} min`;};
 export const usedUp=(r?:Route)=>!!r?.exhaustedUntil&&r.exhaustedUntil>Date.now();
@@ -24,8 +24,9 @@ export function Stamp({until,refused}:{until:number;refused?:boolean}){
 export function ExitPass({data,metrics,onManage}:{data:Snapshot;metrics?:Metrics|null;onManage:()=>void}){
   const r=data.settings.routes.find(x=>x.id===data.settings.routeId);
   if(!r)return <section className="pass pass-missing"><div className="pass-body"><h2 className="pass-name">No exit selected</h2><p className="pass-where">Requests have nowhere to go. Pick an exit on Routing.</p><button className="button primary" onClick={onManage}>Open Routing</button></div></section>;
-  const info=data.routeInfo?.[r.id];const s=data.stats||{};const total=Number(s.total)||0;const last=data.logs[0];
-  const hours=Array.from({length:24},(_,i)=>{const h=(Math.floor(Date.now()/3600000)-23+i)*3600000;return metrics?.hourly.find(x=>x.hour===h)||{hour:h,requests:0,errors:0};});
+  // Everything on this card is about this exit alone: its own hours, answers, average and last answer.
+  const info=data.routeInfo?.[r.id];const mine=metrics?.byRoute.find(x=>x.route===r.name);const total=mine?.requests||0;const last=data.logs.find(l=>l.route===r.name);
+  const hours=Array.from({length:24},(_,i)=>{const h=(Math.floor(Date.now()/3600000)-23+i)*3600000;return metrics?.hourlyByRoute?.find(x=>x.route===r.name&&x.hour===h)||{hour:h,requests:0,errors:0};});
   const peak=Math.max(1,...hours.map(h=>h.requests));
   return <article className={`pass ${usedUp(r)?'is-used':''}`} aria-label={`Active exit: ${r.name}`}>
     <div className="pass-body">
@@ -33,7 +34,7 @@ export function ExitPass({data,metrics,onManage}:{data:Snapshot;metrics?:Metrics
       <p className="pass-where">{kind(r)} · {exitWhere(r)}</p>
       <div className="punches" role="img" aria-label="Requests per hour over the last 24 hours">{hours.map((h,i)=>{const size=h.requests?Math.round(40+60*h.requests/peak):0;return <i key={h.hour} className={i===23?'now':''} title={`${hourLabel(h.hour)} · ${h.requests} requests${h.errors?`, ${h.errors} failed`:''}`}>{size?<b className={h.errors?'bad':''} style={{width:size+'%',height:size+'%'}}/>:null}</i>;})}</div>
       <div className="punch-hours" aria-hidden="true">{hours.map((h,i)=><span key={h.hour}>{i%6===0?new Date(h.hour).getHours().toString().padStart(2,'0'):''}</span>)}</div>
-      <div className="pass-facts"><span>Last answer <b>{last?time(last.time):'—'}</b></span><span>Average <b>{ms(s.latency)}</b></span><span>Answered <b>{total?`${Math.round((s.success||0)/total*100)}%`:'—'}</b></span></div>
+      <div className="pass-facts"><span>Last answer <b>{last?time(last.time):'—'}</b></span><span>Average <b>{total?ms(mine!.avgMs):'—'}</b></span><span>Answered <b>{total?`${Math.round((total-(mine?.errors||0))/total*100)}%`:'—'}</b></span></div>
     </div>
     <div className="pass-stub">
       <div><strong className="pass-count">{count(metrics,r).toLocaleString()}</strong><span>requests in 24 h</span></div>

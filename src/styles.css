@@ -416,3 +416,7 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .usage-page .metric-line>div:nth-child(2) strong{color:var(--red)}
 .relay-cell{display:flex;flex-direction:column;gap:2px;min-width:200px}.relay-cell .truncate{max-width:360px}
 .relay-results td.relay-main{white-space:normal;width:44%}.relay-results .relay-cell .verdict{white-space:normal}
+/* Panels hide what overflows them, so on a narrow screen rows wrap and grid cells may shrink instead of being cut off. */
+.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.form-grid>*{min-width:0}.form-grid input,.form-grid select,.form-grid .select{max-width:100%}
+.form-actions{flex-wrap:wrap}
+@media(max-width:570px){.form-grid,.form-grid.three{grid-template-columns:minmax(0,1fr)}.section-top,.section-toolbar{flex-wrap:wrap;row-gap:10px}}

@@ -181,7 +181,8 @@ export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: bo
       candidates = usedApi ? candidates : [...candidates].sort((a, b) => (a.latencyMs || 1e9) - (b.latencyMs || 1e9));
       candidates = candidates.slice(0, cfg.maxTested);
       if (stopRequested) { job = { ...job, running: false, phase: 'stopped', finishedAt: Date.now(), message: 'Stopped.' }; return; }
-      if (usedApi && !deep) { job = { ...job, running: false, phase: 'done', ready: candidates.length, finishedAt: Date.now(), message: apiScan.message }; return; }
+      // Only the API stage ran: these proxies reach the API but have not answered a model request, so none of them is ready for routing yet.
+      if (usedApi && !deep) { job = { ...job, running: false, phase: 'done', ready: 0, finishedAt: Date.now(), message: `${apiScan.message} None are model-tested yet, so none is ready for requests; run a full check to promote them.` }; return; }
       const survivors: PoolEntry[] = [];
       if (usedApi) { survivors.push(...candidates); job = { ...job, phase: 'deep', done: 0, total: survivors.length, message: `${apiScan.passed.toLocaleString()} of ${list.length.toLocaleString()} reach the API in time. Model-testing the fastest ${survivors.length}…` }; }
       else {

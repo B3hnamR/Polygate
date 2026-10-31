@@ -12,6 +12,8 @@ export function metrics() {
   const speed = one('SELECT COALESCE(SUM(output),0) out, COALESCE(SUM(ms),0) ms FROM requests WHERE time>? AND status<400 AND output>0', day);
   const hourly = rows('SELECT (time/3600000) h, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY h ORDER BY h', now - 24 * 3600000);
   const byModel = rows('SELECT model, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY model ORDER BY n DESC LIMIT 12', day);
+  // The same hours, per route, so a card about one route can show that route's own activity.
+  const hourlyByRoute = rows("SELECT CASE WHEN route='' THEN '—' ELSE route END route, (time/3600000) h, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors FROM requests WHERE time>? GROUP BY route, h LIMIT 1500", now - 24 * 3600000);
   const byRoute = rows("SELECT CASE WHEN route='' THEN '—' ELSE route END route, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY route ORDER BY n DESC LIMIT 12", day);
   const byStatus = rows('SELECT status, COUNT(*) n FROM requests WHERE time>? GROUP BY status ORDER BY n DESC LIMIT 8', day);
   const n = Number(total.n) || 0;
@@ -21,6 +23,7 @@ export function metrics() {
     rpm: Number(live.n), tpm: Number(live.tokens), tokensPerSecond: Number(speed.ms) ? Math.round(Number(speed.out) / (Number(speed.ms) / 1000) * 10) / 10 : 0,
     hourly: hourly.map(r => ({ hour: Number(r.h) * 3600000, requests: Number(r.n), errors: Number(r.errors), tokens: Number(r.tokens), avgMs: Math.round(Number(r.avg)) })),
     byModel: byModel.map(r => ({ model: r.model, requests: Number(r.n), errors: Number(r.errors), tokens: Number(r.tokens), avgMs: Math.round(Number(r.avg)) })),
+    hourlyByRoute: hourlyByRoute.map(r => ({ route: r.route, hour: Number(r.h) * 3600000, requests: Number(r.n), errors: Number(r.errors) })),
     byRoute: byRoute.map(r => ({ route: r.route, requests: Number(r.n), errors: Number(r.errors), avgMs: Math.round(Number(r.avg)) })),
     byStatus: byStatus.map(r => ({ status: Number(r.status), requests: Number(r.n) })),
     keys: settings.keys.map(k => ({ id: k.id, name: k.name, requests: k.requests || 0, tokens: k.used || 0, budget: k.budget || 0, lastUsed: k.lastUsed || 0 })),
