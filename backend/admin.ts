@@ -23,6 +23,7 @@ import { GatewayError } from './queue';
 import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
 import { checkForUpdates } from './updates';
+import * as agentEngine from './agent-engine';
 import { queryEvents, exportEvents, clearEvents, parseLogQuery, logEvent } from './logbook';
 import { mcpConfig, mcpState, serverStatus, cleanServer, parseImport, slug, testServer, saveServers, settle, reconnect, callTool, canManageLocal, syncMcp } from './mcp';
 // The MCP page: hub settings, servers, their tools, connection tests and trying a tool.
@@ -340,6 +341,14 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/proxies/remove'&&method==='POST'){const b=await readJson(req);if(b.all===true)removeProxies();else if(Array.isArray(b.urls))removeProxies(b.urls.map(String).slice(0,5000));else throw new GatewayError('Say which proxies to remove',400);await poolEntries(true);return json(res,200,{ok:true});}
   // Model-test the proxies already saved: OpenCode API check, speed gate, model test, then the working ones go into the pool.
   if(pathname==='/admin/pool/find'&&method==='POST'){const b=await readJson(req);return json(res,200,await testPool({deep:true,api:true,attach:{select:b.select===true}}));}
+  // --- Agent engine ---
+  // The agent runs in the desktop app only; a server install never downloads or starts it. Installing takes a while (a 100 MB download),
+  // so it answers at once and the dashboard follows the status.
+  if(pathname.startsWith('/admin/agent/')&&!serverConfig().desktop)throw new GatewayError('The agent runs in the desktop app only',404);
+  if(pathname==='/admin/agent/engine'&&method==='GET')return json(res,200,agentEngine.engineStatus());
+  if(pathname==='/admin/agent/engine/install'&&method==='POST'){await readJson(req);agentEngine.installEngine().catch(()=>{/* the status carries the reason */});return json(res,202,agentEngine.engineStatus());}
+  if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);return json(res,200,await agentEngine.startEngine());}
+  if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}
   // --- HTTPS ---
   // The desktop app is pinned to a loopback HTTP listener; HTTPS would bind every interface on 443/80 at the next start.
   if(pathname.startsWith('/admin/https')&&serverConfig().desktop)throw new GatewayError('HTTPS is configured on a server install, not in the desktop app',404);

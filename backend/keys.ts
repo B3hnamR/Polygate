@@ -37,6 +37,13 @@ export function authenticate(req: IncomingMessage, count = false): ApiKey {
   if (key.tpm && toks.reduce((s, e) => s + e.n, 0) >= key.tpm) throw limited(`Token rate limit of ${key.tpm}/min reached for this key`, Math.max(1, Math.ceil((toks[0].t + 60000 - now) / 1000)));
   reqs.push(now); reqWindow.set(key.id, reqs); tokenWindow.set(key.id, toks); return key;
 }
+// The agent's own client key (docs/agent/PLAN.md): created the first time the agent engine starts, then kept. Its traffic is attributed to
+// it like any client's. Turning it off on the Keys page cuts the agent off from models; a deleted one is replaced at the next start.
+export function ensureAgentKey(): ApiKey {
+  let key = settings.keys.find(k => k.agent);
+  if (!key) { key = { id: crypto.randomUUID(), name: 'Polygate Agent', value: 'pg_' + randomBytes(24).toString('hex'), enabled: true, limit: 4, agent: true }; settings.keys.push(key); persist(); }
+  return key;
+}
 export const modelAllowed = (key: ApiKey, model: string) => !key.models?.length || /^auto(:|$)/.test(model) || key.models.includes(model) || key.models.some(m => model.endsWith('/' + m));
 export function recordUsage(keyId: string, tokens: number) {
   const key = settings.keys.find(k => k.id === keyId); if (!key) return;

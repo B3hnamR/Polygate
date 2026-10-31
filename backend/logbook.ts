@@ -76,6 +76,7 @@ const actions: Record<string, [string, string]> = {
   '/admin/providers': ['providers', 'Provider saved'], '/admin/providers/delete': ['providers', 'Provider removed'],
   '/admin/routes': ['routes', 'Route saved'], '/admin/routes/delete': ['routes', 'Route removed'], '/admin/routes/toggle': ['routes', 'Route switched on or off'], 
   '/admin/relays/deploy': ['relays', 'Relay deployed'], '/admin/relays/inspect': ['relays', 'Relay checked'],
+  '/admin/agent/engine/install': ['agent', 'Agent engine install started'], '/admin/agent/engine/start': ['agent', 'Agent engine start requested'], '/admin/agent/engine/stop': ['agent', 'Agent engine stop requested'],
   '/admin/keys': ['keys', 'Client API key created'], '/admin/keys/update': ['keys', 'Client API key changed'], '/admin/keys/delete': ['keys', 'Client API key deleted'],
   '/admin/pool/settings': ['proxies', 'Proxy pool settings saved'], '/admin/pool/test': ['proxies', 'Proxy pool test started'], '/admin/pool/stop': ['proxies', 'Proxy pool test stopped'], '/admin/pool/find': ['proxies', 'Proxy search started'], '/admin/pool/role': ['proxies', 'Proxy role changed'],
   '/admin/proxies/scan': ['proxies', 'Proxy scan started'], '/admin/proxies/import': ['proxies', 'Proxies imported'], '/admin/proxies/remove': ['proxies', 'Proxies removed'], '/admin/proxies/stop': ['proxies', 'Proxy scan stopped'], '/admin/proxies/sources': ['proxies', 'Proxy list links saved'], '/admin/proxy/attach': ['proxies', 'Proxy attached to a route'],

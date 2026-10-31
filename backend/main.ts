@@ -21,6 +21,7 @@ import { version } from './version';
 import { closeSocksBridges } from './socks-bridge';
 import { logEvent, captureConsole, adminAction } from './logbook';
 import { handleMcp, syncMcp, stopMcp } from './mcp';
+import { setEngineGateway, stopEngine } from './agent-engine';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
   const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');rememberAdminToken(token);
@@ -108,6 +109,8 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
   catch(e){if(!desktop||!port)throw e;console.error(`[gateway] Port ${port} is not available (${redactError(String((e as any)?.message||e))}); using a free port instead.`);server=serve(handler,0,firstHost,secure.tls);}
   if(recoveryOnly)console.error('[https] Configured certificate is unavailable; HTTP recovery is loopback-only until issuance succeeds.');
   let actual=server.port as number;
+  // The agent engine sends its model requests to this gateway, on loopback, whatever address the listener has.
+  setEngineGateway(`http://127.0.0.1:${actual}`);
   let current:{port:number;host:string;tls?:{cert:string;key:string}}={port:actual,host:firstHost,tls:secure.tls};
   // Swaps the listener (new certificate, new port, HTTPS on or off). The new socket is up before the old one stops accepting, so requests are not refused.
   // Where the port cannot be shared (same port, no reusePort), the old socket closes first; if the new bind then fails too, the previous
@@ -125,9 +128,9 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
       }
       server=next;actual=next.port as number;current={...o,port:actual};return actual;
     }
-    const old=server;server=next;actual=next.port as number;current={...o,port:actual};old.stop();return actual;
+    const old=server;server=next;actual=next.port as number;current={...o,port:actual};setEngineGateway(`http://127.0.0.1:${actual}`);old.stop();return actual;
   };
-  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();await stopWarp();};
+  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();await Promise.all([stopWarp(),stopEngine()]);};
   if(process.env.POLYGATE_NO_DISCOVERY!=='1')discover().catch(e=>console.error('[catalog]',redactError(String(e))));
   startWarp().catch(e=>console.error('[warp]',redactError(String(e))));
   syncMcp();
