@@ -2,17 +2,19 @@ import {useState} from 'react';
 import {Button,usePoll,compact,ms} from './ui';
 // Usage over time. The request log keeps a week; the daily summary behind this page keeps 400 days (days are UTC days).
 type Group={name:string;requests:number;errors:number;tokens:number;avgMs:number;daily:number[]};
-type Usage={days:number;daily:{day:number;requests:number;errors:number;input:number;output:number}[];models:Group[];routes:Group[];totals:{requests:number;errors:number;input:number;output:number;activeDays:number;busiestDay:number;busiestRequests:number}};
+type Usage={days:number;daily:{day:number;requests:number;errors:number;input:number;output:number}[];models:Group[];routes:Group[];keys?:Group[];totals:{requests:number;errors:number;input:number;output:number;activeDays:number;busiestDay:number;busiestRequests:number}};
+// What the table can be grouped by: the toggle's label and the first column's heading. Keys shows each client key, the agent's included.
+const GROUPS={models:['Models','Model'],routes:['Routes','Route'],keys:['Keys','Client key']} as const;
 const RANGES=[[7,'7 days'],[30,'30 days'],[90,'90 days'],[365,'1 year']] as const;
 const date=(t:number,long=false)=>new Date(t).toLocaleDateString([],long?{weekday:'short',day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}:{day:'numeric',month:'short',timeZone:'UTC'});
 const Spark=({values}:{values:number[]})=>{const peak=Math.max(1,...values);const w=96,h=22;const step=values.length>1?w/(values.length-1):w;
   return <svg className="spark" width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-hidden="true"><polyline fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" points={values.map((v,i)=>`${(i*step).toFixed(1)},${(h-2-(v/peak)*(h-4)).toFixed(1)}`).join(' ')}/></svg>;};
 export function UsagePage(){
-  const [days,setDays]=useState<number>(30);const [by,setBy]=useState<'models'|'routes'>('models');const [metric,setMetric]=useState<'requests'|'tokens'>('requests');
+  const [days,setDays]=useState<number>(30);const [by,setBy]=useState<'models'|'routes'|'keys'>('models');const [metric,setMetric]=useState<'requests'|'tokens'>('requests');
   const {data,error}=usePoll<Usage>(`/admin/usage?days=${days}`,30000);
   if(!data)return <section className="section-block"><p className="muted" style={{padding:'18px'}}>{error||'Loading…'}</p></section>;
   const value=(d:Usage['daily'][number])=>metric==='requests'?d.requests:d.input+d.output;const peak=Math.max(1,...data.daily.map(value));const t=data.totals;
-  const rows=data[by];const top=Math.max(1,...rows.map(r=>r.requests));
+  const rows=data[by]||[];const top=Math.max(1,...rows.map(r=>r.requests));
   return <div className="usage-page">
     <section className="section-block"><div className="section-top"><div><h2>Usage over time</h2><p className="subtle">One bar per day. Days are counted in UTC, and the summary is kept for 400 days even though the request log keeps only a week.</p></div>
       <div className="usage-controls"><div className="usage-range" role="group" aria-label="Range">{RANGES.map(([n,l])=><Button key={n} variant={n===days?'primary':''} onClick={()=>setDays(n)}>{l}</Button>)}</div></div></div>
@@ -23,8 +25,8 @@ export function UsagePage(){
       :<p className="muted" style={{padding:'6px 21px 20px'}}>No requests in this range yet.</p>}
     </section>
     <section className="section-block"><div className="section-top"><div><h2>Where it went</h2><p className="subtle">The ten busiest in this range. The line is that one's requests per day.</p></div>
-      <div className="usage-range" role="group" aria-label="Group by">{(['models','routes'] as const).map(g=><Button key={g} variant={g===by?'primary':''} onClick={()=>setBy(g)}>{g==='models'?'Models':'Routes'}</Button>)}</div></div>
-      {rows.length?<div className="table-wrap"><table><thead><tr><th>{by==='models'?'Model':'Route'}</th><th className="numeric">Requests</th><th>Share</th><th className="numeric">Tokens</th><th className="numeric">Failed</th><th className="numeric">Average</th><th>Per day</th></tr></thead>
+      <div className="usage-range" role="group" aria-label="Group by">{(['models','routes','keys'] as const).map(g=><Button key={g} variant={g===by?'primary':''} onClick={()=>setBy(g)}>{GROUPS[g][0]}</Button>)}</div></div>
+      {rows.length?<div className="table-wrap"><table><thead><tr><th>{GROUPS[by][1]}</th><th className="numeric">Requests</th><th>Share</th><th className="numeric">Tokens</th><th className="numeric">Failed</th><th className="numeric">Average</th><th>Per day</th></tr></thead>
         <tbody>{rows.map(r=><tr key={r.name}><td className="truncate" title={r.name}>{r.name}</td><td className="numeric">{r.requests.toLocaleString()}</td><td><span className="share-bar"><i style={{width:Math.max(2,r.requests/top*100)+'%'}}/></span></td><td className="numeric">{compact(r.tokens)}</td><td className="numeric">{r.errors?<span className="red">{r.errors}</span>:<span className="muted">0</span>}</td><td className="numeric mono">{ms(r.avgMs)}</td><td className="usage-spark"><Spark values={r.daily}/></td></tr>)}</tbody></table></div>
       :<p className="muted" style={{padding:'6px 21px 20px'}}>Nothing to show yet.</p>}
     </section>

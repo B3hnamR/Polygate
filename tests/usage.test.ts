@@ -19,3 +19,16 @@ test('usage groups requests by day, model and route, and fills idle days with ze
 test('usage keeps counting after the request log is pruned', () => {
   const before = usage(30).totals.requests; db.exec('DELETE FROM requests'); expect(usage(30).totals.requests).toBe(before);
 });
+test('usage also groups by client key: the agent key by its name, and a deleted key or no key for what they are', async () => {
+  const { settings } = await import('../backend/state');
+  db.exec('DELETE FROM usage_keys_daily');
+  const saved = settings.keys; settings.keys = [...saved, { id: 'k-agent', name: 'Polygate Agent', value: 'pg_usage_agent', enabled: true, limit: 4, agent: true }];
+  try {
+    record({ ...row(0, 'a/one', 'Direct', 200), keyId: 'k-agent' }); record({ ...row(0, 'a/one', 'Direct', 500), keyId: 'k-agent' });
+    record({ ...row(1, 'a/two', 'Direct', 200), keyId: 'k-gone-123456' }); record({ ...row(1, 'a/two', 'Direct', 200), keyId: '' });
+    const keys = usage(7).keys;
+    expect(keys.find(k => k.name === 'Polygate Agent')).toMatchObject({ requests: 2, errors: 1, tokens: 60 });
+    expect(keys.map(k => k.name).sort()).toEqual(['Deleted key k-gone', 'No key', 'Polygate Agent']);
+    db.exec('DELETE FROM requests'); expect(usage(7).keys.find(k => k.name === 'Polygate Agent')!.requests).toBe(2);
+  } finally { settings.keys = saved; }
+});

@@ -96,8 +96,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       for(let attempt=0;attempt<=attempts;attempt++){
         if(attempt>0&&providerPicksAgain(p)){r=routeForProvider(p,m.id);route=r.name;}
         tried=true;t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
-        // A tool list OpenCode refused earlier goes out already trimmed.
-        if(!trimmed.length&&settings.trimTools!==false&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
+        // A tool list OpenCode refused earlier goes out already trimmed; never for the agent, whose model must see every tool it may call.
+        if(!trimmed.length&&settings.trimTools!==false&&!k.agent&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
         try{
           upstream=await providerChat(p,m,chat,controller.signal,r.id,sessionFor(k.id,chat.messages,req.headers),requestId);status=upstream.status;
           if(upstream.ok)break;
@@ -109,7 +109,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
           const refused=takeRefused(requestId);if(refused)confirmedClean=true;
           // The exit is fine, so the refusal belongs to this request. When it carries tools OpenCode may object to, ask again with the standard ones only.
-          if(refused&&settings.trimTools!==false&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
+          if(refused&&settings.trimTools!==false&&!k.agent&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
           const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
           if(ex){

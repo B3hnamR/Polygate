@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes, type Hash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, watch, writeSync, type FSWatcher } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -52,7 +52,7 @@ function readManifest(p: Paths): Manifest | undefined {
 
 // --- Status ---
 export type EngineState = 'not_installed' | 'installing' | 'installed' | 'starting' | 'running' | 'restarting' | 'stopping' | 'failed';
-type Status = { state: EngineState | 'idle'; message: string; problems: string[]; progress?: number; port?: number; pid?: number; startedAt?: number; restarts: number };
+type Status = { state: EngineState | 'idle'; message: string; problems: string[]; progress?: number; port?: number; pid?: number; startedAt?: number; restarts: number; snapshots?: { ok: boolean; reason?: string } };
 let status: Status = { state: 'idle', message: '', problems: [], restarts: 0 };
 const setStatus = (next: Partial<Status>) => { status = { ...status, ...next }; };
 // What the dashboard sees. The engine's password never leaves this module except through engineConnection().
@@ -187,6 +187,16 @@ export const ENGINE_PERMISSIONS = [
   { action: 'external_directory', resource: '*', effect: 'ask' }, { action: 'webfetch', resource: '*', effect: 'ask' }, { action: 'websearch', resource: '*', effect: 'ask' },
   { action: 'subagent', resource: '*', effect: 'ask' },
 ] as const;
+type Rule = { action: string; resource: string; effect: 'allow' | 'ask' | 'deny' };
+// The Phase 1 modes (docs/agent/PERMISSIONS.md), one engine agent each; a session runs as the agent of its mode. Each agent's rules come
+// after the shared ones above. Rules-based approvals and Full access come in Phase 3.
+export const ENGINE_MODES: Record<'ask' | 'accept-edits' | 'plan', { agent: string; description: string; permissions: Rule[] }> = {
+  ask: { agent: 'polygate-ask', description: 'Ask for approval: reading is allowed; edits, commands and anything outside the working folder ask first.', permissions: [] },
+  'accept-edits': { agent: 'polygate-accept-edits', description: 'Accept edits: reading and edits are allowed; commands and anything outside the working folder ask first.',
+    permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
+  plan: { agent: 'polygate-plan', description: 'Plan: reading only; no edits and no commands until the plan is approved.',
+    permissions: [{ action: 'edit', resource: '*', effect: 'deny' }, { action: 'shell', resource: '*', effect: 'deny' }, { action: 'execute', resource: '*', effect: 'deny' }, { action: 'subagent', resource: '*', effect: 'deny' }] },
+};
 const PLUGIN = 'polygate-scrub';
 // Commands the agent runs inherit the engine's environment; this engine plugin drops the engine password and the agent key from it.
 const PLUGIN_SOURCE = `// Written by Polygate. Commands the agent runs must not inherit the engine's password or the agent's key.
@@ -200,26 +210,71 @@ export default {
 };
 `;
 type EngineModel = { id: string; name: string; context: number; output: number };
-export function engineConfig(o: { gatewayUrl: string; models: EngineModel[] }) {
+// File tools never reach Polygate's own folders (its vault, keys, logs and the engine's files) in these modes; a command can, since
+// permissions are consent and not a sandbox. OpenCode names a folder outside the working one as `C:/path/*` (forward slashes), and
+// these rules come last, after a mode's own, so Accept edits does not reopen them.
+export const protectedRules = (folders: string[]): Rule[] => [...new Set(folders.map(f => path.resolve(f).replace(/\\/g, '/').replace(/\/+$/, '')))]
+  .flatMap(f => (['external_directory', 'read', 'edit'] as const).map(action => ({ action, resource: `${f}/*`, effect: 'deny' as const })));
+export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; protect?: string[] }) {
   // A model whose limits Polygate does not know yet gets conservative ones; OpenCode needs both to plan its context.
   const entries = o.models.map(m => [m.id, { name: m.name || m.id, limit: { context: m.context > 0 ? m.context : 32000, output: m.output > 0 ? m.output : 4096 }, capabilities: { tools: true } }]);
+  const guard = protectedRules(o.protect || []);
   return {
     $schema: 'https://opencode.ai/config.json', update: 'disable', share: 'disabled', snapshots: true,
     providers: { polygate: { name: 'Polygate', package: '@ai-sdk/openai-compatible', env: ['POLYGATE_AGENT_KEY'], settings: { baseURL: o.gatewayUrl.replace(/\/+$/, '') + '/v1', apiKey: '{env:POLYGATE_AGENT_KEY}' }, models: Object.fromEntries(entries) } },
     policies: [{ action: 'provider.use', resource: '*', effect: 'deny' }, { action: 'provider.use', resource: 'polygate', effect: 'allow' }],
-    permissions: ENGINE_PERMISSIONS.map(r => ({ ...r })),
+    permissions: [...ENGINE_PERMISSIONS, ...guard].map(r => ({ ...r })),
+    agents: Object.fromEntries(Object.values(ENGINE_MODES).map(m => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...guard].map(r => ({ ...r })) }])),
     plugins: [`./${PLUGIN}`],
   } as any;
 }
+// The rules each engine agent must end with: the shared ones, then the agent's own.
+const expectedRules = (cfg: any): Record<string, Rule[]> => ({ build: cfg.permissions, ...Object.fromEntries(Object.entries<any>(cfg.agents).map(([id, a]) => [id, [...cfg.permissions, ...a.permissions]])) });
 // Models the agent can use: from enabled providers, able to call tools, not known to be gone.
 const agentModels = (): EngineModel[] => [...models.values()]
   .filter(m => m.tools && m.state !== 'unavailable' && settings.providers.some(x => x.id === m.providerId && x.enabled))
   .map(m => ({ id: m.id, name: m.name, context: m.context, output: m.output }));
+const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
+// Writes the engine's configuration and returns it, with the hash of every file written (the configuration watch compares against them).
 function writeEngineFiles(p: Paths, gatewayUrl: string) {
   for (const dir of [p.configDir, path.join(p.configDir, PLUGIN), p.cache, p.state, p.userhome, p.data]) mkdirSync(dir, { recursive: true });
-  writeFileAtomic(path.join(p.configDir, 'opencode.json'), JSON.stringify(engineConfig({ gatewayUrl, models: agentModels() }), null, 1));
-  writeFileAtomic(path.join(p.configDir, PLUGIN, 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0', type: 'module', main: 'index.js', exports: { '.': './index.js' } }, null, 1));
-  writeFileAtomic(path.join(p.configDir, PLUGIN, 'index.js'), PLUGIN_SOURCE);
+  const cfg = engineConfig({ gatewayUrl, models: agentModels(), protect: [stateDir, p.root, p.data] });
+  const files: [string, string][] = [
+    [path.join(p.configDir, 'opencode.json'), JSON.stringify(cfg, null, 1)],
+    [path.join(p.configDir, PLUGIN, 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0', type: 'module', main: 'index.js', exports: { '.': './index.js' } }, null, 1)],
+    [path.join(p.configDir, PLUGIN, 'index.js'), PLUGIN_SOURCE],
+  ];
+  // Anything else in the configuration folder would be read by the engine too (an agent, a command, another plugin): it goes.
+  for (const dir of [p.configDir, path.join(p.configDir, PLUGIN)]) for (const name of readdirSync(dir)) {
+    const f = path.join(dir, name); if (!(dir === p.configDir && name === PLUGIN) && !files.some(([w]) => w === f)) rmSync(f, { recursive: true, force: true });
+  }
+  for (const [f, text] of files) writeFileAtomic(f, text);
+  return { cfg, written: new Map(files.map(([f, text]) => [f, sha256(text)])) };
+}
+// The files in the configuration folder that are not exactly what Polygate wrote: changed, removed or added.
+function configChanges(p: Paths, written: Map<string, string>) {
+  const out: string[] = [];
+  for (const dir of [p.configDir, path.join(p.configDir, PLUGIN)]) {
+    let names: string[] = []; try { names = readdirSync(dir); } catch { out.push(`${dir} was removed`); continue; }
+    for (const name of names) { const f = path.join(dir, name); if (!(dir === p.configDir && name === PLUGIN) && !written.has(f)) out.push(`${f} was added`); }
+  }
+  for (const [f, hash] of written) { let now = ''; try { now = sha256(readFileSync(f)); } catch { /* removed */ } if (now !== hash) out.push(`${f} was ${now ? 'changed' : 'removed'}`); }
+  return out;
+}
+// Undo depends on OpenCode's Git snapshots. Checked at each start with a repository at the same depth OpenCode uses; the answer goes in
+// the status, so the workspace can hide Undo rather than offer one that silently does nothing.
+export function snapshotCheck(p: Paths, gitExe = 'git'): { ok: boolean; reason?: string } {
+  const parent = path.join(p.data, 'opencode', 'snapshot', 'polygate-check' + '0'.repeat(26)); const dir = path.join(parent, '0'.repeat(40));
+  try {
+    mkdirSync(parent, { recursive: true });
+    const git = (args: string[]) => spawnSync(gitExe, args, { windowsHide: true, encoding: 'utf8', timeout: 15000, env: process.env });
+    const init = git(['init', '--bare', '--quiet', dir]);
+    if (init.error) return { ok: false, reason: 'Git is not installed, so the agent cannot undo its changes.' };
+    const rev = git(['--git-dir', dir, 'rev-parse', '--is-bare-repository']);
+    if (rev.status === 0 && rev.stdout.trim() === 'true') return { ok: true };
+    return { ok: false, reason: `Git cannot use the snapshot folder: ${String(rev.stderr || init.stderr || '').trim().split('\n')[0]}` };
+  } catch (e: any) { return { ok: false, reason: `The snapshot folder could not be prepared: ${e?.message || e}` }; }
+  finally { rmSync(parent, { recursive: true, force: true }); }
 }
 // The engine's environment: the user's own (commands the agent runs need PATH, the user's home and tools), minus everything of
 // Polygate's and any OpenCode setting the user has, plus the engine's folders, its password, the agent key and the switches the spike
@@ -234,23 +289,26 @@ export function engineEnv(p: Paths, password: string, agentKey: string) {
 
 // --- Self-test ---
 // After every start: the right version, configuration read only from Polygate's folder, Polygate as the only provider, and Polygate's
-// rules in force (nothing allows more after them). Any problem stops the engine; it is never used with a configuration it was not given.
-export async function selfTest(url: string, auth: string, p: Paths, directory = p.home) {
+// rules in force for every agent of a mode (nothing allows more after them). Any problem stops the engine; it is never used with a
+// configuration it was not given. `cfg` is the configuration Polygate wrote.
+export async function selfTest(url: string, auth: string, p: Paths, cfg: any, directory = p.home) {
   const get = async (route: string) => {
     const r = await fetch(`${url}${route}?directory=${encodeURIComponent(directory)}`, { headers: { authorization: auth }, signal: AbortSignal.timeout(10000) });
     if (!r.ok) throw new Error(`${route} answered ${r.status}`); return r.json() as Promise<any>;
   };
   const problems: string[] = [];
   const info = await get('/api/info'); if (info?.version !== ENGINE_VERSION) problems.push(`it is OpenCode ${info?.version}, not ${ENGINE_VERSION}`);
-  const inside = (file: string) => { const rel = path.relative(p.configDir, String(file || '')); return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel)); };
-  for (const doc of (await get('/api/config')) as any[]) if (!inside(doc?.path)) problems.push(`it read configuration from ${doc?.path}`);
+  const norm = (f: string) => path.resolve(String(f || '')).toLowerCase(); const ours = new Set([p.configDir, path.join(p.configDir, 'opencode.json')].map(norm));
+  for (const doc of (await get('/api/config')) as any[]) if (!ours.has(norm(doc?.path))) problems.push(`it read configuration from ${doc?.path}`);
   for (const m of ((await get('/api/model')).data || []) as any[]) if (m?.providerID !== 'polygate') problems.push(`it offers ${m?.providerID}/${m?.id}, a provider Polygate did not configure`);
-  const build = (((await get('/api/agent')).data || []) as any[]).find(a => a?.id === 'build');
-  const rules = (build?.permissions || []) as { action: string; resource: string; effect: string }[];
-  const key = (r: any) => `${r.action} ${r.resource} ${r.effect}`; const ours = ENGINE_PERMISSIONS.map(key);
-  let end = -1;
-  for (let i = rules.length - ours.length; i >= 0 && end < 0; i--) if (ours.every((k, j) => key(rules[i + j]) === k)) end = i + ours.length;
-  if (end < 0 || rules.slice(end).some(r => r.effect === 'allow')) problems.push('its permission rules are not the ones Polygate wrote');
+  const agents = ((await get('/api/agent')).data || []) as any[];
+  const key = (r: any) => `${r?.action} ${r?.resource} ${r?.effect}`;
+  for (const [id, expected] of Object.entries(expectedRules(cfg))) {
+    const rules = (agents.find(a => a?.id === id)?.permissions || []) as Rule[]; const want = expected.map(key);
+    let end = -1;
+    for (let i = rules.length - want.length; i >= 0 && end < 0; i--) if (want.every((k, j) => key(rules[i + j]) === k)) end = i + want.length;
+    if (end < 0 || rules.slice(end).some(r => r.effect === 'allow')) problems.push(`the permission rules of its ${id} agent are not the ones Polygate wrote`);
+  }
   return problems;
 }
 
@@ -262,6 +320,22 @@ let crashes: number[] = []; let restartTimer: ReturnType<typeof setTimeout> | un
 export const setEngineGateway = (url: string) => { gatewayUrl = url; };
 // For the agent controller: where the running engine listens and how to sign in. Never sent to the dashboard.
 export const engineConnection = () => connection;
+// OpenCode 2.x reloads its configuration file the moment it changes, so a change Polygate did not make is acted on as it happens: the
+// configuration folder is watched while the engine runs, and anything that is not exactly what Polygate wrote stops the engine.
+let guard: { watchers: FSWatcher[]; timer?: ReturnType<typeof setTimeout> } | undefined;
+function stopWatching() { if (!guard) return; clearTimeout(guard.timer); for (const w of guard.watchers) { try { w.close(); } catch { /* closed */ } } guard = undefined; }
+function watchConfig(p: Paths, written: Map<string, string>) {
+  stopWatching();
+  const check = () => { if (!guard) return; clearTimeout(guard.timer); guard.timer = setTimeout(() => { const changes = configChanges(p, written); if (changes.length) tampered(changes); }, 200); };
+  guard = { watchers: [] };
+  for (const dir of [p.configDir, path.join(p.configDir, PLUGIN)]) { const w = watch(dir, check); w.on('error', check); guard.watchers.push(w); }
+}
+function tampered(changes: string[]) {
+  const proc = child; stopWatching(); wanted = false; connection = undefined; child = undefined;
+  setStatus({ state: 'failed', problems: changes, message: `The agent engine was stopped: its configuration was changed outside Polygate (${changes.join('; ')}).`, port: undefined, pid: undefined });
+  logEvent('error', 'agent', `Agent engine stopped: its configuration was changed outside Polygate (${changes.join('; ')})`);
+  if (proc) killTree(proc);
+}
 // `command` replaces the engine program in tests (a stand-in that answers the same endpoints).
 export type StartOptions = { command?: string[] };
 export function startEngine(o: StartOptions = {}, restart = false) {
@@ -284,7 +358,7 @@ function openLog(p: Paths) {
   return openSync(p.log, 'a');
 }
 async function launch(o: StartOptions) {
-  const p = enginePaths(); wanted = true; lastStart = o;
+  const p = enginePaths(); wanted = true; lastStart = o; stopWatching();
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = undefined; }
   try {
     const exe = o.command ? o.command[0] : verifiedExe(p);
@@ -292,7 +366,9 @@ async function launch(o: StartOptions) {
     if (!gatewayUrl) throw new GatewayError('The gateway address is not known yet. Try again in a moment.', 503);
     const key = ensureAgentKey();
     if (!key.enabled) throw new GatewayError(`The agent's client key "${key.name}" is turned off. Turn it on under Keys to start the agent.`, 409, 'agent_key_disabled');
-    writeEngineFiles(p, gatewayUrl);
+    const { cfg, written } = writeEngineFiles(p, gatewayUrl);
+    const snapshots = snapshotCheck(p);
+    if (!snapshots.ok) logEvent('warn', 'agent', `Agent undo is unavailable: ${snapshots.reason}`);
     const port = await freePort(); const password = randomBytes(24).toString('base64url');
     const auth = 'Basic ' + Buffer.from('opencode:' + password).toString('base64'); const url = `http://127.0.0.1:${port}`;
     setStatus({ state: status.state === 'restarting' ? 'restarting' : 'starting', message: 'Starting the agent engine', problems: [], port: undefined, pid: undefined });
@@ -308,12 +384,13 @@ async function launch(o: StartOptions) {
         ready = await fetch(url + '/api/info', { headers: { authorization: auth }, signal: AbortSignal.timeout(2000) }).then(r => r.ok, () => false);
         if (!ready) await Bun.sleep(150);
       }
-      const problems = await selfTest(url, auth, p);
+      const problems = [...await selfTest(url, auth, p, cfg), ...configChanges(p, written)];
       if (problems.length) { setStatus({ problems }); throw new GatewayError(`The agent engine was stopped: ${problems.join('; ')}.`, 502, 'agent_engine_self_test'); }
+      watchConfig(p, written);
     // Forgotten before it is killed, so its exit is not taken for a crash (it can arrive while the next start is already under way).
-    } catch (e) { wanted = false; if (child === proc) child = undefined; killTree(proc); throw e; }
+    } catch (e) { wanted = false; stopWatching(); if (child === proc) child = undefined; killTree(proc); throw e; }
     connection = { url, auth };
-    setStatus({ state: 'running', message: '', problems: [], port, pid: proc.pid, startedAt: Date.now() });
+    setStatus({ state: 'running', message: '', problems: [], port, pid: proc.pid, startedAt: Date.now(), snapshots });
     logEvent('info', 'agent', `Agent engine OpenCode ${ENGINE_VERSION} started on 127.0.0.1:${port}`);
     return engineStatus();
   } catch (e: any) {
@@ -325,7 +402,7 @@ async function launch(o: StartOptions) {
 }
 function onExit(proc: ChildProcess, code: number | null, signal: NodeJS.Signals | null) {
   if (proc !== child) return;
-  child = undefined; connection = undefined;
+  child = undefined; connection = undefined; stopWatching();
   if (status.state === 'starting' || status.state === 'restarting') return; // launch() reports it
   if (!wanted) { if (status.state !== 'failed') setStatus({ state: 'idle', message: '', port: undefined, pid: undefined }); return; }
   // It stopped by itself: started again after a growing pause, until it has stopped too often.
@@ -341,8 +418,9 @@ function onExit(proc: ChildProcess, code: number | null, signal: NodeJS.Signals 
   restartTimer.unref?.();
 }
 export async function stopEngine() {
-  wanted = false; if (restartTimer) { clearTimeout(restartTimer); restartTimer = undefined; }
+  wanted = false; stopWatching(); if (restartTimer) { clearTimeout(restartTimer); restartTimer = undefined; }
   if (starting) await starting.catch(() => {});
+  stopWatching();
   const proc = child; connection = undefined;
   if (!proc) { if (status.state !== 'failed') setStatus({ state: 'idle', message: '' }); return; }
   setStatus({ state: 'stopping', message: '' });

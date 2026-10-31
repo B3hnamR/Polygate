@@ -322,6 +322,22 @@ test('A request OpenCode refuses only because of its tool list is retried with t
     const off=await chat('remote/toolgate',{tools});await off.text();expect(off.status).toBe(429);
   }finally{settings.trimTools=undefined;__setExitVerifier();settings.routes.find(z=>z.id==='direct')!.exhaustedUntil=0;models.get('remote/toolgate')!.cooldownUntil=0;}
 });});
+// The agent (docs/agent/PLAN.md) runs real OpenCode: its tool list is what its model is told it can call. Trimming it would hide tools the
+// agent then tries to use, so its key never gets the shorter list, neither as a retry nor from what other clients taught Polygate.
+test('The agent key always sends its own tool list: no retry with fewer tools, and no list trimmed for other clients',async()=>{await scoped([remoteProvider()],async()=>{
+  freshModel('remote','toolgate');__resetToolTrim();toolgateSeen.length=0;__setExitVerifier(async()=>'refused');
+  const agent={id:'agent-key-test',name:'Polygate Agent',value:'pg_'+'a'.repeat(48),enabled:true,limit:4,agent:true};settings.keys.push(agent);
+  const tools=['bash','read','edit','agent_manager_models','background_process','suggest'].map(tool);const names=tools.map(t=>t.function.name);
+  const agentChat=()=>call('/v1/chat/completions',{model:'remote/toolgate',stream:true,messages:[{role:'user',content:'x'}],tools,tool_choice:'auto'},agent.value);
+  const clear=()=>{models.get('remote/toolgate')!.cooldownUntil=0;settings.routes.find(z=>z.id==='direct')!.exhaustedUntil=0;};
+  try{
+    const refused=await agentChat();await refused.text();
+    expect(refused.status).toBe(429);expect(refused.headers.get('x-polygate-tools-trimmed')).toBeNull();expect(toolgateSeen).toEqual([names]);
+    clear();const other=await chat('remote/toolgate',{tools,tool_choice:'auto'});await other.text();expect(other.headers.get('x-polygate-tools-trimmed')).toBe('3');
+    clear();toolgateSeen.length=0;
+    const again=await agentChat();await again.text();expect(again.headers.get('x-polygate-tools-trimmed')).toBeNull();expect(toolgateSeen).toEqual([names]);
+  }finally{settings.keys=settings.keys.filter(k=>k.id!==agent.id);__setExitVerifier();clear();__resetToolTrim();}
+});});
 test('A request that succeeds on its retry is not recorded as a model fault',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','recover');recoverCalls=0;settings.retries=1;
   const r=await chat('remote/recover',{stream:false});await r.text();expect(r.status).toBe(200);

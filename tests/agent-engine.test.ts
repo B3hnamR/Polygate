@@ -1,6 +1,6 @@
 import { test, expect, afterAll } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 // The agent's engine manager (docs/agent/PLAN.md, Phase 1): the pinned OpenCode download, how it is run, and the self-test that refuses
@@ -99,6 +99,21 @@ test('the engine configuration holds Polygate as the only provider, the ask-firs
   expect(JSON.stringify(cfg)).not.toMatch(/pg_[0-9a-f]{10}/);
 });
 
+test('each mode is an engine agent with its own rules, and Polygate\'s folders stay closed to file tools in every mode', () => {
+  const state = path.join(tmpdir(), 'Polygate', 'state'); const folder = path.resolve(state).replace(/\\/g, '/');
+  const cfg = engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [], protect: [state, state + path.sep] });
+  expect(Object.keys(cfg.agents).sort()).toEqual(['polygate-accept-edits', 'polygate-ask', 'polygate-plan']);
+  const last = (rules: any[], action: string) => rules.filter(r => r.action === action && r.resource === '*').at(-1)?.effect;
+  const rulesOf = (agent: string) => [...cfg.permissions, ...cfg.agents[agent].permissions];
+  expect(['edit', 'shell', 'external_directory'].map(a => last(rulesOf('polygate-ask'), a))).toEqual(['ask', 'ask', 'ask']);
+  expect(['edit', 'shell', 'external_directory'].map(a => last(rulesOf('polygate-accept-edits'), a))).toEqual(['allow', 'ask', 'ask']);
+  expect(['read', 'edit', 'shell', 'external_directory'].map(a => last(rulesOf('polygate-plan'), a))).toEqual(['allow', 'deny', 'deny', 'ask']);
+  // The folder rules close every list, after a mode's own rules, and a folder named twice is written once.
+  const guard = ['external_directory', 'read', 'edit'].map(action => ({ action, resource: `${folder}/*`, effect: 'deny' }));
+  expect(cfg.permissions.slice(-3)).toEqual(guard);
+  for (const agent of Object.keys(cfg.agents)) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
+});
+
 test('the engine gets none of Polygate\'s secrets, a password of its own and every hardening switch', () => {
   const saved = { ...process.env };
   Object.assign(process.env, { POLYGATE_ADMIN_TOKEN: 'admin-secret', POLYGATE_ADMIN_PASSWORD: 'pw', OPENCODE_CONFIG: 'C:\\elsewhere.json', XDG_CONFIG_HOME: 'C:\\mine' });
@@ -138,7 +153,7 @@ test('a started engine passes its self-test on a loopback port with a fresh pass
 });
 
 test('an engine that reads a project\'s configuration, offers another provider, loosens the rules or is another version is stopped, with the reason', async () => {
-  const reasons: Record<string, RegExp> = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/ };
+  const reasons: Record<string, RegExp> = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/, 'missing-agent': /polygate-plan agent/ };
   try {
     for (const [mode, reason] of Object.entries(reasons)) {
       process.env.FAKE_OPENCODE_MODE = mode;
@@ -159,6 +174,30 @@ test('an engine that stops by itself is started again, and stays stopped once as
     await engine.stopEngine(); await Bun.sleep(1500);
     expect(engine.engineStatus().state).not.toBe('running'); expect(alive(now.pid)).toBe(false);
   } finally { delete process.env.FAKE_OPENCODE_CRASH_FILE; }
+});
+
+test('a change to the engine\'s configuration that Polygate did not make stops the engine at once, and leftovers are removed before a start', async () => {
+  const p = paths(); const config = path.join(p.configDir, 'opencode.json');
+  const first = await engine.startEngine({ command: FAKE });
+  writeFileSync(config, readFileSync(config, 'utf8').replace('"permissions": [', '"permissions": [{"action":"shell","resource":"*","effect":"allow"},'));
+  await until(() => engine.engineStatus().state === 'failed');
+  expect(engine.engineStatus().problems.join(' ')).toContain('opencode.json was changed'); expect(engine.engineConnection()).toBeUndefined();
+  await until(() => !alive(first.pid));
+  // A planted agent in the configuration folder: removed when Polygate writes the folder again, and caught if it appears while running.
+  const planted = path.join(p.configDir, 'agents'); mkdirSync(planted, { recursive: true }); writeFileSync(path.join(planted, 'evil.md'), '---\nmode: primary\n---\n');
+  const second = await engine.startEngine({ command: FAKE });
+  expect(existsSync(planted)).toBe(false); expect(JSON.parse(readFileSync(config, 'utf8')).permissions[0]).toEqual({ action: '*', resource: '*', effect: 'ask' });
+  mkdirSync(planted, { recursive: true }); writeFileSync(path.join(planted, 'evil.md'), '---\nmode: primary\n---\n');
+  await until(() => engine.engineStatus().state === 'failed');
+  expect(engine.engineStatus().problems.join(' ')).toContain('was added');
+  await until(() => !alive(second.pid));
+});
+
+test('the snapshot check says whether undo can work, and why not', () => {
+  const p = { ...paths(), data: mkdtempSync(path.join(tmpdir(), 'pg-snap-')) };
+  expect(engine.snapshotCheck(p)).toEqual({ ok: true });
+  expect(engine.snapshotCheck(p, 'git-that-is-not-installed').reason).toContain('Git is not installed');
+  expect(readdirSync(path.join(p.data, 'opencode', 'snapshot'))).toEqual([]);
 });
 
 test('the agent\'s own client key is created once and kept, and a turned-off key stops the engine from starting', async () => {
