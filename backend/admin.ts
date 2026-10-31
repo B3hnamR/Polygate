@@ -17,7 +17,8 @@ import { createBackup, restoreBackup } from './backup';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig, requirePassword } from './auth';
-import { previewRouting } from './plan';
+import { previewRouting, needsOf } from './plan';
+import { toChat } from './protocols';
 import { GatewayError } from './queue';
 import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
@@ -151,7 +152,10 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/route-preview'&&method==='POST'){
     const b=await readJson(req);const key=b.keyId?settings.keys.find(k=>k.id===String(b.keyId)):undefined;
     if(b.keyId&&!key)throw new GatewayError('That client key does not exist',404);
-    const tokens=Number(b.tokens);const needs={tools:b.tools===true,images:b.images===true,tokens:Number.isFinite(tokens)&&tokens>0?Math.min(Math.round(tokens),5_000_000):0};
+    // A request that is already composed (the Playground's) is read exactly as a real request is: what it needs follows from what it contains.
+    // Otherwise the needs are the ones the person ticked.
+    const tokens=Number(b.tokens);let needs={tools:b.tools===true,images:b.images===true,tokens:Number.isFinite(tokens)&&tokens>0?Math.min(Math.round(tokens),5_000_000):0};
+    if(b.request&&typeof b.request==='object'){try{needs=needsOf(toChat(b.request,['chat','responses','anthropic'].includes(b.protocol)?b.protocol:'chat'));}catch(e:any){throw new GatewayError('That request cannot be previewed: '+(e?.message||e),400);}}
     return json(res,200,previewRouting(String(b.model||'auto'),key,needs));
   }
   if(pathname==='/admin/discover'&&method==='POST'){await discover();return json(res,200,{ok:true,count:models.size});}

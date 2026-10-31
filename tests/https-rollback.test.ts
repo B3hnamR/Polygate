@@ -10,6 +10,7 @@ afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
 // A throwaway self-signed certificate for a name; needs the openssl program, which the test machines have.
 const make = (name: string) => {
   const key = path.join(dir, name + '.key'), crt = path.join(dir, name + '.crt');
+  if (!Bun.which('openssl')) return null; // without the program there is nothing to make a certificate with
   const r = Bun.spawnSync(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', key, '-out', crt, '-subj', `/CN=${name}.test`, '-days', '30', '-addext', `subjectAltName=DNS:${name}.test`], { stderr: 'pipe' });
   if (r.exitCode !== 0) return null;
   return { cert: readFileSync(crt, 'utf8'), key: readFileSync(key, 'utf8') };
@@ -37,4 +38,20 @@ test.skipIf(!A)('a first certificate that fails to install leaves no files behin
     await https.httpsApply({ mode: 'custom', certPem: A!.cert, keyPem: A!.key, port: 8443 }); await settled();
     expect(existsSync(path.join(stateDir, 'tls', 'custom-fullchain.pem'))).toBe(false); expect(existsSync(path.join(stateDir, 'tls', 'custom-privkey.pem'))).toBe(false);
   } finally { https.stopHttps(); settings.https = { mode: 'off', httpPort: 80, redirect: true } as any; }
+});
+
+test.skipIf(!A)('the manager reaches the gateway over HTTPS only when the gateway can really serve it: both files present and the certificate readable', () => {
+  const tls = path.join(stateDir, 'tls'); const cert = path.join(tls, 'custom-fullchain.pem'), key = path.join(tls, 'custom-privkey.pem');
+  const { mkdirSync, writeFileSync } = require('node:fs');
+  mkdirSync(tls, { recursive: true });
+  const before = settings.https; settings.https = { mode: 'custom', port: 8443, httpPort: 80, redirect: true } as any;
+  try {
+    rmSync(cert, { force: true }); rmSync(key, { force: true });
+    expect(https.localTarget(4317)).toEqual({ secure: false, port: 4317 });                    // nothing installed
+    writeFileSync(cert, A!.cert); expect(https.localTarget(4317).secure).toBe(false);           // certificate without its key
+    writeFileSync(key, A!.key); expect(https.localTarget(4317)).toEqual({ secure: true, port: 8443 }); // a readable pair
+    writeFileSync(cert, A!.cert.slice(0, 120));                                                 // both files there, the certificate cut short
+    expect(https.localTarget(4317)).toEqual({ secure: false, port: 4317 });                     // the gateway is on loopback HTTP recovery, and so is the manager
+    settings.https = { ...(settings.https as any), mode: 'off' }; writeFileSync(cert, A!.cert); expect(https.localTarget(4317).secure).toBe(false);
+  } finally { settings.https = before; rmSync(cert, { force: true }); rmSync(key, { force: true }); }
 });

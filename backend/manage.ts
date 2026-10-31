@@ -4,14 +4,14 @@ import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 process.env.POLYGATE_READ_ONLY_STATE='1';
 const { settings, persist, stateDir, db } = await import('./state');
+const { localTarget } = await import('./https');
 
 const command=process.argv[2]||'settings';
 // Calls the running gateway on this machine: over HTTPS on its own port once a certificate is active, else over plain HTTP on the loopback port.
 async function call(endpoint:string,body?:unknown){
   if(!/^\/(admin\/|healthz$|readyz$)/.test(endpoint))throw new Error('Only local management endpoints are allowed');
-  // The gateway serves HTTPS only when it can read both the certificate and its key, so both must exist here too; otherwise it is on plain HTTP.
-  const mode=settings.https?.mode||'off';const pair=(f:string)=>existsSync(path.join(stateDir,'tls',`${mode==='custom'?'custom':mode}-${f}.pem`));const secure=mode!=='off'&&pair('fullchain')&&pair('privkey');
-  const port=secure?(settings.https?.port||443):Number(process.env.POLYGATE_PORT||4317);
+  // The same decision the gateway makes at startup: HTTPS only when it can really serve it; otherwise plain HTTP on the loopback port.
+  const {secure,port}=localTarget(Number(process.env.POLYGATE_PORT||4317));
   const token=process.env.POLYGATE_ADMIN_TOKEN||readFileSync(path.join(stateDir,'admin-token'),'utf8').trim();
   const response=await fetch(`${secure?'https':'http'}://127.0.0.1:${port}${endpoint}`,{method:body===undefined?'GET':'POST',headers:{authorization:`Bearer ${token}`,...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(45000),...(secure?{tls:{rejectUnauthorized:false}}:{})} as any);
   return {ok:response.ok,status:response.status,text:await response.text()};

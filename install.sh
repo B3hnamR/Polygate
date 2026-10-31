@@ -589,7 +589,9 @@ configure_service() {
   install -m 0755 "$release/install/polygate" /usr/local/bin/polygate
   export POLYGATE_APP_DIR=/opt/polygate/current POLYGATE_STATE=/var/lib/polygate POLYGATE_PORT="$PORT"
   if [ ! -f /var/lib/polygate/settings.vault ]; then
-    printf '%s' "${POLYGATE_ADMIN_PASSWORD:-}" | runuser -u polygate --preserve-environment -- "$release/bin/bun" "$release/build/manage.js" password --stdin >>"$LOG" 2>&1
+    # The supplied password goes in on stdin. The variable itself is removed for this one command: the password command refuses to reset a password the
+    # environment controls, and this is the first password being created, not a reset.
+    printf '%s' "${POLYGATE_ADMIN_PASSWORD:-}" | env -u POLYGATE_ADMIN_PASSWORD runuser -u polygate --preserve-environment -- "$release/bin/bun" "$release/build/manage.js" password --stdin >>"$LOG" 2>&1
     if [ "$PASSWORD_SUPPLIED" = 1 ]; then rm -f /var/lib/polygate/admin-password.txt; fi
   fi
   ok 'Installed Polygate'

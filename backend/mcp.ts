@@ -186,8 +186,10 @@ class McpClient {
 }
 
 // ------------------------------------------------------------------------------------------------------------------- the hub's servers
-type Live = { state: 'off' | 'connecting' | 'ready' | 'error'; error: string; tools: McpTool[]; client?: McpClient; connecting?: Promise<void>; gen?: number; signature: string; serverInfo?: { name?: string; version?: string }; protocol?: string; connectedAt?: number; retryAt: number; calls: number; failures: number; totalMs: number; lastCallAt?: number };
+type Live = { state: 'off' | 'connecting' | 'ready' | 'error'; error: string; tools: McpTool[]; client?: McpClient; connecting?: Promise<void>; opening?: McpClient; gen?: number; signature: string; serverInfo?: { name?: string; version?: string }; protocol?: string; connectedAt?: number; retryAt: number; calls: number; failures: number; totalMs: number; lastCallAt?: number };
 const live = new Map<string, Live>();
+// Cancels a connection that is still being made: it is closed now (a local program stops), and whatever it reports when it ends is dropped.
+function cancelConnecting(l: Live) { l.gen = (l.gen || 0) + 1; l.opening?.close(); l.opening = undefined; l.connecting = undefined; }
 const signature = (s: McpServer) => JSON.stringify([s.transport, s.url, s.headers, s.command, s.args, s.env, s.cwd, routeOf(s)]);
 const blank = (s: McpServer, state: Live['state'] = 'off'): Live => ({ state, error: '', tools: [], signature: signature(s), retryAt: 0, calls: 0, failures: 0, totalMs: 0 });
 const timeoutOf = (s: McpServer) => Math.max(5, Math.min(600, s.timeoutSec || 60)) * 1000;
@@ -204,6 +206,7 @@ function connect(s: McpServer): Promise<void> {
       if (entry.client !== client) return; entry.client = undefined; entry.state = 'error'; entry.error = why; entry.retryAt = Date.now() + 15000;
       logEvent('warn', 'mcp', `${s.name} disconnected: ${why}`, { server: s.name });
     });
+    entry.opening = client;
     try {
       // npx and uvx may download the server the first time, so local programs get longer to start.
       const wait = s.transport === 'stdio' ? 120000 : 30000;
@@ -217,7 +220,7 @@ function connect(s: McpServer): Promise<void> {
       entry.state = 'error'; entry.error = plain(e); entry.retryAt = Date.now() + 30000;
       logEvent('warn', 'mcp', `${s.name} could not connect: ${entry.error}`, { server: s.name, transport: s.transport });
       throw e;
-    } finally { if (entry.gen === gen) entry.connecting = undefined; }
+    } finally { if (entry.gen === gen) { entry.connecting = undefined; entry.opening = undefined; } }
   })();
   return entry.connecting;
 }
@@ -238,14 +241,14 @@ async function ready(s: McpServer, waitMs: number) {
 // Brings the running connections in line with the settings: new and changed servers (re)connect, removed and switched-off ones close.
 export function syncMcp() {
   const cfg = mcpConfig(); const ids = new Set(cfg.servers.map(s => s.id));
-  for (const [id, l] of live) if (!ids.has(id)) { l.client?.close(); live.delete(id); }
+  for (const [id, l] of live) if (!ids.has(id)) { cancelConnecting(l); l.client?.close(); live.delete(id); }
   for (const s of cfg.servers) {
     const l = live.get(s.id);
-    if (!s.enabled || !cfg.enabled) { if (l) { l.client?.close(); l.client = undefined; l.state = 'off'; l.error = ''; } else live.set(s.id, blank(s)); continue; }
+    if (!s.enabled || !cfg.enabled) { if (l) { cancelConnecting(l); l.client?.close(); l.client = undefined; l.state = 'off'; l.error = ''; } else live.set(s.id, blank(s)); continue; }
     if (!l || l.state === 'off' || l.signature !== signature(s)) { if (!l) live.set(s.id, blank(s, 'connecting')); connect(s).catch(() => {}); }
   }
 }
-export function stopMcp() { for (const l of live.values()) { l.client?.close(); l.client = undefined; } live.clear(); }
+export function stopMcp() { for (const l of live.values()) { cancelConnecting(l); l.client?.close(); l.client = undefined; } live.clear(); }
 
 // ------------------------------------------------------------------------------------------------------------------- tools
 // Tool names may hold letters, digits, _ and - and at most 64 characters (what Claude, OpenAI and Cursor accept).

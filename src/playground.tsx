@@ -113,7 +113,10 @@ function MessageView({ turn, notice }: { turn: Turn; notice: (m: string, kind?: 
 function PaneView({ turns, running, label, picker, notice }: { turns: Turn[]; running: boolean; label: string; picker?: ReactNode; notice: (m: string, kind?: 'ok' | 'error') => void }) {
   // The thread scrolls inside its own box, and only while the reader is at the bottom: scrolling up to read stays put, and a new message of their own follows.
   const thread = useRef<HTMLDivElement>(null); const following = useRef(true);
-  useEffect(() => { const el = thread.current; if (!el) return; if (turns[turns.length - 1]?.role === 'user') following.current = true; if (following.current) el.scrollTop = el.scrollHeight; }, [turns]);
+  // Sending follows the answer again, however far up the reader had scrolled. This is read from the number of messages of their own: the answer's placeholder is added in the
+  // same update as their message, so the last message alone would not show that a new one was sent.
+  const sent = useRef(0);
+  useEffect(() => { const el = thread.current; if (!el) return; const mine = turns.filter(t => t.role === 'user').length; if (mine > sent.current) following.current = true; sent.current = mine; if (following.current) el.scrollTop = el.scrollHeight; }, [turns]);
   return <section className="pg-pane" aria-label={label}>
     <header className="pg-pane-head">{picker || <strong className="mono truncate" title={label}>{label}</strong>}<span className="toolbar-spacer" />{running && <Loader2 size={14} className="spin" />}</header>
     <div className="pg-thread" aria-live="polite" ref={thread} onScroll={e => { const el = e.currentTarget; following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}>{turns.length ? turns.map((t, i) => <MessageView key={i} turn={t} notice={notice} />) : <Empty icon={Terminal} title="A response starts here">Pick a model and send a message through the actual gateway. No sample responses are generated.</Empty>}</div>
@@ -185,7 +188,7 @@ export function Playground({ data, apiKey, model, setModel, refresh, notice }: {
         <Button disabled={busy || !turns[0].some(t => t.role === 'user')} onClick={regenerate}><RotateCcw size={14} />Try again</Button><Button onClick={() => setExporting(true)}><Code2 size={14} />Code</Button><Button onClick={() => setPreviewing(true)}><Eye size={14} />Preview routing</Button><Button disabled={!turns[0].length && !turns[1].length} onClick={clear}><Eraser size={14} />New chat</Button></div>
       <div className="pg-panes">{Array.from({ length: slots }, (_, k) => <PaneView key={k} turns={turns[k]} running={running[k]} label={k ? model2 : model} notice={notice} picker={compare ? <Select aria-label={`Model for pane ${k + 1}`} value={k ? model2 : model} onChange={k ? setModel2 : setModel}>{modelOptions(data)}</Select> : undefined} />)}</div>
     </div>
-    {previewing && <RoutePreview data={data} model={model} tools={chatOnly && params.tool} onClose={() => setPreviewing(false)} />}
+    {previewing && <RoutePreview data={data} model={model} request={{ protocol, body: request.body }} keyId={data.settings.keys.find(x => x.value === apiKey)?.id} onClose={() => setPreviewing(false)} />}
     {exporting && <ExportDialog request={request} onClose={() => setExporting(false)} notice={notice} />}
   </div>;
 }

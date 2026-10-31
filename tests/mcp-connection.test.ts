@@ -4,15 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 const { settings } = await import('../backend/state');
-const { mcpConfig, saveServers, callTool, settle, stopMcp } = await import('../backend/mcp');
+const { mcpConfig, saveServers, callTool, settle, stopMcp, serverStatus } = await import('../backend/mcp');
 const dir = mkdtempSync(path.join(os.tmpdir(), 'pg-mcp-'));
 const saved = { mcp: settings.mcp };
 afterAll(() => { stopMcp(); settings.mcp = saved.mcp; rmSync(dir, { recursive: true, force: true }); fixture.stop(true); });
 
 // An HTTP server that answers like MCP. /slow takes 700 ms to answer anything; every tool call says which path it reached.
+let inits = 0, closes = 0;
 const fixture = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
-  const url = new URL(req.url); if (req.method !== 'POST') return new Response(null, { status: 204 });
-  const m = await req.json() as any; if (m.id === undefined) return new Response(null, { status: 202 });
+  const url = new URL(req.url); if (req.method === 'DELETE') closes++; if (req.method !== 'POST') return new Response(null, { status: 204 });
+  const m = await req.json() as any; if (m.id === undefined) return new Response(null, { status: 202 }); if (m.method === 'initialize') inits++;
   if (url.pathname === '/slow') await Bun.sleep(700);
   const result = m.method === 'initialize' ? { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } }
     : m.method === 'tools/list' ? { tools: [{ name: 'where', inputSchema: { type: 'object' } }] }
@@ -47,4 +48,17 @@ test('text from a local program keeps its non-ASCII characters even when a chunk
   saveServers([{ id: 'loc', name: 'loc', enabled: true, transport: 'stdio', command: process.execPath, args: [script], timeoutSec: 30 }]);
   await settle('loc', 20000);
   expect(await text('loc')).toBe('你好 🌍');
+});
+
+test('disabling a server while it is still connecting cancels that connection: it is closed, not installed, and enabling again makes a new one', async () => {
+  mcpConfig().servers = []; mcpConfig().enabled = true; inits = 0; closes = 0;
+  saveServers([http('/slow')]);                          // starts connecting, and takes 700 ms
+  await Bun.sleep(100);
+  saveServers([{ ...http('/slow'), enabled: false }]);   // switched off before it finished
+  await Bun.sleep(1400);                                 // the old connection finishes now
+  expect(serverStatus(mcpConfig().servers[0]).status.state).toBe('off');
+  expect(closes).toBeGreaterThan(0);                     // the connection that finished was closed, not kept
+  const before = inits; saveServers([http('/slow')]); await settle('srv', 10000);
+  expect(inits).toBe(before + 1);                        // a new connection, not the old one revived
+  expect(await text('srv')).toBe('reached /slow');
 });

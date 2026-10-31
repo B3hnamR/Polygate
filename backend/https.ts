@@ -152,6 +152,11 @@ export function httpsRuntime(): { tls?: Tls; port?: number } {
   if (!tls) return {};
   return { tls: { cert: tls.cert, key: tls.key }, port: cfg.port };
 }
+// Where a program on this machine reaches the gateway: over HTTPS on its own port when the gateway really serves HTTPS (it can read and parse the certificate
+// and key), otherwise over plain HTTP on the loopback port, which is also where recovery listens. The manager asks this instead of checking files itself.
+export function localTarget(plainPort: number): { secure: boolean; port: number } {
+  const r = httpsRuntime(); return r.tls ? { secure: true, port: r.port || 443 } : { secure: false, port: plainPort };
+}
 export async function httpsStatus() {
   const cfg = httpsConfig(); const tls = readTls(cfg); const expiresAt = tls ? expiryOf(tls.cert509) : 0;
   return {

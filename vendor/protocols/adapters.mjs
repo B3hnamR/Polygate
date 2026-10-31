@@ -1851,16 +1851,18 @@ async function collectChatCompletion(upstreamRes) {
   const part = (index) => {
     let p = parts.get(index)
     if (!p) {
-      p = { message: { role: "assistant", content: "" }, finish_reason: "stop", toolCalls: [] }
+      p = { message: { role: "assistant", content: "" }, finish_reason: null, finished: false, toolCalls: [] }
       parts.set(index, p)
-      out.choices.push({ index, message: p.message, finish_reason: "stop" })
+      out.choices.push({ index, message: p.message, finish_reason: null })
     }
     return p
   }
   part(0)
+  let sawDone = false
   for await (const block of sseChunks(upstreamRes)) {
     let raw = ""
     for (const line of block.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+    if (raw === "[DONE]") sawDone = true
     if (!raw || raw === "[DONE]") continue
     let d
     try {
@@ -1887,12 +1889,17 @@ async function collectChatCompletion(upstreamRes) {
         if (tc.function?.name) cur.function.name = tc.function.name
         if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
       }
-      if (choice.finish_reason) cp.finish_reason = choice.finish_reason
+      if (choice.finish_reason) {
+        cp.finish_reason = choice.finish_reason
+        cp.finished = true
+      }
     }
   }
   out.choices.sort((a, b) => a.index - b.index)
   for (const c of out.choices) {
     const cp = parts.get(c.index)
+    // A choice that never reported a finish gets none: "stop" is given only when the stream ended properly ([DONE]), never to a cut-off choice.
+    if (!cp.finished && sawDone) cp.finish_reason = "stop"
     const calls = cp.toolCalls.filter(Boolean)
     if (calls.length) {
       cp.message.tool_calls = calls
@@ -1985,6 +1992,42 @@ async function* responsesChunksAsChat(upstreamRes) {
 // relay has to say so instead of ending like a clean empty answer — measured
 // in the hostile sweep: a mid-flight cut used to read back to agents as a
 // "successful" turn that simply held less text than the model said.
+// A chat stream that carries several choices (n > 1) is finished at [DONE], or when every choice that started has finished: one choice finishing
+// while another is still writing is not the end of the answer.
+function chatFinishTracker() {
+  const open = new Set()
+  let finished = false
+  let done = false
+  return {
+    feed(block) {
+      for (const line of block.split("\n")) {
+        if (!line.startsWith("data:")) continue
+        const raw = line.slice(5).trim()
+        if (raw === "[DONE]") {
+          done = true
+          continue
+        }
+        if (!raw.includes("choices")) continue
+        let d
+        try {
+          d = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        for (const c of d?.choices ?? []) {
+          const i = Number.isInteger(c?.index) ? c.index : 0
+          if (c?.finish_reason != null) {
+            open.delete(i)
+            finished = true
+          } else open.add(i)
+        }
+      }
+    },
+    get terminal() {
+      return done || (finished && open.size === 0)
+    },
+  }
+}
 function chatBlockTerminal(block) {
   const b = block.trim()
   if (b === "data: [DONE]") return true
@@ -2352,6 +2395,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   const decoder = new TextDecoder()
   let buffer = ""
   let sawFinish = false
+  const finish = chatFinishTracker()
   let upstreamErr = null
   const ctrl = new AbortController()
   let stalled = false
@@ -2402,7 +2446,8 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
           if (!upstreamErr) upstreamErr = chatBlockError(block)
           const out = rewriteSSE(block, requested, strip, pinned)
           if (out) res.write(out)
-          if (chatBlockTerminal(block)) sawFinish = true
+          finish.feed(block)
+          sawFinish = finish.terminal
         }
       }
     } catch (err) {

@@ -14,12 +14,17 @@ export type CheckItem = { id: string; severity: 'blocking' | 'warning'; title: s
 const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const REFRESH: Fix = { label: 'Refresh catalog', endpoint: '/admin/discover' };
 
-export function checklist(ctx: { providers: Provider[]; usable: Model[]; starting: boolean }): CheckItem[] {
+export function checklist(ctx: { providers: Provider[]; known: Model[]; usable: Model[]; starting: boolean }): CheckItem[] {
   const now = Date.now(); const items: CheckItem[] = [];
-  const { providers, usable, starting } = ctx;
+  const { providers, known, usable, starting } = ctx;
   // ---- what stops every request
   if (!providers.length) items.push({ id: 'no_provider', severity: 'blocking', title: 'No provider is switched on', detail: 'No provider is switched on.', page: 'Providers' });
-  else if (!usable.length && !starting) items.push({ id: 'no_models', severity: 'blocking', title: 'No models were found', detail: 'No usable models are known yet. Refresh the model catalog.', page: 'Models', fix: REFRESH });
+  else if (!known.length && !starting) items.push({ id: 'no_models', severity: 'blocking', title: 'No models were found', detail: 'No usable models are known yet. Refresh the model catalog.', page: 'Models', fix: REFRESH });
+  else if (known.length && !usable.length) {
+    // Listed, but every one is paused after errors: requests are refused until the first comes back.
+    const back = Math.min(...known.map(m => m.cooldownUntil));
+    items.push({ id: 'models_resting', severity: 'blocking', title: 'Every model is resting', detail: `All ${known.length} known model${known.length === 1 ? ' is' : 's are'} resting after errors; the first is back at ${clock(back)}. The pause can be turned off under Routing.`, page: 'Models' });
+  }
   const keys = settings.keys; const usableKeys = keys.filter(k => !keyProblem(k, now));
   if (!usableKeys.length) {
     const why = keys.map(k => `"${k.name}" ${keyProblem(k, now)}`).join('; ');

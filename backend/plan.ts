@@ -30,45 +30,70 @@ export function lacks(m: Model, n: Needs): { short: string; long: string } | und
   return undefined;
 }
 export const autoOrder = (requested: string, ranked: Model[]) => requested === 'auto:smart' ? ranked.filter(m => m.reasoning || m.score >= 65) : requested === 'auto:fast' ? [...ranked].sort((a, b) => (a.latency || 1e9) - (b.latency || 1e9)) : ranked;
-// The first `limit` models of the list that can handle the request. The models passed over on the way are named in `skipped`. When the listings say
-// that none can, the best ones are tried as they are: the listing may be wrong, and a refusal then costs one attempt, not the whole request.
-export function pickCapable(list: Model[], needs: Needs, limit: number, skipped: string[]): Model[] {
-  const out: Model[] = []; const passed: string[] = [];
-  for (const m of list) { if (out.length >= limit) break; const why = lacks(m, needs); if (why) passed.push(`${m.id} (${why.short})`); else out.push(m); }
-  if (!out.length) { if (passed.length) logEvent('warn', 'requests', `No model is listed as able to handle this request (${passed.slice(0, 3).join(', ')}); trying the best ones anyway`); return list.slice(0, limit); }
-  skipped.push(...passed); return out;
+export const keyProblem = (key: ApiKey, now = Date.now()) => !key.enabled ? 'it is switched off' : key.expiresAt && key.expiresAt <= now ? 'it has expired' : key.budget && (key.used || 0) >= key.budget ? 'its token budget is used up' : '';
+const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+// ---- one decision for a model, used by real requests and by the preview alike
+export type Verdict = { ok: boolean; reason: string; short: string; via?: string };
+// `capability` says whether a model that is listed as unable to do what the request needs is excluded (true for automatic choices, false for a
+// model the user named, which is tried anyway and only noted).
+export function judge(m: Model, key: ApiKey | undefined, needs: Needs, capability: boolean): Verdict {
+  const p = settings.providers.find(x => x.id === m.providerId);
+  if (!p || !p.enabled) return { ok: false, short: 'provider off', reason: 'its provider is switched off or removed' };
+  if (m.state === 'unavailable') return { ok: false, short: 'unavailable', reason: m.error ? `it is marked unavailable (${m.error.slice(0, 90)})` : 'it is marked unavailable' };
+  if (m.cooldownUntil > Date.now()) return { ok: false, short: 'resting', reason: `it is resting until ${clock(m.cooldownUntil)}` };
+  if (key && !modelAllowed(key, m.id)) return { ok: false, short: 'key not allowed', reason: 'this client key does not allow that model' };
+  const why = lacks(m, needs);
+  if (why && capability) return { ok: false, short: why.short, reason: why.long };
+  try { const route = routeForProvider(p, m.id, true); return { ok: true, short: '', reason: why ? `eligible, but ${why.long}; it is tried anyway because it was named` : 'eligible', via: route.name }; }
+  catch (e: any) { return { ok: false, short: 'route unavailable', reason: `its configured route is unavailable: ${String(e?.message || e).replace(/\s*Change them on the Providers page\.?$/, '').slice(0, 220)}` }; }
+}
+export type Selection = { picked: Model[]; rows: { m: Model; v: Verdict }[]; fallback?: 'capability' };
+// The first `limit` models of an automatic list that can take the request, in order: not resting, allowed for the key, able to do what the request
+// needs, and with a route that would really be used. The models passed over on the way are in `rows` with their reason; `extra` more are judged after
+// the limit is reached so a preview can show what comes next.
+// When none passes only because of capability, the best ones are tried as they are: the listing may be wrong, and a refusal then costs one attempt.
+// With `lastResort` (real requests) the first models are tried even when none passes at all, so the request fails with the real reason, not silently.
+export function select(list: Model[], limit: number, key: ApiKey | undefined, needs: Needs, opts: { extra?: number; max?: number; lastResort?: boolean } = {}): Selection {
+  const { extra = 0, max = 40, lastResort = false } = opts;
+  const rows: Selection['rows'] = []; const picked: Model[] = []; let after = 0;
+  for (const m of list) {
+    if (rows.length >= max) break;
+    if (picked.length >= limit) { if (after >= extra) break; after++; }
+    const v = judge(m, key, needs, true); rows.push({ m, v });
+    if (v.ok && picked.length < limit) picked.push(m);
+  }
+  if (picked.length) return { picked, rows };
+  if (rows.some(r => !r.v.ok && lacks(r.m, needs))) {
+    const alt = list.slice(0, max).filter(m => judge(m, key, needs, false).ok).slice(0, limit);
+    if (alt.length) return { picked: alt, rows, fallback: 'capability' };
+  }
+  return { picked: lastResort ? list.slice(0, limit) : [], rows };
+}
+// The real-request form: the chosen models, and the ones passed over before the last of them, named in `skipped` as `model (why)`.
+export function pickFrom(list: Model[], limit: number, key: ApiKey | undefined, needs: Needs, skipped: string[]): Model[] {
+  const s = select(list, limit, key, needs, { lastResort: true });
+  if (s.fallback === 'capability') { logEvent('warn', 'requests', `No model is listed as able to handle this request (${s.rows.filter(r => !r.v.ok).slice(0, 3).map(r => `${r.m.id}: ${r.v.short}`).join(', ')}); trying the best ones anyway`); return s.picked; }
+  const last = s.picked.length ? Math.max(...s.picked.map(m => list.indexOf(m))) : -1;
+  for (const r of s.rows) if (!r.v.ok && list.indexOf(r.m) < last) skipped.push(`${r.m.id} (${r.v.short})`);
+  return s.picked;
 }
 
 // ---- the preview: the same choices as a real request, asked without sending anything
 export type PlanStep = { model: string; provider: string; status: 'try' | 'backup' | 'skip' | 'later'; reason: string; via?: string; from?: string };
 export type Plan = { request: string; kind: 'auto' | 'chain' | 'model'; key: string | null; needs: Needs; steps: PlanStep[]; notes: string[]; summary: string; sent: false };
-export const keyProblem = (key: ApiKey, now = Date.now()) => !key.enabled ? 'it is switched off' : key.expiresAt && key.expiresAt <= now ? 'it has expired' : key.budget && (key.used || 0) >= key.budget ? 'its token budget is used up' : '';
-const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-type Look = { ok: boolean; reason: string; via?: string };
-function look(m: Model, key: ApiKey | undefined, needs: Needs, capabilityApplies: boolean): Look {
-  const p = settings.providers.find(x => x.id === m.providerId);
-  if (!p || !p.enabled) return { ok: false, reason: 'its provider is switched off or removed' };
-  if (m.state === 'unavailable') return { ok: false, reason: m.error ? `it is marked unavailable (${m.error.slice(0, 90)})` : 'it is marked unavailable' };
-  if (m.cooldownUntil > Date.now()) return { ok: false, reason: `it is resting until ${clock(m.cooldownUntil)}` };
-  if (key && !modelAllowed(key, m.id)) return { ok: false, reason: 'this client key does not allow that model' };
-  const why = lacks(m, needs);
-  if (why && capabilityApplies) return { ok: false, reason: why.long };
-  try { const route = routeForProvider(p, m.id, true); return { ok: true, reason: why ? `eligible, but ${why.long}; it is tried anyway because it was named` : 'eligible', via: route.name }; }
-  catch (e: any) { return { ok: false, reason: `its configured route is unavailable: ${String(e?.message || e).replace(/\s*Change them on the Providers page\.?$/, '').slice(0, 220)}` }; }
-}
 export function previewRouting(requested: string, key: ApiKey | undefined, needs: Needs): Plan {
   const asked = requested.trim() || 'auto'; const notes: string[] = []; const ranked = rankedModels();
   if (key) { const why = keyProblem(key); if (why) notes.push(`This client key cannot be used right now: ${why}.`); }
-  const rows: { m?: Model; id: string; look: Look; from?: string; group: string; groupLimit: number }[] = [];
-  // An alias (auto, auto:smart, auto:fast) shows the models in its order until enough are eligible, and a few more so the order is clear.
+  type Row = { id: string; m?: Model; v: Verdict; from?: string; chosen: boolean; note?: string };
+  const rows: Row[] = [];
+  // An alias (auto, auto:smart, auto:fast) goes through the same selection as a real request; a few models after the chosen ones are shown for context.
   const alias = (name: string, limit: number) => {
-    let found = 0, shown = 0;
-    for (const m of autoOrder(name, ranked)) {
-      if (shown >= 15 || found >= limit + 2) break;
-      const l = look(m, key, needs, true); if (l.ok) found++; shown++;
-      rows.push({ m, id: m.id, look: l, from: name === asked ? undefined : name, group: name, groupLimit: limit });
-    }
-    if (!shown) notes.push(`No model is available for "${name}" right now.`);
+    const sel = select(autoOrder(name, ranked), limit, key, needs, { extra: 2, max: 15 });
+    if (!sel.rows.length) notes.push(`No model is available for "${name}" right now.`);
+    if (sel.fallback === 'capability') notes.push('No model is listed as able to handle this request, so the best ones are tried anyway: provider listings are not always right.');
+    for (const r of sel.rows) rows.push({ id: r.m.id, m: r.m, v: r.v, from: name === asked ? undefined : name, chosen: sel.picked.includes(r.m) });
+    if (sel.fallback === 'capability') for (const m of sel.picked) { const i = rows.findIndex(r => r.m === m); const v = judge(m, key, needs, false); if (i >= 0) rows[i] = { ...rows[i], v: { ...v, reason: `tried anyway: ${rows[i].v.reason}` }, chosen: true }; }
   };
   let kind: Plan['kind'] = 'model';
   const chain = chainFor(asked);
@@ -77,23 +102,23 @@ export function previewRouting(requested: string, key: ApiKey | undefined, needs
     for (const step of chain.models) {
       if (AUTO_STEPS.includes(step)) { alias(step, 3); continue; }
       const m = modelFor(step);
-      if (!m) rows.push({ id: step, look: { ok: false, reason: 'Polygate no longer lists this model' }, group: step, groupLimit: 1 });
-      else rows.push({ m, id: m.id, look: look(m, key, needs, false), group: m.id, groupLimit: 1 });
+      if (!m) rows.push({ id: step, v: { ok: false, short: 'unknown', reason: 'Polygate no longer lists this model' }, chosen: false });
+      else { const v = judge(m, key, needs, false); rows.push({ id: m.id, m, v, chosen: v.ok }); }
     }
   } else if (AUTO_STEPS.includes(asked)) { kind = 'auto'; alias(asked, settings.fallback ? 3 : 1); }
   else {
     const m = models.get(asked) || [...models.values()].find(x => x.upstreamId === asked);
-    if (!m) rows.push({ id: asked, look: { ok: false, reason: 'Polygate does not know a model or chain with this name' }, group: asked, groupLimit: 1 });
-    else rows.push({ m, id: m.id, look: look(m, key, needs, false), group: m.id, groupLimit: 1 });
+    if (!m) rows.push({ id: asked, v: { ok: false, short: 'unknown', reason: 'Polygate does not know a model or chain with this name' }, chosen: false });
+    else { const v = judge(m, key, needs, false); rows.push({ id: m.id, m, v, chosen: v.ok }); }
   }
-  const taken = new Map<string, number>(); let first = true;
+  let first = true;
   const steps: PlanStep[] = rows.map(r => {
     const provider = r.m ? settings.providers.find(p => p.id === r.m!.providerId)?.name || r.m.providerId : '—';
-    if (!r.look.ok) return { model: r.id, provider, status: 'skip' as const, reason: r.look.reason, ...(r.from ? { from: r.from } : {}) };
-    const n = taken.get(r.group) || 0; taken.set(r.group, n + 1);
-    if (n >= r.groupLimit) return { model: r.id, provider, status: 'later' as const, reason: `not reached: only the first ${r.groupLimit} ${r.groupLimit === 1 ? 'is' : 'are'} tried`, ...(r.from ? { from: r.from } : {}) };
+    const from = r.from ? { from: r.from } : {};
+    if (!r.v.ok && !r.chosen) return { model: r.id, provider, status: 'skip' as const, reason: r.v.reason, ...from };
+    if (!r.chosen) return { model: r.id, provider, status: 'later' as const, reason: 'not reached: the models before it are tried first', ...from };
     const status = first ? 'try' as const : 'backup' as const; first = false;
-    return { model: r.id, provider, status, reason: r.look.reason, via: r.look.via, ...(r.from ? { from: r.from } : {}) };
+    return { model: r.id, provider, status, reason: r.v.reason, via: r.v.via, ...from };
   });
   const head = steps.find(s => s.status === 'try');
   const summary = head ? `Would try ${head.model} first${head.via ? `, through ${head.via}` : ''}.` : 'No model can take this request right now.';

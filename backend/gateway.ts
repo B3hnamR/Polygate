@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { settings, models, record, saveModel, redactError } from './state';
 import { authenticate, modelAllowed, recordUsage } from './keys';
 import { AdmissionQueue, GatewayError } from './queue';
-import { toChat, fromChat, collect, stream, observeSse, type Protocol } from './protocols';
+import { toChat, fromChat, collect, stream, observeSse, lfBody, type Protocol } from './protocols';
 import { rankedModels, providerChat, sessionFor } from './providers';
 import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
@@ -13,7 +13,7 @@ import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
 import { chainFor, modelFor, AUTO_STEPS } from './chains';
 import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
-import { autoOrder, needsOf, pickCapable, type Needs } from './plan';
+import { autoOrder, needsOf, pickFrom, type Needs } from './plan';
 import { checklist } from './checklist';
 import type { Model, ApiKey, Chain } from './types';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
@@ -23,11 +23,11 @@ export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
 const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
 // A chain is the user's own order: its steps that are ready right now, each tried when the one before it fails. The "fallback" setting
 // does not shorten it, because the user listed these on purpose.
-function chainModels(chain:Chain,ranked:Model[],needs:Needs,skipped:string[]){
+function chainModels(chain:Chain,ranked:Model[],key:ApiKey|undefined,needs:Needs,skipped:string[]){
   if(!chain.enabled)throw new GatewayError(`The chain "${chain.name}" is switched off in Polygate.`,404,'model_not_found');
   const out:Model[]=[];
   for(const step of chain.models){
-    if(AUTO_STEPS.includes(step)){for(const m of pickCapable(autoOrder(step,ranked),needs,3,skipped))if(!out.includes(m))out.push(m);continue;}
+    if(AUTO_STEPS.includes(step)){for(const m of pickFrom(autoOrder(step,ranked),3,key,needs,skipped))if(!out.includes(m))out.push(m);continue;}
     const m=modelFor(step);if(m&&ranked.includes(m)&&!out.includes(m))out.push(m);
   }
   if(out.length)return out;
@@ -39,10 +39,10 @@ function chainModels(chain:Chain,ranked:Model[],needs:Needs,skipped:string[]){
 // and each one passed over is added to `skipped` with its reason. A model named on purpose (a chain step, an exact model) is never swapped out.
 function chosenModels(requested:string,key:ApiKey|undefined,needs:Needs,skipped:string[]){
   const all=rankedModels();const ranked=all.filter(m=>m.state!=='unavailable'&&m.cooldownUntil<=Date.now()&&(!key?.models?.length||modelAllowed(key,m.id)));
-  const chain=chainFor(requested);if(chain)return chainModels(chain,ranked,needs,skipped);
+  const chain=chainFor(requested);if(chain)return chainModels(chain,ranked,key,needs,skipped);
   if(requested==='auto'||requested==='auto:smart'||requested==='auto:fast'){
     const eligible=autoOrder(requested,ranked);
-    if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return pickCapable(eligible,needs,settings.fallback?3:1,skipped);
+    if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return pickFrom(eligible,settings.fallback?3:1,key,needs,skipped);
   }
   const exact=models.get(requested)||all.find(m=>m.upstreamId===requested);if(!exact)throw new GatewayError('Unknown model. Use a model from /v1/models.',404,'model_not_found');
   if(!providerEnabled(exact))throw new GatewayError('Model belongs to a disabled or removed provider. Enable it in Providers.',404,'model_not_found');
@@ -154,13 +154,14 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
     if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
     res.setHeader('x-polygate-model',used.id);if(chain)res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));res.setHeader('x-polygate-route',encodeURIComponent(route));
-    let ended=false;let firstAt=0;
+    // The answer is complete at [DONE], or when every choice that started has finished: with n > 1 one choice finishing is not the end.
+    let ended=false;let done=false;let firstAt=0;const writing=new Set<number>();let anyFinished=false;
     const observer=observeSse(raw=>{
-      if(raw==='[DONE]'){ended=true;return;}
-      try{const d=JSON.parse(raw);if(d.choices?.some((x:any)=>x.finish_reason))ended=true;if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
+      if(raw==='[DONE]'){done=true;ended=true;return;}
+      try{const d=JSON.parse(raw);for(const c of d.choices||[]){const i=Number.isInteger(c?.index)?c.index:0;if(c?.finish_reason){writing.delete(i);anyFinished=true;}else writing.add(i);}ended=done||(anyFinished&&writing.size===0);if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
     },()=>{firstAt=Date.now();streaming();},()=>{if(firstAt)armIdle();});
     // pipeTo rather than pipeThrough: an abort in the middle of the stream rejects the pipe, and that is handled here instead of surfacing as an unhandled rejection.
-    upstream.body!.pipeTo(observer.writable).catch(()=>{});const observed=observer.readable;
+    lfBody(upstream).body!.pipeTo(observer.writable).catch(()=>{});const observed=observer.readable;
     const wrapped=new Response(observed,{headers:upstream.headers,status:upstream.status});
     if(body.stream){
       status=200;await stream(req,res,wrapped,protocol,used.id);
@@ -197,10 +198,12 @@ export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'M
 // `checklist` is everything worth fixing; `issues` are the ones among them that stop requests.
 export function readiness(){
   const now=Date.now();const providers=settings.providers.filter(p=>p.enabled);
-  const usable=[...models.values()].filter(m=>m.state!=='unavailable'&&providers.some(p=>p.id===m.providerId));
+  // `known` models are listed and not gone; `usable` ones can also be asked right now (not resting).
+  const known=[...models.values()].filter(m=>m.state!=='unavailable'&&providers.some(p=>p.id===m.providerId));
+  const usable=known.filter(m=>m.cooldownUntil<=now);
   const routes=settings.routes.filter(r=>r.enabled&&(!r.cooldownUntil||r.cooldownUntil<now)).length;
-  const starting=process.uptime()<30&&!usable.length;
-  const items=checklist({providers,usable,starting});
+  const starting=process.uptime()<30&&!known.length;
+  const items=checklist({providers,known,usable,starting});
   const issues:ReadyIssue[]=items.filter(i=>i.severity==='blocking').map(i=>({code:i.id,message:i.detail,page:i.page}));
   const state:'paused'|'starting'|'ready'|'attention'=!settings.enabled?'paused':starting&&!issues.length?'starting':issues.length?'attention':'ready';
   return {ready:state==='ready',state,issues,checklist:items,enabled:settings.enabled,models:usable.length,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
