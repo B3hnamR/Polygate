@@ -475,7 +475,7 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .agent-title{display:flex;flex-direction:column;min-width:0;flex:0 1 auto}.agent-title h2{margin:0;font-size:17px}.agent-title .subtle{font-size:13.5px}
 .agent-mode{min-width:175px}
 .agent-live{font-size:12.5px;color:var(--muted)}.agent-live.live{color:var(--green)}.agent-live.lost{color:var(--amber)}
-.agent-thread{flex:1;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+.agent-thread{flex:1;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}.agent-thread>*{flex:none}
 .agent-hint{margin:auto 0;text-align:center;max-width:520px;align-self:center}
 .agent-working{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14.5px}
 .agent-note{font-size:13.5px;color:var(--muted)}.agent-note.warn{color:var(--amber)}.agent-note.bad{color:var(--red)}
@@ -495,3 +495,16 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .agent-composer textarea{flex:1;min-height:60px;max-height:240px}
 .agent-composer-actions{display:flex;gap:8px;flex:none}
 @media (max-width:900px){.agent-layout{grid-template-columns:minmax(0,1fr)}.agent-session{height:auto;min-height:560px}.agent-thread{max-height:60vh}}
+/* Agent page, Phase 2c: a turn's changed files with their diffs, undo, rename, and the model switch on a paused session. */
+.agent-changes{border:1px solid var(--accent-line);border-radius:8px;background:var(--surface);overflow:hidden}
+.agent-changes-head{display:flex;align-items:center;gap:8px;padding:8px 12px;font-size:14px;background:var(--accent-soft)}.agent-changes-head .text-button{font-size:13.5px}
+.agent-change{border-top:1px solid var(--line)}.agent-change summary{display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;min-width:0;font-size:13.5px}
+.agent-change summary code{font-family:var(--mono);font-size:13px;min-width:0}.agent-change>p{margin:0;padding:6px 12px 10px;font-size:13.5px}
+.agent-change-status{flex:none;font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:4px;background:var(--surface-raised);color:var(--muted)}
+.agent-change-status.added{color:var(--green);background:var(--green-soft)}.agent-change-status.deleted{color:var(--red);background:var(--red-soft)}
+.agent-diff{margin:0;padding:6px 0 8px;max-height:360px;overflow:auto;font:12.5px/1.55 var(--mono);border-top:1px solid var(--line)}
+.agent-diff span{display:block;padding:0 12px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-diff .add{background:var(--green-soft);color:var(--green)}.agent-diff .del{background:var(--red-soft);color:var(--red)}.agent-diff .hunk{color:var(--muted)}
+.agent-title h2{display:flex;align-items:center;gap:6px}.agent-rename-button{opacity:.6;flex:none}.agent-rename-button:hover,.agent-rename-button:focus-visible{opacity:1}
+.agent-rename{font-size:15px;padding:4px 8px;min-width:240px}
+.agent-paused-body{display:flex;flex-direction:column;gap:8px;min-width:0}.agent-paused-switch{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.agent-paused-switch .select{min-width:220px}
+.agent-notice{margin:0 18px 12px;padding:8px 12px;border-radius:8px;background:var(--green-soft);color:var(--green);font-size:14px}

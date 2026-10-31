@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the desktop-only API the Agent page uses, in front of the engine. A stand-in engine
@@ -147,6 +147,77 @@ test('the mode switches to that mode\'s engine agent, and cancel interrupts the 
   expect((await admin('/admin/agent/session/cancel', { id: a })).status).toBe(200);
   expect((await calls()).some(c => c.path === `/api/session/${a}/interrupt`)).toBe(true);
   expect((await admin('/admin/agent/session/cancel', { id: 'ses_unknown' })).status).toBe(404);
+});
+
+// Phase 2c: what each turn changed, and undo that never overwrites a change made after the agent's.
+const inFolder = (rel: string) => path.join(FOLDER, rel);
+const put = (rel: string, text: string) => { mkdirSync(path.dirname(inFolder(rel)), { recursive: true }); writeFileSync(inFolder(rel), text); };
+// One turn as the engine reports it: the message, the agent's file changes, a diff route answer, then the end of the turn.
+async function turn(id: string, ui: ReturnType<typeof listen>, text: string, change: () => void, diff: any[], stepFiles: string[] = diff.map(f => f.file)) {
+  const before = ui.events.filter(e => e.type === 'agent.changes').length;
+  await admin('/admin/agent/session/prompt', { id, text }); await emit('session.execution.started', { sessionID: id });
+  change(); await fake('/test/session', { sessionID: id, diff });
+  if (stepFiles.length) await emit('session.step.ended', { sessionID: id, files: stepFiles });
+  await emit('session.execution.succeeded', { sessionID: id });
+  await until(() => ui.events.filter(e => e.type === 'agent.changes').length > before);
+}
+
+test('each turn\'s changes are recorded, with every file the engine says the turn touched', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  await turn(a, ui, 'change a', () => { put('src/a.js', 'agent v1'); put('src/b.js', 'made by a command'); },
+    [{ file: 'src/a.js', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-original\n+agent v1\n' }], ['src/a.js', 'src/b.js']);
+  const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+  expect(turns).toHaveLength(1); expect(turns[0].message).toBe(`msg_${a}_0`);
+  expect(turns[0].files.map((f: any) => [f.file, f.status])).toEqual([['src/a.js', 'modified'], ['src/b.js', 'modified']]);
+  expect(ui.events.find(e => e.type === 'agent.changes').data.turn.files[0].patch).toContain('+agent v1');
+  ui.stop();
+});
+
+test('undo restores a turn when its files are exactly as the agent left them', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/u.js', 'original');
+  await turn(a, ui, 'change u', () => { put('src/u.js', 'agent'); put('src/new.js', 'added'); },
+    [{ file: 'src/u.js', status: 'modified', additions: 1, deletions: 1, patch: '-original\n+agent\n' }, { file: 'src/new.js', status: 'added', additions: 1, deletions: 0, patch: '+added\n' }]);
+  await fake('/test/session', { sessionID: a, stage: [{ file: 'src/u.js', status: 'modified' }, { file: 'src/new.js', status: 'deleted' }], revert: [{ file: 'src/u.js', content: 'original' }, { file: 'src/new.js', content: null }] });
+  const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
+  expect(r.status).toBe(200); expect(r.body.files).toEqual(['src/u.js', 'src/new.js']);
+  expect(readFileSync(inFolder('src/u.js'), 'utf8')).toBe('original'); expect(existsSync(inFolder('src/new.js'))).toBe(false);
+  const mine = (await calls()).filter(c => c.path.startsWith(`/api/session/${a}/revert`)).map(c => `${c.method} ${c.path.split('/').slice(4).join('/')}`);
+  expect(mine).toEqual(['POST revert/stage', 'POST revert/commit']);
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toEqual([]);
+  await until(() => ui.events.some(e => e.type === 'agent.undone'));
+  ui.stop();
+});
+
+test('undo refuses, and changes nothing, when a file changed after the agent left it, was never recorded, or the agent is busy', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/c.js', 'original');
+  await turn(a, ui, 'change c', () => put('src/c.js', 'agent'), [{ file: 'src/c.js', status: 'modified', additions: 1, deletions: 1, patch: '-original\n+agent\n' }]);
+  put('src/c.js', 'agent\nmy own line\n'); put('src/unseen.js', 'never recorded');
+  await fake('/test/session', { sessionID: a, stage: [{ file: 'src/c.js', status: 'modified' }, { file: 'src/unseen.js', status: 'modified' }], revert: [{ file: 'src/c.js', content: 'original' }] });
+  const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
+  expect(r.status).toBe(409); expect(r.body.error.type).toBe('agent_undo_conflict');
+  expect(r.body.conflicts.map((c: any) => c.file)).toEqual(['src/c.js', 'src/unseen.js']);
+  expect(readFileSync(inFolder('src/c.js'), 'utf8')).toBe('agent\nmy own line\n');
+  const mine = (await calls()).filter(c => c.path.startsWith(`/api/session/${a}/revert`)).map(c => `${c.method} ${c.path.split('/').slice(4).join('/')}`);
+  expect(mine).toEqual(['POST revert/stage', 'DELETE revert']);
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toHaveLength(1);
+  const started = ui.events.filter(e => e.type === 'session.execution.started').length;
+  await emit('session.execution.started', { sessionID: a }); await until(() => ui.events.filter(e => e.type === 'session.execution.started').length > started);
+  const busy = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` }); expect(busy.status).toBe(409); expect(busy.body.error.message).toMatch(/working/);
+  await emit('session.execution.succeeded', { sessionID: a });
+  expect((await admin('/admin/agent/session/undo', { id: a, message: 'msg_unknown' })).status).toBe(404);
+  ui.stop();
+});
+
+test('a session can switch to another usable model (with its effort), and can be renamed', async () => {
+  const a = await create();
+  expect((await admin('/admin/agent/session/model', { id: a, model: THINKER, effort: 'low' })).status).toBe(200);
+  expect((await calls()).find(c => c.path === `/api/session/${a}/model`)!.body).toEqual({ model: { providerID: 'polygate', id: THINKER, variant: 'low' } });
+  for (const bad of [{ model: TOOLLESS }, { model: 'kilo/nope' }, { model: MODEL, effort: 'high' }]) expect((await admin('/admin/agent/session/model', { id: a, ...bad })).status).toBe(400);
+  expect((await admin('/admin/agent/session/rename', { id: a, title: '  Fix the failing test  ' })).status).toBe(200);
+  expect((await calls()).find(c => c.method === 'PATCH' && c.path === `/api/session/${a}`)!.body).toEqual({ title: 'Fix the failing test' });
+  expect((await admin('/admin/agent/session/rename', { id: a, title: '   ' })).status).toBe(400);
 });
 
 test('the agent routes answer in the desktop app only', async () => {

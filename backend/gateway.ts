@@ -195,7 +195,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
       detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
-    const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});
+    const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail,
+      // The agent engine names its session in each request; kept for the agent's key only (per-session usage on the Agent page).
+      session:k.agent?String(req.headers['x-opencode-session-id']||req.headers['x-session-id']||'').slice(0,80)||undefined:undefined});
     logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
 // What could stop a client request right now, and where to fix it. `page` is the dashboard page that has the remedy.

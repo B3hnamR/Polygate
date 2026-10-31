@@ -1,14 +1,16 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {Bot,Brain,Check,Download,FolderOpen,Loader2,Play,Plus,Send,ShieldCheck,Square,TriangleAlert,X} from 'lucide-react';
+import {Bot,Brain,Check,Download,FileDiff,FolderOpen,Loader2,Pencil,Play,Plus,Send,ShieldCheck,Square,TriangleAlert,Undo2,X} from 'lucide-react';
 import {api,at} from './api';
 import {Badge,Button,Empty,Field,Progress,Select,compact,usePoll,when} from './ui';
-import {MODES,modeLabel,fromHistory,applyEvent,approvalTitle,toolSubject,type Approval,type Item,type Mode} from './agent-logic';
+import {MODES,modeLabel,fromHistory,applyEvent,approvalTitle,toolSubject,withChanges,type Approval,type Item,type Mode} from './agent-logic';
+import {useConfirm} from './confirm';
 // The Agent page (docs/agent/PLAN.md, Phase 2b): a coding agent working in a folder the user chooses, through Polygate's own models.
 // Everything goes through the agent controller (backend/agent.ts); the page never talks to the engine itself. Desktop app only.
 
 type Engine={state:string;installed:boolean;version:string;message:string;problems:string[];progress?:number;snapshots?:{ok:boolean;reason?:string};freeIdentity?:{presented:string;engine:string;usable:boolean}};
 type AgentModel={id:string;name:string;provider:string;context:number;output:number;reasoning:boolean;efforts:string[];usable:boolean;reason?:string};
 type Models={models:AgentModel[];modes:Record<string,string>};
+type RouteUsage={requests:number;errors:number;input:number;output:number;last:number;routes:{route:string;requests:number}[]};
 type SessionInfo={id:string;title:string;mode:Mode|'';model:string;effort:string;folder:string;created?:number;tokens?:{input:number;output:number;reasoning?:number;cache?:{read:number;write:number}}};
 const cap=(s:string)=>s.charAt(0).toUpperCase()+s.slice(1);
 // Remembered on this computer only: the last folder, recent folders, the open session per folder and the last model.
@@ -120,11 +122,11 @@ function NewSession({folder,data,onCreated}:{folder:string;data:Models;onCreated
 function SessionView({id,folder,models,onChanged}:{id:string;folder:string;models:AgentModel[];onChanged:()=>void}){
   const [info,setInfo]=useState<SessionInfo|null>(null);const [items,setItems]=useState<Item[]>([]);const [pending,setPending]=useState<Approval[]>([]);
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>();
-  const [error,setError]=useState('');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');
+  const [error,setError]=useState('');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
   const [text,setText]=useState('');const [sending,setSending]=useState(false);
   const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;
   const load=useCallback(async()=>{
-    try{const s=await api('/admin/agent/session?id='+encodeURIComponent(id));setInfo(s.session);setItems(fromHistory(s.messages));setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);setError('');}
+    try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);setInfo(s.session);setItems(withChanges(fromHistory(s.messages),changes.turns||[]));setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);setError('');}
     catch(e:any){setError(e.message);}
   },[id]);
   // History first, then the live stream. After a dropped connection the history is read again, so nothing missed meanwhile is lost.
@@ -137,8 +139,9 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
       if(e.type==='permission.replied'){setPending(p=>p.filter(x=>x.id!==d.requestID));return;}
       if(e.type==='agent.approval.auto')setPending(p=>p.filter(x=>x.id!==d.requestID));
       if(e.type==='agent.paused'){setPaused(d.message||'The model kept failing.');setBusy(false);return;}
+      if(e.type==='agent.undone'){load();return;}
       if(e.type==='session.execution.started'){setBusy(true);setPaused('');}
-      if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();}
+      if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();api('/admin/agent/session?id='+encodeURIComponent(id)).then(s=>setRequests(s.usage||null),()=>{});}
       if(e.type==='session.usage.updated'&&d.tokens)setUsage(d.tokens);
       setItems(list=>applyEvent(list,e));
     };
@@ -153,9 +156,20 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   },[id,load]);
   // Follows the newest output while the reader is near the bottom; reading further up is left alone.
   useEffect(()=>{const el=thread.current;if(el&&el.scrollHeight-el.scrollTop-el.clientHeight<160)el.scrollTop=el.scrollHeight;},[items,pending,busy]);
-  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');try{await api('/admin/agent/session/prompt',{id,text:t});setText('');}catch(e:any){setError(e.message);}finally{setSending(false);}};
+  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{await api('/admin/agent/session/prompt',{id,text:t});setText('');}catch(e:any){setError(e.message);}finally{setSending(false);}};
   const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
   const changeMode=async(mode:Mode)=>{try{await api('/admin/agent/session/mode',{id,mode});setInfo(i=>i&&{...i,mode});}catch(e:any){setError(e.message);}};
+  const {confirm,dialog}=useConfirm();const [notice,setNotice]=useState('');
+  // Undo goes back to just before this turn's message: this turn and every later one are undone, and their messages leave the conversation.
+  const undo=async(message:string)=>{
+    const cards=items.filter((i):i is Extract<Item,{kind:'changes'}>=>i.kind==='changes');const from=cards.findIndex(c=>c.message===message);if(from<0)return;
+    const files=[...new Set(cards.slice(from).flatMap(c=>c.files.map(f=>f.file)))];const later=cards.length-from-1;
+    const ok=await confirm(<>Restore {files.length===1?<code>{files[0]}</code>:`${files.length} files`} to how {files.length===1?'it was':'they were'} before this turn.{later>0?` This also undoes the ${later} later turn${later>1?'s':''} that changed files.`:''} The conversation from this message on is removed. If a file was changed after the agent changed it, nothing is undone.</>,{title:'Undo this turn',confirm:'Undo'});
+    if(!ok)return;setError('');setNotice('');
+    try{const r=await api('/admin/agent/session/undo',{id,message});setNotice(`Undone: ${r.files.length} file${r.files.length===1?'':'s'} restored.`);}catch(e:any){setError(e.message);}
+  };
+  const [nextModel,setNextModel]=useState('');const switchModel=async()=>{if(!nextModel)return;try{await api('/admin/agent/session/model',{id,model:nextModel});setInfo(i=>i&&{...i,model:nextModel,effort:''});setPaused('');setNotice('Model changed. Send a message to carry on.');}catch(e:any){setError(e.message);}};
+  const [naming,setNaming]=useState<string|null>(null);const rename=async()=>{const title=(naming||'').trim();if(!title){setNaming(null);return;}try{await api('/admin/agent/session/rename',{id,title});setInfo(i=>i&&{...i,title});changed.current();}catch(e:any){setError(e.message);}setNaming(null);};
   const answer=async(p:Approval,decision:'once'|'session'|'deny')=>{
     setPending(list=>list.filter(x=>x.id!==p.id));
     try{await api('/admin/agent/session/approve',{id,request:p.id,decision});}catch(e:any){setError(e.message);load();}
@@ -163,19 +177,24 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   const model=models.find(m=>m.id===info?.model);const tokens=usage?usage.input+usage.output+(usage.reasoning||0):0;
   return <section className="section-block agent-session">
     <header className="agent-session-head">
-      <div className="agent-title"><h2 className="truncate" title={info?.title}>{info?.title||'Session'}</h2>
+      <div className="agent-title">{naming!==null?<input className="agent-rename" aria-label="Session name" autoFocus value={naming} maxLength={120} onChange={e=>setNaming(e.target.value)} onBlur={rename} onKeyDown={e=>{if(e.key==='Enter')rename();if(e.key==='Escape')setNaming(null);}}/>
+        :<h2 className="truncate" title={info?.title}>{info?.title||'Session'}<button className="icon-button agent-rename-button" aria-label="Rename session" title="Rename" onClick={()=>setNaming(info?.title||'')}><Pencil size={13}/></button></h2>}
         <span className="subtle truncate">{model?`${model.name} · ${model.provider}`:info?.model}{info?.effort?` · ${cap(info.effort)} effort`:''}</span></div>
       <span className="toolbar-spacer"/>
       {tokens>0&&<span className="pg-stat" title="Tokens this session has used, as the engine counts them">{compact(tokens)} tokens</span>}
+      {requests&&requests.requests>0&&<span className={`pg-stat${requests.errors?' warn':''}`} title={`Model requests this session made through Polygate, by route:\n${requests.routes.map(r=>`${r.route||'—'}: ${r.requests}`).join('\n')}`}>
+        {requests.requests} request{requests.requests===1?'':'s'}{requests.errors?`, ${requests.errors} failed`:''}{requests.routes[0]?` · ${requests.routes[0].route}`:''}</span>}
       <Select value={info?.mode||'ask'} onChange={v=>changeMode(v as Mode)} aria-label="Mode" className="agent-mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select>
       <span className={`agent-live ${live}`}>{live==='live'?'Live':live==='lost'?'Reconnecting…':'Connecting…'}</span>
     </header>
     <div className="agent-thread" ref={thread} aria-live="polite">
-      {items.length?items.map(i=><Row key={i.key} item={i} folder={folder}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {info?.mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':info?.mode==='accept-edits'?'It changes files without asking and asks before running commands.':'It reads freely and asks before changing files or running commands.'}</p>}
+      {items.length?items.map(i=><Row key={i.key} item={i} folder={folder} busy={busy} onUndo={undo}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {info?.mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':info?.mode==='accept-edits'?'It changes files without asking and asks before running commands.':'It reads freely and asks before changing files or running commands.'}</p>}
       {busy&&!pending.length&&<div className="agent-working"><Loader2 className="spin" size={15}/>Working…</div>}
     </div>
     {pending.map(p=><ApprovalCard key={p.id} request={p} answer={answer}/>)}
-    {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {paused} Send a message to try again, or start a session with another model.</div></div>}
+    {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div className="agent-paused-body"><div><strong>Paused.</strong> {paused} Send a message to try again, or carry on with another model.</div>
+      {models.some(m=>m.usable&&m.id!==info?.model)&&<div className="agent-paused-switch"><Select value={nextModel} onChange={setNextModel} aria-label="Another model"><option value="">Choose another model…</option>{models.filter(m=>m.usable&&m.id!==info?.model).map(m=><option key={m.id} value={m.id}>{`${m.name} · ${m.provider}`}</option>)}</Select><Button onClick={switchModel} disabled={!nextModel}>Use this model</Button></div>}</div></div>}
+    {notice&&!error&&<div className="agent-notice" role="status">{notice}</div>}
     {error&&<div className="pg-error agent-error">{error}</div>}
     <div className="agent-composer">
       <textarea aria-label="Message to the agent" placeholder={busy?'The agent is working. A message now is queued for when it is done.':'Ask the agent to do something in this folder…'} value={text} rows={3}
@@ -185,10 +204,12 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
         <Button variant="primary" onClick={send} disabled={sending||!text.trim()}>{sending?<Loader2 className="spin" size={15}/>:<Send size={15}/>}{busy?'Queue':'Send'}</Button>
       </div>
     </div>
+    {dialog}
   </section>;
 }
 
-function Row({item,folder}:{item:Item;folder:string}){
+function Row({item,folder,busy,onUndo}:{item:Item;folder:string;busy:boolean;onUndo:(message:string)=>void}){
+  if(item.kind==='changes')return <ChangesCard files={item.files} busy={busy} undo={()=>onUndo(item.message)}/>;
   if(item.kind==='user')return <div className="pg-msg user"><pre>{item.text}</pre></div>;
   if(item.kind==='text')return item.text?<div className="pg-msg assistant"><pre>{item.text}</pre></div>:null;
   if(item.kind==='reasoning')return <details className="pg-think"><summary><Brain size={14}/>{item.done?'Reasoning':'Thinking…'}</summary><pre>{item.text}</pre></details>;
@@ -201,6 +222,22 @@ function Row({item,folder}:{item:Item;folder:string}){
   </details>;
 }
 
+const STATUS:Record<string,string>={added:'Added',deleted:'Deleted',modified:'Changed',renamed:'Renamed'};
+// What one turn changed, file by file, with the patch the engine recorded (a file a command changed may have none).
+function ChangesCard({files,busy,undo}:{files:Extract<Item,{kind:'changes'}>['files'];busy:boolean;undo:()=>void}){
+  const add=files.reduce((s,f)=>s+f.additions,0),del=files.reduce((s,f)=>s+f.deletions,0);
+  return <div className="agent-changes">
+    <div className="agent-changes-head"><FileDiff size={15}/><strong>{files.length} file{files.length===1?'':'s'} changed</strong>{add>0&&<span className="green">+{add}</span>}{del>0&&<span className="red">−{del}</span>}<span className="toolbar-spacer"/>
+      <button className="text-button" disabled={busy} onClick={undo}><Undo2 size={14}/>Undo this turn</button></div>
+    {files.map(f=><details key={f.file} className="agent-change"><summary><span className={`agent-change-status ${f.status}`}>{STATUS[f.status]||f.status}</span><code className="truncate" title={f.file}>{f.file}</code>{f.additions>0&&<small className="green">+{f.additions}</small>}{f.deletions>0&&<small className="red">−{f.deletions}</small>}</summary>
+      {f.patch?<Diff patch={f.patch}/>:<p className="subtle">No patch was recorded for this file (it was changed by a command).</p>}</details>)}
+  </div>;
+}
+function Diff({patch}:{patch:string}){
+  const lines=patch.replace(/\r/g,'').split('\n').filter(l=>!/^(diff --git|index |--- |\+\+\+ |new file mode|deleted file mode|similarity index|rename (from|to) )/.test(l));
+  return <pre className="agent-diff">{lines.map((l,i)=><span key={i} className={l.startsWith('+')?'add':l.startsWith('-')?'del':l.startsWith('@@')?'hunk':''}>{l||' '}{'\n'}</span>)}</pre>;
+}
+
 function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,decision:'once'|'session'|'deny')=>void}){
   return <div className="agent-approval" role="alert">
     <div className="agent-approval-head"><ShieldCheck size={18}/><strong>{approvalTitle(p.action)}</strong></div>
@@ -208,9 +245,9 @@ function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,de
     {p.note&&<p className="agent-approval-note">{p.note}</p>}
     <div className="agent-approval-actions">
       <Button variant="primary" onClick={()=>answer(p,'once')}>Allow once</Button>
-      <Button onClick={()=>answer(p,'session')} title="Allowed again without asking, for exactly this, until this session ends">Allow for this session</Button>
+      <Button onClick={()=>answer(p,'session')}>Allow for this session</Button>
       <Button onClick={()=>answer(p,'deny')}>Deny</Button>
     </div>
-    <p className="subtle">Deny stops this turn, together with anything else the agent asked to do at the same time.</p>
+    <p className="subtle">Allow for this session: this exact request goes ahead without asking again until the session ends. Deny stops this turn, together with anything else the agent asked to do at the same time.</p>
   </div>;
 }

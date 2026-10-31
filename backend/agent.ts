@@ -1,7 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { models, settings, stateDir } from './state';
+import { models, sessionUsage, settings, stateDir, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
 import { logEvent } from './logbook';
 import { ENGINE_MODES, engineConnection, enginePaths, freeIdentityProblem } from './agent-engine';
@@ -15,7 +16,7 @@ import { presentedOpenCodeVersion } from './providers';
 const MAX_RETRIES = 3;
 type Mode = keyof typeof ENGINE_MODES;
 type Pending = { id: string; action: string; resources: string[]; note: string };
-type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean };
+type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; turns?: Turn[] };
 const sessions = new Map<string, Session>();
 const listeners = new Map<string, Set<ServerResponse>>();
 const folders = new Map<string, { abort: AbortController; ready: Promise<void> }>();
@@ -65,7 +66,7 @@ function watchFolder(folder: string) {
 }
 function session(id: string, folder = '') {
   let s = sessions.get(id);
-  if (!s) { s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0 }; sessions.set(id, s); }
+  if (!s) { s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0, stepFiles: new Set() }; sessions.set(id, s); }
   if (folder && !s.folder) s.folder = folder;
   return s;
 }
@@ -99,7 +100,11 @@ function onEvent(e: any, folder: string) {
   }
   if (e.type === 'permission.replied') s.pending.delete(String(d.requestID));
   if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; s.busy = true; }
-  if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) s.busy = false;
+  if (e.type === 'session.step.ended' && Array.isArray(d.files)) for (const f of d.files) if (typeof f === 'string' && f) s.stepFiles.add(f);
+  if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) {
+    s.busy = false;
+    if (s.stepFiles.size) recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`));
+  }
   publish(sid, e);
   // The engine retries a failing model request for a long time on its own; after a few tries the turn is stopped and the page told why,
   // so the user can wait, resume or pick another model. A tool action that already ran is never repeated by this.
@@ -109,6 +114,51 @@ function onEvent(e: any, folder: string) {
     publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused, status: d.error?.status } });
     logEvent('warn', 'agent', `Agent session paused after ${s.retries} failed model requests: ${s.paused}`);
   }
+}
+
+// --- Changes and undo ---
+// What each turn changed, kept per session in the agent's folder so it outlives a restart: the files the engine's steps reported, the
+// patch from its diff of the turn, and a hash of every changed file as the agent left it. Undo compares the files with those hashes first,
+// so it never overwrites a change made after the agent's (by the user, an editor or another program).
+type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after: string | null };
+type Turn = { message: string; at: number; files: FileChange[] };
+const enc = encodeURIComponent;
+const turnsFile = (sid: string) => path.join(enginePaths().root, 'turns', `${sid.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
+function loadTurns(s: Session): Turn[] { if (!s.turns) { try { const v = JSON.parse(readFileSync(turnsFile(s.id), 'utf8')); s.turns = Array.isArray(v) ? v : []; } catch { s.turns = []; } } return s.turns!; }
+function saveTurns(s: Session) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(s.turns || [])); }
+const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch { return null; } };
+const publicTurn = (t: Turn) => ({ message: t.message, at: t.at, files: t.files.map(({ after, ...f }) => f) });
+// The engine's diff route answers for the latest turn that changed something, so a turn that changed nothing could be handed the previous
+// turn's files: which files a turn changed comes from its own steps, and only the patches from the diff.
+async function recordTurn(s: Session) {
+  const changed = [...s.stepFiles]; s.stepFiles.clear();
+  const [diff, ctx] = await Promise.all([engine('GET', `/api/session/${enc(s.id)}/diff`), engine('GET', `/api/session/${enc(s.id)}/context`)]);
+  const message = [...(Array.isArray(ctx) ? ctx : [])].reverse().find((m: any) => m?.type === 'user')?.id; if (!message) return;
+  const byFile = new Map<string, any>((Array.isArray(diff) ? diff : []).filter((f: any) => f?.file).map((f: any) => [String(f.file), f]));
+  const files: FileChange[] = changed.map(file => { const f = byFile.get(file) || {}; return { file, status: String(f.status || 'modified'), additions: Number(f.additions) || 0, deletions: Number(f.deletions) || 0, patch: String(f.patch || '').slice(0, 200000), after: hashOf(s.folder, file) }; });
+  const turns = loadTurns(s); const known = turns.find(t => t.message === message);
+  // A message can take more than one run (sent again after a pause): its record keeps every file, with the newest state of each.
+  const turn = known ? Object.assign(known, { at: Date.now(), files: [...known.files.filter(f => !files.some(n => n.file === f.file)), ...files] }) : { message, at: Date.now(), files };
+  if (!known) turns.push(turn);
+  saveTurns(s); publish(s.id, { type: 'agent.changes', data: { sessionID: s.id, turn: publicTurn(turn) } });
+}
+async function undoTurn(s: Session, message: string) {
+  if (s.busy) throw new GatewayError('The agent is working. Stop it or wait until it is done, then undo.', 409, 'agent_busy');
+  const turns = loadTurns(s); const from = turns.findIndex(t => t.message === message);
+  if (from < 0) throw new GatewayError('Polygate has no recorded changes for that turn.', 404, 'agent_undo_unknown');
+  const latest = new Map<string, string | null>(); for (const t of turns) for (const f of t.files) latest.set(f.file, f.after);
+  // Read before staging: the engine writes a staged undo into the files at once (and puts them back when the stage is cleared).
+  const now = new Map([...latest.keys()].map(file => [file, hashOf(s.folder, file)]));
+  const staged = await engine('POST', `/api/session/${enc(s.id)}/revert/stage`, { messageID: message, files: true });
+  const files: string[] = (Array.isArray(staged?.files) ? staged.files : []).map((f: any) => String(f.file));
+  const conflicts = files.flatMap(file => !latest.has(file) ? [{ file, reason: 'Polygate has no record of how the agent left this file.' }]
+    : now.get(file) !== latest.get(file) ? [{ file, reason: 'It changed after the agent last changed it.' }] : []);
+  if (conflicts.length) { await engine('DELETE', `/api/session/${enc(s.id)}/revert`).catch(() => {}); return { conflicts }; }
+  await engine('POST', `/api/session/${enc(s.id)}/revert/commit`);
+  s.turns = turns.slice(0, from); saveTurns(s);
+  publish(s.id, { type: 'agent.undone', data: { sessionID: s.id, message, files } });
+  logEvent('info', 'agent', `Agent turn undone: ${files.length} file(s) restored`);
+  return { files };
 }
 
 // --- What the page asks for ---
@@ -142,14 +192,18 @@ async function clearSavedPermissions() {
   for (const s of saved) await engine('DELETE', `/api/permission/saved/${encodeURIComponent(s.id)}`);
   if (saved.length) logEvent('warn', 'agent', `Removed ${saved.length} permission rule(s) saved in the agent engine (${saved.map(s => `${s.action}: ${s.resource}`).join(', ')}); Polygate asks every time unless a session allows it`);
 }
+function checkEffort(entry: ReturnType<typeof agentModels>[number] | undefined, raw: unknown) {
+  const effort = raw === undefined || raw === '' ? '' : String(raw);
+  if (effort && !(entry?.efforts || []).includes(effort)) throw new GatewayError(entry?.reasoning ? `Effort is one of: ${EFFORTS.join(', ')}.` : 'That model does not take a reasoning effort.', 400, 'agent_effort');
+  return effort;
+}
 async function createSession(b: any) {
   if (!engineConnection()) throw new GatewayError('Start the agent engine first.', 409, 'agent_engine_not_running');
   const folder = checkFolder(b.folder); const mode = checkMode(b.mode); const model = String(b.model || '');
   const list = await engine('GET', `/api/model${q(folder)}`); const known = (Array.isArray(list) ? list : []).some((m: any) => m.providerID === 'polygate' && m.id === model);
   if (!known) throw new GatewayError('The agent engine does not have that model. Pick one from the list, or start the engine again after the catalog changed.', 400, 'agent_model');
   const entry = agentModels().find(m => m.id === model); if (entry?.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
-  const effort = b.effort === undefined || b.effort === '' ? '' : String(b.effort);
-  if (effort && !(entry?.efforts || []).includes(effort)) throw new GatewayError(entry?.reasoning ? `Effort is one of: ${EFFORTS.join(', ')}.` : 'That model does not take a reasoning effort.', 400, 'agent_effort');
+  const effort = checkEffort(entry, b.effort);
   await clearSavedPermissions();
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
@@ -178,7 +232,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session' && method === 'GET') {
     const s = await known(url.searchParams.get('id'));
     const [info, messages] = await Promise.all([engine('GET', `/api/session/${encodeURIComponent(s.id)}`), engine('GET', `/api/session/${encodeURIComponent(s.id)}/context`)]);
-    return json(res, 200, { session: summary(info), messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy });
+    return json(res, 200, { session: summary(info), messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy, usage: sessionUsage(s.id) });
   }
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
     const b = await readJson(req, 1024 * 1024); const s = await known(b.id); const text = String(b.text || '');
@@ -199,6 +253,29 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
       for (const other of [...s.pending.values()]) if (keyOf(other.action, other.resources) === key) { s.pending.delete(other.id); await reply(s.id, other.id, 'once'); publish(s.id, { type: 'agent.approval.auto', data: { sessionID: s.id, requestID: other.id, action: other.action, resources: other.resources } }); }
     }
     return json(res, 200, { ok: true });
+  }
+  if (pathname === '/admin/agent/session/changes' && method === 'GET') { const s = await known(url.searchParams.get('id')); return json(res, 200, { turns: loadTurns(s).map(publicTurn) }); }
+  if (pathname === '/admin/agent/session/undo' && method === 'POST') {
+    const b = await readJson(req); const s = await known(b.id); const out = await undoTurn(s, String(b.message || ''));
+    if (out.conflicts) return json(res, 409, { error: { type: 'agent_undo_conflict', message: `Nothing was undone. ${out.conflicts.map(c => `${c.file}: ${c.reason}`).join(' ')} Undoing would overwrite that.` }, conflicts: out.conflicts });
+    return json(res, 200, { ok: true, files: out.files });
+  }
+  // Another model for a session, typically one that is paused because its model keeps failing. Same checks as a new session.
+  if (pathname === '/admin/agent/session/model' && method === 'POST') {
+    const b = await readJson(req); const s = await known(b.id); const model = String(b.model || '');
+    const entry = agentModels().find(m => m.id === model);
+    if (!entry) throw new GatewayError('The agent cannot use that model: it is unknown, cannot call tools, or its provider is switched off.', 400, 'agent_model');
+    if (entry.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
+    const effort = checkEffort(entry, b.effort);
+    const list = await engine('GET', `/api/model${q(s.folder)}`);
+    if (!(Array.isArray(list) ? list : []).some((m: any) => m.providerID === 'polygate' && m.id === model)) throw new GatewayError('The agent engine does not have that model. Start the engine again after the catalog changed.', 400, 'agent_model');
+    await engine('POST', `/api/session/${enc(s.id)}/model`, { model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) } });
+    s.paused = undefined; s.retries = 0; return json(res, 200, { ok: true });
+  }
+  if (pathname === '/admin/agent/session/rename' && method === 'POST') {
+    const b = await readJson(req); const s = await known(b.id); const title = String(b.title || '').trim().slice(0, 120);
+    if (!title) throw new GatewayError('Give the session a name.', 400);
+    await engine('PATCH', `/api/session/${enc(s.id)}`, { title }); return json(res, 200, { ok: true, title });
   }
   if (pathname === '/admin/agent/session/cancel' && method === 'POST') { const s = await known((await readJson(req)).id); await engine('POST', `/api/session/${encodeURIComponent(s.id)}/interrupt`); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/session/mode' && method === 'POST') {

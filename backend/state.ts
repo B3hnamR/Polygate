@@ -66,6 +66,9 @@ db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS models (id TEXT PRI
 if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='fault'))db.exec('ALTER TABLE requests ADD COLUMN fault INTEGER NOT NULL DEFAULT 0; UPDATE requests SET fault=1 WHERE status>=500 OR status=429;');
 // detail is the request-shape record (sizes, counts, header names, upstream answer; no content) described in diagnostics.ts.
 if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='detail'))db.exec('ALTER TABLE requests ADD COLUMN detail TEXT;');
+// session is the agent session a request belongs to (agent key only), for the Agent page's per-session usage.
+if(!(db.query('PRAGMA table_info(requests)').all() as {name:string}[]).some(c=>c.name==='session'))db.exec('ALTER TABLE requests ADD COLUMN session TEXT;');
+db.exec('CREATE INDEX IF NOT EXISTS requests_session ON requests(session) WHERE session IS NOT NULL;');
 // The request log keeps a week. This table keeps one row per day, model and route for 400 days, so usage over months stays on the Usage page.
 // Days are UTC days. A new table is filled from the requests that are still in the log.
 db.exec('CREATE TABLE IF NOT EXISTS usage_daily (day INTEGER NOT NULL, model TEXT NOT NULL, route TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0, ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model, route));');
@@ -89,7 +92,7 @@ export function saveModel(m: Model) { models.set(m.id, m); db.query('INSERT OR R
 export function removeModels(providerId: string) { for (const [id, m] of models) if (m.providerId === providerId) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); } }
 let lastPrune = 0;
 export function record(row: LogRow) {
-  db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null);
+  db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail,session) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null,row.session||null);
   db.query('INSERT INTO usage_daily (day,model,route,requests,errors,input,output,ms) VALUES (?,?,?,1,?,?,?,?) ON CONFLICT(day,model,route) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 86400000), row.model, row.route || '', row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
   db.query('INSERT INTO usage_keys_daily (day,key,requests,errors,input,output,ms) VALUES (?,?,1,?,?,?,?) ON CONFLICT(day,key) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 86400000), row.keyId || '', row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
   if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM usage_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM usage_keys_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
@@ -97,6 +100,12 @@ export function record(row: LogRow) {
     db.query('DELETE FROM requests WHERE time <= (SELECT time FROM requests ORDER BY time DESC LIMIT 1 OFFSET 100000)').run();
     // Failures keep their shape record for the whole retention window; successes only the latest 50, as a baseline to compare with.
     db.exec('UPDATE requests SET detail=NULL WHERE detail IS NOT NULL AND status<400 AND id NOT IN (SELECT id FROM requests WHERE detail IS NOT NULL AND status<400 ORDER BY time DESC LIMIT 50)'); }
+}
+// One agent session's model requests, from the request log (kept a week): how many, how many failed, tokens, and the routes they took.
+export function sessionUsage(session: string) {
+  const t = db.query('SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END),0) errors, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output, MAX(time) last FROM requests WHERE session=?').get(session) as any;
+  const routes = (db.query('SELECT route, COUNT(*) n FROM requests WHERE session=? GROUP BY route ORDER BY n DESC, MAX(time) DESC').all(session) as any[]).map(r => ({ route: String(r.route || ''), requests: Number(r.n) }));
+  return { requests: Number(t?.n || 0), errors: Number(t?.errors || 0), input: Number(t?.input || 0), output: Number(t?.output || 0), last: Number(t?.last || 0), routes };
 }
 export function logs(limit = 150) { return db.query('SELECT id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,(detail IS NOT NULL) AS hasDetail FROM requests ORDER BY time DESC LIMIT ?').all(limit) as LogRow[]; }
 export function requestDetail(id: string) { const r = db.query('SELECT id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,detail FROM requests WHERE id=?').get(id) as any; if (!r) return undefined; const { detail, ...row } = r; return { ...row, detail: detail ? JSON.parse(detail) : null }; }

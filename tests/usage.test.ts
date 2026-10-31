@@ -19,6 +19,15 @@ test('usage groups requests by day, model and route, and fills idle days with ze
 test('usage keeps counting after the request log is pruned', () => {
   const before = usage(30).totals.requests; db.exec('DELETE FROM requests'); expect(usage(30).totals.requests).toBe(before);
 });
+test('an agent session\'s usage comes from the request log: requests, failures, tokens and the routes it went through', async () => {
+  const { sessionUsage } = await import('../backend/state');
+  for (const [status, route, ms] of [[200, 'Direct connection', 100], [500, 'Relay one', 200], [200, 'Relay one', 300]] as const) record({ ...row(0, 'a/one', route, status, 10, 20, ms), session: 'ses_usage_test' });
+  record({ ...row(0, 'a/one', 'Direct connection', 200), session: 'ses_other' });
+  const u = sessionUsage('ses_usage_test');
+  expect(u).toMatchObject({ requests: 3, errors: 1, input: 30, output: 60 });
+  expect(u.routes).toEqual([{ route: 'Relay one', requests: 2 }, { route: 'Direct connection', requests: 1 }]);
+  expect(sessionUsage('ses_none')).toMatchObject({ requests: 0, routes: [] });
+});
 test('usage also groups by client key: the agent key by its name, and a deleted key or no key for what they are', async () => {
   const { settings } = await import('../backend/state');
   db.exec('DELETE FROM usage_keys_daily');

@@ -12,8 +12,23 @@ export type Item =
   | { kind: 'text'; key: string; text: string }
   | { kind: 'reasoning'; key: string; text: string; done: boolean }
   | { kind: 'tool'; key: string; name: string; input?: any; status: ToolStatus; output?: string; error?: string }
-  | { kind: 'note'; key: string; tone: 'info' | 'warn' | 'bad'; text: string };
+  | { kind: 'note'; key: string; tone: 'info' | 'warn' | 'bad'; text: string }
+  | { kind: 'changes'; key: string; message: string; files: FileChange[] };
 export type Approval = { id: string; action: string; resources: string[]; note: string };
+export type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string };
+export type Turn = { message: string; at: number; files: FileChange[] };
+
+// A turn's changed files go at the end of that turn: just before the next message the user sent, or at the end.
+export function withChanges(items: Item[], turns: Turn[]): Item[] {
+  let out: Item[] = items.filter(i => i.kind !== 'changes');
+  for (const t of turns) {
+    const card: Item = { kind: 'changes', key: `changes:${t.message}`, message: t.message, files: t.files };
+    const at = out.findIndex(i => i.key === t.message);
+    const next = at < 0 ? -1 : out.findIndex((i, n) => n > at && i.kind === 'user');
+    out = next < 0 ? [...out, card] : [...out.slice(0, next), card, ...out.slice(next)];
+  }
+  return out;
+}
 
 const textOf = (content: unknown) => Array.isArray(content) ? content.map((c: any) => typeof c?.text === 'string' ? c.text : '').join('') : typeof content === 'string' ? content : '';
 
@@ -66,6 +81,12 @@ export function applyEvent(items: Item[], e: any): Item[] {
     case 'session.execution.failed': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `failed:${e.id || items.length}`, tone: 'bad', text: d.error?.message ? `This turn failed: ${d.error.message}` : 'This turn failed.' }];
     case 'session.execution.interrupted': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `stopped:${e.id || items.length}`, tone: 'info', text: 'Stopped.' }];
     case 'session.agent.selected': return AGENT_MODES[d.agent] ? [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: 'info', text: `Mode: ${modeLabel(AGENT_MODES[d.agent])}` }] : items;
+    // Polygate's record of what a turn changed (at the end of the turn; again, merged, if the same message runs once more).
+    case 'agent.changes': {
+      const t = d.turn; if (!t?.message) return items;
+      const key = `changes:${t.message}`; const card: Item = { kind: 'changes', key, message: t.message, files: t.files || [] };
+      return items.some(x => x.key === key) ? items.map(x => x.key === key ? card : x) : [...items, card];
+    }
     default: return items;
   }
 }

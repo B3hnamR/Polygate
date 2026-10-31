@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { fromHistory, applyEvent, approvalTitle, toolSubject, type Item } from '../src/agent-logic';
+import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, type Item } from '../src/agent-logic';
 // The Agent page's transcript, from a session's history and its live events (shapes as OpenCode 2.0.32 sends them).
 
 test('history becomes the transcript: messages, reasoning, tools with their result, and stops', () => {
@@ -48,6 +48,21 @@ test('retries keep one note that a new turn clears; stops, failures, auto-approv
   items = applyEvent(items, { id: 'e3', type: 'session.agent.selected', data: { agent: 'polygate-accept-edits' } });
   expect(items.map(i => (i as any).text)).toEqual(['Allowed for this session: npm test', 'This turn failed: boom', 'Stopped.', 'Mode: Accept edits']);
   expect(applyEvent(items, { type: 'server.heartbeat', data: {} })).toBe(items);
+});
+
+test('each turn\'s changed files sit at the end of that turn, from history and live', () => {
+  const items = fromHistory([
+    { id: 'u1', type: 'user', text: 'first' }, { id: 'a1', type: 'assistant', content: [{ type: 'text', text: 'did one' }] },
+    { id: 'u2', type: 'user', text: 'second' }, { id: 'a2', type: 'assistant', content: [{ type: 'text', text: 'did two' }] },
+  ]);
+  const files = (file: string) => [{ file, status: 'modified', additions: 1, deletions: 0, patch: '+x' }];
+  const merged = withChanges(items, [{ message: 'u1', at: 1, files: files('a.js') }, { message: 'u2', at: 2, files: files('b.js') }, { message: 'gone', at: 3, files: files('c.js') }]);
+  expect(merged.map(i => i.kind === 'changes' ? `changes:${(i as any).files[0].file}` : (i as any).text)).toEqual(['first', 'did one', 'changes:a.js', 'second', 'did two', 'changes:b.js', 'changes:c.js']);
+  expect(withChanges(merged, []).some(i => i.kind === 'changes')).toBe(false);
+  let live: Item[] = [{ kind: 'user', key: 'u3', text: 'third' }];
+  live = applyEvent(live, { type: 'agent.changes', data: { turn: { message: 'u3', files: files('d.js') } } });
+  live = applyEvent(live, { type: 'agent.changes', data: { turn: { message: 'u3', files: [...files('d.js'), ...files('e.js')] } } });
+  expect(live.filter(i => i.kind === 'changes').map(i => (i as any).files.length)).toEqual([2]);
 });
 
 test('approval cards and tool lines say what a request is about', () => {

@@ -2,8 +2,10 @@
 // agent controller use, answered from the configuration Polygate wrote. FAKE_OPENCODE_MODE makes it misbehave the way a real engine could;
 // a file named by FAKE_OPENCODE_CRASH_FILE makes it exit once it has answered the self-test (once: the file is removed), so a slow machine
 // cannot turn the crash into a failed start. FAKE_OPENCODE_SAVED=1 starts it with one saved permission, the kind OpenCode's "always" leaves.
-// Like the real engine, answers are wrapped as {data: …} except /api/info and /api/config. Two routes exist for tests only: POST /test/emit sends an event to the folder's event streams, GET /test/calls lists what it was asked.
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+// Like the real engine, answers are wrapped as {data: …} except /api/info and /api/config. Three routes exist for tests only: POST /test/session
+// sets what a session's diff, staged undo and undo are. Like the real engine, staging an undo already writes the files (the given
+// contents) and clearing the stage puts them back; committing keeps them; POST /test/emit sends an event to the folder's event streams, GET /test/calls lists what it was asked.
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 const args = process.argv.slice(2); const port = Number(args[args.indexOf('--port') + 1]);
 writeFileSync(path.join(process.cwd(), 'fake-env.json'), JSON.stringify({ args, env: process.env }));
@@ -14,6 +16,8 @@ const expected = 'Basic ' + Buffer.from('opencode:' + (process.env.OPENCODE_PASS
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const calls: { method: string; path: string; body: any }[] = [];
 const sessions = new Map<string, any>(); const prompts = new Map<string, string[]>(); let next = 0;
+const scripted = new Map<string, { diff?: any[]; stage?: any[]; revert?: { file: string; content: string | null }[] }>();
+const staged = new Map<string, { file: string; content: string | null }[]>();
 let saved = process.env.FAKE_OPENCODE_SAVED === '1' ? [{ id: 'psv_planted', projectID: 'p', action: 'shell', resource: 'node *' }] : [];
 const streams = new Set<{ directory: string; send: (text: string) => void }>();
 const broadcast = (event: any, directory: string) => { for (const s of streams) if (s.directory === directory) s.send(`data: ${JSON.stringify({ id: 'evt_' + ++next, created: Date.now(), location: { directory }, ...event })}\n\n`); };
@@ -54,6 +58,19 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
   if (m) {
     const [, id, rest] = m; if (!sessions.has(id)) return json({ _tag: 'SessionNotFound', message: 'Session not found' }, 404);
     if (!rest && req.method === 'GET') return json({ data: sessions.get(id) });
+    if (!rest && req.method === 'PATCH') { Object.assign(sessions.get(id), { title: body.title }); return json({ data: sessions.get(id) }); }
+    if (rest === 'diff') return json({ data: scripted.get(id)?.diff || [] });
+    if (rest === 'revert/stage') {
+      const kept: { file: string; content: string | null }[] = [];
+      for (const f of scripted.get(id)?.revert || []) {
+        const file = path.join(folderOf(id), f.file); kept.push({ file, content: existsSync(file) ? readFileSync(file, 'utf8') : null });
+        if (f.content === null) rmSync(file, { force: true }); else { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, f.content); }
+      }
+      staged.set(id, kept);
+      return json({ data: { messageID: body.messageID, snapshot: 'snap', files: scripted.get(id)?.stage || [] } });
+    }
+    if (rest === 'revert' && req.method === 'DELETE') { for (const k of staged.get(id) || []) { if (k.content === null) rmSync(k.file, { force: true }); else writeFileSync(k.file, k.content); } staged.delete(id); return new Response(null, { status: 204 }); }
+    if (rest === 'revert/commit') { staged.delete(id); return new Response(null, { status: 204 }); }
     if (rest === 'context') return json({ data: (prompts.get(id) || []).map((text, i) => ({ id: `msg_${id}_${i}`, type: 'user', text })) });
     if (rest === 'prompt') { prompts.set(id, [...(prompts.get(id) || []), body.text]); broadcast({ type: 'session.execution.started', data: { sessionID: id } }, folderOf(id)); return json({ data: { id: 'msg_' + ++next } }); }
     if (rest === 'interrupt') { broadcast({ type: 'session.execution.interrupted', data: { sessionID: id } }, folderOf(id)); return json({ data: { interrupted: true } }); }
@@ -64,6 +81,7 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
   }
   if (p === '/test/emit') { broadcast(body.event, body.directory || folderOf(body.event?.data?.sessionID)); return json({ ok: true }); }
   if (p === '/test/calls') return json(calls);
+  if (p === '/test/session') { scripted.set(body.sessionID, { ...scripted.get(body.sessionID), ...body }); return json({ ok: true }); }
   return new Response('not found', { status: 404 });
 } });
 function crashSoon() { const crash = process.env.FAKE_OPENCODE_CRASH_FILE; if (crash && existsSync(crash)) { rmSync(crash); setTimeout(() => process.exit(3), 300); } }

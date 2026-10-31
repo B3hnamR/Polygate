@@ -354,6 +354,17 @@ test('The agent is refused OpenCode Free, with the reason, while the bridge pres
     }finally{__setPresentedVersion();settings.keys=settings.keys.filter(k=>k.id!==agent.id);}
   });
 });
+// Per-session usage on the Agent page: the engine names its session in every model request; the gateway keeps it for the agent's key only.
+test('The agent\'s requests are recorded with the agent session they belong to, and no other client\'s are',async()=>{await scoped([remoteProvider()],async()=>{
+  freshModel('remote','plain');
+  const agent={id:'agent-session-test',name:'Polygate Agent',value:'pg_'+'d'.repeat(48),enabled:true,limit:4,agent:true};settings.keys.push(agent);
+  const ask=(key:string)=>fetch(base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+key,'content-type':'application/json','x-opencode-session-id':'ses_core_test'},body:JSON.stringify({model:'remote/plain',stream:true,messages:[{role:'user',content:'x'}]})});
+  try{
+    const a=await ask(agent.value);await a.text();const b=await ask(settings.keys[0].value);await b.text();
+    const rows=db.query('SELECT keyId,session FROM requests WHERE keyId IN (?,?) ORDER BY time DESC LIMIT 2').all(agent.id,settings.keys[0].id) as any[];
+    expect(rows.find(r=>r.keyId===agent.id).session).toBe('ses_core_test');expect(rows.find(r=>r.keyId===settings.keys[0].id).session).toBeNull();
+  }finally{settings.keys=settings.keys.filter(k=>k.id!==agent.id);}
+});});
 test('A request that succeeds on its retry is not recorded as a model fault',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','recover');recoverCalls=0;settings.retries=1;
   const r=await chat('remote/recover',{stream:false});await r.text();expect(r.status).toBe(200);
