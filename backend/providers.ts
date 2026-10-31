@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { stateDir, settings, models, saveModel, usagePenalties } from './state';
+import { stateDir, settings, models, saveModel, usagePenalties, redactError } from './state';
 import { networkFetch, routeContext, routeForProvider, providerRoutes } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
@@ -25,6 +25,9 @@ export function stopBridge(){bridgeServer?.stop(true);}
 export function codingScore(id:string){let score=50;if(/coder|code|deepseek|qwen|glm/i.test(id))score+=15;if(/reason|thinking/i.test(id))score+=8;if(/flash|mini|light/i.test(id))score-=4;const n=Number(id.match(/(\d+)b(?:\b|-)/i)?.[1]);if(n>=70)score+=10;return score;}
 export function rankedModels(){const penalty=usagePenalties();return [...models.values()].filter(m=>settings.providers.some(p=>p.id===m.providerId&&p.enabled)).sort((a,b)=>{const ca=a.cooldownUntil>Date.now()?1:0,cb=b.cooldownUntil>Date.now()?1:0;return ca-cb||a.priority-b.priority||(b.score-(penalty.get(b.id)||0))-(a.score-(penalty.get(a.id)||0))||(a.latency||1e9)-(b.latency||1e9);});}
 const ABSENT='Absent from latest provider catalog';
+// Providers whose catalog could not be read on the last refresh, with the reason; a successful refresh clears the entry.
+const catalogErrors=new Map<string,string>();
+export const catalogProblems=()=>[...catalogErrors].map(([providerId,error])=>({providerId,error}));
 export async function discover(){
   if(discovery)return discovery;
   discovery=(async()=>{await initBridge();const errors:string[]=[];
@@ -44,14 +47,17 @@ export async function discover(){
         if(!found.length)throw new Error(p.kind==='opencode'?'List this OpenCode server\'s provider/model IDs in Model IDs':'Provider returned an empty catalog; existing models were kept');
         const seen=new Set<string>();
         for(const x of found){const upstreamId=x.id||x;if(typeof upstreamId!=='string')continue;const id=p.id+'/'+upstreamId;seen.add(id);const prior=models.get(id);const facts=p.kind==='free'?bridge.identity.getModelFacts(upstreamId):null;
-          const info={name:x.name||upstreamId,context:x.context_length||facts?.context||0,output:facts?.maxOutput||x.maxOutput||0,reasoning:!!(facts?.reasoning||x.reasoning),tools:x.tool_call!==false};
+          // Whether it takes images is known only when the catalog lists its input kinds; otherwise it stays unknown (and never excludes the model).
+          const inputs=x.modalities?.input??x.architecture?.input_modalities??x.input_modalities;const images=Array.isArray(inputs)?inputs.map(String).includes('image'):undefined;
+          const info={name:x.name||upstreamId,context:x.context_length||facts?.context||0,output:facts?.maxOutput||x.maxOutput||0,reasoning:!!(facts?.reasoning||x.reasoning),tools:x.tool_call!==false,...(images!==undefined?{images}:{})};
           if(!prior){saveModel({id,upstreamId,providerId:p.id,...info,state:'unchecked',latency:0,score:codingScore(id),priority:p.kind==='kilo'?150:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});continue;}
           // Catalog facts refresh each pass; priority, score and measured health stay. A model that returns to the catalog is retried.
           const returned=prior.state==='unavailable'&&prior.error===ABSENT;
           saveModel({...prior,...info,context:info.context||prior.context,output:info.output||prior.output,reasoning:info.reasoning||prior.reasoning,...(returned?{state:'unchecked' as const,error:''}:{})});
         }
         if(authoritative)for(const m of models.values())if(m.providerId===p.id&&!seen.has(m.id)){m.state='unavailable';m.error=ABSENT;saveModel(m);}
-      }catch(e){errors.push(p.name+': '+String(e));logEvent('warn','models',`${p.name} catalog could not be read: ${String(e)}`,{provider:p.id});}
+        catalogErrors.delete(p.id);
+      }catch(e){catalogErrors.set(p.id,redactError(String(e)).slice(0,240));errors.push(p.name+': '+String(e));logEvent('warn','models',`${p.name} catalog could not be read: ${String(e)}`,{provider:p.id});}
     }
     const listed=[...models.values()].filter(m=>m.state!=='unavailable'&&settings.providers.some(p=>p.id===m.providerId&&p.enabled)).length;
     logEvent('info','models',`Model catalog refreshed: ${listed} model(s) listed`,{providers:settings.providers.filter(p=>p.enabled).map(p=>p.name),errors:errors.length||undefined});

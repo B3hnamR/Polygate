@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Copy, Loader2, Maximize2, Pause, Pin, PinOff, Play, Power, PowerOff } from 'lucide-react';
 import { api } from './api';
-import { Badge, Logo, Select, ms, usePoll, type Snapshot } from './ui';
+import { Badge, Logo, Select, ms, usePoll, gatewayState, type Snapshot } from './ui';
 import { clock, firstSentence, routeOptionLabel, warpLabel } from './mini-logic';
 
 type Metrics = { tokensPerSecond: number };
@@ -18,7 +18,7 @@ export function MiniView({ data, base, apiKey, busy, copy, notice, onToggle, onR
   // The route in use stays in the list even when it has been switched off, so it shows its name and not a raw id.
   const routes = data.settings.routes.filter(r => r.enabled || r.id === data.settings.routeId);
   const { total, success, latency } = data.stats; const rate = total ? Math.round(100 * success / total) : null;
-  const online = data.settings.enabled;
+  const online = data.settings.enabled; const gs = gatewayState(data);
   // Connecting can take a while (it may register first), so the button shows progress and the row polls faster meanwhile.
   async function toggleWarp() {
     setWorking(true);
@@ -33,7 +33,7 @@ export function MiniView({ data, base, apiKey, busy, copy, notice, onToggle, onR
       <button className="icon-button" aria-label="Open the full window" title="Back to the full window (Ctrl+Shift+M)" onClick={onFull}><Maximize2 size={15} /></button>
     </header>
     <section className="mini-card" aria-label="Gateway status">
-      <div className="mini-line"><Badge state={online ? 'running' : 'neutral'}>{online ? 'Gateway online' : 'Paused'}</Badge><span className="toolbar-spacer" />
+      <div className="mini-line"><Badge state={gs.badge}>{gs.label}</Badge><span className="toolbar-spacer" />
         <button className="mini-button" disabled={busy} onClick={onToggle}>{online ? <Pause size={13} /> : <Play size={13} />}{online ? 'Pause' : 'Resume'}</button></div>
       <div className="mini-field"><span className="subtle">Route</span>
         <Select aria-label="Route for requests" value={data.settings.routeId} onChange={id => { if (id === 'warp' && !connected && hasWarp) notice('WARP is not connected yet: press Connect first.', 'error'); onRoute(id); }}>
@@ -46,7 +46,7 @@ export function MiniView({ data, base, apiKey, busy, copy, notice, onToggle, onR
         {connecting && warp.progress?.message && <p className="subtle mini-note">{warp.progress.message}</p>}
         {!connecting && !connected && warp.lastError && <p className="mini-warn" title={warp.lastError}>{firstSentence(warp.lastError)}</p>}
       </div>}
-      {online && !data.ready.ready && <p className="mini-warn">Not ready: no model or route can answer right now.</p>}
+      {gs.state === 'attention' && <p className="mini-warn">{data.ready.issues[0]?.message || 'No model or route can answer right now.'}</p>}
     </section>
     <section className="mini-stats" aria-label="Last 24 hours">
       <div className="mini-stat"><span>Requests</span><strong>{total.toLocaleString()}</strong></div>

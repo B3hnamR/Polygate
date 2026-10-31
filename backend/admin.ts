@@ -17,6 +17,7 @@ import { createBackup, restoreBackup } from './backup';
 import { notices, markAllRead, clearNotices, testWebhook } from './notifications';
 import { httpsStatus, httpsApply, httpsDisable, httpsRenew } from './https';
 import { serverConfig, requirePassword } from './auth';
+import { previewRouting } from './plan';
 import { GatewayError } from './queue';
 import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
@@ -145,6 +146,14 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     persist();return json(res,200,{ok:true,chain});
   }
   if(pathname==='/admin/chains/delete'&&method==='POST'){const b=await readJson(req);if(!settings.chains?.some(c=>c.id===b.id))throw new GatewayError('Chain not found',404);settings.chains=settings.chains.filter(c=>c.id!==b.id);persist();return json(res,200,{ok:true});}
+  // Preview routing: which models a request would try, in order, and why each was skipped, without sending anything. It reads the current settings
+  // and the health Polygate already knows; it does not prove the provider will accept the next real request.
+  if(pathname==='/admin/route-preview'&&method==='POST'){
+    const b=await readJson(req);const key=b.keyId?settings.keys.find(k=>k.id===String(b.keyId)):undefined;
+    if(b.keyId&&!key)throw new GatewayError('That client key does not exist',404);
+    const tokens=Number(b.tokens);const needs={tools:b.tools===true,images:b.images===true,tokens:Number.isFinite(tokens)&&tokens>0?Math.min(Math.round(tokens),5_000_000):0};
+    return json(res,200,previewRouting(String(b.model||'auto'),key,needs));
+  }
   if(pathname==='/admin/discover'&&method==='POST'){await discover();return json(res,200,{ok:true,count:models.size});}
   if(pathname==='/admin/identity/refresh'&&method==='POST')return json(res,200,await syncIdentity());
   if(pathname==='/admin/probe'&&method==='POST'){const b=await readJson(req);return json(res,200,await probeModel(String(b.id)));}

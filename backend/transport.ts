@@ -115,7 +115,8 @@ export function exhaustedAlternative(current:Route):Route|undefined{
 }
 // Virtual routes ("pool:<proxy>") let the pool tester send real traffic through one specific proxy without saving a route for it.
 export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id&&r.enabled);
-export function routeFor(model='', explicit='', kind?: string): Route {
+// peek: only ask which route would be chosen. The rotation does not move on, so a readiness check never changes where real requests go.
+export function routeFor(model='', explicit='', kind?: string, peek=false): Route {
   const selected=explicit||settings.routeId;
   let current=findRoute(selected);
   const rotating=settings.rotate&&!explicit;
@@ -135,7 +136,7 @@ export function routeFor(model='', explicit='', kind?: string): Route {
   }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
   // "Selected route" used to be an order here, but with the selected route outside the spread it just stuck to the first exit; it now takes turns.
-  if(settings.strategy==='round_robin'||settings.strategy==='single')return pool[cursor++%pool.length];
+  if(settings.strategy==='round_robin'||settings.strategy==='single')return pool[(peek?cursor:cursor++)%pool.length];
   // Unmeasured routes are tried first so every route gets a latency before the fastest one is locked in.
   if(settings.strategy==='fastest')return pool.find(r=>r.latency==null)||pool.reduce((best,r)=>r.latency!<best.latency!?r:best);
   return pool.find(x=>x.id===selected)||pool[0];
@@ -159,12 +160,12 @@ function whyNot(id: string, kind?: string): string {
   if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
   return `${r.name} is resting after errors${r.cooldownUntil && r.cooldownUntil > now() ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. Resume it on the Routes page if the connection is back` : ''}`;
 }
-export function routeForProvider(p: Provider, model: string): Route {
+export function routeForProvider(p: Provider, model: string, peek=false): Route {
   const set = providerRoutes(p);
-  if (!set) return routeFor(model, '', p.kind);
+  if (!set) return routeFor(model, '', p.kind, peek);
   const usable = set.ids.map(id => findRoute(id)).filter((r): r is Route => routeUsable(r, p.kind));
   if (usable.length) {
-    if (set.spread && usable.length > 1) { const at = spreadAt.get(p.id) || 0; spreadAt.set(p.id, at + 1); return usable[at % usable.length]; }
+    if (set.spread && usable.length > 1) { const at = spreadAt.get(p.id) || 0; if (!peek) spreadAt.set(p.id, at + 1); return usable[at % usable.length]; }
     return usable[0];
   }
   // Nothing in the list can take it. OpenCode Free may be allowed the backup exits; every other provider stays inside its list.

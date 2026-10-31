@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Brain, BookmarkPlus, Code2, Columns2, Copy, Eraser, Loader2, RotateCcw, Send, Square, Terminal, Trash2, Wrench } from 'lucide-react';
+import { RoutePreview } from './route-preview';
+import { Brain, BookmarkPlus, Code2, Columns2, Copy, Eraser, Eye, Loader2, RotateCcw, Send, Square, Terminal, Trash2, Wrench } from 'lucide-react';
 import { at, BASE } from './api';
 import { Button, Empty, Field, Select, Toggle, ms, type Snapshot } from './ui';
 import { Dialog } from './mcp';
@@ -110,18 +111,19 @@ function MessageView({ turn, notice }: { turn: Turn; notice: (m: string, kind?: 
   </div>;
 }
 function PaneView({ turns, running, label, picker, notice }: { turns: Turn[]; running: boolean; label: string; picker?: ReactNode; notice: (m: string, kind?: 'ok' | 'error') => void }) {
-  const end = useRef<HTMLDivElement>(null);
-  useEffect(() => { end.current?.scrollIntoView({ block: 'end' }); }, [turns]);
+  // The thread scrolls inside its own box, and only while the reader is at the bottom: scrolling up to read stays put, and a new message of their own follows.
+  const thread = useRef<HTMLDivElement>(null); const following = useRef(true);
+  useEffect(() => { const el = thread.current; if (!el) return; if (turns[turns.length - 1]?.role === 'user') following.current = true; if (following.current) el.scrollTop = el.scrollHeight; }, [turns]);
   return <section className="pg-pane" aria-label={label}>
     <header className="pg-pane-head">{picker || <strong className="mono truncate" title={label}>{label}</strong>}<span className="toolbar-spacer" />{running && <Loader2 size={14} className="spin" />}</header>
-    <div className="pg-thread" aria-live="polite">{turns.length ? turns.map((t, i) => <MessageView key={i} turn={t} notice={notice} />) : <Empty icon={Terminal} title="A response starts here">Pick a model and send a message through the actual gateway. No sample responses are generated.</Empty>}<div ref={end} /></div>
+    <div className="pg-thread" aria-live="polite" ref={thread} onScroll={e => { const el = e.currentTarget; following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}>{turns.length ? turns.map((t, i) => <MessageView key={i} turn={t} notice={notice} />) : <Empty icon={Terminal} title="A response starts here">Pick a model and send a message through the actual gateway. No sample responses are generated.</Empty>}</div>
   </section>;
 }
 export function Playground({ data, apiKey, model, setModel, refresh, notice }: { data: Snapshot; apiKey: string; model: string; setModel: (x: string) => void; refresh: () => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
   const saved = useRef(load(STORE, { protocol: 'chat' as Protocol, system: '', stream: true, compare: false, model2: 'auto:smart', params: DEFAULTS })).current;
   const [protocol, setProtocol] = useState<Protocol>(saved.protocol); const [system, setSystem] = useState(saved.system); const [stream, setStream] = useState(saved.stream);
   const [compare, setCompare] = useState(saved.compare); const [model2, setModel2] = useState(saved.model2); const [params, setParams] = useState<Params>({ ...DEFAULTS, ...saved.params });
-  const [draft, setDraft] = useState(''); const [turns, setTurns] = useState<Turn[][]>([[], []]); const [running, setRunning] = useState([false, false]); const [exporting, setExporting] = useState(false);
+  const [draft, setDraft] = useState(''); const [turns, setTurns] = useState<Turn[][]>([[], []]); const [running, setRunning] = useState([false, false]); const [previewing, setPreviewing] = useState(false); const [exporting, setExporting] = useState(false);
   const [prompts, setPrompts] = useState<{ name: string; system: string; prompt: string }[]>(() => load(PROMPTS, { list: [] as { name: string; system: string; prompt: string }[] }).list); const [picked, setPicked] = useState('');
   const controller = useRef<AbortController | null>(null); const busy = running.some(Boolean); const slots = compare ? 2 : 1;
   useEffect(() => keep(STORE, { protocol, system, stream, compare, model2, params }), [protocol, system, stream, compare, model2, params]);
@@ -154,35 +156,36 @@ export function Playground({ data, apiKey, model, setModel, refresh, notice }: {
   const history = turns[0].filter(t => !t.error && t.content).map(t => ({ role: t.role, content: t.content })); if (draft.trim()) history.push({ role: 'user', content: draft.trim() });
   const request = buildRequest(protocol, model, system, history.length ? history : [{ role: 'user', content: 'Say hello in five words.' }], params, stream);
   const chatOnly = protocol === 'chat';
-  return <div className={`pg${compare ? ' compare' : ''}`}>
+  return <div className={`pg${compare ? ' compare' : ''}${turns.some(t => t.length) ? ' has-turns' : ''}`}>
     <section className="section-block form-section pg-config">
       <div className="section-title"><Terminal size={19} /><h2>Request</h2></div>
       <Field label="Model"><Select value={model} onChange={setModel}>{modelOptions(data)}</Select></Field>
-      <Toggle checked={compare} onChange={setCompare} label="Compare two models" detail="Send each message to a second model too, side by side." />
-      {compare && <Field label="Second model"><Select value={model2} onChange={setModel2}>{modelOptions(data)}</Select></Field>}
-      <Field label="Client protocol"><Select value={protocol} onChange={v => setProtocol(v as Protocol)}><option value="chat">Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option></Select></Field>
-      <Field label="System instruction (optional)"><textarea rows={2} value={system} onChange={e => setSystem(e.target.value)} placeholder="Instructions for the model" /></Field>
-      <details className="pg-settings"><summary>Settings</summary>
-        <div className="form-grid three">
-          <Field label="Temperature" hint="Blank: the model's own."><input inputMode="decimal" value={params.temperature} onChange={e => setParam({ temperature: e.target.value })} placeholder="default" /></Field>
-          <Field label="Top P"><input inputMode="decimal" value={params.topP} onChange={e => setParam({ topP: e.target.value })} placeholder="default" /></Field>
-          <Field label="Max tokens"><input type="number" min="1" max="65536" value={params.maxTokens} onChange={e => setParam({ maxTokens: Math.max(1, Math.min(65536, +e.target.value || 1024)) })} /></Field>
-        </div>
-        <Toggle checked={stream} onChange={setStream} label="Stream the response" detail="Read text as it arrives. Upstream requests always use streaming." />
-        <Toggle checked={chatOnly && params.tool} onChange={tool => setParam({ tool })} label="Offer a sample tool" detail={chatOnly ? 'Adds a get_weather function, to see whether a model asks to call it.' : 'Chat Completions only.'} />
-        <Toggle checked={chatOnly && params.json} onChange={json => setParam({ json })} label="Ask for JSON" detail={chatOnly ? 'Sets response_format to a JSON object. Mention JSON in your message too.' : 'Chat Completions only.'} />
-      </details>
       <div className="pg-quick" aria-label="Quick tests">{QUICK.map(q => <button key={q.label} type="button" className="filter-chip" onClick={() => { setDraft(q.prompt); if (q.tool) { setProtocol('chat'); setParam({ tool: true }); } }}>{q.label}</button>)}</div>
       <Field label={turns[0].length ? 'Next message' : 'Message'}><textarea className="prompt-input" rows={6} value={draft} onChange={e => setDraft(e.target.value)} placeholder="Ask your model something…" onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); } }} /></Field>
       <div className="form-actions"><span className="subtle">{apiKey ? 'Ctrl + Enter to send' : 'No usable client key. Add one in Settings.'}</span>{busy ? <Button onClick={() => controller.current?.abort()}><Square size={14} />Cancel</Button> : <Button variant="primary" disabled={!draft.trim() || !apiKey} onClick={send}><Send size={15} />Send</Button>}</div>
       <div className="pg-saved"><Select aria-label="Saved prompts" value={picked} onChange={v => { const p = prompts.find(x => x.name === v); if (p) { setPicked(v); setSystem(p.system); setDraft(p.prompt); } }}><option value="" disabled>{prompts.length ? 'Saved prompts' : 'No saved prompts yet'}</option>{prompts.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}</Select>
         <button className="icon-button" aria-label="Save this prompt" title="Save the system instruction and message" onClick={savePrompt}><BookmarkPlus size={15} /></button><button className="icon-button" aria-label="Delete the chosen saved prompt" title="Delete the chosen saved prompt" disabled={!picked} onClick={removePrompt}><Trash2 size={15} /></button></div>
+      <details className="pg-settings pg-advanced" open={compare || undefined}><summary>Advanced: compare, protocol, system instruction, parameters</summary>
+        <Toggle checked={compare} onChange={setCompare} label="Compare two models" detail="Send each message to a second model too, side by side." />
+        {compare && <Field label="Second model"><Select value={model2} onChange={setModel2}>{modelOptions(data)}</Select></Field>}
+        <Field label="Client protocol"><Select value={protocol} onChange={v => setProtocol(v as Protocol)}><option value="chat">Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option></Select></Field>
+        <Field label="System instruction (optional)"><textarea rows={2} value={system} onChange={e => setSystem(e.target.value)} placeholder="Instructions for the model" /></Field>
+          <div className="form-grid three">
+            <Field label="Temperature" hint="Blank: the model's own."><input inputMode="decimal" value={params.temperature} onChange={e => setParam({ temperature: e.target.value })} placeholder="default" /></Field>
+            <Field label="Top P"><input inputMode="decimal" value={params.topP} onChange={e => setParam({ topP: e.target.value })} placeholder="default" /></Field>
+            <Field label="Max tokens"><input type="number" min="1" max="65536" value={params.maxTokens} onChange={e => setParam({ maxTokens: Math.max(1, Math.min(65536, +e.target.value || 1024)) })} /></Field>
+          </div>
+          <Toggle checked={stream} onChange={setStream} label="Stream the response" detail="Read text as it arrives. Upstream requests always use streaming." />
+          <Toggle checked={chatOnly && params.tool} onChange={tool => setParam({ tool })} label="Offer a sample tool" detail={chatOnly ? 'Adds a get_weather function, to see whether a model asks to call it.' : 'Chat Completions only.'} />
+          <Toggle checked={chatOnly && params.json} onChange={json => setParam({ json })} label="Ask for JSON" detail={chatOnly ? 'Sets response_format to a JSON object. Mention JSON in your message too.' : 'Chat Completions only.'} />
+      </details>
     </section>
     <div className="pg-main">
       <div className="pg-toolbar"><Columns2 size={15} className={compare ? '' : 'muted'} /><span className="subtle">{compare ? 'Comparing two models' : turns[0].length ? 'Conversation' : 'New conversation'}</span><span className="toolbar-spacer" />
-        <Button disabled={busy || !turns[0].some(t => t.role === 'user')} onClick={regenerate}><RotateCcw size={14} />Try again</Button><Button onClick={() => setExporting(true)}><Code2 size={14} />Code</Button><Button disabled={!turns[0].length && !turns[1].length} onClick={clear}><Eraser size={14} />New chat</Button></div>
+        <Button disabled={busy || !turns[0].some(t => t.role === 'user')} onClick={regenerate}><RotateCcw size={14} />Try again</Button><Button onClick={() => setExporting(true)}><Code2 size={14} />Code</Button><Button onClick={() => setPreviewing(true)}><Eye size={14} />Preview routing</Button><Button disabled={!turns[0].length && !turns[1].length} onClick={clear}><Eraser size={14} />New chat</Button></div>
       <div className="pg-panes">{Array.from({ length: slots }, (_, k) => <PaneView key={k} turns={turns[k]} running={running[k]} label={k ? model2 : model} notice={notice} picker={compare ? <Select aria-label={`Model for pane ${k + 1}`} value={k ? model2 : model} onChange={k ? setModel2 : setModel}>{modelOptions(data)}</Select> : undefined} />)}</div>
     </div>
+    {previewing && <RoutePreview data={data} model={model} tools={chatOnly && params.tool} onClose={() => setPreviewing(false)} />}
     {exporting && <ExportDialog request={request} onClose={() => setExporting(false)} notice={notice} />}
   </div>;
 }

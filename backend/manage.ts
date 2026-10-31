@@ -91,7 +91,7 @@ async function run(){
       else note(false,`HTTPS is set to ${hs.mode} but no valid certificate is active${hs.lastError?': '+hs.lastError:''}`);
       if(hs.mode!=='off'&&hs.mode!=='custom')note(hs.challengeServer,hs.challengeServer?`Port ${hs.httpPort} is open for certificate checks and the redirect`:`Port ${hs.httpPort} is not being served, so certificates cannot renew`);
       const ready=JSON.parse((await call('/readyz')).text);
-      note(!!ready.ready,ready.ready?`Ready: ${ready.models} model(s), ${ready.routes} route(s)`:`Not ready yet: ${ready.models} model(s), ${ready.routes} route(s). Open the dashboard and refresh the catalog.`);
+      note(!!ready.ready,ready.ready?`Ready: ${ready.models} model(s), ${ready.routes} route(s)`:`Not ready: ${ready.state==='paused'?'the gateway is paused':(ready.issues||[]).map((i:any)=>i.message).join(' ')||'it is still starting'} (${ready.models} model(s), ${ready.routes} route(s)).`);
     }catch(e:any){note(false,`Could not reach the gateway on this machine (${String(e.message||e).slice(0,120)}). Is the service running? Try: polygate status`);}
     console.log(lines.join('\n'));if(bad)process.exitCode=1;return;
   }

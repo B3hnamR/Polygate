@@ -13,20 +13,21 @@ import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
 import { chainFor, modelFor, AUTO_STEPS } from './chains';
 import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
+import { autoOrder, needsOf, pickCapable, type Needs } from './plan';
+import { checklist } from './checklist';
 import type { Model, ApiKey, Chain } from './types';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
 export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
 export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
 export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
 const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
-const autoOrder=(requested:string,ranked:Model[])=>requested==='auto:smart'?ranked.filter(m=>m.reasoning||m.score>=65):requested==='auto:fast'?[...ranked].sort((a,b)=>(a.latency||1e9)-(b.latency||1e9)):ranked;
 // A chain is the user's own order: its steps that are ready right now, each tried when the one before it fails. The "fallback" setting
 // does not shorten it, because the user listed these on purpose.
-function chainModels(chain:Chain,ranked:Model[]){
+function chainModels(chain:Chain,ranked:Model[],needs:Needs,skipped:string[]){
   if(!chain.enabled)throw new GatewayError(`The chain "${chain.name}" is switched off in Polygate.`,404,'model_not_found');
   const out:Model[]=[];
   for(const step of chain.models){
-    if(AUTO_STEPS.includes(step)){for(const m of autoOrder(step,ranked).slice(0,3))if(!out.includes(m))out.push(m);continue;}
+    if(AUTO_STEPS.includes(step)){for(const m of pickCapable(autoOrder(step,ranked),needs,3,skipped))if(!out.includes(m))out.push(m);continue;}
     const m=modelFor(step);if(m&&ranked.includes(m)&&!out.includes(m))out.push(m);
   }
   if(out.length)return out;
@@ -34,12 +35,14 @@ function chainModels(chain:Chain,ranked:Model[]){
   if(resting.length){const soon=Math.min(...resting.map(m=>m.cooldownUntil));throw new GatewayError(`Every model in the chain "${chain.name}" is resting. The first is back at ${resetTime(soon)}.`,429,'model_paused',Math.max(1,Math.ceil((soon-Date.now())/1000)));}
   throw new GatewayError(`None of the models in the chain "${chain.name}" can answer: they are unavailable, switched off, or not allowed for this API key.`,503,'models_unavailable');
 }
-function chosenModels(requested:string,key?:ApiKey){
+// `needs` is what the request asks of a model; models that are listed as unable to do it are passed over for auto and for the auto steps of a chain,
+// and each one passed over is added to `skipped` with its reason. A model named on purpose (a chain step, an exact model) is never swapped out.
+function chosenModels(requested:string,key:ApiKey|undefined,needs:Needs,skipped:string[]){
   const all=rankedModels();const ranked=all.filter(m=>m.state!=='unavailable'&&m.cooldownUntil<=Date.now()&&(!key?.models?.length||modelAllowed(key,m.id)));
-  const chain=chainFor(requested);if(chain)return chainModels(chain,ranked);
+  const chain=chainFor(requested);if(chain)return chainModels(chain,ranked,needs,skipped);
   if(requested==='auto'||requested==='auto:smart'||requested==='auto:fast'){
     const eligible=autoOrder(requested,ranked);
-    if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return eligible.slice(0,settings.fallback?3:1);
+    if(!eligible.length)throw new GatewayError('No models are ready. Refresh the catalog or wait for cooldowns.',503,'models_unavailable');return pickCapable(eligible,needs,settings.fallback?3:1,skipped);
   }
   const exact=models.get(requested)||all.find(m=>m.upstreamId===requested);if(!exact)throw new GatewayError('Unknown model. Use a model from /v1/models.',404,'model_not_found');
   if(!providerEnabled(exact))throw new GatewayError('Model belongs to a disabled or removed provider. Enable it in Providers.',404,'model_not_found');
@@ -65,7 +68,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const k=authenticate(req,true);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
   const requestId=crypto.randomUUID();const body=await readJson(req);let chat=toChat(body,protocol);const askedChat=chat;
   // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
-  const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const candidates=chosenModels(chat.model,k);const chain=chainFor(chat.model);const hops:string[]=[];const controller=new AbortController();(req as any).signal=controller.signal;
+  const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const needs=needsOf(chat);const skipped:string[]=[];const candidates=chosenModels(chat.model,k,needs,skipped);const chain=chainFor(chat.model);const hops:string[]=[...skipped];const controller=new AbortController();(req as any).signal=controller.signal;
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   // The deadline covers the wait for the first byte. Once an answer is streaming, only silence counts, so a long answer that is still arriving is
   // not cut off; a stream that never stops is ended after an hour.
@@ -150,7 +153,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
     if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
     if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
-    res.setHeader('x-polygate-model',used.id);if(chain){res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));}res.setHeader('x-polygate-route',encodeURIComponent(route));
+    res.setHeader('x-polygate-model',used.id);if(chain)res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));res.setHeader('x-polygate-route',encodeURIComponent(route));
     let ended=false;let firstAt=0;
     const observer=observeSse(raw=>{
       if(raw==='[DONE]'){ended=true;return;}
@@ -187,11 +190,20 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail});
     logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
-// Ready means a client request could succeed right now: enabled, at least one usable model, and at least one route that is not cooling down.
+// What could stop a client request right now, and where to fix it. `page` is the dashboard page that has the remedy.
+export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' };
+// Ready means a client request could succeed right now: not paused, a usable model, a usable client key and a route that would really be chosen
+// (the same selection real requests use, asked without moving the rotation). Paused, Starting, Ready and Needs attention are the four states.
+// `checklist` is everything worth fixing; `issues` are the ones among them that stop requests.
 export function readiness(){
-  const now=Date.now();const usableModels=[...models.values()].filter(m=>m.state!=='unavailable'&&settings.providers.some(p=>p.id===m.providerId&&p.enabled)).length;
+  const now=Date.now();const providers=settings.providers.filter(p=>p.enabled);
+  const usable=[...models.values()].filter(m=>m.state!=='unavailable'&&providers.some(p=>p.id===m.providerId));
   const routes=settings.routes.filter(r=>r.enabled&&(!r.cooldownUntil||r.cooldownUntil<now)).length;
-  return {ready:settings.enabled&&usableModels>0&&routes>0,enabled:settings.enabled,models:usableModels,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
+  const starting=process.uptime()<30&&!usable.length;
+  const items=checklist({providers,usable,starting});
+  const issues:ReadyIssue[]=items.filter(i=>i.severity==='blocking').map(i=>({code:i.id,message:i.detail,page:i.page}));
+  const state:'paused'|'starting'|'ready'|'attention'=!settings.enabled?'paused':starting&&!issues.length?'starting':issues.length?'attention':'ready';
+  return {ready:state==='ready',state,issues,checklist:items,enabled:settings.enabled,models:usable.length,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
 }
 export async function probeModel(id:string){
   const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);

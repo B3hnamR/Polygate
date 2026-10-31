@@ -257,7 +257,9 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .pg-main{display:flex;flex-direction:column;gap:12px;min-width:0}
 .pg-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .pg-panes{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}.pg.compare .pg-panes{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(max-width:1180px){.pg{grid-template-columns:minmax(0,1fr)}.pg-main{order:-1}.pg.compare .pg-panes{grid-template-columns:minmax(0,1fr)}}
+/* Below 1180px the form and the results stack. With nothing to read yet the form comes first and the empty pane stays small; once there is a conversation it comes above the next message. */
+@media(max-width:1180px){.pg{grid-template-columns:minmax(0,1fr)}.pg.has-turns .pg-main{order:-1}.pg:not(.has-turns) .pg-pane{min-height:150px}.pg.compare .pg-panes{grid-template-columns:minmax(0,1fr)}}
+.pg-advanced{margin-top:6px}.pg-advanced>*+*{margin-top:12px}
 .pg-pane{display:flex;flex-direction:column;min-height:420px;max-height:76vh;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
 .pg-pane-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)}.pg-pane-head .select{flex:1;min-width:0}
 .pg-thread{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
@@ -420,3 +422,29 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.form-grid>*{min-width:0}.form-grid input,.form-grid select,.form-grid .select{max-width:100%}
 .form-actions{flex-wrap:wrap}
 @media(max-width:570px){.form-grid,.form-grid.three{grid-template-columns:minmax(0,1fr)}.section-top,.section-toolbar{flex-wrap:wrap;row-gap:10px}}
+/* Gateway state: the amber dot and the banner that says what to fix. */
+.status-dot.attention{background:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}
+.attention-banner{display:flex;align-items:center;gap:12px;margin:18px 46px 0;padding:12px 18px;border:1px solid var(--amber);border-radius:10px;background:var(--amber-soft);color:var(--text)}.attention-banner>svg{flex:none;color:var(--amber)}.attention-banner>span{flex:1;min-width:0}.attention-banner small{color:var(--text-secondary)}
+@media(max-width:850px){.attention-banner{margin:14px 26px 0}}
+@media(max-width:570px){.attention-banner{margin:12px 16px 0;flex-wrap:wrap}}
+/* The search boxes draw no outline of their own, so the whole control shows the keyboard focus. */
+.search:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:4px;border-radius:6px}
+/* Settings: where a setting takes effect, and a row of links to its sections. */
+.apply-tag{display:inline-block;margin-left:10px;padding:2px 9px;border:1px solid var(--line);border-radius:999px;font-size:11.5px;font-weight:600;letter-spacing:.01em;color:var(--text-secondary);vertical-align:middle;white-space:nowrap}
+.apply-tag.now{color:var(--green);border-color:var(--green-soft)}.apply-tag.restart,.apply-tag.dirty{color:var(--amber);border-color:var(--amber)}
+.form-actions .apply-tag.dirty{margin:0 auto 0 0}
+.settings-nav{position:sticky;top:0;z-index:4;display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px;padding:10px 0;background:var(--canvas);border-bottom:1px solid var(--line)}
+[data-set]{scroll-margin-top:64px}
+/* Recovery checklist and routing preview */
+.recovery{margin-bottom:22px}.recovery h2{display:flex;align-items:center;gap:8px}
+.recovery td strong{display:block}.recovery .sev{display:inline-block;margin-bottom:4px;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid var(--line);color:var(--text-secondary)}
+.recovery .sev.blocking{color:var(--red);border-color:var(--red)}.recovery .sev.warning{color:var(--amber);border-color:var(--amber)}
+.recovery td,.recovery th{white-space:normal}.recovery td{vertical-align:top}.recovery td:nth-child(2){min-width:200px}.recovery-actions{white-space:nowrap}.recovery-actions>*+*{margin-left:10px}
+.recovery tr.resolved td{color:var(--text-secondary)}.recovery tr.resolved .resolved-title{text-decoration:line-through}.recovery tr.resolved svg{color:var(--green);vertical-align:-2px}
+.preview-needs{display:grid;gap:10px;margin:14px 0 4px}.preview-result{margin-top:16px;display:grid;gap:12px}.preview-summary{margin:0;font-size:15.5px}.preview-summary small{margin-left:8px}
+.preview-steps{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.preview-step{display:flex;gap:12px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface)}.preview-step>div{min-width:0}.preview-step p{margin:3px 0 0;color:var(--text-secondary);font-size:13.5px;overflow-wrap:anywhere}
+.preview-step.skip,.preview-step.later{opacity:.82}
+.preview-chip{flex:none;min-width:92px;text-align:center;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:650;border:1px solid var(--line);color:var(--text-secondary)}
+.preview-chip.try{color:var(--green);border-color:var(--green)}.preview-chip.backup{color:var(--accent);border-color:var(--accent-line)}.preview-chip.skip{color:var(--amber);border-color:var(--amber)}
+@media(max-width:570px){.preview-step{flex-direction:column;gap:6px}.recovery-actions{white-space:normal}}

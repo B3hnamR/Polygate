@@ -2,7 +2,7 @@ import {useState,useEffect,useRef,type FormEvent} from 'react';
 import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Zap} from 'lucide-react';
 import {api,at} from './api';
 import {ProxyLists} from './proxy-lists';
-import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,type Snapshot} from './ui';
+import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,ApplyTag,type Snapshot} from './ui';
 export type Notice=(message:string,kind?:'ok'|'error')=>void;
 const errorOf=(e:unknown)=>String((e as Error)?.message||e);
 // ---------- sign in ----------
@@ -199,7 +199,7 @@ export function SecurityPanel({serverMode,notice,onSignedOut}:{serverMode:boolea
 export function NotifySettings({data,notice,refresh}:{data:Snapshot;notice:Notice;refresh:()=>void}){
   const [url,setUrl]=useState(data.settings.notify?.webhookUrl||'');const [level,setLevel]=useState(data.settings.notify?.minLevel||'warning');const [busy,setBusy]=useState(false);
   async function save(test=false){setBusy(true);try{await api('/admin/notify/settings',{webhookUrl:url,minLevel:level});if(test){await api('/admin/notify/test',{});notice('Test notification sent');}else notice('Notification settings saved');refresh();}catch(e){notice(errorOf(e),'error');}finally{setBusy(false);}}
-  return <section className="section-block form-section"><div className="section-title"><Bell size={19}/><h2>Alerts</h2></div><p className="muted">Notices appear in the bell menu. Add a Discord, Slack or generic webhook to be told when routes, models or WARP go down.</p>
+  return <section className="section-block form-section"><div className="section-title"><Bell size={19}/><h2>Alerts <ApplyTag when="save"/></h2></div><p className="muted">Notices appear in the bell menu. Add a Discord, Slack or generic webhook to be told when routes, models or WARP go down.</p>
     <div className="form-grid"><Field label="Webhook URL" hint="Discord, Slack, or any endpoint that accepts JSON."><input type="url" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://discord.com/api/webhooks/…"/></Field><Field label="Send alerts from level"><Select value={level} onChange={v=>setLevel(v as typeof level)}><option value="info">Everything</option><option value="success">Recoveries and up</option><option value="warning">Warnings and errors</option><option value="error">Errors only</option></Select></Field></div>
     <div className="form-actions"><Button disabled={busy||!url} onClick={()=>save(true)}>Save &amp; send test</Button><Button variant="primary" disabled={busy} onClick={()=>save(false)}>Save</Button></div></section>;
 }

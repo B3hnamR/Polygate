@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Toggle } from './ui';
+import { ApplyTag, Toggle } from './ui';
 
 type DesktopPrefs = { closeToTray: boolean };
 export type DesktopView = { compact: boolean; pinned: boolean };
@@ -17,7 +17,7 @@ export function DesktopPanel() {
     try { setPrefs(await bridge.setCloseToTray(value)); } catch { setPrefs(prefs); setError('Could not save this preference. Try again.'); }
   };
   return <section className="section-block form-section" aria-labelledby="desktop-heading">
-    <h2 id="desktop-heading">Desktop app</h2>
+    <h2 id="desktop-heading">Desktop app <ApplyTag when="now" /></h2>
     <Toggle checked={prefs.closeToTray} onChange={v => void change(v)} label="Keep running in the tray when the window is closed" detail={prefs.closeToTray ? 'Closing the window hides it; your clients keep working. Right-click the tray icon and choose Exit to stop Polygate.' : 'Closing the window stops Polygate and its API.'} />
     {error && <p className="update-error" role="alert">{error}</p>}
   </section>;

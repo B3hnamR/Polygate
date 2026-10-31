@@ -2,7 +2,8 @@ import {useState,useEffect,useCallback,useRef,useId,Children,Fragment,isValidEle
 import {Activity,Box,Check,ChevronDown} from 'lucide-react';
 import {api} from './api';
 import type {LogRow,Model,Settings} from '../backend/types';
-export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
+export type CheckItem={id:string;severity:'blocking'|'warning';title:string;detail:string;page:string;fix?:{label:string;endpoint:string;body?:Record<string,unknown>}};
+export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;state:'paused'|'starting'|'ready'|'attention';issues:{code:string;message:string;page:string}[];checklist:CheckItem[];models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
 // The Polygate mark (assets/logo.svg): a hexagon with a lit gate archway. Gradient ids are unique per instance so several can share a page.
 // The same Night sea mark as the app icon and favicon (assets/logo.svg).
 export function Logo({size=36}:{size?:number}){
@@ -13,6 +14,24 @@ export const ms=(n:number)=>n?`${Math.round(n).toLocaleString()} ms`:'—';
 export const time=(n:number)=>new Date(n).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 export const statusState=(n:number)=>n<400?'available':n===429||n===499?'cooldown':'error';
 export function Button({children,onClick,variant='',disabled=false,className='',title='',type='button'}:{children:ReactNode;onClick?:()=>void;variant?:string;disabled?:boolean;className?:string;title?:string;type?:'button'|'submit'}){return <button type={type} title={title} disabled={disabled} className={`button ${variant} ${className}`} onClick={onClick}>{children}</button>;}
+// Says when a setting takes effect, so nobody has to guess whether a change needs Save or a restart.
+export function ApplyTag({when}:{when:'now'|'save'|'restart'}){const text={now:'Applies immediately',save:'Applies when saved',restart:'Needs a restart'}[when];return <span className={`apply-tag ${when}`}>{text}</span>;}
+// A sticky row of links to the sections that are on the page (sections that rendered nothing are left out).
+export function SectionNav({label}:{label:string}){
+  const [items,setItems]=useState<string[]>([]);
+  useEffect(()=>{const read=()=>setItems([...document.querySelectorAll<HTMLElement>('[data-set]')].filter(e=>e.childElementCount>0).map(e=>e.dataset.set!));read();const t=setTimeout(read,800);return()=>clearTimeout(t);},[]);
+  if(items.length<2)return null;
+  return <nav className="settings-nav" aria-label={label}>{items.map(n=><button key={n} type="button" className="filter-chip" onClick={()=>document.querySelector<HTMLElement>(`[data-set="${n}"]`)?.scrollIntoView({behavior:'smooth',block:'start'})}>{n}</button>)}</nav>;
+}
+// One word for what the gateway can do right now. "Online" used to mean only that the switch was on.
+export function gatewayState(d?:{settings:{enabled:boolean};ready?:Snapshot['ready']}){
+  const s=d?(d.ready?.state||(d.settings.enabled?'ready':'paused')):undefined;
+  if(!s)return {state:'connecting' as const,label:'Connecting',badge:'neutral',dot:'',sentence:'Connecting to gateway'};
+  if(s==='ready')return {state:s,label:'Ready',badge:'running',dot:'online',sentence:'Gateway is ready'};
+  if(s==='paused')return {state:s,label:'Paused',badge:'neutral',dot:'',sentence:'Gateway paused'};
+  if(s==='starting')return {state:s,label:'Starting',badge:'cooldown',dot:'attention',sentence:'Gateway is starting'};
+  return {state:s,label:'Needs attention',badge:'cooldown',dot:'attention',sentence:'Gateway needs attention'};
+}
 export function Badge({state,children}:{state:string;children?:ReactNode}){return <span className={`badge ${['available','healthy','running','200'].includes(state)?'good':['cooldown','429','buffered'].includes(state)?'warn':['unavailable','error','502','403'].includes(state)?'bad':'neutral'}`}><i/>{sentence(children||state)}</span>;}
 // Only the first letter is capitalized, so a label such as "No clean proxy yet" reads as a sentence.
 const sentence=(node:ReactNode):ReactNode=>{if(typeof node==='string')return node.charAt(0).toUpperCase()+node.slice(1);if(Array.isArray(node)){const i=node.findIndex(x=>typeof x==='string'&&x);return i<0?node:node.map((x,j)=>j===i?sentence(x):x);}return node;};
