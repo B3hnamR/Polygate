@@ -75,6 +75,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
   let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
+  // The first provider whose exit was used up: kept while later providers (not on that allowance) are tried, and reported if none of them answers.
+  let spent:{ex:Exhaustion;message:string;status:number;used:typeof used;route:string}|undefined;
   try{
     release=await queue.acquire(k.id,k.limit,controller.signal,settings.queueWaitMs||0);
     let upstream:Response|undefined;
@@ -83,7 +85,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       // A trimmed tool list was chosen for the provider that refused the full one; the next candidate starts from what the client sent.
       if(trimmed.length){chat=askedChat;trimmed=[];}
       used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
-      let r=routeForProvider(p,m.id);route=r.name;
+      // A provider whose chosen routes cannot take the request right now is skipped like one that failed, so the next provider is still tried.
+      let r:ReturnType<typeof routeForProvider>;
+      try{r=routeForProvider(p,m.id);route=r.name;}catch(e){if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;fault=false;continue;}throw e;}
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
@@ -127,11 +131,20 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}}
       }
       if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);
-      if(upstream?.ok)break;if(exhausted)break;if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status))&&!(candidates.length>1&&[404,410].includes(status)))break; // "auto" also moves on from a model the provider says is gone
+      if(upstream?.ok)break;
+      if(exhausted){
+        // The daily allowance follows the exit, so every model of this provider is skipped. A provider that is not on it (Kilo, your own) can still answer.
+        limited.add(p.id);const later=candidates.slice(candidates.indexOf(m)+1).some(c=>!limited.has(c.providerId)&&settings.providers.some(q=>q.id===c.providerId&&q.enabled&&q.kind!=='free'));
+        if(!later)break;
+        spent??={ex:exhausted,message,status,used,route};exhausted=undefined;upstream=undefined;continue;
+      }
+      if(status!==429&&status<500&&!(chain&&[401,403,404,410].includes(status))&&!(candidates.length>1&&[404,410].includes(status)))break; // "auto" also moves on from a model the provider says is gone
     }
     if(!tried)throw new GatewayError('No enabled provider can serve this request',503,'models_unavailable');
     // A later attempt or candidate answered, so the failures before it are not recorded against this request or its model.
     if(upstream?.ok){fault=false;message='';}
+    // Nothing answered after an exit was found used up: the used-up message, with its reset time, is the one the client reads.
+    else if(spent){exhausted=spent.ex;message=spent.message;status=spent.status;used=spent.used;route=spent.route;}
     // A trimmed list that is refused too was not the cause: forget it, so the next request starts from the full list again.
     if(trimmed.length&&!upstream?.ok)forgetTrim(trimmedFor,askedChat);
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
