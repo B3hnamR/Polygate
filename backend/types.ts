@@ -3,7 +3,7 @@
 export type ProviderRoutes = { ids: string[]; spread?: boolean; backups?: boolean };
 export type Provider = { id: string; name: string; kind: 'free' | 'openai' | 'opencode' | 'kilo'; enabled: boolean; baseUrl: string; apiKey: string; models: string[]; routeId: string; routes?: ProviderRoutes };
 // Set when Polygate deployed a relay itself: what the platform calls it, so it can be updated or removed there later.
-export type Deployed = { platform: 'vercel' | 'netlify' | 'cloudflare'; name: string; region?: string; siteId?: string; account?: string; runtime?: 'bun' | 'node' };
+export type Deployed = { platform: 'vercel' | 'netlify' | 'cloudflare'; name: string; region?: string; siteId?: string; account?: string; team?: string; runtime?: 'bun' | 'node' };
 export type Route = { id: string; name: string; kind: 'direct' | 'proxy' | 'relay' | 'warp'; url: string; token?: string; enabled: boolean; models: string[]; status?: string; latency?: number; cooldownUntil?: number; failures?: number; buffered?: boolean; poolUrls?: string[]; poolCount?: number; managed?: boolean; openUntil?: number; opened?: number; exhaustedUntil?: number; recheckedAt?: number; only?: Provider['kind']; deployed?: Deployed };
 export type Model = { id: string; upstreamId: string; providerId: string; name: string; context: number; output: number; reasoning: boolean; tools: boolean; state: 'unchecked' | 'available' | 'cooldown' | 'unavailable'; latency: number; score: number; priority: number; failCount: number; cooldownUntil: number; checkedAt: number; error: string };
 export type WarpSettings = { engine: 'embedded' | 'disabled'; autoStart: boolean; pool: number; rotateMinutes: number; helperPath: string; endpoint: string; split?: 'auto' | 'off' | 'on' };

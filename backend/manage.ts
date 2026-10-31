@@ -9,7 +9,8 @@ const command=process.argv[2]||'settings';
 // Calls the running gateway on this machine: over HTTPS on its own port once a certificate is active, else over plain HTTP on the loopback port.
 async function call(endpoint:string,body?:unknown){
   if(!/^\/(admin\/|healthz$|readyz$)/.test(endpoint))throw new Error('Only local management endpoints are allowed');
-  const mode=settings.https?.mode||'off';const secure=mode!=='off'&&existsSync(path.join(stateDir,'tls',`${mode==='custom'?'custom':mode}-fullchain.pem`));
+  // The gateway serves HTTPS only when it can read both the certificate and its key, so both must exist here too; otherwise it is on plain HTTP.
+  const mode=settings.https?.mode||'off';const pair=(f:string)=>existsSync(path.join(stateDir,'tls',`${mode==='custom'?'custom':mode}-${f}.pem`));const secure=mode!=='off'&&pair('fullchain')&&pair('privkey');
   const port=secure?(settings.https?.port||443):Number(process.env.POLYGATE_PORT||4317);
   const token=process.env.POLYGATE_ADMIN_TOKEN||readFileSync(path.join(stateDir,'admin-token'),'utf8').trim();
   const response=await fetch(`${secure?'https':'http'}://127.0.0.1:${port}${endpoint}`,{method:body===undefined?'GET':'POST',headers:{authorization:`Bearer ${token}`,...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(45000),...(secure?{tls:{rejectUnauthorized:false}}:{})} as any);
@@ -18,6 +19,8 @@ async function call(endpoint:string,body?:unknown){
 async function run(){
   if(command==='password'){
     const supplied=process.argv.includes('--stdin')?(await Bun.stdin.text()).trim():'';
+    // With POLYGATE_ADMIN_PASSWORD set, that value is the password and a saved one is never used, so a reset here would report a password that cannot sign in.
+    if(process.env.POLYGATE_ADMIN_PASSWORD)throw new Error('The dashboard password is set by POLYGATE_ADMIN_PASSWORD; change it there and restart Polygate.');
     const password=supplied||randomBytes(18).toString('base64url');
     if(password.length<12)throw new Error('Password must contain at least 12 characters');
     // A running gateway holds the settings in memory and would write its old password back, so it is asked to change it; only a stopped one is edited on disk.

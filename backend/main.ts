@@ -88,7 +88,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
         const root=process.env.POLYGATE_UI_DIST||path.resolve('dist');let decoded:string;try{decoded=decodeURIComponent(p);}catch{throw new GatewayError('Invalid asset path',400);}
         const target=path.resolve(root,'.'+decoded);if(!target.startsWith(path.resolve(root)+path.sep)&&target!==path.resolve(root))throw new GatewayError('Invalid asset path',400);
         const file=p!=='/'&&existsSync(target)&&statSync(target).isFile()?target:path.join(root,'index.html');if(!existsSync(file))return json(res,503,{error:{message:'UI is not built. Run bun run build:ui.'}});
-        const mime=mimeTypes[path.extname(file).toLowerCase()]||'text/html';res.writeHead(200,{'content-type':mime,'content-security-policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'"});res.end(readFileSync(file));return;
+        const mime=mimeTypes[path.extname(file).toLowerCase()]||'text/html';res.writeHead(200,{'content-type':mime,'content-security-policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'"});res.end(readFileSync(file));return;
       }
       throw new GatewayError('Endpoint not found',404);
     }catch(e:any){

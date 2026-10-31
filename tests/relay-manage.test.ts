@@ -132,3 +132,12 @@ test('updating uses the platform name exactly, even a long one, and never makes 
   seen = []; const up = await call('/admin/relays/update', { id: 'r-long', token: 'vercel-token-123456' }); expect(up.status).toBe(200);
   expect(seen.find(s => s.method === 'POST')!.body.name).toBe(long);
 });
+
+test('a Vercel relay deployed into a team is updated and removed in that same team', async () => {
+  const v = await call('/admin/relays/deploy', { platform: 'vercel', token: 'vercel-token-123456', name: 'team-relay', region: 'fra1', teamId: 'team_9' });
+  expect(v.status).toBe(200); expect(route(v.body.id)!.deployed?.team).toBe('team_9');
+  seen = []; expect((await call('/admin/relays/update', { id: v.body.id, token: 'vercel-token-123456' })).status).toBe(200);
+  expect(seen.filter(s => s.url.includes('api.vercel.com')).every(s => s.url.includes('teamId=team_9'))).toBe(true); expect(seen.length).toBeGreaterThan(0);
+  seen = []; expect((await call('/admin/relays/remove', { id: v.body.id, token: 'vercel-token-123456' })).status).toBe(200);
+  expect(seen.find(s => s.method === 'DELETE')!.url).toContain('/v9/projects/team-relay?teamId=team_9');
+});

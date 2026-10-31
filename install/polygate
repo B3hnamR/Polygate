@@ -95,6 +95,8 @@ cmd_doctor() {
 }
 cmd_password() {
   local was=0 rc=0
+  # With POLYGATE_ADMIN_PASSWORD set that value is the password; a reset would write a different one that cannot sign in. Nothing is stopped.
+  if [ -n "${POLYGATE_ADMIN_PASSWORD:-}" ]; then printf 'The dashboard password is set by POLYGATE_ADMIN_PASSWORD in %s. Change it there, then run: sudo polygate restart\n' "$ENV_FILE" >&2; return 1; fi
   is_running && was=1
   systemctl stop polygate
   if [ "${1:-}" = '--stdin' ]; then control password --stdin; rc=$?; else control password; rc=$?; fi

@@ -578,6 +578,11 @@ render_env() {
 configure_service() {
   local src=/dev/null
   if [ "$UPDATE" = 1 ] && [ -f /etc/polygate/polygate.env ]; then src=/etc/polygate/polygate.env; fi
+  # A fresh install over the settings file a data-preserving uninstall left behind starts from the choices made now; the old file is kept beside it.
+  if [ "$UPDATE" = 0 ] && [ -f /etc/polygate/polygate.env ]; then
+    local old=/etc/polygate/polygate.env.before-reinstall-$(date +%Y%m%d-%H%M%S)
+    cp -p /etc/polygate/polygate.env "$old" && chmod 0600 "$old" && note "The settings file of the earlier installation was kept as $old"
+  fi
   render_env "$src" >/etc/polygate/polygate.env.new
   chmod 0600 /etc/polygate/polygate.env.new; mv -f /etc/polygate/polygate.env.new /etc/polygate/polygate.env
   install -m 0644 "$release/install/polygate.service" /etc/systemd/system/polygate.service

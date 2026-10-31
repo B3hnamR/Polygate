@@ -211,7 +211,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/relays/deploy'&&method==='POST'){
     const b=await readJson(req);const platform=platformOf(b.platform);const token=deployToken(b);const accountId=deployAccount(b);
     const r=await deployRelay({platform,token,name:b.name?String(b.name):undefined,region:b.region?String(b.region):undefined,runtime:b.runtime==='node'?'node':undefined,teamId:b.teamId?String(b.teamId):undefined,accountId:accountId||undefined});
-    const deployed:Deployed={platform,name:r.name,...(r.region?{region:r.region}:{}),...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{}),...(platform==='vercel'?{runtime:b.runtime==='node'?'node' as const:'bun' as const}:{})};
+    const deployed:Deployed={platform,name:r.name,...(r.region?{region:r.region}:{}),...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{}),...(platform==='vercel'&&b.teamId?{team:String(b.teamId)}:{}),...(platform==='vercel'?{runtime:b.runtime==='node'?'node' as const:'bun' as const}:{})};
     const route:Route={id:'r-'+randomBytes(4).toString('hex'),name:`${labels[platform]} relay${r.region?' '+r.region:''} (${r.name})`.slice(0,80),kind:'relay',url:r.url,token:r.accessToken,enabled:true,models:[],...(r.buffered?{buffered:true}:{}),...(r.only?{only:r.only}:{}),deployed};
     settings.routes.push(route);if(b.remember===true&&b.useSaved!==true)remember(platform,token,r.account);persist();
     return json(res,200,{ok:true,id:route.id,name:r.name,url:r.url,platform:r.platform,runtime:r.runtime,region:r.region,only:r.only,reachable:r.reachable,status:r.status,detail:r.detail});
@@ -222,7 +222,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(!d)throw new GatewayError('Polygate did not deploy this relay, so it cannot update it. Deploy a new one instead.',400);
     if(!route.token)throw new GatewayError('This relay has no access token saved, so it cannot be updated',400);
     const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account||'';
-    const r=await deployRelay({platform:d.platform,token,name:d.name,region:d.region,runtime:d.runtime,accountId:accountId||undefined,update:{access:route.token,siteId:d.siteId}});
+    const r=await deployRelay({platform:d.platform,token,name:d.name,region:d.region,runtime:d.runtime,teamId:d.team,accountId:accountId||undefined,update:{access:route.token,siteId:d.siteId}});
     route.url=r.url;if(r.buffered)route.buffered=true;else delete route.buffered;route.deployed={...d,name:r.name,...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{})};if(r.reachable)route.status='healthy';
     if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,r.account);persist();
     logEvent('info','relays',`${route.name} updated to the current relay code${r.reachable?'':' (not answering yet)'}`);
@@ -234,7 +234,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(!d)throw new GatewayError('Polygate did not deploy this relay, so there is nothing for it to remove on a platform. Delete the route instead.',400);
     assertRouteDeletable(route.id);
     const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account;
-    await removeFromPlatform({platform:d.platform,token,name:d.name,siteId:d.siteId,accountId});
+    await removeFromPlatform({platform:d.platform,token,name:d.name,siteId:d.siteId,accountId,teamId:d.team});
     if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,accountId);
     deleteRoute(route.id);logEvent('info','relays',`${route.name} removed from ${labels[d.platform]} and from Polygate`);
     return json(res,200,{ok:true});

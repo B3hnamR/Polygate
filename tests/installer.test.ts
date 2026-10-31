@@ -87,3 +87,12 @@ test('the dashboard path is set for a new install and shown in every address', (
   expect(installer).toContain('location $path {');           // the nginx example keeps the other paths of the site free
   expect(command).toContain('${url%/}/v1');
 });
+
+test('a fresh install over the settings file left by a data-preserving uninstall keeps that file beside the new one', () => {
+  expect(installer).toContain('/etc/polygate/polygate.env.before-reinstall-');
+  expect(installer.indexOf('before-reinstall-')).toBeLessThan(installer.indexOf('render_env "$src" >/etc/polygate/polygate.env.new'));
+});
+test('polygate password refuses before it stops anything when the password is set by POLYGATE_ADMIN_PASSWORD', () => {
+  const fn = command.slice(command.indexOf('cmd_password()')); const guard = fn.indexOf('POLYGATE_ADMIN_PASSWORD');
+  expect(guard).toBeGreaterThan(0); expect(guard).toBeLessThan(fn.indexOf('systemctl stop polygate'));
+});

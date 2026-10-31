@@ -163,12 +163,12 @@ export async function deployRelay(input: DeployInput): Promise<DeployResult> {
 }
 // Removes what deployRelay made on the platform, so deleting a relay in Polygate does not leave a project, site or Worker running (and counting toward a plan's limits).
 // A project that is already gone counts as removed.
-export async function removeFromPlatform(input: { platform: Platform; token: string; name: string; siteId?: string; accountId?: string }): Promise<void> {
+export async function removeFromPlatform(input: { platform: Platform; token: string; name: string; siteId?: string; accountId?: string; teamId?: string }): Promise<void> {
   if (!PLATFORMS.includes(input.platform)) throw new GatewayError('Choose Vercel, Netlify or Cloudflare', 400);
   const token = String(input.token || '').trim(); if (token.length < 8) throw new GatewayError('Enter the platform API token', 400);
   const name = String(input.name || ''); if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw new GatewayError('This relay has no usable platform name to remove', 400);
   const secrets = [token]; const gone = [404];
-  if (input.platform === 'vercel') { await api('Vercel', `https://api.vercel.com/v9/projects/${encodeURIComponent(name)}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone); return; }
+  if (input.platform === 'vercel') { await api('Vercel', `https://api.vercel.com/v9/projects/${encodeURIComponent(name)}${input.teamId ? `?teamId=${encodeURIComponent(input.teamId)}` : ''}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone); return; }
   if (input.platform === 'netlify') { await api('Netlify', `https://api.netlify.com/api/v1/sites/${encodeURIComponent(input.siteId || name + '.netlify.app')}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + token } }, secrets, gone); return; }
   const account = String(input.accountId || '').trim().toLowerCase();
   if (!/^[a-f0-9]{32}$/.test(account)) throw new GatewayError('Enter the Cloudflare Account ID: 32 letters and digits, shown in the dashboard under Workers & Pages', 400);
