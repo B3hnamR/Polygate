@@ -11,19 +11,20 @@ import {BackupPanel} from './backup';
 import {McpPage} from './mcp';
 import {ChainsPage} from './chains';
 import {Playground} from './playground';
+import {AgentPage} from './agent';
 import {Activity,ArrowDownToLine,ArrowRight,ArrowUpRight,Box,Check,CheckCircle2,ChevronRight,Clipboard,Code2,Copy,Database,FileText,Globe,Layers3,Loader2,Network,Pause,Play,Plus,RefreshCw,Search,Send,Server,Settings2,Shield,SlidersHorizontal,Square,Terminal,Trash2,Workflow,X,ExternalLink,Eye,EyeOff,AlertCircle,KeyRound,Radio,Route, Zap, LogOut,ScrollText,Plug,ListOrdered,Minimize2,Clock3} from 'lucide-react';
 import {api,at,BASE,hasToken,dropToken} from './api';
 import {RecoveryChecklist} from './recovery';
 import {Login,NotificationsMenu,WarpPanel,PoolPanel,KeysPanel,SecurityPanel,NotifySettings,HttpsPanel,MetricsPanel,RequestDetail,type Notice} from './panels';
 import type {Model,Settings,LogRow,Provider,Route as NetworkRoute} from '../backend/types';
 
-type Page='Overview'|'Models'|'Chains'|'Providers'|'Proxies'|'Relays'|'Routing'|'MCP'|'Playground'|'Requests'|'Usage'|'Logs'|'Settings'|'Guide';
-const navigation:{name:Page;icon:any}[]=[{name:'Overview',icon:Layers3},{name:'Models',icon:Box},{name:'Chains',icon:ListOrdered},{name:'Providers',icon:Server},{name:'Proxies',icon:Globe},{name:'Relays',icon:Radio},{name:'Routing',icon:Workflow},{name:'MCP',icon:Plug},{name:'Playground',icon:Terminal},{name:'Requests',icon:Activity},{name:'Usage',icon:BarChart3},{name:'Logs',icon:ScrollText}];
-const descriptions:Record<Page,string>={Overview:'Your models. One local endpoint.',Models:'Discover, check, and prioritize the models your clients can use.',Chains:'Name a list of models. Clients ask for it and Polygate tries them in your order.',Providers:'Choose where model requests are executed.',Proxies:'Find a working route. Keep the good ones.',Relays:'Connect an edge relay using the shared forwarding contract.',Routing:'Control exactly how requests leave this machine.',Playground:'Make a real request through your gateway.',Requests:'Request outcomes and timing. Prompts stay out of the log.',Usage:'How much you used, day by day, for as long as a year.',Logs:'Everything the gateway did, searchable and filterable.',MCP:'One MCP address for all your tool servers, through your own routes.',Settings:'Local credentials, limits, and application preferences.',Guide:'A map of your local gateway.'};
+type Page='Overview'|'Models'|'Chains'|'Providers'|'Proxies'|'Relays'|'Routing'|'MCP'|'Playground'|'Agent'|'Requests'|'Usage'|'Logs'|'Settings'|'Guide';
+const navigation:{name:Page;icon:any}[]=[{name:'Overview',icon:Layers3},{name:'Models',icon:Box},{name:'Chains',icon:ListOrdered},{name:'Providers',icon:Server},{name:'Proxies',icon:Globe},{name:'Relays',icon:Radio},{name:'Routing',icon:Workflow},{name:'MCP',icon:Plug},{name:'Playground',icon:Terminal},{name:'Agent',icon:Bot},{name:'Requests',icon:Activity},{name:'Usage',icon:BarChart3},{name:'Logs',icon:ScrollText}];
+const descriptions:Record<Page,string>={Overview:'Your models. One local endpoint.',Models:'Discover, check, and prioritize the models your clients can use.',Chains:'Name a list of models. Clients ask for it and Polygate tries them in your order.',Providers:'Choose where model requests are executed.',Proxies:'Find a working route. Keep the good ones.',Relays:'Connect an edge relay using the shared forwarding contract.',Routing:'Control exactly how requests leave this machine.',Playground:'Make a real request through your gateway.',Agent:'A coding agent that works in a folder you choose, through your models. It asks before it changes things, as its mode says.',Requests:'Request outcomes and timing. Prompts stay out of the log.',Usage:'How much you used, day by day, for as long as a year.',Logs:'Everything the gateway did, searchable and filterable.',MCP:'One MCP address for all your tool servers, through your own routes.',Settings:'Local credentials, limits, and application preferences.',Guide:'A map of your local gateway.'};
 import {useConfirm} from './confirm';
 import {ProviderRoutesDialog,providerRouteText,usedByText} from './provider-routes';
 import {ProviderEditDialog} from './provider-edit';
-import {Pencil,BarChart3} from 'lucide-react';
+import {Pencil,BarChart3,Bot} from 'lucide-react';
 import {Logo,ms,time,statusState,tickWhileVisible,usePoll,Button,Badge,Empty,Field,Toggle,Select,Logs,gatewayState,ApplyTag,SectionNav,type Snapshot} from './ui';
 import {ExitPass,NextInLine,ExitTickets,Stamp,usedUp,exitWhere,type Metrics} from './daypass';
 
@@ -54,7 +55,7 @@ export function App(){
   return <div className="app-shell">
     <aside className="sidebar"><a className="brand" href="#" onClick={e=>{e.preventDefault();setPage('Overview');}} aria-label="Polygate overview"><div className="brand-mark"><Logo size={38}/></div><span>Polygate<small>FREE MODEL GATEWAY</small></span></a>
       <div className="workspace-label"><span className="workspace-avatar">{serverMode?'S':'L'}</span><span>{serverMode?'Server dashboard':'Personal workspace'}<small>{serverMode?location.hostname:'On this computer'}</small></span><Shield size={15}/></div>
-      <nav aria-label="Workspace">{navigation.map(n=><button key={n.name} className={`nav-item ${page===n.name?'active':''}`} aria-current={page===n.name?'page':undefined} aria-label={n.name} title={n.name} onClick={()=>setPage(n.name)}><n.icon size={18}/><span>{n.name}</span>{n.name==='Proxies'&&<span className="nav-note">Built in</span>}</button>)}</nav>
+      <nav aria-label="Workspace">{navigation.filter(n=>n.name!=='Agent'||data?.server?.mode==='desktop').map(n=><button key={n.name} className={`nav-item ${page===n.name?'active':''}`} aria-current={page===n.name?'page':undefined} aria-label={n.name} title={n.name} onClick={()=>setPage(n.name)}><n.icon size={18}/><span>{n.name}</span>{n.name==='Proxies'&&<span className="nav-note">Built in</span>}</button>)}</nav>
       <div className="sidebar-bottom"><button className={`nav-item ${page==='Guide'?'active':''}`} aria-current={page==='Guide'?'page':undefined} title="Guide & architecture" onClick={()=>setPage('Guide')}><FileText size={18}/>Guide & architecture</button><button className={`nav-item ${page==='Settings'?'active':''}`} aria-current={page==='Settings'?'page':undefined} title="Settings" onClick={()=>setPage('Settings')}><Settings2 size={18}/>Settings</button>{serverMode&&<button className="nav-item" title="Sign out" onClick={signOut}><LogOut size={18}/>Sign out</button>}<div className="local-status"><span className={`status-dot ${gs.dot}`}/><span>{gs.sentence}<small>{serverMode?location.hostname:'127.0.0.1'} {data?.version?<> · v{data.version}</>:null}</small></span></div></div>
     </aside>
     <main><header className="page-header"><div><div className="breadcrumb">Workspace <ChevronRight size={13}/> {page}</div><h1>{page}</h1><p>{descriptions[page]}</p></div><div className="header-actions">{desktop.available&&<Button onClick={()=>desktop.setCompact(true)} title="A small window to keep beside your work (Ctrl+Shift+M)"><Minimize2 size={15}/> Compact view</Button>}{data&&<NotificationsMenu unread={data.notices||0} onChange={refresh}/>}{data&&<Badge state={gs.badge}>{gs.label}</Badge>}<Button disabled={!data||!!pending} onClick={()=>act('gateway','/admin/settings',{enabled:!data?.settings.enabled},data?.settings.enabled?'Gateway paused':'Gateway resumed')}>{data?.settings.enabled?<Pause size={15}/>:<Play size={15}/>} {data?.settings.enabled?'Pause gateway':'Resume gateway'}</Button></div></header>
@@ -68,6 +69,7 @@ export function App(){
         {page==='Providers'&&<Providers data={data} act={act} action={action} pending={pending}/>}
         {page==='Proxies'&&<Proxies go={setPage} data={data} action={action} notice={setNotice} refresh={refresh}/>}
         {(page==='Relays'||page==='Routing')&&<Routes data={data} act={act} action={action} pending={pending} relayOnly={page==='Relays'} notice={setNotice} refresh={refresh} go={setPage}/>}
+        {page==='Agent'&&data?.server?.mode==='desktop'&&<AgentPage/>}
         {page==='Playground'&&<Playground data={data} apiKey={key} model={selectedModel} setModel={setSelectedModel} refresh={refresh} notice={setNotice}/>}
         {page==='Requests'&&<RequestPage data={data} act={act}/>}
         {page==='Usage'&&<UsagePage/>}

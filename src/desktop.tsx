@@ -3,7 +3,7 @@ import { ApplyTag, Toggle } from './ui';
 
 type DesktopPrefs = { closeToTray: boolean };
 export type DesktopView = { compact: boolean; pinned: boolean };
-type DesktopBridge = { getPrefs(): Promise<DesktopPrefs>; setCloseToTray(value: boolean): Promise<DesktopPrefs>; getView?(): Promise<DesktopView>; setCompact?(value: boolean): Promise<DesktopView>; setPinned?(value: boolean): Promise<DesktopView>; onView?(callback: (view: DesktopView) => void): () => void };
+type DesktopBridge = { getPrefs(): Promise<DesktopPrefs>; setCloseToTray(value: boolean): Promise<DesktopPrefs>; getView?(): Promise<DesktopView>; setCompact?(value: boolean): Promise<DesktopView>; setPinned?(value: boolean): Promise<DesktopView>; pickFolder?(): Promise<string>; onView?(callback: (view: DesktopView) => void): () => void };
 declare global { interface Window { polygateDesktop?: DesktopBridge } }
 // Only the Windows app has a window and a tray; in a browser this panel is not shown.
 export function DesktopPanel() {

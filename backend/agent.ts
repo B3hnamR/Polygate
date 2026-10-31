@@ -15,7 +15,7 @@ import { presentedOpenCodeVersion } from './providers';
 const MAX_RETRIES = 3;
 type Mode = keyof typeof ENGINE_MODES;
 type Pending = { id: string; action: string; resources: string[]; note: string };
-type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string };
+type Session = { id: string; folder: string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean };
 const sessions = new Map<string, Session>();
 const listeners = new Map<string, Set<ServerResponse>>();
 const folders = new Map<string, { abort: AbortController; ready: Promise<void> }>();
@@ -98,7 +98,8 @@ function onEvent(e: any, folder: string) {
     const { save, ...rest } = d; publish(sid, { ...e, data: { ...rest, resources, note: pending.note } }); return;
   }
   if (e.type === 'permission.replied') s.pending.delete(String(d.requestID));
-  if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; }
+  if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; s.busy = true; }
+  if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) s.busy = false;
   publish(sid, e);
   // The engine retries a failing model request for a long time on its own; after a few tries the turn is stopped and the page told why,
   // so the user can wait, resume or pick another model. A tool action that already ran is never repeated by this.
@@ -111,6 +112,8 @@ function onEvent(e: any, folder: string) {
 }
 
 // --- What the page asks for ---
+// Reasoning effort, offered for models that reason: OpenCode names these variants of the model (its default when none is chosen).
+const EFFORTS = ['low', 'medium', 'high'];
 // Models the agent can be pinned to: able to call tools, from an enabled provider, not known to be gone. OpenCode Free only while the
 // bridge presents the engine's own OpenCode version (agent-engine.ts).
 export function agentModels() {
@@ -118,7 +121,7 @@ export function agentModels() {
   return [...models.values()].filter(m => m.tools && m.state !== 'unavailable').flatMap(m => {
     const p = settings.providers.find(x => x.id === m.providerId && x.enabled); if (!p) return [];
     const reason = p.kind === 'free' ? freeIdentityProblem(presented) : '';
-    return [{ id: m.id, name: m.name, provider: p.name, context: m.context, output: m.output, reasoning: m.reasoning, usable: !reason, ...(reason ? { reason } : {}) }];
+    return [{ id: m.id, name: m.name, provider: p.name, context: m.context, output: m.output, reasoning: m.reasoning, efforts: m.reasoning ? EFFORTS : [], usable: !reason, ...(reason ? { reason } : {}) }];
   }).sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name));
 }
 const inside = (folder: string, parent: string) => { const rel = path.relative(path.resolve(parent), path.resolve(folder)); return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel)); };
@@ -132,7 +135,7 @@ function checkFolder(raw: unknown) {
 }
 const checkMode = (raw: unknown): Mode => { if (typeof raw === 'string' && raw in ENGINE_MODES) return raw as Mode; throw new GatewayError(`Unknown mode. Use one of: ${Object.keys(ENGINE_MODES).join(', ')}.`, 400, 'agent_mode'); };
 const modeOf = (agent: string) => (Object.entries(ENGINE_MODES).find(([, m]) => m.agent === agent)?.[0] || '') as Mode | '';
-const summary = (s: any) => ({ id: s.id, title: s.title, mode: modeOf(s.agent || ''), model: s.model?.id || '', folder: s.location?.directory || '', created: s.time?.created, tokens: s.tokens, cost: s.cost, outcome: s.outcome });
+const summary = (s: any) => ({ id: s.id, title: s.title, mode: modeOf(s.agent || ''), model: s.model?.id || '', effort: EFFORTS.includes(s.model?.variant) ? s.model.variant : '', folder: s.location?.directory || '', created: s.time?.created, tokens: s.tokens, cost: s.cost, outcome: s.outcome });
 // Rules OpenCode saved through "always" (never sent by Polygate) would allow commands without asking in every session of the project.
 async function clearSavedPermissions() {
   const found = await engine('GET', '/api/permission/saved'); const saved: any[] = Array.isArray(found) ? found : [];
@@ -144,11 +147,13 @@ async function createSession(b: any) {
   const folder = checkFolder(b.folder); const mode = checkMode(b.mode); const model = String(b.model || '');
   const list = await engine('GET', `/api/model${q(folder)}`); const known = (Array.isArray(list) ? list : []).some((m: any) => m.providerID === 'polygate' && m.id === model);
   if (!known) throw new GatewayError('The agent engine does not have that model. Pick one from the list, or start the engine again after the catalog changed.', 400, 'agent_model');
-  const why = agentModels().find(m => m.id === model)?.reason; if (why) throw new GatewayError(why, 400, 'agent_model');
+  const entry = agentModels().find(m => m.id === model); if (entry?.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
+  const effort = b.effort === undefined || b.effort === '' ? '' : String(b.effort);
+  if (effort && !(entry?.efforts || []).includes(effort)) throw new GatewayError(entry?.reasoning ? `Effort is one of: ${EFFORTS.join(', ')}.` : 'That model does not take a reasoning effort.', 400, 'agent_effort');
   await clearSavedPermissions();
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
-  const info = await engine('POST', '/api/session', { title, agent: ENGINE_MODES[mode].agent, model: { providerID: 'polygate', id: model }, location: { directory: folder } });
+  const info = await engine('POST', '/api/session', { title, agent: ENGINE_MODES[mode].agent, model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) }, location: { directory: folder } });
   session(info.id, folder);
   return summary(info);
 }
@@ -173,7 +178,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session' && method === 'GET') {
     const s = await known(url.searchParams.get('id'));
     const [info, messages] = await Promise.all([engine('GET', `/api/session/${encodeURIComponent(s.id)}`), engine('GET', `/api/session/${encodeURIComponent(s.id)}/context`)]);
-    return json(res, 200, { session: summary(info), messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '' });
+    return json(res, 200, { session: summary(info), messages: messages || [], pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy });
   }
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
     const b = await readJson(req, 1024 * 1024); const s = await known(b.id); const text = String(b.text || '');
@@ -204,7 +209,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     const s = await known(url.searchParams.get('id'));
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
     // What the page needs after it (re)connects: approvals still waiting and whether the session is paused.
-    res.write(`data: ${JSON.stringify({ type: 'agent.state', data: { sessionID: s.id, pending: [...s.pending.values()], paused: s.paused || '' } })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'agent.state', data: { sessionID: s.id, pending: [...s.pending.values()], paused: s.paused || '', busy: !!s.busy } })}\n\n`);
     const set = listeners.get(s.id) || new Set(); set.add(res); listeners.set(s.id, set);
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* closed */ } }, 15000);
     req.on('close', () => { clearInterval(ping); set.delete(res); if (!set.size) listeners.delete(s.id); });

@@ -1,0 +1,89 @@
+// The Agent page's transcript: a session's history (from /admin/agent/session) and its live events (from /admin/agent/events), turned
+// into the items the page draws. No React here, so tests/agent-logic.test.ts can check it on its own.
+
+export type Mode = 'ask' | 'accept-edits' | 'plan';
+export const MODES: { id: Mode; label: string }[] = [{ id: 'ask', label: 'Ask for approval' }, { id: 'accept-edits', label: 'Accept edits' }, { id: 'plan', label: 'Plan' }];
+export const modeLabel = (id: string) => MODES.find(m => m.id === id)?.label || id;
+const AGENT_MODES: Record<string, Mode> = { 'polygate-ask': 'ask', 'polygate-accept-edits': 'accept-edits', 'polygate-plan': 'plan' };
+
+export type ToolStatus = 'preparing' | 'running' | 'done' | 'failed';
+export type Item =
+  | { kind: 'user'; key: string; text: string }
+  | { kind: 'text'; key: string; text: string }
+  | { kind: 'reasoning'; key: string; text: string; done: boolean }
+  | { kind: 'tool'; key: string; name: string; input?: any; status: ToolStatus; output?: string; error?: string }
+  | { kind: 'note'; key: string; tone: 'info' | 'warn' | 'bad'; text: string };
+export type Approval = { id: string; action: string; resources: string[]; note: string };
+
+const textOf = (content: unknown) => Array.isArray(content) ? content.map((c: any) => typeof c?.text === 'string' ? c.text : '').join('') : typeof content === 'string' ? content : '';
+
+export function fromHistory(messages: any[]): Item[] {
+  const out: Item[] = [];
+  for (const m of messages || []) {
+    if (m?.type === 'user') out.push({ kind: 'user', key: m.id, text: String(m.text ?? textOf(m.content)) });
+    else if (m?.type === 'assistant') (m.content || []).forEach((c: any, i: number) => {
+      const key = `${m.id}:${i}`;
+      if (c?.type === 'text' && c.text) out.push({ kind: 'text', key, text: c.text });
+      else if (c?.type === 'reasoning' && c.text) out.push({ kind: 'reasoning', key, text: c.text, done: true });
+      else if (c?.type === 'tool') {
+        const st = c.state || {}; const status: ToolStatus = st.status === 'completed' ? 'done' : st.status === 'error' || st.status === 'failed' ? 'failed' : 'running';
+        out.push({ kind: 'tool', key: c.id || key, name: c.name || 'tool', input: st.input, status, output: textOf(st.content), error: st.error?.message || (typeof st.error === 'string' ? st.error : undefined) });
+      }
+    });
+    else if (m?.type === 'idle' && (m.outcome === 'failed' || m.outcome === 'interrupted')) out.push({ kind: 'note', key: m.id, tone: m.outcome === 'failed' ? 'bad' : 'info', text: m.outcome === 'failed' ? 'This turn failed.' : 'Stopped.' });
+    else if (m?.type === 'agent-switched' && AGENT_MODES[m.agent]) out.push({ kind: 'note', key: m.id, tone: 'info', text: `Mode: ${modeLabel(AGENT_MODES[m.agent])}` });
+  }
+  return out;
+}
+
+// One live event applied to the transcript. Returns the same array when nothing changed.
+export function applyEvent(items: Item[], e: any): Item[] {
+  const d = e?.data || {};
+  const upsert = <T extends Item>(key: string, make: () => T, change: (x: T) => T): Item[] => {
+    const i = items.findIndex(x => x.key === key);
+    if (i < 0) return [...items, change(make())];
+    const next = items.slice(); next[i] = change(items[i] as T); return next;
+  };
+  const part = (kind: 't' | 'r') => `${d.assistantMessageID}:${kind}${d.ordinal ?? 0}`;
+  switch (e?.type) {
+    case 'session.inbox.enqueued':
+      if (d.item?.type !== 'user') return items;
+      return items.some(x => x.key === d.inboxID) ? items : [...items, { kind: 'user', key: d.inboxID, text: String(d.item.payload?.text ?? '') }];
+    case 'session.text.started': return upsert(part('t'), () => ({ kind: 'text', key: part('t'), text: '' }), x => x);
+    case 'session.text.delta': return upsert(part('t'), () => ({ kind: 'text', key: part('t'), text: '' }), x => ({ ...x, text: x.text + String(d.delta ?? '') }));
+    case 'session.text.ended': return typeof d.text === 'string' ? upsert(part('t'), () => ({ kind: 'text', key: part('t'), text: '' }), x => ({ ...x, text: d.text })) : items;
+    case 'session.reasoning.started': return upsert(part('r'), () => ({ kind: 'reasoning', key: part('r'), text: '', done: false }), x => x);
+    case 'session.reasoning.delta': return upsert(part('r'), () => ({ kind: 'reasoning', key: part('r'), text: '', done: false }), x => ({ ...x, text: x.text + String(d.delta ?? '') }));
+    case 'session.reasoning.ended': return upsert(part('r'), () => ({ kind: 'reasoning', key: part('r'), text: '', done: true }), x => ({ ...x, text: typeof d.text === 'string' ? d.text : x.text, done: true }));
+    case 'session.tool.input.started': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: d.name || 'tool', status: 'preparing' as ToolStatus }), x => x);
+    case 'session.tool.called': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'running' as ToolStatus }), x => ({ ...x, input: d.input, status: 'running' }));
+    case 'session.tool.success': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'done' as ToolStatus }), x => ({ ...x, status: 'done', output: textOf(d.content) }));
+    case 'session.tool.failed': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'failed' as ToolStatus }), x => ({ ...x, status: 'failed', error: d.error?.message || 'Failed' }));
+    case 'agent.approval.auto': return [...items, { kind: 'note', key: `auto:${d.requestID}`, tone: 'info', text: `Allowed for this session: ${(d.resources || []).join(', ')}` }];
+    // One note per turn for model retries, updated in place rather than one line per attempt.
+    case 'session.retry.scheduled': return upsert('retry', () => ({ kind: 'note', key: 'retry', tone: 'warn', text: '' }), x => ({ ...x, text: `The model request failed (${d.error?.message || 'no reason given'}). Trying again (attempt ${d.attempt ?? '?'}).` }));
+    case 'session.execution.started': return items.filter(x => x.key !== 'retry');
+    case 'session.execution.failed': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `failed:${e.id || items.length}`, tone: 'bad', text: d.error?.message ? `This turn failed: ${d.error.message}` : 'This turn failed.' }];
+    case 'session.execution.interrupted': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `stopped:${e.id || items.length}`, tone: 'info', text: 'Stopped.' }];
+    case 'session.agent.selected': return AGENT_MODES[d.agent] ? [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: 'info', text: `Mode: ${modeLabel(AGENT_MODES[d.agent])}` }] : items;
+    default: return items;
+  }
+}
+
+// What an approval card says about the request, in plain words.
+export function approvalTitle(action: string) {
+  return ({ shell: 'Run a command', edit: 'Change files', external_directory: 'Use a folder outside the working folder', webfetch: 'Fetch a web page', websearch: 'Search the web', subagent: 'Start a helper agent', read: 'Read a file' } as Record<string, string>)[action] || `Use ${action}`;
+}
+// The one line that says what a tool call is about. A path inside the working folder is shown relative to it.
+export function toolSubject(name: string, input: any, folder = '') {
+  if (!input || typeof input !== 'object') return '';
+  const v = input.command ?? input.path ?? input.filePath ?? input.pattern ?? input.url ?? input.query ?? input.description;
+  if (typeof v !== 'string') return JSON.stringify(input).slice(0, 200);
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (folder && (input.path ?? input.filePath) === v) {
+    const base = norm(folder); const here = norm(v);
+    if (here === base) return '.';
+    if (here.startsWith(base + '/')) return v.replace(/\\/g, '/').slice(base.length + 1);
+  }
+  return v;
+}

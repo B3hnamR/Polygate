@@ -1,0 +1,216 @@
+import {useCallback,useEffect,useRef,useState} from 'react';
+import {Bot,Brain,Check,Download,FolderOpen,Loader2,Play,Plus,Send,ShieldCheck,Square,TriangleAlert,X} from 'lucide-react';
+import {api,at} from './api';
+import {Badge,Button,Empty,Field,Progress,Select,compact,usePoll,when} from './ui';
+import {MODES,modeLabel,fromHistory,applyEvent,approvalTitle,toolSubject,type Approval,type Item,type Mode} from './agent-logic';
+// The Agent page (docs/agent/PLAN.md, Phase 2b): a coding agent working in a folder the user chooses, through Polygate's own models.
+// Everything goes through the agent controller (backend/agent.ts); the page never talks to the engine itself. Desktop app only.
+
+type Engine={state:string;installed:boolean;version:string;message:string;problems:string[];progress?:number;snapshots?:{ok:boolean;reason?:string};freeIdentity?:{presented:string;engine:string;usable:boolean}};
+type AgentModel={id:string;name:string;provider:string;context:number;output:number;reasoning:boolean;efforts:string[];usable:boolean;reason?:string};
+type Models={models:AgentModel[];modes:Record<string,string>};
+type SessionInfo={id:string;title:string;mode:Mode|'';model:string;effort:string;folder:string;created?:number;tokens?:{input:number;output:number;reasoning?:number;cache?:{read:number;write:number}}};
+const cap=(s:string)=>s.charAt(0).toUpperCase()+s.slice(1);
+// Remembered on this computer only: the last folder, recent folders, the open session per folder and the last model.
+const stored=(key:string)=>{try{return localStorage.getItem(key)||'';}catch{return '';}};
+const store=(key:string,value:string)=>{try{localStorage.setItem(key,value);}catch{/* storage can be off */}};
+const storedList=(key:string):string[]=>{try{const v=JSON.parse(localStorage.getItem(key)||'[]');return Array.isArray(v)?v.filter(x=>typeof x==='string'):[];}catch{return [];}};
+
+const ENGINE_LABEL:Record<string,string>={not_installed:'Not installed',installing:'Downloading',installed:'Off',starting:'Starting',restarting:'Restarting',running:'Running',stopping:'Stopping',failed:'Stopped with a problem'};
+export function AgentPage(){
+  const {data:engine,error,reload}=usePoll<Engine>('/admin/agent/engine',2000);
+  const [busy,setBusy]=useState('');const [problem,setProblem]=useState('');
+  const act=async(path:string,label:string)=>{setBusy(label);setProblem('');try{await api(path,{});}catch(e:any){setProblem(e.message);}finally{setBusy('');reload();}};
+  if(!engine)return <section className="section-block agent-engine"><div className="agent-engine-body">{error?<div className="pg-error">{error}</div>:<p className="subtle"><Loader2 className="spin" size={15}/> Checking the agent engine…</p>}</div></section>;
+  return <div className="agent-page">
+    <EngineBar engine={engine} busy={busy} problem={problem} act={act}/>
+    {engine.state==='running'&&<Workspace/>}
+  </div>;
+}
+
+function EngineBar({engine,busy,problem,act}:{engine:Engine;busy:string;problem:string;act:(path:string,label:string)=>void}){
+  const s=engine.state;const running=s==='running';const working=['installing','starting','restarting','stopping'].includes(s)||!!busy;
+  const badge=running?'running':s==='failed'?'error':working?'buffered':'idle';
+  return <section className={`section-block agent-engine${running?' running':''}`}><div className="agent-engine-body">
+    <div className="agent-engine-head">
+      <Bot size={20}/><div><strong>Agent engine</strong> <span className="subtle">OpenCode {engine.version}</span></div>
+      <Badge state={badge}>{s==='installing'?`Downloading ${engine.progress??0}%`:ENGINE_LABEL[s]||s}</Badge>
+      <span className="toolbar-spacer"/>
+      {s==='not_installed'&&<Button variant="primary" disabled={working} onClick={()=>act('/admin/agent/engine/install','install')}><Download size={15}/>Install</Button>}
+      {(s==='installed'||s==='failed')&&<Button variant="primary" disabled={working} onClick={()=>act('/admin/agent/engine/start','start')}>{busy==='start'?<Loader2 className="spin" size={15}/>:<Play size={15}/>}Start</Button>}
+      {(running||s==='restarting')&&<Button disabled={working} onClick={()=>act('/admin/agent/engine/stop','stop')}><Square size={14}/>Stop</Button>}
+      {working&&!busy&&<Loader2 className="spin" size={16}/>}
+    </div>
+    {s==='not_installed'&&<p className="subtle">The agent runs on OpenCode, an open-source coding agent. Polygate downloads its pinned version once from npm (about 100 MB), checks it against the published checksum, and runs it on this computer only. Its model requests go through Polygate under its own key.</p>}
+    {s==='installing'&&<Progress value={engine.progress||0} label="Downloading the agent engine"/>}
+    {s==='installed'&&<p className="subtle">Start the engine to work with the agent. Other clients are not affected by it.</p>}
+    {engine.message&&!running&&<p className={s==='failed'?'agent-error-text':'subtle'}>{engine.message}</p>}
+    {engine.problems?.length>0&&<ul className="agent-problems">{engine.problems.map(p=><li key={p}>{p}</li>)}</ul>}
+    {running&&engine.snapshots&&!engine.snapshots.ok&&<p className="agent-warn"><TriangleAlert size={15}/>Undo is unavailable: {engine.snapshots.reason}</p>}
+    {running&&engine.freeIdentity&&!engine.freeIdentity.usable&&<p className="agent-warn"><TriangleAlert size={15}/>OpenCode Free models are unavailable to the agent: OpenCode Free now expects OpenCode {engine.freeIdentity.presented}, and the agent runs {engine.freeIdentity.engine}.</p>}
+    {problem&&<div className="pg-error">{problem}</div>}
+  </div></section>;
+}
+
+function Workspace(){
+  const [folder,setFolder]=useState(()=>stored('polygate-agent-folder'));
+  const [recent,setRecent]=useState<string[]>(()=>storedList('polygate-agent-recent'));
+  const [selected,setSelected]=useState(()=>folder?stored('polygate-agent-session:'+folder):'');const [fresh,setFresh]=useState('');
+  const {data:models}=usePoll<Models>('/admin/agent/models',60000);
+  const sessionsPath=folder?`/admin/agent/sessions?folder=${encodeURIComponent(folder)}`:'/admin/agent/models';
+  const {data:list,error:listError,reload}=usePoll<{sessions:SessionInfo[]}>(sessionsPath,10000,!!folder);
+  const pick=(f:string)=>{setFolder(f);store('polygate-agent-folder',f);const next=[f,...recent.filter(x=>x!==f)].slice(0,6);setRecent(next);store('polygate-agent-recent',JSON.stringify(next));setSelected(stored('polygate-agent-session:'+f));};
+  const select=(id:string)=>{setSelected(id);store('polygate-agent-session:'+folder,id);};
+  const sessions=folder&&list?list.sessions:[];
+  return <div className="agent-layout">
+    <aside className="section-block agent-side">
+      <div className="agent-side-block">
+        <h3>Working folder</h3>
+        {folder?<p className="agent-folder mono" title={folder}>{folder}</p>:<p className="subtle">Choose the project folder the agent works in.</p>}
+        <FolderPicker onPick={pick}/>
+        {recent.filter(f=>f!==folder).length>0&&<div className="agent-recent">{recent.filter(f=>f!==folder).map(f=><button key={f} className="text-button truncate" title={f} onClick={()=>pick(f)}>{f}</button>)}</div>}
+        {folder&&listError&&<div className="pg-error">{listError}</div>}
+      </div>
+      {folder&&!listError&&models&&<NewSession folder={folder} data={models} onCreated={id=>{setFresh(id);select(id);reload();}}/>}
+      {folder&&!listError&&<div className="agent-side-block"><h3>Sessions</h3>
+        {sessions.length?<ul className="agent-sessions">{sessions.map(s=><li key={s.id}><button className={`agent-session-item${s.id===selected?' active':''}`} aria-current={s.id===selected?'true':undefined} onClick={()=>select(s.id)}>
+          <span className="truncate">{s.title}</span><small>{when(s.created||0)}{s.mode?` · ${modeLabel(s.mode)}`:''}</small></button></li>)}</ul>:<p className="subtle">No sessions in this folder yet.</p>}
+      </div>}
+    </aside>
+    <div className="agent-main">
+      {folder&&selected&&(selected===fresh||sessions.some(s=>s.id===selected))?<SessionView key={selected} id={selected} folder={folder} models={models?.models||[]} onChanged={reload}/>
+        :<Empty icon={Bot} title={folder?'No session open':'Choose a working folder'}>{folder?'Start a session, or open one from the list.':'The agent reads, edits and runs commands in the folder you choose, and asks first where its mode says so.'}</Empty>}
+    </div>
+  </div>;
+}
+
+function FolderPicker({onPick}:{onPick:(folder:string)=>void}){
+  const bridge=window.polygateDesktop;const [text,setText]=useState('');
+  if(bridge?.pickFolder)return <Button onClick={async()=>{const f=await bridge.pickFolder!();if(f)onPick(f);}}><FolderOpen size={15}/>Choose folder…</Button>;
+  // In a browser (not the desktop app) there is no folder dialog: the path is typed and checked by the gateway.
+  return <form className="agent-folder-form" onSubmit={e=>{e.preventDefault();if(text.trim()){onPick(text.trim());setText('');}}}>
+    <input aria-label="Working folder path" placeholder="C:\path\to\project" value={text} onChange={e=>setText(e.target.value)}/><Button type="submit">Use</Button>
+  </form>;
+}
+
+function NewSession({folder,data,onCreated}:{folder:string;data:Models;onCreated:(id:string)=>void}){
+  const usable=data.models.filter(m=>m.usable);const blocked=data.models.filter(m=>!m.usable);
+  const [model,setModel]=useState(()=>stored('polygate-agent-model'));const current=usable.find(m=>m.id===model)||usable[0];
+  const [mode,setMode]=useState<Mode>('ask');const [effort,setEffort]=useState('');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
+  const start=async()=>{
+    if(!current)return;setBusy(true);setError('');
+    try{const s=await api('/admin/agent/session/create',{folder,model:current.id,mode,effort:current.efforts.includes(effort)?effort:''});store('polygate-agent-model',current.id);onCreated(s.id);}
+    catch(e:any){setError(e.message);}finally{setBusy(false);}
+  };
+  const small=current&&current.context>0&&current.context<32000;
+  return <div className="agent-side-block"><h3>New session</h3>
+    {usable.length?<>
+      <Field label="Model" hint={current?(current.context?`${compact(current.context)} context${small?': small for longer tasks':''}`:'Context size unknown'):undefined}>
+        <Select value={current?.id} onChange={setModel} aria-label="Model">{usable.map(m=><option key={m.id} value={m.id}>{`${m.name} · ${m.provider}`}</option>)}</Select>
+      </Field>
+      {current&&current.efforts.length>0&&<Field label="Effort"><Select value={effort} onChange={setEffort} aria-label="Reasoning effort"><option value="">Default</option>{current.efforts.map(x=><option key={x} value={x}>{cap(x)}</option>)}</Select></Field>}
+      <Field label="Mode" hint={data.modes[mode]}><Select value={mode} onChange={v=>setMode(v as Mode)} aria-label="Mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select></Field>
+      <Button variant="primary" onClick={start} disabled={busy||!current}>{busy?<Loader2 className="spin" size={15}/>:<Plus size={15}/>}Start session</Button>
+    </>:<p className="subtle">No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
+    {blocked.length>0&&<p className="subtle agent-blocked" title={blocked[0].reason}>{blocked.length} OpenCode Free model{blocked.length>1?'s are':' is'} unavailable to the agent right now.</p>}
+    {error&&<div className="pg-error">{error}</div>}
+  </div>;
+}
+
+function SessionView({id,folder,models,onChanged}:{id:string;folder:string;models:AgentModel[];onChanged:()=>void}){
+  const [info,setInfo]=useState<SessionInfo|null>(null);const [items,setItems]=useState<Item[]>([]);const [pending,setPending]=useState<Approval[]>([]);
+  const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>();
+  const [error,setError]=useState('');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');
+  const [text,setText]=useState('');const [sending,setSending]=useState(false);
+  const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;
+  const load=useCallback(async()=>{
+    try{const s=await api('/admin/agent/session?id='+encodeURIComponent(id));setInfo(s.session);setItems(fromHistory(s.messages));setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);setError('');}
+    catch(e:any){setError(e.message);}
+  },[id]);
+  // History first, then the live stream. After a dropped connection the history is read again, so nothing missed meanwhile is lost.
+  useEffect(()=>{
+    let source:EventSource|undefined;let closed=false;let lost=false;
+    const handle=(e:any)=>{
+      const d=e.data||{};
+      if(e.type==='agent.state'){setPending(d.pending||[]);setPaused(d.paused||'');setBusy(!!d.busy);return;}
+      if(e.type==='permission.asked'){setPending(p=>p.some(x=>x.id===d.id)?p:[...p,{id:d.id,action:d.action,resources:d.resources||[],note:d.note||''}]);return;}
+      if(e.type==='permission.replied'){setPending(p=>p.filter(x=>x.id!==d.requestID));return;}
+      if(e.type==='agent.approval.auto')setPending(p=>p.filter(x=>x.id!==d.requestID));
+      if(e.type==='agent.paused'){setPaused(d.message||'The model kept failing.');setBusy(false);return;}
+      if(e.type==='session.execution.started'){setBusy(true);setPaused('');}
+      if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();}
+      if(e.type==='session.usage.updated'&&d.tokens)setUsage(d.tokens);
+      setItems(list=>applyEvent(list,e));
+    };
+    (async()=>{
+      await load();if(closed)return;
+      source=new EventSource(at('/admin/agent/events?id='+encodeURIComponent(id)));
+      source.onopen=()=>{setLive('live');if(lost){lost=false;load();}};
+      source.onerror=()=>{lost=true;setLive('lost');};
+      source.onmessage=m=>{try{handle(JSON.parse(m.data));}catch{/* a malformed event is skipped */}};
+    })();
+    return ()=>{closed=true;source?.close();};
+  },[id,load]);
+  // Follows the newest output while the reader is near the bottom; reading further up is left alone.
+  useEffect(()=>{const el=thread.current;if(el&&el.scrollHeight-el.scrollTop-el.clientHeight<160)el.scrollTop=el.scrollHeight;},[items,pending,busy]);
+  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');try{await api('/admin/agent/session/prompt',{id,text:t});setText('');}catch(e:any){setError(e.message);}finally{setSending(false);}};
+  const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
+  const changeMode=async(mode:Mode)=>{try{await api('/admin/agent/session/mode',{id,mode});setInfo(i=>i&&{...i,mode});}catch(e:any){setError(e.message);}};
+  const answer=async(p:Approval,decision:'once'|'session'|'deny')=>{
+    setPending(list=>list.filter(x=>x.id!==p.id));
+    try{await api('/admin/agent/session/approve',{id,request:p.id,decision});}catch(e:any){setError(e.message);load();}
+  };
+  const model=models.find(m=>m.id===info?.model);const tokens=usage?usage.input+usage.output+(usage.reasoning||0):0;
+  return <section className="section-block agent-session">
+    <header className="agent-session-head">
+      <div className="agent-title"><h2 className="truncate" title={info?.title}>{info?.title||'Session'}</h2>
+        <span className="subtle truncate">{model?`${model.name} · ${model.provider}`:info?.model}{info?.effort?` · ${cap(info.effort)} effort`:''}</span></div>
+      <span className="toolbar-spacer"/>
+      {tokens>0&&<span className="pg-stat" title="Tokens this session has used, as the engine counts them">{compact(tokens)} tokens</span>}
+      <Select value={info?.mode||'ask'} onChange={v=>changeMode(v as Mode)} aria-label="Mode" className="agent-mode">{MODES.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}</Select>
+      <span className={`agent-live ${live}`}>{live==='live'?'Live':live==='lost'?'Reconnecting…':'Connecting…'}</span>
+    </header>
+    <div className="agent-thread" ref={thread} aria-live="polite">
+      {items.length?items.map(i=><Row key={i.key} item={i} folder={folder}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {info?.mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':info?.mode==='accept-edits'?'It changes files without asking and asks before running commands.':'It reads freely and asks before changing files or running commands.'}</p>}
+      {busy&&!pending.length&&<div className="agent-working"><Loader2 className="spin" size={15}/>Working…</div>}
+    </div>
+    {pending.map(p=><ApprovalCard key={p.id} request={p} answer={answer}/>)}
+    {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {paused} Send a message to try again, or start a session with another model.</div></div>}
+    {error&&<div className="pg-error agent-error">{error}</div>}
+    <div className="agent-composer">
+      <textarea aria-label="Message to the agent" placeholder={busy?'The agent is working. A message now is queued for when it is done.':'Ask the agent to do something in this folder…'} value={text} rows={3}
+        onChange={e=>setText(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();send();}}}/>
+      <div className="agent-composer-actions">
+        {busy&&<Button onClick={stop}><Square size={14}/>Stop</Button>}
+        <Button variant="primary" onClick={send} disabled={sending||!text.trim()}>{sending?<Loader2 className="spin" size={15}/>:<Send size={15}/>}{busy?'Queue':'Send'}</Button>
+      </div>
+    </div>
+  </section>;
+}
+
+function Row({item,folder}:{item:Item;folder:string}){
+  if(item.kind==='user')return <div className="pg-msg user"><pre>{item.text}</pre></div>;
+  if(item.kind==='text')return item.text?<div className="pg-msg assistant"><pre>{item.text}</pre></div>:null;
+  if(item.kind==='reasoning')return <details className="pg-think"><summary><Brain size={14}/>{item.done?'Reasoning':'Thinking…'}</summary><pre>{item.text}</pre></details>;
+  if(item.kind==='note')return <div className={`agent-note ${item.tone}`}>{item.text}</div>;
+  const subject=toolSubject(item.name,item.input,folder);
+  const icon=item.status==='done'?<Check size={14} className="green"/>:item.status==='failed'?<X size={14} className="red"/>:<Loader2 size={14} className="spin"/>;
+  return <details className={`agent-tool ${item.status}`}><summary>{icon}<strong>{item.name}</strong>{subject&&<code className="truncate" title={subject}>{subject}</code>}</summary>
+    {item.error&&<p className="agent-error-text">{item.error}</p>}
+    {item.output?<pre>{item.output.length>6000?item.output.slice(0,6000)+'\n…':item.output}</pre>:!item.error&&<p className="subtle">{item.status==='done'?'No output.':'Waiting for the result…'}</p>}
+  </details>;
+}
+
+function ApprovalCard({request:p,answer}:{request:Approval;answer:(p:Approval,decision:'once'|'session'|'deny')=>void}){
+  return <div className="agent-approval" role="alert">
+    <div className="agent-approval-head"><ShieldCheck size={18}/><strong>{approvalTitle(p.action)}</strong></div>
+    {p.resources.map(r=><code key={r} className="agent-approval-target">{r}</code>)}
+    {p.note&&<p className="agent-approval-note">{p.note}</p>}
+    <div className="agent-approval-actions">
+      <Button variant="primary" onClick={()=>answer(p,'once')}>Allow once</Button>
+      <Button onClick={()=>answer(p,'session')} title="Allowed again without asking, for exactly this, until this session ends">Allow for this session</Button>
+      <Button onClick={()=>answer(p,'deny')}>Deny</Button>
+    </div>
+    <p className="subtle">Deny stops this turn, together with anything else the agent asked to do at the same time.</p>
+  </div>;
+}

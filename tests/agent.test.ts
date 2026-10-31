@@ -11,21 +11,21 @@ const engine = await import('../backend/agent-engine');
 const { settings, saveModel, models, db, stateDir } = await import('../backend/state');
 const { startGateway } = await import('../backend/main');
 const FAKE = [process.execPath, path.join(import.meta.dir, 'fixtures', 'fake-opencode.ts')];
-const MODEL = 'kilo/agent-test-model'; const TOOLLESS = 'kilo/agent-test-chat';
+const MODEL = 'kilo/agent-test-model'; const TOOLLESS = 'kilo/agent-test-chat'; const THINKER = 'kilo/agent-test-thinker';
 const saved = { token: process.env.POLYGATE_ADMIN_TOKEN, desktop: process.env.POLYGATE_DESKTOP, providers: settings.providers };
 const keysBefore = settings.keys.map(k => k.id);
 let gateway: Awaited<ReturnType<typeof startGateway>>; let base = '';
-const model = (id: string, tools: boolean) => ({ id, upstreamId: id.split('/').pop()!, providerId: 'kilo', name: id, context: 128000, output: 8192, reasoning: false, tools, state: 'available' as const, latency: 0, score: 50, priority: 100, failCount: 0, cooldownUntil: 0, checkedAt: 0, error: '' });
+const model = (id: string, tools: boolean, reasoning = false) => ({ id, upstreamId: id.split('/').pop()!, providerId: 'kilo', name: id, context: 128000, output: 8192, reasoning, tools, state: 'available' as const, latency: 0, score: 50, priority: 100, failCount: 0, cooldownUntil: 0, checkedAt: 0, error: '' });
 
 beforeAll(async () => {
   process.env.POLYGATE_ADMIN_TOKEN = 'agent-controller-secret'; process.env.POLYGATE_DESKTOP = '1';
   settings.providers = settings.providers.map(p => p.id === 'kilo' ? { ...p, enabled: true } : p);
-  saveModel(model(MODEL, true)); saveModel(model(TOOLLESS, false));
+  saveModel(model(MODEL, true)); saveModel(model(TOOLLESS, false)); saveModel(model(THINKER, true, true));
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => {
   await engine.stopEngine(); await gateway?.close();
-  for (const id of [MODEL, TOOLLESS]) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); }
+  for (const id of [MODEL, TOOLLESS, THINKER]) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); }
   settings.providers = saved.providers; settings.keys = settings.keys.filter(k => keysBefore.includes(k.id));
   for (const [k, v] of [['POLYGATE_ADMIN_TOKEN', saved.token], ['POLYGATE_DESKTOP', saved.desktop]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   delete process.env.FAKE_OPENCODE_SAVED; delete process.env.POLYGATE_AGENT_DIR;
@@ -73,6 +73,15 @@ test('a session is created in an existing folder, with a model the engine has an
   expect(all.find(c => c.method === 'POST' && c.path === '/api/session')!.body).toMatchObject({ agent: 'polygate-plan', model: { providerID: 'polygate', id: MODEL }, location: { directory: FOLDER } });
   expect(all.some(c => c.method === 'DELETE' && c.path === '/api/permission/saved/psv_planted')).toBe(true);
   expect((await admin('/admin/agent/sessions?folder=' + encodeURIComponent(FOLDER))).body.sessions.map((s: any) => s.id)).toContain(id);
+});
+
+test('a reasoning model can be given an effort; other models, and unknown efforts, are refused', async () => {
+  const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: THINKER, mode: 'ask', effort: 'high' });
+  expect(r.status).toBe(200); expect(r.body.effort).toBe('high');
+  expect((await calls()).filter(c => c.method === 'POST' && c.path === '/api/session').at(-1)!.body.model).toEqual({ providerID: 'polygate', id: THINKER, variant: 'high' });
+  expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'ask', effort: 'high' })).status).toBe(400);
+  expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: THINKER, mode: 'ask', effort: 'max' })).status).toBe(400);
+  expect((await admin('/admin/agent/models')).body.models.find((m: any) => m.id === THINKER).efforts).toEqual(['low', 'medium', 'high']);
 });
 
 test('a prompt reaches the engine, and the UI stream carries this session\'s events only', async () => {
