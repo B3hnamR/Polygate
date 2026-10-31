@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { settings, persist, models, redactError, maskMcp, maskUrl } from './state';
 import { networkFetch, testRoute } from './transport';
@@ -104,7 +105,7 @@ class SseChannel implements Channel {
 }
 // A local program speaking MCP on its standard input and output. Its own error output goes to the log (a few lines a minute at most).
 class StdioChannel implements Channel {
-  proc?: ChildProcess; protocolVersion?: string; onMessage?: (m: Msg) => void; onClose?: (why: string) => void; private buffer = ''; private noise = { at: 0, n: 0 };
+  proc?: ChildProcess; protocolVersion?: string; onMessage?: (m: Msg) => void; onClose?: (why: string) => void; private buffer = ''; private outDecoder = new StringDecoder('utf8'); private errDecoder = new StringDecoder('utf8'); private errBuffer = ''; private noise = { at: 0, n: 0 };
   constructor(private s: McpServer) {}
   async open() {
     const win = process.platform === 'win32'; const args = this.s.args || [];
@@ -118,13 +119,13 @@ class StdioChannel implements Channel {
     // Writing to a program that has just exited raises EPIPE on this stream; without a listener that would take the whole gateway down.
     proc.stdin!.on('error', e => this.onClose?.(`The program closed its input (${(e as NodeJS.ErrnoException).code || e.message})`));
     proc.stdout!.on('data', (chunk: Buffer) => {
-      this.buffer += chunk.toString('utf8'); let i;
+      this.buffer += this.outDecoder.write(chunk); let i; // a multibyte character split between two chunks is held until its last byte arrives
       while ((i = this.buffer.indexOf('\n')) >= 0) {
         const line = this.buffer.slice(0, i).trim(); this.buffer = this.buffer.slice(i + 1); if (!line) continue;
         try { each(JSON.parse(line), x => this.onMessage?.(x)); } catch { this.noisy(line); }
       }
     });
-    proc.stderr!.on('data', (chunk: Buffer) => { for (const line of chunk.toString('utf8').split(/\r?\n/)) if (line.trim()) this.noisy(line.trim()); });
+    proc.stderr!.on('data', (chunk: Buffer) => { const lines = (this.errBuffer + this.errDecoder.write(chunk)).split(/\r?\n/); this.errBuffer = lines.pop() || ''; for (const line of lines) if (line.trim()) this.noisy(line.trim()); if (this.errBuffer.length > 8192) { this.noisy(this.errBuffer.trim()); this.errBuffer = ''; } });
     proc.on('exit', (code, signal) => this.onClose?.(`The program exited (${code ?? signal})`));
     await new Promise<void>((resolve, reject) => { proc.once('spawn', () => resolve()); proc.once('error', e => reject(new Error(`Could not start "${this.s.command}": ${e.message}`))); });
   }
@@ -185,15 +186,18 @@ class McpClient {
 }
 
 // ------------------------------------------------------------------------------------------------------------------- the hub's servers
-type Live = { state: 'off' | 'connecting' | 'ready' | 'error'; error: string; tools: McpTool[]; client?: McpClient; connecting?: Promise<void>; signature: string; serverInfo?: { name?: string; version?: string }; protocol?: string; connectedAt?: number; retryAt: number; calls: number; failures: number; totalMs: number; lastCallAt?: number };
+type Live = { state: 'off' | 'connecting' | 'ready' | 'error'; error: string; tools: McpTool[]; client?: McpClient; connecting?: Promise<void>; gen?: number; signature: string; serverInfo?: { name?: string; version?: string }; protocol?: string; connectedAt?: number; retryAt: number; calls: number; failures: number; totalMs: number; lastCallAt?: number };
 const live = new Map<string, Live>();
 const signature = (s: McpServer) => JSON.stringify([s.transport, s.url, s.headers, s.command, s.args, s.env, s.cwd, routeOf(s)]);
 const blank = (s: McpServer, state: Live['state'] = 'off'): Live => ({ state, error: '', tools: [], signature: signature(s), retryAt: 0, calls: 0, failures: 0, totalMs: 0 });
 const timeoutOf = (s: McpServer) => Math.max(5, Math.min(600, s.timeoutSec || 60)) * 1000;
 function connect(s: McpServer): Promise<void> {
   let l = live.get(s.id); if (!l) { l = blank(s); live.set(s.id, l); }
-  if (l.connecting) return l.connecting;
-  const entry = l; entry.client?.close(); entry.client = undefined; entry.state = 'connecting'; entry.error = ''; entry.signature = signature(s);
+  const sig = signature(s);
+  // A connection still being made for the same settings is shared. One made for older settings is replaced: it keeps running but its result is dropped.
+  if (l.connecting && l.signature === sig) return l.connecting;
+  const entry = l; const gen = entry.gen = (entry.gen || 0) + 1;
+  entry.client?.close(); entry.client = undefined; entry.state = 'connecting'; entry.error = ''; entry.signature = sig;
   const started = Date.now();
   entry.connecting = (async () => {
     const client = new McpClient(channelFor(s), () => { void refreshTools(s.id).catch(() => {}); }, why => {
@@ -204,14 +208,16 @@ function connect(s: McpServer): Promise<void> {
       // npx and uvx may download the server the first time, so local programs get longer to start.
       const wait = s.transport === 'stdio' ? 120000 : 30000;
       await client.connect(wait); const tools = await client.listTools(wait);
-      if (live.get(s.id) !== entry) { client.close(); return; }
+      if (live.get(s.id) !== entry || entry.gen !== gen) { client.close(); return entry.gen !== gen ? entry.connecting : undefined; }
       Object.assign(entry, { client, tools, state: 'ready', error: '', serverInfo: client.info?.serverInfo, protocol: client.info?.protocolVersion, connectedAt: Date.now(), retryAt: 0 });
       logEvent('info', 'mcp', `${s.name} connected: ${tools.length} tool(s) in ${Date.now() - started} ms`, { server: s.name, transport: s.transport, route: s.transport === 'stdio' ? undefined : routeOf(s), serverInfo: client.info?.serverInfo, protocol: client.info?.protocolVersion });
     } catch (e) {
-      client.close(); entry.state = 'error'; entry.error = plain(e); entry.retryAt = Date.now() + 30000;
+      client.close();
+      if (entry.gen !== gen) return entry.connecting; // replaced by a connection with newer settings, which owns the state now
+      entry.state = 'error'; entry.error = plain(e); entry.retryAt = Date.now() + 30000;
       logEvent('warn', 'mcp', `${s.name} could not connect: ${entry.error}`, { server: s.name, transport: s.transport });
       throw e;
-    } finally { entry.connecting = undefined; }
+    } finally { if (entry.gen === gen) entry.connecting = undefined; }
   })();
   return entry.connecting;
 }
@@ -223,7 +229,7 @@ async function refreshTools(id: string) {
 async function ready(s: McpServer, waitMs: number) {
   if (!s.enabled || !mcpConfig().enabled) throw new Error(`${s.name} is switched off`);
   const l = live.get(s.id);
-  if (l?.state === 'ready' && l.client) return l;
+  if (l?.state === 'ready' && l.client && l.signature === signature(s)) return l; // a connection made for older settings is not reused
   if (l?.state === 'error' && l.retryAt > Date.now() && !l.connecting) throw new Error(l.error || `${s.name} is not connected`);
   let timer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([connect(s), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${s.name} is still connecting`)), waitMs); })]).finally(() => clearTimeout(timer));

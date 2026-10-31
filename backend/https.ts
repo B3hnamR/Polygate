@@ -1,6 +1,6 @@
 import { serverConfig } from './auth';
 import { X509Certificate, createPrivateKey, generateKeyPairSync, createHash, sign as signData, type KeyObject } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import path from 'node:path';
@@ -24,6 +24,13 @@ const b64u = (v: Buffer | string) => Buffer.from(v).toString('base64url');
 // --- certificate files ---
 const certPath = (id: string) => path.join(tlsDir, `${id}-fullchain.pem`); const keyPath = (id: string) => path.join(tlsDir, `${id}-privkey.pem`);
 function writeCert(id: string, cert: string, key: string) { mkdirSync(tlsDir, { recursive: true, mode: 0o700 }); writeFileSync(certPath(id), cert); writeFileSync(keyPath(id), key, { mode: 0o600 }); try { chmodSync(keyPath(id), 0o600); } catch { /* windows */ } }
+// The certificate and key a mode had before a change, so a change that fails can put them back (null: there were none).
+const readPemPair = (id: string) => { const get = (f: string) => { try { return readFileSync(f, 'utf8'); } catch { return null; } }; return { cert: get(certPath(id)), key: get(keyPath(id)) }; };
+function restorePemPair(id: string, before: { cert: string | null; key: string | null }) {
+  for (const [file, text, mode] of [[certPath(id), before.cert, 0o644], [keyPath(id), before.key, 0o600]] as const) {
+    try { if (text === null) rmSync(file, { force: true }); else { writeFileSync(file, text, { mode }); try { chmodSync(file, mode); } catch { /* windows */ } } } catch { /* the original error is the one to report */ }
+  }
+}
 function readTls(cfg: HttpsSettings): (Tls & { cert509: X509Certificate }) | undefined {
   const id = cfg.mode === 'custom' ? 'custom' : cfg.mode; if (cfg.mode === 'off') return undefined;
   const cf = certPath(id), kf = keyPath(id); if (!existsSync(cf) || !existsSync(kf)) return undefined;
@@ -181,6 +188,7 @@ async function applyHttps(b: any) {
   }
   job = { running: true, startedAt: Date.now(), finishedAt: 0, steps: [], error: '', url: '' };
   const previous = { ...httpsConfig() };
+  let pemBefore: { id: string; files: ReturnType<typeof readPemPair> } | undefined;
   void (async () => {
     try {
       let result = custom;
@@ -189,13 +197,13 @@ async function applyHttps(b: any) {
         log(`Opening port ${next.httpPort} for the validation request…`); settings.https = { ...next }; stopChallengeServer(); try { await startChallengeServer(); } catch (e: any) { throw new Error(`Could not listen on port ${next.httpPort} (${e.code || e.message}). Free it, or run the service with permission to bind low ports.`); }
         result = await issue(next, identifier);
       }
-      const id = mode === 'custom' ? 'custom' : mode; writeCert(id, result!.cert, result!.key);
+      const id = mode === 'custom' ? 'custom' : mode; pemBefore = { id, files: readPemPair(id) }; writeCert(id, result!.cert, result!.key);
       const c = new X509Certificate(result!.cert); next.issuedAt = Date.parse(c.validFrom); next.expiresAt = expiryOf(c); settings.https = next; persist();
       log('Certificate installed. Switching the listener to HTTPS…', 'ok'); await applyListener();
       if (mode === 'custom') { stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined; } else { await startChallengeServer().catch(() => {}); startRenewal(); }
       job.url = `https://${next.domain || next.ip}${next.port === 443 ? '' : ':' + next.port}${serverConfig().dashboardPath}/`; log(`HTTPS is active at ${job.url}`, 'ok');
       notify('HTTPS enabled', `The dashboard is now served at ${job.url}`, 'success', 'https-on', 0);
-    } catch (e: any) { job.error = redactError(String(e.message || e)); log(job.error, 'error'); settings.https = { ...previous, lastError: job.error }; persist(); }
+    } catch (e: any) { job.error = redactError(String(e.message || e)); log(job.error, 'error'); if (pemBefore) restorePemPair(pemBefore.id, pemBefore.files); settings.https = { ...previous, lastError: job.error }; persist(); }
     finally { challenges.clear(); job.running = false; job.finishedAt = Date.now(); }
   })();
   return httpsStatus();

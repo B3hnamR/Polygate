@@ -197,7 +197,7 @@ async function startTunnel(port: number, index: number, preferredEndpoint: strin
       const egress = alive ? await tunnelUp(port, () => output, () => exited) : null;
       if (egress?.ip) {
         const epochAtStart = epoch; const tunnel: Tunnel = { port, index, proc, identity, endpoint, split: !!split, startedAt: Date.now(), egressIp: egress.ip, egress, failures: 0, cooldownUntil: 0, restarts: 0 };
-        proc.once('exit', code => { if (tunnels.get(port)?.proc !== proc) return; tunnels.delete(port); if (!stopping) { notify('WARP tunnel stopped', `Tunnel on port ${port} exited (${code}).`, 'warning', 'warp-tunnel-' + port); setTimeout(() => void restartTunnel(port, index, tunnel.restarts + 1, epochAtStart), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref(); } });
+        proc.once('exit', code => tunnelExited(port, proc, code, index, epochAtStart));
         if (split && mode === 'auto' && workingSplit !== split) notify('WARP splits its handshake', 'This network resets a plain connection to Cloudflare, so WARP sends the first part of its secure handshake in small pieces.', 'info', 'warp-split', 3600000);
         workingSplit = split; return tunnel;
       }
@@ -210,6 +210,16 @@ async function startTunnel(port: number, index: number, preferredEndpoint: strin
 }
 // Every stop, disconnect or rotation starts a new epoch: a restart that was scheduled before it belongs to a connection the user already ended.
 let epoch = 0; const restarting = new Set<number>();
+// The one place a tunnel's process end is handled: it leaves the pool and, unless WARP is being stopped on purpose, comes back after a pause.
+// A deliberate stop removes the entry first, so the check below finds nothing and no restart is scheduled. The health monitor only kills the
+// process of a tunnel that stopped answering and leaves the rest to this.
+function tunnelExited(port: number, proc: ChildProcess, code: number | null, index: number, epochAtStart: number) {
+  const tunnel = tunnels.get(port); if (tunnel?.proc !== proc) return;
+  tunnels.delete(port);
+  if (stopping) return;
+  notify('WARP tunnel stopped', `Tunnel on port ${port} exited (${code}).`, 'warning', 'warp-tunnel-' + port);
+  setTimeout(() => void restartTunnel(port, index, tunnel.restarts + 1, epochAtStart), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref();
+}
 async function restartTunnel(port: number, index: number, restarts: number, scheduled = epoch) {
   if (scheduled !== epoch || stopping || status.busy || restarting.has(index) || [...tunnels.values()].some(t => t.index === index) || engineMode() !== 'embedded') return;
   restarting.add(index);
@@ -275,7 +285,7 @@ export async function refreshStatus(force = false, probe = false): Promise<void>
   const engine = engineMode(); const before = status.state;
   if (engine === 'disabled') { status.state = 'disabled'; }
   else {
-    for (const [port, t] of [...tunnels]) if (!(await socksAlive('127.0.0.1', port, 1500))) { t.failures++; if (t.failures >= 3) { stopProcess(t.proc); tunnels.delete(port); } }
+    for (const [port, t] of [...tunnels]) if (!(await socksAlive('127.0.0.1', port, 1500))) { t.failures++; if (t.failures >= 3) stopProcess(t.proc); } // the exit handler removes the tunnel and schedules its restart: one path owns both
     status.state = tunnels.size ? 'connected' : (findWarpHelper() ? (status.busy ? 'connecting' : 'disconnected') : 'not_installed');
   }
   if (status.state === 'connected' && !status.egress) { const t = [...tunnels.values()].find(x => x.egress); if (t?.egress) status.egress = t.egress; else { const target = warpTarget(); if (target) status.egress = await traceVia(target.host, target.port, 20000) || undefined; } }
@@ -383,3 +393,5 @@ export async function startWarp() {
 export async function stopWarp() { stopping = true; if (monitor) clearInterval(monitor); if (rotateTimer) clearInterval(rotateTimer); monitor = rotateTimer = undefined; await stopTunnels(); }
 export function listWarpFiles() { try { return readdirSync(warpDir); } catch { return []; } }
 export { socksConnect };
+export const __tunnels = tunnels;
+export const __tunnelExited = tunnelExited;
