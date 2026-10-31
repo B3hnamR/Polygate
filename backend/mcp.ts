@@ -54,12 +54,18 @@ const each = (x: any, fn: (m: Msg) => void) => { for (const m of Array.isArray(x
 // Streamable HTTP (MCP 2025-03-26 and later): every message is a POST; the answer comes back as JSON or as a short event stream.
 class HttpChannel implements Channel {
   session = ''; protocolVersion?: string; onMessage?: (m: Msg) => void; onClose?: (why: string) => void;
+  // Everything this channel has in flight shares one signal, so closing it can stop the requests and the answer streams still being read.
+  private abort = new AbortController(); private closed = false;
   constructor(private s: McpServer) {}
   async open() { new URL(this.s.url || ''); }
   private headers() { return { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(this.s.headers || {}), ...(this.session ? { 'mcp-session-id': this.session } : {}), ...(this.protocolVersion ? { 'mcp-protocol-version': this.protocolVersion } : {}) }; }
   async send(m: Msg, signal?: AbortSignal) {
-    const r = await networkFetch(this.s.url!, { method: 'POST', headers: this.headers(), body: JSON.stringify(m), signal }, routeOf(this.s));
-    const sid = r.headers.get('mcp-session-id'); if (sid) this.session = sid;
+    const r = await networkFetch(this.s.url!, { method: 'POST', headers: this.headers(), body: JSON.stringify(m), signal: signal ? AbortSignal.any([signal, this.abort.signal]) : this.abort.signal }, routeOf(this.s));
+    const sid = r.headers.get('mcp-session-id');
+    // The channel was closed while this request was on its way (the initialization of a server switched off meanwhile): the session it just started is
+    // closed at once, and nothing is kept.
+    if (this.closed) { if (sid) this.endSession(sid); await r.body?.cancel().catch(() => {}); throw new Error('The connection was closed'); }
+    if (sid) this.session = sid;
     if (r.status === 404 && this.session && m.method !== 'initialize') { await r.body?.cancel().catch(() => {}); this.session = ''; throw new SessionExpired(); }
     if (!r.ok) { const t = (await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 240); throw new Error(r.status === 401 || r.status === 403 ? `The server refused the credentials (HTTP ${r.status}). Check the headers or the address.${t ? ' ' + t : ''}` : `The server answered HTTP ${r.status}${t ? ': ' + t : ''}`); }
     if (r.status === 202 || m.id === undefined || m.id === null) { await r.body?.cancel().catch(() => {}); return; }
@@ -74,7 +80,10 @@ class HttpChannel implements Channel {
     }
     const text = await r.text(); if (text.trim()) each(JSON.parse(text), x => this.onMessage?.(x));
   }
-  close() { if (this.session && this.s.url) void networkFetch(this.s.url, { method: 'DELETE', headers: this.headers(), signal: AbortSignal.timeout(5000) }, routeOf(this.s)).then(r => r.body?.cancel()).catch(() => {}); this.session = ''; }
+  private endSession(sid: string) { if (this.s.url) void networkFetch(this.s.url, { method: 'DELETE', headers: { ...this.headers(), 'mcp-session-id': sid }, signal: AbortSignal.timeout(5000) }, routeOf(this.s)).then(r => r.body?.cancel()).catch(() => {}); }
+  // With a session, it is ended on the server and everything in flight is cancelled with it. Without one the initialization is still on its way: it is left
+  // to finish (it is short and has its own time limit) and `send` ends the session it starts, because a session that has not been named cannot be ended.
+  close() { this.closed = true; const sid = this.session; this.session = ''; if (sid) { this.endSession(sid); this.abort.abort(); } }
 }
 // The older HTTP+SSE transport (MCP 2024-11-05): one long event stream for answers, messages POSTed to the address it announces.
 class SseChannel implements Channel {

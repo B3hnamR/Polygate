@@ -1992,11 +1992,11 @@ async function* responsesChunksAsChat(upstreamRes) {
 // relay has to say so instead of ending like a clean empty answer — measured
 // in the hostile sweep: a mid-flight cut used to read back to agents as a
 // "successful" turn that simply held less text than the model said.
-// A chat stream that carries several choices (n > 1) is finished at [DONE], or when every choice that started has finished: one choice finishing
-// while another is still writing is not the end of the answer.
-function chatFinishTracker() {
+// A chat stream that carries several choices (n > 1) is finished at [DONE], or when every choice that started has finished and as many have finished as
+// were asked for: one choice finishing while another is still writing, or one that never started, is not the end of the answer.
+function chatFinishTracker(expected = 1) {
   const open = new Set()
-  let finished = false
+  const closed = new Set()
   let done = false
   return {
     feed(block) {
@@ -2018,13 +2018,13 @@ function chatFinishTracker() {
           const i = Number.isInteger(c?.index) ? c.index : 0
           if (c?.finish_reason != null) {
             open.delete(i)
-            finished = true
+            closed.add(i)
           } else open.add(i)
         }
       }
     },
     get terminal() {
-      return done || (finished && open.size === 0)
+      return done || (closed.size >= expected && open.size === 0)
     },
   }
 }
@@ -2381,7 +2381,7 @@ function filterPinnedDelta(parsed, pinState) {
   }
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null, expectChoices = 1) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
@@ -2395,7 +2395,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   const decoder = new TextDecoder()
   let buffer = ""
   let sawFinish = false
-  const finish = chatFinishTracker()
+  const finish = chatFinishTracker(expectChoices)
   let upstreamErr = null
   const ctrl = new AbortController()
   let stalled = false

@@ -155,16 +155,18 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
     res.setHeader('x-polygate-model',used.id);if(chain)res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));res.setHeader('x-polygate-route',encodeURIComponent(route));
     // The answer is complete at [DONE], or when every choice that started has finished: with n > 1 one choice finishing is not the end.
-    let ended=false;let done=false;let firstAt=0;const writing=new Set<number>();let anyFinished=false;
+    // `asked` is the number of answers requested (n): with fewer finished, a stream that ends without [DONE] is cut short.
+    const asked=Math.max(1,Math.min(16,Math.floor(Number(askedChat.n))||1));
+    let ended=false;let done=false;let firstAt=0;const writing=new Set<number>();const finished=new Set<number>();
     const observer=observeSse(raw=>{
       if(raw==='[DONE]'){done=true;ended=true;return;}
-      try{const d=JSON.parse(raw);for(const c of d.choices||[]){const i=Number.isInteger(c?.index)?c.index:0;if(c?.finish_reason){writing.delete(i);anyFinished=true;}else writing.add(i);}ended=done||(anyFinished&&writing.size===0);if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
+      try{const d=JSON.parse(raw);for(const c of d.choices||[]){const i=Number.isInteger(c?.index)?c.index:0;if(c?.finish_reason){writing.delete(i);finished.add(i);}else writing.add(i);}ended=done||(finished.size>=asked&&writing.size===0);if(d.usage){input=d.usage.prompt_tokens||0;output=d.usage.completion_tokens||0;}if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
     },()=>{firstAt=Date.now();streaming();},()=>{if(firstAt)armIdle();});
     // pipeTo rather than pipeThrough: an abort in the middle of the stream rejects the pipe, and that is handled here instead of surfacing as an unhandled rejection.
     lfBody(upstream).body!.pipeTo(observer.writable).catch(()=>{});const observed=observer.readable;
     const wrapped=new Response(observed,{headers:upstream.headers,status:upstream.status});
     if(body.stream){
-      status=200;await stream(req,res,wrapped,protocol,used.id);
+      status=200;await stream(req,res,wrapped,protocol,used.id,asked);
       if(!controller.signal.aborted&&!ended){status=502;fault=true;message='Upstream stream ended before a terminal event';}
     }else{
       const data=await collect(wrapped);input=data.usage?.prompt_tokens||0;output=data.usage?.completion_tokens||0;
