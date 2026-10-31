@@ -82,6 +82,8 @@ app.whenReady().then(async()=>{
     win.webContents.on('before-input-event',(e,input)=>{if(input.type==='keyDown'&&input.control&&input.shift&&!input.alt&&!input.meta&&String(input.key).toLowerCase()==='m'){e.preventDefault();setCompact(!compact);}});
     ipcMain.handle('polygate:desktop:view',fromDashboard(()=>viewState()));
     ipcMain.handle('polygate:desktop:set-compact',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');return setCompact(value);}));
+    // The Agent page's working folder: Windows' own folder dialog, so the page never types or guesses a path. Only the chosen folder comes back.
+    ipcMain.handle('polygate:desktop:pick-folder',fromDashboard(async()=>{const r=await dialog.showOpenDialog(win,{title:"Choose the agent's working folder",properties:['openDirectory']});return r.canceled?'':r.filePaths[0]||'';}));
     ipcMain.handle('polygate:desktop:set-pinned',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');return setPinned(value);}));
     tray=new Tray(nativeImage.createFromPath(trayIconPath));tray.setToolTip(`Polygate · 127.0.0.1:${port}`);
     refreshTray();

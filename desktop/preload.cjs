@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('polygateDesktop', {
   getView: () => ipcRenderer.invoke('polygate:desktop:view'),
   setCompact: value => ipcRenderer.invoke('polygate:desktop:set-compact', value === true),
   setPinned: value => ipcRenderer.invoke('polygate:desktop:set-pinned', value === true),
+  // The agent's working folder, chosen in Windows' folder dialog ('' when cancelled).
+  pickFolder: () => ipcRenderer.invoke('polygate:desktop:pick-folder'),
   onView: callback => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on('polygate:desktop:view', listener);

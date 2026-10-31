@@ -22,6 +22,7 @@ import { closeSocksBridges } from './socks-bridge';
 import { logEvent, captureConsole, adminAction } from './logbook';
 import { handleMcp, syncMcp, stopMcp } from './mcp';
 import { setEngineGateway, stopEngine } from './agent-engine';
+import { stopAgent } from './agent';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
   const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');rememberAdminToken(token);
@@ -130,7 +131,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
     }
     const old=server;server=next;actual=next.port as number;current={...o,port:actual};setEngineGateway(`http://127.0.0.1:${actual}`);old.stop();return actual;
   };
-  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();await Promise.all([stopWarp(),stopEngine()]);};
+  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();stopAgent();await Promise.all([stopWarp(),stopEngine()]);};
   if(process.env.POLYGATE_NO_DISCOVERY!=='1')discover().catch(e=>console.error('[catalog]',redactError(String(e))));
   startWarp().catch(e=>console.error('[warp]',redactError(String(e))));
   syncMcp();
