@@ -114,6 +114,12 @@ test('each mode is an engine agent with its own rules, and Polygate\'s folders s
   for (const agent of Object.keys(cfg.agents)) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
 });
 
+test('the agent\'s shell is chosen by Polygate: PowerShell 7 when it is installed, Windows PowerShell otherwise, and written to the configuration', () => {
+  expect(engine.chooseShell(name => name === 'pwsh' ? 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' : null)).toBe('C:\\Program Files\\PowerShell\\7\\pwsh.exe');
+  expect(engine.chooseShell(() => null)).toBe(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
+  expect(engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [], shell: 'C:\\pwsh.exe' }).shell).toBe('C:\\pwsh.exe');
+});
+
 test('the engine gets none of Polygate\'s secrets, a password of its own and every hardening switch', () => {
   const saved = { ...process.env };
   Object.assign(process.env, { POLYGATE_ADMIN_TOKEN: 'admin-secret', POLYGATE_ADMIN_PASSWORD: 'pw', OPENCODE_CONFIG: 'C:\\elsewhere.json', XDG_CONFIG_HOME: 'C:\\mine' });

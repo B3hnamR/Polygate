@@ -16,6 +16,8 @@ import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
 import { autoOrder, needsOf, pickFrom, type Needs } from './plan';
 import { checklist } from './checklist';
 import type { Model, ApiKey, Chain } from './types';
+import { freeIdentityProblem } from './agent-engine';
+import { presentedOpenCodeVersion } from './providers';
 export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
 export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
 export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
@@ -69,6 +71,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const requestId=crypto.randomUUID();const body=await readJson(req);let chat=toChat(body,protocol);const askedChat=chat;
   // Shape of what the client sent (sizes, counts, header names; no content), kept with the request for later diagnosis.
   const clientShape={headers:describeHeaders(Object.entries(req.headers).map(([k,v])=>[k,String(v)] as [string,string])),body:describeBody(body,Number(req.headers['content-length'])||JSON.stringify(body).length)};const needs=needsOf(chat);const skipped:string[]=[];const candidates=chosenModels(chat.model,k,needs,skipped);const chain=chainFor(chat.model);const hops:string[]=[...skipped];const controller=new AbortController();(req as any).signal=controller.signal;
+  // The agent on OpenCode Free: only while the bridge presents the engine's own OpenCode version, so its tools are not swapped (agent-engine.ts).
+  // 403, not 409: the engine retries a 409 for over a minute (like a 429 or a 5xx) before showing the reason.
+  if(k.agent&&candidates.some(m=>settings.providers.find(p=>p.id===m.providerId)?.kind==='free')){const why=freeIdentityProblem(presentedOpenCodeVersion());if(why)throw new GatewayError(why,403,'agent_engine_outdated');}
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   // The deadline covers the wait for the first byte. Once an answer is streaming, only silence counts, so a long answer that is still arriving is
   // not cut off; a stream that never stops is ended after an hour.

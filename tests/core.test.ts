@@ -338,6 +338,22 @@ test('The agent key always sends its own tool list: no retry with fewer tools, a
     const again=await agentChat();await again.text();expect(again.headers.get('x-polygate-tools-trimmed')).toBeNull();expect(toolgateSeen).toEqual([names]);
   }finally{settings.keys=settings.keys.filter(k=>k.id!==agent.id);__setExitVerifier();clear();__resetToolTrim();}
 });});
+// The bridge passes the agent's tools to OpenCode Free untouched only while it presents the OpenCode version the agent's engine runs.
+// When the gate has moved it on, the agent's OpenCode Free requests are refused with the reason instead of going out with swapped tools.
+test('The agent is refused OpenCode Free, with the reason, while the bridge presents another OpenCode version than the engine runs',async()=>{
+  const {__setPresentedVersion}=await import('../backend/providers');const {ENGINE_VERSION,freeIdentityProblem}=await import('../backend/agent-engine');
+  expect(freeIdentityProblem(ENGINE_VERSION)).toBe('');expect(freeIdentityProblem('')).toBe('');
+  await scoped([remoteProvider(),{id:'freebie',name:'OpenCode Free',kind:'free' as const,enabled:true,baseUrl:'',apiKey:'',models:[] as string[],routeId:'direct'}],async()=>{
+    freshModel('freebie','m');freshModel('remote','plain');
+    const agent={id:'agent-identity-test',name:'Polygate Agent',value:'pg_'+'c'.repeat(48),enabled:true,limit:4,agent:true};settings.keys.push(agent);
+    __setPresentedVersion('9.9.9');
+    try{
+      const r=await call('/v1/chat/completions',{model:'freebie/m',messages:[{role:'user',content:'x'}]},agent.value);const x:any=await r.json();
+      expect(r.status).toBe(403);expect(x.error.type).toBe('agent_engine_outdated');expect(x.error.message).toContain('9.9.9');expect(x.error.message).toContain(ENGINE_VERSION);
+      const other=await call('/v1/chat/completions',{model:'remote/plain',stream:true,messages:[{role:'user',content:'x'}]},agent.value);expect(other.status).toBe(200);await other.text();
+    }finally{__setPresentedVersion();settings.keys=settings.keys.filter(k=>k.id!==agent.id);}
+  });
+});
 test('A request that succeeds on its retry is not recorded as a model fault',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','recover');recoverCalls=0;settings.retries=1;
   const r=await chat('remote/recover',{stream:false});await r.text();expect(r.status).toBe(200);

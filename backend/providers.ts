@@ -15,6 +15,10 @@ const proxy=require('../vendor/bridge/proxy.js');
 proxy.netFetch=(url:any,init:any)=>networkFetch(url,init);
 let bridgeUrl=''; let bridgeServer:ReturnType<typeof serve>|undefined; let discovery:Promise<void>|undefined;
 export const identityState=()=>bridge.identity.getState();
+// The OpenCode version the bridge presents to OpenCode Free (its identity recipe); the agent's engine must run the same one. Tests set it.
+let presentedOverride:string|undefined;
+export const presentedOpenCodeVersion=()=>presentedOverride??String(bridge.identity.getRecipe()?.version||'');
+export const __setPresentedVersion=(v?:string)=>{presentedOverride=v;};
 export async function syncIdentity(){return await bridge.identity.refresh({force:true});}
 export async function initBridge(){
   if(bridgeUrl)return;

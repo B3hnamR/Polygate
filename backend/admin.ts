@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { settings, publicSettings, persist, models, logs, stats, saveModel, removeModels, requestDetail, recentFailureDetails, recentBaselineDetails } from './state';
 import { json, readJson, queue, probeModel, readiness } from './gateway';
-import { discover, identityState, syncIdentity, rankedModels } from './providers';
+import { discover, identityState, syncIdentity, rankedModels, presentedOpenCodeVersion } from './providers';
 import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
 import { PROXY_SOURCES } from './proxy-sources';
 import { testRoute, describeRoutes, backupChain, providerRoutes } from './transport';
@@ -345,7 +345,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // The agent runs in the desktop app only; a server install never downloads or starts it. Installing takes a while (a 100 MB download),
   // so it answers at once and the dashboard follows the status.
   if(pathname.startsWith('/admin/agent/')&&!serverConfig().desktop)throw new GatewayError('The agent runs in the desktop app only',404);
-  if(pathname==='/admin/agent/engine'&&method==='GET')return json(res,200,agentEngine.engineStatus());
+  // freeIdentity says whether the agent can use OpenCode Free now (the bridge presents the engine's OpenCode version).
+  if(pathname==='/admin/agent/engine'&&method==='GET'){const presented=presentedOpenCodeVersion();return json(res,200,{...agentEngine.engineStatus(),freeIdentity:{presented,engine:agentEngine.ENGINE_VERSION,usable:!agentEngine.freeIdentityProblem(presented)}});}
   if(pathname==='/admin/agent/engine/install'&&method==='POST'){await readJson(req);agentEngine.installEngine().catch(()=>{/* the status carries the reason */});return json(res,202,agentEngine.engineStatus());}
   if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);return json(res,200,await agentEngine.startEngine());}
   if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}

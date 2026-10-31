@@ -210,17 +210,28 @@ export default {
 };
 `;
 type EngineModel = { id: string; name: string; context: number; output: number };
+// The agent's shell, chosen by Polygate rather than left to the engine (which follows the environment: Git Bash when SHELL is set).
+// PowerShell 7 when it is installed, Windows PowerShell otherwise; both come with every Windows the desktop app supports.
+export function chooseShell(which: (name: string) => string | null = name => Bun.which(name)) {
+  return which('pwsh') || path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+// OpenCode Free must see the agent's tools exactly as the CLI sends them, and the bridge passes them untouched only while it presents the
+// OpenCode version the engine runs. When the gate has made the bridge move on, the agent's OpenCode Free requests are refused with this
+// reason (other providers still work) until Polygate updates its engine. An unknown version is not a reason to refuse.
+export function freeIdentityProblem(presented: string) {
+  return presented && presented !== ENGINE_VERSION ? `OpenCode Free now expects OpenCode ${presented}, and the agent runs OpenCode ${ENGINE_VERSION}, so its tools would be changed on the way. Choose a model from another provider for the agent until Polygate updates its engine.` : '';
+}
 // File tools never reach Polygate's own folders (its vault, keys, logs and the engine's files) in these modes; a command can, since
 // permissions are consent and not a sandbox. OpenCode names a folder outside the working one as `C:/path/*` (forward slashes), and
 // these rules come last, after a mode's own, so Accept edits does not reopen them.
 export const protectedRules = (folders: string[]): Rule[] => [...new Set(folders.map(f => path.resolve(f).replace(/\\/g, '/').replace(/\/+$/, '')))]
   .flatMap(f => (['external_directory', 'read', 'edit'] as const).map(action => ({ action, resource: `${f}/*`, effect: 'deny' as const })));
-export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; protect?: string[] }) {
+export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; protect?: string[]; shell?: string }) {
   // A model whose limits Polygate does not know yet gets conservative ones; OpenCode needs both to plan its context.
   const entries = o.models.map(m => [m.id, { name: m.name || m.id, limit: { context: m.context > 0 ? m.context : 32000, output: m.output > 0 ? m.output : 4096 }, capabilities: { tools: true } }]);
   const guard = protectedRules(o.protect || []);
   return {
-    $schema: 'https://opencode.ai/config.json', update: 'disable', share: 'disabled', snapshots: true,
+    $schema: 'https://opencode.ai/config.json', update: 'disable', share: 'disabled', snapshots: true, ...(o.shell ? { shell: o.shell } : {}),
     providers: { polygate: { name: 'Polygate', package: '@ai-sdk/openai-compatible', env: ['POLYGATE_AGENT_KEY'], settings: { baseURL: o.gatewayUrl.replace(/\/+$/, '') + '/v1', apiKey: '{env:POLYGATE_AGENT_KEY}' }, models: Object.fromEntries(entries) } },
     policies: [{ action: 'provider.use', resource: '*', effect: 'deny' }, { action: 'provider.use', resource: 'polygate', effect: 'allow' }],
     permissions: [...ENGINE_PERMISSIONS, ...guard].map(r => ({ ...r })),
@@ -238,7 +249,7 @@ const sha256 = (data: string | Buffer) => createHash('sha256').update(data).dige
 // Writes the engine's configuration and returns it, with the hash of every file written (the configuration watch compares against them).
 function writeEngineFiles(p: Paths, gatewayUrl: string) {
   for (const dir of [p.configDir, path.join(p.configDir, PLUGIN), p.cache, p.state, p.userhome, p.data]) mkdirSync(dir, { recursive: true });
-  const cfg = engineConfig({ gatewayUrl, models: agentModels(), protect: [stateDir, p.root, p.data] });
+  const cfg = engineConfig({ gatewayUrl, models: agentModels(), protect: [stateDir, p.root, p.data], shell: process.platform === 'win32' ? chooseShell() : undefined });
   const files: [string, string][] = [
     [path.join(p.configDir, 'opencode.json'), JSON.stringify(cfg, null, 1)],
     [path.join(p.configDir, PLUGIN, 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0', type: 'module', main: 'index.js', exports: { '.': './index.js' } }, null, 1)],
