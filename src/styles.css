@@ -464,7 +464,7 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .ag-new:hover:not(:disabled),.ag-new.active{border-color:var(--accent-line);background:var(--accent-soft)}
 .ag-sessions{flex:1;min-height:0;overflow:auto;padding:2px 8px 12px}
 .ag-group+.ag-group{margin-top:12px}
-.ag-group h3{display:flex;align-items:center;gap:6px;margin:0;padding:6px 10px 4px;font:700 12px/1.3 var(--font);letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}.ag-group h3 svg{flex:none}
+.ag-group h3{margin:0}
 .ag-group ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
 .ag-group li{display:flex;align-items:center;border-radius:8px;min-width:0}
 .ag-group li:hover,.ag-group li:focus-within{background:var(--hover)}.ag-group li.active{background:var(--accent-soft)}
@@ -492,9 +492,9 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .ag-thread{flex:1;min-height:0;overflow:auto;padding:22px 0 10px}
 .ag-thread>.ag-column{display:flex;flex-direction:column;gap:14px;min-height:100%}.ag-thread>.ag-column>*{flex:none}
 .ag-bottom{padding:6px 0 16px}.ag-bottom>.ag-column{display:flex;flex-direction:column;gap:10px}
-.ag-composer{display:flex;flex-direction:column;gap:4px;padding:10px 10px 8px 14px;border:1px solid var(--line-strong);border-radius:18px;background:var(--surface);box-shadow:var(--lift);transition:border-color 140ms}
+.ag-composer{display:flex;flex-direction:row;align-items:flex-end;gap:8px;padding:10px 10px 10px 16px;border:1px solid var(--line-strong);border-radius:18px;background:var(--surface);box-shadow:var(--lift);transition:border-color 140ms}
 .ag-composer:focus-within{border-color:var(--accent-line)}
-.ag-composer textarea{border:0;background:transparent;padding:4px 2px;resize:none;min-height:52px;max-height:260px;field-sizing:content;line-height:1.6}
+.ag-composer textarea{flex:1;min-width:0;border:0;background:transparent;padding:6px 2px;resize:none;min-height:34px;max-height:260px;field-sizing:content;line-height:1.6}
 .ag-composer textarea:focus,.ag-composer textarea:focus-visible{outline:none;border:0;box-shadow:none}
 .ag-composer-row{display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0;margin-left:-6px}
 .ag-send{width:34px;height:34px;flex:none;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:50%;background:var(--accent);color:var(--on-accent)}
@@ -607,3 +607,13 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .ag-resync button{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;border:0;background:none;padding:2px 0;color:var(--text-secondary);font:600 13px/1.2 var(--font)}.ag-resync button:hover:not(:disabled){color:var(--text)}
 .ag-resync small{font-size:12px;color:var(--muted)}
 @media(max-width:640px){.ag-providers-col{border-right:0;border-bottom:1px solid var(--line)}.ag-resync{flex-direction:row;align-items:center;border-top:0;padding:4px 10px}}
+/* The Agent's sidebar groups (a folder with its sessions, folded with its caret) and the row under the message box. */
+.ag-group-head{display:flex;align-items:center;gap:5px;max-width:100%;border:0;background:none;padding:6px 10px 4px;color:var(--muted);font:600 13px/1.3 var(--font)}
+.ag-group-head:hover{color:var(--text-secondary)}.ag-group-head svg{flex:none;transition:transform .15s}.ag-group-head svg.shut{transform:rotate(-90deg)}
+.ag-session{padding:8px 10px}.ag-session span{font-size:14.5px}
+.ag-compose{display:flex;flex-direction:column;gap:6px}
+.ag-composer-actions{display:flex;align-items:center;gap:6px;flex:none}
+.ag-under{display:flex;align-items:center;gap:2px;flex-wrap:wrap;min-width:0;padding:0 2px}
+.ag-under-note{display:inline-flex;align-items:center;gap:6px;max-width:300px;padding:0 9px;color:var(--muted);font:600 13px/1 var(--font)}.ag-under-note svg{flex:none}
+.ag-menu-label{padding:8px 10px 3px;font-size:12px;font-weight:600;color:var(--muted)}
+.ag-folder-pick>.ag-menu{flex:1;min-height:0}

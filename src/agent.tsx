@@ -21,6 +21,9 @@ type FolderInfo={folder:string;trusted:boolean};
 type Opening={draft?:string;error?:string;notice?:string};
 const cap=(s:string)=>s.charAt(0).toUpperCase()+s.slice(1);
 const sameFolder=(a:string,b:string)=>a.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase()===b.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase();
+const inFolder=(f:string,root:string)=>{const n=(p:string)=>p.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase();return n(f).startsWith(n(root)+'/');};
+// The session list's group for sessions started with "No folder".
+const NO_FOLDER='\u0000no-folder';
 // Remembered on this computer only: the open session, and the folder, model and mode the next new session starts with.
 const stored=(key:string)=>{try{return localStorage.getItem(key)||'';}catch{return '';}};
 const store=(key:string,value:string)=>{try{localStorage.setItem(key,value);}catch{/* storage can be off */}};
@@ -36,7 +39,7 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const {data:models,reload:reloadModels}=usePoll<Models>('/admin/agent/models',60000);
   // Resync in the model picker: the engine is given the models added since it started.
   const resync=async()=>{const r=await api('/admin/agent/models/sync',{});reloadModels();return Number(r.models)||0;};
-  const {data:folderList,reload:reloadFolders}=usePoll<{folders:FolderInfo[]}>('/admin/agent/folders',15000);
+  const {data:folderList,reload:reloadFolders}=usePoll<{folders:FolderInfo[];scratch?:string}>('/admin/agent/folders',15000);
   const [open,setOpen]=useState(()=>stored('polygate-agent-open'));const [fresh,setFresh]=useState<{info:SessionInfo;opening:Opening}|null>(null);
   const [settings,setSettings]=useState(false);const [problem,setProblem]=useState('');
   const [busy,setBusy]=useState('');
@@ -44,8 +47,13 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const choose=(id:string)=>{setOpen(id);store('polygate-agent-open',id);if(fresh?.info.id!==id)setFresh(null);};
   const sessions=list?.sessions||[];
   const info=sessions.find(s=>s.id===open)||(fresh?.info.id===open?fresh.info:undefined);
-  // Sessions grouped by their folder, the folder with the newest session first (the list comes newest first).
-  const groups=useMemo(()=>{const out=new Map<string,SessionInfo[]>();for(const s of sessions){const k=[...out.keys()].find(f=>sameFolder(f,s.folder))??s.folder;out.set(k,[...(out.get(k)||[]),s]);}return [...out.entries()];},[sessions]);
+  // Sessions grouped by their folder, the folder with the newest session first (the list comes newest first). Sessions started with
+  // "No folder" (each in its own empty folder under the scratch folder) share one group.
+  const scratch=folderList?.scratch||'';
+  const groups=useMemo(()=>{const out=new Map<string,SessionInfo[]>();for(const s of sessions){const k=scratch&&inFolder(s.folder,scratch)?NO_FOLDER:[...out.keys()].find(f=>sameFolder(f,s.folder))??s.folder;out.set(k,[...(out.get(k)||[]),s]);}return [...out.entries()];},[sessions,scratch]);
+  // Folded folder groups, remembered on this computer.
+  const [folded,setFolded]=useState<string[]>(()=>{try{const v=JSON.parse(stored('polygate-agent-folded')||'[]');return Array.isArray(v)?v:[];}catch{return [];}});
+  const fold=(k:string)=>setFolded(f=>{const next=f.includes(k)?f.filter(x=>x!==k):[...f,k];store('polygate-agent-folded',JSON.stringify(next));return next;});
   const {confirm,dialog}=useConfirm();
   const remove=async(s:SessionInfo)=>{
     if(!await confirm(<>Delete <strong>{s.title}</strong>? Its conversation and Polygate's records of what it changed (and its undo) are removed. The files in <code>{s.folder}</code> are not changed.</>,{title:'Delete session',confirm:'Delete session'}))return;
@@ -54,20 +62,20 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const main=!engine?<div className="ag-center">{engineError?<div className="pg-error">{engineError}</div>:<p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Checking the agent engine…</p>}</div>
     :!running?<div className="ag-center"><div className="ag-column"><div className="ag-card"><EngineCard engine={engine} busy={busy} act={act}/></div></div></div>
     :!list&&!listError&&open&&!info?<div className="ag-center"><p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Loading sessions…</p></div>
-    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
+    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} scratch={scratch} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
     :<NewSession models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
   return <div className="ag-app">
     <aside className="ag-side" aria-label="Agent sessions">
       <div className="ag-side-head"><button className="ag-back" onClick={onBack} title="Back to Polygate"><ArrowLeft size={16}/>Polygate</button><span className="ag-side-title"><Bot size={17}/>Agent</span></div>
       <button className={`ag-new${running&&!info?' active':''}`} onClick={()=>choose('')} disabled={!running}><Plus size={16}/>New session</button>
       <nav className="ag-sessions">
-        {groups.map(([folder,items])=><section key={folder} className="ag-group">
-          <h3 title={folder}><Folder size={13}/><span className="truncate">{folderName(folder)}</span></h3>
-          <ul>{items.map(s=><li key={s.id} className={s.id===info?.id?'active':''}>
-            <button className="ag-session" aria-current={s.id===info?.id?'true':undefined} onClick={()=>choose(s.id)} title={`${s.title}\n${s.folder}`}><span className="truncate">{s.title}</span><small>{when(s.created||0)}{s.mode?` · ${modeLabel(s.mode)}`:''}</small></button>
+        {groups.map(([folder,items])=>{const shut=folded.includes(folder);return <section key={folder} className="ag-group">
+          <h3><button type="button" className="ag-group-head" aria-expanded={!shut} title={folder===NO_FOLDER?'Sessions started without a project folder':folder} onClick={()=>fold(folder)}><span className="truncate">{folder===NO_FOLDER?'No folder':folderName(folder)}</span><ChevronDown size={13} className={shut?'shut':''}/></button></h3>
+          {!shut&&<ul>{items.map(s=><li key={s.id} className={s.id===info?.id?'active':''}>
+            <button className="ag-session" aria-current={s.id===info?.id?'true':undefined} onClick={()=>choose(s.id)} title={`${s.title}\n${when(s.created||0)}${s.mode?` · ${modeLabel(s.mode)}`:''}\n${s.folder}`}><span className="truncate">{s.title}</span></button>
             <button className="icon-button danger ag-session-delete" aria-label={`Delete session ${s.title}`} title="Delete session" onClick={()=>remove(s)}><Trash2 size={14}/></button>
-          </li>)}</ul>
-        </section>)}
+          </li>)}</ul>}
+        </section>;})}
         {running&&list&&!sessions.length&&<p className="ag-side-empty">No sessions yet. Start one with a working folder, a model and a message.</p>}
         {running&&listError&&<p className="pg-error">{listError}</p>}
       </nav>
@@ -223,28 +231,42 @@ function ModelPicker({models,value,effort,onPick,onResync}:{models:AgentModel[];
   </div>;
 }
 
-function FolderChip({folder,folders,onPick}:{folder:string;folders:FolderInfo[];onPick:(folder:string)=>void}){
-  const bridge=window.polygateDesktop;const [text,setText]=useState('');
-  return <Popover icon={<Folder size={14}/>} label={folder?folderName(folder):'Choose a working folder'} title={folder||'Working folder'} width={460}>
-    {close=><div className="ag-folder-pick">
-      {folders.length>0&&<ul className="ag-menu" role="listbox" aria-label="Working folders">{folders.map(f=><li key={f.folder}><button type="button" role="option" aria-selected={sameFolder(f.folder,folder)} className={sameFolder(f.folder,folder)?'chosen':''} onClick={()=>{close();onPick(f.folder);}}>
-        <span><strong className="truncate">{folderName(f.folder)}</strong><small className="truncate">{f.folder}{f.trusted?'':' · needs review'}</small></span>{sameFolder(f.folder,folder)&&<Check size={14}/>}</button></li>)}</ul>}
-      {bridge?.pickFolder?<button type="button" className="ag-folder-browse" onClick={async()=>{const f=await bridge.pickFolder!();if(f){close();onPick(f);}}}><FolderOpen size={15}/>Choose another folder…</button>
+// The working folder of a new session: a search, "No folder", the recent folders, or another folder from disk. `folder` is null until one
+// is chosen ("Choose…"), and "" for No folder; both start a session in an empty folder of its own.
+function FolderChip({folder,folders,onPick}:{folder:string|null;folders:FolderInfo[];onPick:(folder:string)=>void}){
+  const bridge=window.polygateDesktop;const [text,setText]=useState('');const [query,setQuery]=useState('');
+  const q=query.trim().toLowerCase();const shown=folders.filter(f=>!q||f.folder.toLowerCase().includes(q));
+  return <Popover icon={<Folder size={14}/>} label={folder===null?'Choose…':folder===''?'No folder':folderName(folder)} title={folder||'Working folder'} width={420}>
+    {close=>{const choose=(f:string)=>{close();setQuery('');onPick(f);};return <div className="ag-folder-pick">
+      <label className="ag-models-search"><Search size={15}/><input autoFocus aria-label="Search folders" placeholder="Search folders…" value={query} onChange={e=>setQuery(e.target.value)}
+        onKeyDown={e=>{if(e.key==='Enter'&&shown[0]){e.preventDefault();choose(shown[0].folder);}}}/></label>
+      <ul className="ag-menu" role="listbox" aria-label="Working folders">
+        {!q&&<li><button type="button" role="option" aria-selected={folder===''} className={folder===''?'chosen':''} onClick={()=>choose('')}><span><strong>No folder</strong><small>An empty folder of its own, for a task that is not about a project</small></span>{folder===''&&<Check size={14}/>}</button></li>}
+        {shown.length>0&&<li className="ag-menu-label" role="presentation">Recent</li>}
+        {shown.map(f=><li key={f.folder}><button type="button" role="option" aria-selected={!!folder&&sameFolder(f.folder,folder)} className={folder&&sameFolder(f.folder,folder)?'chosen':''} title={f.folder} onClick={()=>choose(f.folder)}>
+          <span><strong className="truncate">{folderName(f.folder)}</strong><small className="truncate">{f.folder}{f.trusted?'':' · needs review'}</small></span>{!!folder&&sameFolder(f.folder,folder)&&<Check size={14}/>}</button></li>)}
+        {q&&!shown.length&&<li className="ag-models-none">No recent folder matches.</li>}
+      </ul>
+      {bridge?.pickFolder?<button type="button" className="ag-folder-browse" onClick={async()=>{const f=await bridge.pickFolder!();if(f)choose(f);}}><FolderOpen size={15}/>Open folder…</button>
         // In a browser (not the desktop app) there is no folder dialog: the path is typed and checked by the gateway.
-        :<form className="ag-folder-form" onSubmit={e=>{e.preventDefault();if(text.trim()){close();onPick(text.trim());setText('');}}}><input aria-label="Working folder path" placeholder="C:\path\to\project" value={text} onChange={e=>setText(e.target.value)}/><Button type="submit">Use</Button></form>}
-    </div>}
+        :<form className="ag-folder-form" onSubmit={e=>{e.preventDefault();if(text.trim()){choose(text.trim());setText('');}}}><input aria-label="Working folder path" placeholder="C:\path\to\project" value={text} onChange={e=>setText(e.target.value)}/><Button type="submit">Open</Button></form>}
+    </div>;}}
   </Popover>;
 }
 
-function Composer({value,onChange,onSend,canSend,sending,busy,onStop,placeholder,chips,autoFocus}:{value:string;onChange:(v:string)=>void;onSend:()=>void;canSend:boolean;sending:boolean;busy?:boolean;onStop?:()=>void;placeholder:string;chips:ReactNode;autoFocus?:boolean}){
+// The message box, with send (and stop while the agent works) inside it, and the folder, mode and model in a row under it.
+function Composer({value,onChange,onSend,canSend,sending,busy,onStop,placeholder,left,right,autoFocus}:{value:string;onChange:(v:string)=>void;onSend:()=>void;canSend:boolean;sending:boolean;busy?:boolean;onStop?:()=>void;placeholder:string;left?:ReactNode;right:ReactNode;autoFocus?:boolean}){
   const ready=canSend&&!sending&&!!value.trim();
-  return <div className="ag-composer">
-    <textarea aria-label="Message to the agent" placeholder={placeholder} value={value} rows={2} autoFocus={autoFocus}
-      onChange={e=>onChange(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();if(ready)onSend();}}}/>
-    <div className="ag-composer-row">{chips}<span className="toolbar-spacer"/>
-      {busy&&onStop&&<button type="button" className="ag-stop" onClick={onStop} title="Stop the agent"><Square size={12}/>Stop</button>}
-      <button type="button" className="ag-send" aria-label={busy?'Queue message':'Send'} title={busy?'Queue: sent when the agent is done':'Send (Enter)'} disabled={!ready} onClick={onSend}>{sending?<Loader2 className="spin" size={16}/>:<ArrowUp size={17}/>}</button>
+  return <div className="ag-compose">
+    <div className="ag-composer">
+      <textarea aria-label="Message to the agent" placeholder={placeholder} value={value} rows={1} autoFocus={autoFocus}
+        onChange={e=>onChange(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();if(ready)onSend();}}}/>
+      <div className="ag-composer-actions">
+        {busy&&onStop&&<button type="button" className="ag-stop" onClick={onStop} title="Stop the agent"><Square size={12}/>Stop</button>}
+        <button type="button" className="ag-send" aria-label={busy?'Queue message':'Send'} title={busy?'Queue: sent when the agent is done':'Send (Enter)'} disabled={!ready} onClick={onSend}>{sending?<Loader2 className="spin" size={16}/>:<ArrowUp size={17}/>}</button>
+      </div>
     </div>
+    <div className="ag-under">{left}<span className="toolbar-spacer"/>{right}</div>
   </div>;
 }
 
@@ -253,34 +275,37 @@ function NewSession({models,folders,reloadFolders,onResync,onCreated}:{models:Mo
   const {confirm,dialog}=useConfirm();
   // Full access is confirmed when it is picked, and never remembered as the mode the next session starts in.
   const pickMode=async(m:Mode)=>{if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;setMode(m);};
-  const [folder,setFolder]=useState(()=>stored('polygate-agent-folder'));
+  // The last project folder, or "Choose…" (null). No folder ("") is never remembered.
+  const [folder,setFolder]=useState<string|null>(()=>stored('polygate-agent-folder')||null);
   const [model,setModel]=useState(()=>stored('polygate-agent-model'));const [effort,setEffort]=useState(()=>stored('polygate-agent-effort'));
   const [mode,setMode]=useState<Mode>(()=>{const m=stored('polygate-agent-mode');return MODES.some(x=>x.id===m&&x.id!=='full')?m as Mode:'ask';});
   const [text,setText]=useState('');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
   const all=models?.models||[];const usable=all.filter(m=>m.usable);const current=usable.find(m=>m.id===model)||usable[0];
   const {data:trust,error:trustError,reload:reloadTrust}=usePoll<TrustReport>(folder?'/admin/agent/trust?folder='+encodeURIComponent(folder):'/admin/agent/folders',5000,!!folder);
-  const report=folder&&trust&&sameFolder(trust.folder,folder)?trust:null;const trusted=!!report?.trusted;
-  const pickFolder=(f:string)=>{setFolder(f);store('polygate-agent-folder',f);setError('');};
+  const report=folder&&trust&&sameFolder(trust.folder,folder)?trust:null;const trusted=!folder||!!report?.trusted;
+  // A folder picked from disk joins the recent folders at once.
+  const pickFolder=(f:string)=>{setFolder(f);if(f)store('polygate-agent-folder',f);setError('');if(f)reloadFolders();};
   const start=async()=>{
     const t=text.trim();if(!t||!current||!trusted)return;setBusy(true);setError('');
     const chosen=current.efforts.includes(effort)?effort:'';
     let s:SessionInfo;
-    try{s=await api('/admin/agent/session/create',{folder,model:current.id,mode,confirmFull:mode==='full',effort:chosen,title:t.split('\n')[0].slice(0,80)});}catch(e:any){setError(e.message);setBusy(false);return;}
+    try{s=await api('/admin/agent/session/create',{...(folder?{folder}:{noFolder:true}),model:current.id,mode,confirmFull:mode==='full',effort:chosen,title:t.split('\n')[0].slice(0,80)});}catch(e:any){setError(e.message);setBusy(false);return;}
     store('polygate-agent-model',current.id);store('polygate-agent-effort',chosen);if(mode!=='full')store('polygate-agent-mode',mode);
     // The session exists from here on: if the message cannot be sent, it opens with the message still in its box and the reason.
     let opening:Opening={};
     try{const r=await api('/admin/agent/session/prompt',{id:s.id,text:t});if(r.limited)opening={notice:LIMITED};}catch(e:any){opening={draft:t,error:e.message};}
     setBusy(false);onCreated(s,opening);
   };
-  const placeholder=!folder?'Choose a working folder first…':!trusted?'Allow this folder first…':!current?'No model can run the agent yet…':'What should the agent do in this folder?';
+  const placeholder=!current?'No model can run the agent yet…':!trusted?'Allow this folder first…':'Describe a task or ask a question';
   return <div className="ag-center">
     <div className="ag-column ag-new-session">
       <div className="ag-hero"><Bot size={30}/><h1>What should the agent do?</h1><p>It reads, edits and runs commands in the folder you choose, through Polygate's own models, and asks first where its mode says so.</p></div>
-      {report&&!report.trusted&&<FolderTrust folder={folder} report={report} error={trustError} reload={()=>{reloadTrust();reloadFolders();}}/>}
+      {folder&&report&&!report.trusted&&<FolderTrust folder={folder} report={report} error={trustError} reload={()=>{reloadTrust();reloadFolders();}}/>}
       {folder&&!report&&trustError&&<div className="pg-error">{trustError}</div>}
       {models&&!usable.length&&<p className="agent-warn"><TriangleAlert size={15}/>No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
       <Composer value={text} onChange={setText} onSend={start} canSend={!!current&&trusted} sending={busy} placeholder={placeholder} autoFocus
-        chips={<><FolderChip folder={folder} folders={folders} onPick={pickFolder}/><ModeChip mode={mode} modes={models?.modes||{}} onPick={pickMode}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onResync={onResync} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
+        left={<FolderChip folder={folder} folders={folders} onPick={pickFolder}/>}
+        right={<><ModeChip mode={mode} modes={models?.modes||{}} onPick={pickMode}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onResync={onResync} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
       {mode==='full'&&<p className="agent-warn"><TriangleAlert size={15}/>This session starts with Full access: its first turn runs without approval prompts.</p>}
       {error&&<div className="pg-error">{error}</div>}
     </div>
@@ -288,8 +313,8 @@ function NewSession({models,folders,reloadFolders,onResync,onCreated}:{models:Mo
   </div>;
 }
 
-function SessionView({start,opening,models:modelData,onResync,onChanged,onDeleted}:{start:SessionInfo;opening?:Opening;models:Models|null;onResync:()=>Promise<number>;onChanged:()=>void;onDeleted:()=>void}){
-  const id=start.id,folder=start.folder;const models=modelData?.models||[];
+function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,onDeleted}:{start:SessionInfo;opening?:Opening;scratch:string;models:Models|null;onResync:()=>Promise<number>;onChanged:()=>void;onDeleted:()=>void}){
+  const id=start.id,folder=start.folder;const models=modelData?.models||[];const noFolder=!!scratch&&inFolder(folder,scratch);
   const [info,setInfo]=useState<SessionInfo>(start);const [items,setItems]=useState<Item[]>([]);const [pending,setPending]=useState<Approval[]>([]);
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>(start.tokens);
   const [error,setError]=useState(opening?.error||'');const [notice,setNotice]=useState(opening?.notice||'');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
@@ -386,7 +411,8 @@ function SessionView({start,opening,models:modelData,onResync,onChanged,onDelete
       {error&&<div className="pg-error agent-error">{error}</div>}
       <Composer value={text} onChange={setText} onSend={send} canSend={!untrusted} sending={sending} busy={busy} onStop={stop}
         placeholder={busy?'The agent is working. A message now is queued for when it is done.':'Reply to the agent…'}
-        chips={<><ModeChip mode={mode} modes={modelData?.modes||{}} disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onResync={onResync} onPick={switchModel}/></>}/>
+        left={<span className="ag-under-note" title={folder}><Folder size={14}/><span className="truncate">{noFolder?'No folder':folderName(folder)}</span></span>}
+        right={<><ModeChip mode={mode} modes={modelData?.modes||{}} disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onResync={onResync} onPick={switchModel}/></>}/>
     </div></div>
     {dialog}
   </>;

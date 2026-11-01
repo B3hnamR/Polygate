@@ -6,6 +6,7 @@ import path from 'node:path';
 // (fixtures/fake-opencode.ts) records what the controller asks of it and sends the events a test tells it to.
 process.env.POLYGATE_AGENT_DIR = mkdtempSync(path.join(tmpdir(), 'pg-agentc-'));
 process.env.FAKE_OPENCODE_SAVED = '1';
+process.env.POLYGATE_AGENT_SCRATCH = mkdtempSync(path.join(tmpdir(), 'pg-scratch-'));
 const FOLDER = mkdtempSync(path.join(tmpdir(), 'pg-project-'));
 const engine = await import('../backend/agent-engine');
 const { settings, saveModel, models, db, stateDir } = await import('../backend/state');
@@ -30,7 +31,7 @@ afterAll(async () => {
   for (const id of [MODEL, TOOLLESS, THINKER]) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); }
   settings.providers = saved.providers; settings.keys = settings.keys.filter(k => keysBefore.includes(k.id)); settings.agentBackups = saved.backups;
   for (const [k, v] of [['POLYGATE_ADMIN_TOKEN', saved.token], ['POLYGATE_DESKTOP', saved.desktop]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-  delete process.env.FAKE_OPENCODE_SAVED; delete process.env.POLYGATE_AGENT_DIR;
+  delete process.env.FAKE_OPENCODE_SAVED; delete process.env.POLYGATE_AGENT_DIR; delete process.env.POLYGATE_AGENT_SCRATCH;
 });
 
 const admin = async (p: string, body?: unknown) => {
@@ -528,6 +529,18 @@ test("every folder's sessions are listed together, each with its folder, and the
   expect(folders.find(f => f.folder === FOLDER)).toEqual({ folder: FOLDER, trusted: true });
   await admin('/admin/agent/trust/revoke', { folder: other });
   expect((await admin('/admin/agent/folders')).body.folders.find((f: any) => f.folder === other)).toEqual({ folder: other, trusted: false });
+});
+
+test('"No folder" starts a session in an empty folder of its own, allowed at once and kept out of the recent folders', async () => {
+  const r = await admin('/admin/agent/session/create', { noFolder: true, model: MODEL, mode: 'ask', title: 'Just a question' }); expect(r.status).toBe(200);
+  const folder = r.body.folder as string;
+  expect(path.dirname(folder)).toBe(path.resolve(process.env.POLYGATE_AGENT_SCRATCH!)); expect(readdirSync(folder)).toEqual([]);
+  expect((await admin('/admin/agent/trust?folder=' + encodeURIComponent(folder))).body.trusted).toBe(true);
+  const listed = (await admin('/admin/agent/folders')).body;
+  expect(listed.scratch).toBe(process.env.POLYGATE_AGENT_SCRATCH); expect(listed.folders.some((f: any) => f.folder === folder)).toBe(false);
+  expect((await admin('/admin/agent/sessions')).body.sessions.find((s: any) => s.id === r.body.id)).toMatchObject({ folder, title: 'Just a question' });
+  const again = await admin('/admin/agent/session/create', { noFolder: true, model: MODEL, mode: 'ask' }); expect(again.body.folder).not.toBe(folder);
+  expect((await admin('/admin/agent/session/create', { noFolder: true, model: MODEL, mode: 'full' })).status).toBe(400);
 });
 
 test('a session can switch to another usable model (with its effort), and can be renamed', async () => {

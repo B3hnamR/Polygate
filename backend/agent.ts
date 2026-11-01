@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import os from 'node:os';
 import { models, sessionUsage, settings, stateDir, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
 import { logEvent } from './logbook';
@@ -323,6 +324,19 @@ function rememberFolder(folder: string) {
   const list = [folder, ...(Array.isArray(saved) ? saved : []).filter((f): f is string => typeof f === 'string' && f.toLowerCase() !== folder.toLowerCase())].slice(0, 100);
   mkdirSync(path.dirname(foldersFile()), { recursive: true }); writeFileAtomic(foldersFile(), JSON.stringify(list));
 }
+// "No folder": a session that is not about a project gets an empty folder of its own, made by Polygate in the user's home folder (where
+// the user can find what the agent wrote), allowed at once because nothing in it can be project customization. These folders are left
+// out of the recent folders and listed as "No folder" on the page.
+export const scratchRoot = () => process.env.POLYGATE_AGENT_SCRATCH || path.join(os.homedir(), 'Polygate Agent');
+function scratchFolder() {
+  const stamp = new Date().toISOString().replace('T', ' ').replace(/:/g, '-').slice(0, 19);
+  let folder = path.join(scratchRoot(), stamp);
+  for (let n = 2; existsSync(folder); n++) folder = path.join(scratchRoot(), `${stamp} (${n})`);
+  mkdirSync(folder, { recursive: true });
+  grantTrust(folder, inspectTrust(folder).fingerprint);
+  return folder;
+}
+const isScratch = (folder: string) => inside(folder, scratchRoot());
 function requireTrust(folder: string) {
   const trust = inspectTrust(folder);
   if (!trust.trusted) throw new GatewayError('Review and allow this working folder before running the agent. Its project instructions or customization may have changed.', 409, 'agent_trust_required');
@@ -343,14 +357,15 @@ function checkEffort(entry: ReturnType<typeof agentModels>[number] | undefined, 
 }
 async function createSession(b: any) {
   if (!engineConnection()) throw new GatewayError('Start the agent engine first.', 409, 'agent_engine_not_running');
-  const folder = checkFolder(b.folder); const mode = checkMode(b.mode); const model = String(b.model || '');
+  const mode = checkMode(b.mode); const model = String(b.model || '');
   if (mode === 'full' && b.confirmFull !== true) throw new GatewayError(FULL_CONSENT, 400, 'agent_full_consent');
+  const folder = checkFolder(b.noFolder === true && !b.folder ? scratchFolder() : b.folder);
   await requireEngineModel(folder, model);
   const entry = agentModels().find(m => m.id === model); if (entry?.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
   const effort = checkEffort(entry, b.effort);
   requireTrust(folder);
   await clearSavedPermissions();
-  rememberFolder(folder);
+  if (!isScratch(folder)) rememberFolder(folder);
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
   const info = await engine('POST', '/api/session', { title, agent: ENGINE_MODES[mode].agent, model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) }, location: { directory: folder } });
@@ -384,10 +399,10 @@ async function known(id: unknown) {
 export async function agentApi(req: IncomingMessage, res: ServerResponse, pathname: string, readJson: (req: IncomingMessage, max?: number) => Promise<any>, json: (res: ServerResponse, status: number, body: unknown) => void) {
   const method = req.method; const url = new URL(req.url || '/', 'http://x');
   if (pathname === '/admin/agent/trust' && method === 'GET') return json(res, 200, inspectTrust(checkFolder(url.searchParams.get('folder'))));
-  if (pathname === '/admin/agent/trust/allow' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); try { return json(res, 200, grantTrust(folder, String(b.fingerprint || ''))); } catch (e: any) { throw new GatewayError(e.message, 409, 'agent_trust_changed'); } }
+  if (pathname === '/admin/agent/trust/allow' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); try { const out = grantTrust(folder, String(b.fingerprint || '')); rememberFolder(folder); return json(res, 200, out); } catch (e: any) { throw new GatewayError(e.message, 409, 'agent_trust_changed'); } }
   if (pathname === '/admin/agent/trust/revoke' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); revokeTrust(folder); for (const s of sessions.values()) if (path.resolve(s.folder).toLowerCase() === folder.toLowerCase()) { s.allowed.clear(); s.paused = 'Working folder consent was revoked. Review and allow the folder before continuing.'; setAgentPause(s.id, s.paused); if (s.mode === 'full') expireFull(s); await engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(s.id, { type: 'agent.paused', data: { sessionID: s.id, message: s.paused } }); } return json(res, 200, { ok: true }); }
   // The folders sessions can be started in (and listed from), with whether the agent may work in each now.
-  if (pathname === '/admin/agent/folders' && method === 'GET') return json(res, 200, { folders: knownFolders().map(folder => ({ folder, trusted: inspectTrust(folder).trusted })) });
+  if (pathname === '/admin/agent/folders' && method === 'GET') return json(res, 200, { folders: knownFolders().filter(f => !isScratch(f)).map(folder => ({ folder, trusted: inspectTrust(folder).trusted })), scratch: scratchRoot() });
   // The engine's model list, written again from the catalog now (Resync in the model picker).
   if (pathname === '/admin/agent/models/sync' && method === 'POST') { await readJson(req); return json(res, 200, { ok: true, models: syncEngineModels() }); }
   if (pathname === '/admin/agent/models' && method === 'GET') return json(res, 200, { models: agentModels(), modes: Object.fromEntries(Object.entries(ENGINE_MODES).map(([k, m]) => [k, m.description])) });
