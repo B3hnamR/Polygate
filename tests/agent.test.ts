@@ -218,21 +218,48 @@ test('saving an exact project approval survives in another session and can be re
   ui.stop();
 });
 
-test('Full access requires explicit consent, is owned by the controller, and ends after the turn', async () => {
+test('Full access requires explicit consent, is owned by the controller, has no time limit and ends after the turn', async () => {
   const a = await create(); const ui = listen(a); await ui.ready();
   expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full' })).status).toBe(400);
   expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'full' })).status).toBe(400);
   expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full', confirmFull: true })).status).toBe(200);
   const info = (await admin('/admin/agent/session?id=' + a)).body;
-  expect(info.session.mode).toBe('full'); expect(info.fullUntil).toBeGreaterThan(Date.now());
+  expect(info.session.mode).toBe('full'); expect(info.fullUntil).toBeUndefined();
   await emit('permission.asked', { id: 'per_full', sessionID: a, action: 'shell', resources: ['npm test'] });
   await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full/reply')));
   expect((await calls()).find(c => c.path.endsWith('/permission/per_full/reply'))!.body.decision).toBe('once');
   await emit('session.execution.succeeded', { sessionID: a });
   await until(async () => (await admin('/admin/agent/session?id=' + a)).body.session.mode === 'ask');
-  expect((await admin('/admin/agent/session?id=' + a)).body.fullUntil).toBe(0);
   expect((await calls()).filter(c => c.path.endsWith('/reply')).every(c => c.body.decision !== 'always')).toBe(true);
   ui.stop();
+});
+
+test('a session can start in Full access when that is confirmed, and its first turn is answered without asking', async () => {
+  await trustFolder();
+  const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'full', confirmFull: true }); expect(r.status).toBe(200);
+  const a = r.body.id as string; const ui = listen(a); await ui.ready();
+  expect((await calls()).filter(c => c.method === 'POST' && c.path === '/api/session').pop()!.body.agent).toBe('polygate-full');
+  expect((await admin('/admin/agent/session?id=' + a)).body.session.mode).toBe('full');
+  await emit('permission.asked', { id: 'per_full_start', sessionID: a, action: 'shell', resources: ['npm test'] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full_start/reply')));
+  await emit('session.execution.succeeded', { sessionID: a });
+  await until(async () => (await admin('/admin/agent/session?id=' + a)).body.session.mode === 'ask');
+  ui.stop();
+});
+
+test('a model added to the catalog after the engine started is given to it: on its own when chosen, or with Resync', async () => {
+  const LATE = 'kilo/agent-test-late'; saveModel(model(LATE, true));
+  try {
+    expect((await fake('/api/model')).data.some((m: any) => m.id === LATE)).toBe(false);
+    await trustFolder();
+    const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: LATE, mode: 'ask' }); expect(r.status).toBe(200);
+    expect((await fake('/api/model')).data.some((m: any) => m.id === LATE)).toBe(true);
+    models.delete(LATE); db.query('DELETE FROM models WHERE id=?').run(LATE);
+    const sync = await admin('/admin/agent/models/sync', {}); expect(sync.status).toBe(200); expect(sync.body.models).toBeGreaterThan(0);
+    expect((await fake('/api/model')).data.some((m: any) => m.id === LATE)).toBe(false);
+    expect(engine.engineStatus().state).toBe('running');
+    expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: 'kilo/never-listed', mode: 'ask' })).body.error.message).toMatch(/resync/);
+  } finally { models.delete(LATE); db.query('DELETE FROM models WHERE id=?').run(LATE); }
 });
 
 test('Full access does not survive the controller stopping, even when the engine agent is still persisted as full', async () => {

@@ -1,10 +1,12 @@
 import {useCallback,useEffect,useMemo,useRef,useState,type CSSProperties,type ReactNode} from 'react';
-import {ArrowLeft,ArrowUp,Bot,Brain,Check,ChevronDown,Cpu,Download,FileDiff,Folder,FolderOpen,ListChecks,Loader2,Pencil,Play,Plus,Search,Settings2,ShieldCheck,Square,Trash2,TriangleAlert,Undo2,X} from 'lucide-react';
+import {ArrowLeft,ArrowUp,Bot,Check,CheckCircle2,ChevronDown,ChevronRight,Circle,Cpu,Download,Folder,FolderOpen,ListChecks,Loader2,Pencil,Play,Plus,RefreshCw,Search,Settings2,ShieldAlert,ShieldCheck,Square,Trash2,TriangleAlert,Undo2,X} from 'lucide-react';
 import {api,at} from './api';
 import {Button,Progress,Toggle,compact,usePoll,when} from './ui';
-import {MODES,modeLabel,fromHistory,applyEvent,approvalTitle,toolSubject,withChanges,undoBlocked,modelProviders,matchModels,folderName,type Approval,type Item,type Mode} from './agent-logic';
+import {MODES,modeLabel,fromHistory,applyEvent,approvalTitle,toolSubject,withChanges,undoBlocked,modelProviders,matchModels,folderName,blocks,stepsSummary,latestTodos,type Approval,type Block,type Item,type Mode,type Todo,type Tool} from './agent-logic';
 import {useConfirm} from './confirm';
 import {Dialog} from './mcp';
+import {Markdown} from './markdown';
+import {plainError} from '../backend/plain-error';
 // The Agent (docs/agent/PLAN.md): a coding agent working in folders the user chooses, through Polygate's own models. It takes the whole
 // window: the sessions of every folder on the left, one conversation in the middle, and the model and mode beside the message box.
 // Everything goes through the agent controller (backend/agent.ts); the page never talks to the engine itself. Desktop app only.
@@ -31,7 +33,9 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const {data:engine,error:engineError,reload:reloadEngine}=usePoll<Engine>('/admin/agent/engine',2000);
   const running=engine?.state==='running';
   const {data:list,error:listError,reload:reloadList}=usePoll<{sessions:SessionInfo[]}>('/admin/agent/sessions',10000,running);
-  const {data:models}=usePoll<Models>('/admin/agent/models',60000);
+  const {data:models,reload:reloadModels}=usePoll<Models>('/admin/agent/models',60000);
+  // Resync in the model picker: the engine is given the models added since it started.
+  const resync=async()=>{const r=await api('/admin/agent/models/sync',{});reloadModels();return Number(r.models)||0;};
   const {data:folderList,reload:reloadFolders}=usePoll<{folders:FolderInfo[]}>('/admin/agent/folders',15000);
   const [open,setOpen]=useState(()=>stored('polygate-agent-open'));const [fresh,setFresh]=useState<{info:SessionInfo;opening:Opening}|null>(null);
   const [settings,setSettings]=useState(false);const [problem,setProblem]=useState('');
@@ -50,8 +54,8 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const main=!engine?<div className="ag-center">{engineError?<div className="pg-error">{engineError}</div>:<p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Checking the agent engine…</p>}</div>
     :!running?<div className="ag-center"><div className="ag-column"><div className="ag-card"><EngineCard engine={engine} busy={busy} act={act}/></div></div></div>
     :!list&&!listError&&open&&!info?<div className="ag-center"><p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Loading sessions…</p></div>
-    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} models={models} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
-    :<NewSession models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
+    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
+    :<NewSession models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
   return <div className="ag-app">
     <aside className="ag-side" aria-label="Agent sessions">
       <div className="ag-side-head"><button className="ag-back" onClick={onBack} title="Back to Polygate"><ArrowLeft size={16}/>Polygate</button><span className="ag-side-title"><Bot size={17}/>Agent</span></div>
@@ -110,7 +114,7 @@ function AgentSettings({engine,busy,act,folders,reloadEngine,reloadFolders,onClo
   const on=backups??!!engine?.backups;
   const switchBackups=async(next:boolean)=>{setBackups(next);setError('');try{await api('/admin/settings',{agentBackups:next});reloadEngine();}catch(e:any){setBackups(null);setError(e.message);}};
   const revoke=async(folder:string)=>{
-    if(!await confirm(<>Stop running turns in <code>{folder}</code> and require consent again before another message there? Saved project rules remain stored.</>,{title:'Revoke folder trust',confirm:'Revoke and stop'}))return;
+    if(!await confirm(<>Stop running turns in <code>{folder}</code> and require consent again before another message there? Saved project rules remain stored.</>,{title:'Revoke folder trust',confirm:'Revoke and stop',icon:<ShieldAlert size={18}/>}))return;
     setError('');try{await api('/admin/agent/trust/revoke',{folder});reloadFolders();}catch(e:any){setError(e.message);}
   };
   return <Dialog title="Agent settings" icon={<Settings2 size={18}/>} onClose={onClose} wide>
@@ -133,7 +137,7 @@ type TrustReport={folder:string;fingerprint:string;trusted:boolean;complete:bool
 function FolderTrust({folder,report,error,reload}:{folder:string;report:TrustReport|null;error:string;reload:()=>void}){
   const [busy,setBusy]=useState(false);const [problem,setProblem]=useState('');const {confirm,dialog}=useConfirm();
   const allow=async()=>{
-    if(!report||!await confirm(<>Allow the agent to work in <code>{folder}</code>? It may read project instructions. Approved commands run project code with your account's access. Project plugins, commands and permission overrides remain disabled; this consent does not enable them. This is not a sandbox.</>,{title:'Allow working folder',confirm:'Allow this folder'}))return;
+    if(!report||!await confirm(<>Allow the agent to work in <code>{folder}</code>? It may read project instructions. Approved commands run project code with your account's access. Project plugins, commands and permission overrides remain disabled; this consent does not enable them. This is not a sandbox.</>,{title:'Allow working folder',confirm:'Allow this folder',icon:<ShieldCheck size={18}/>}))return;
     setBusy(true);setProblem('');try{await api('/admin/agent/trust/allow',{folder,fingerprint:report.fingerprint});reload();}catch(e:any){setProblem(e.message);reload();}finally{setBusy(false);}
   };
   return <div className="agent-folder-trust">
@@ -171,35 +175,44 @@ function Popover({label,icon,title,disabled,width=320,children}:{label:ReactNode
   </div>;
 }
 
-// The one place the mode is chosen. Full access is never where a session starts: it is switched on inside one, with confirmation.
-function ModeChip({mode,modes,allowFull,disabled,onPick}:{mode:Mode;modes:Record<string,string>;allowFull:boolean;disabled?:boolean;onPick:(mode:Mode)=>void}){
+// What Full access means, said each time it is switched on (when a session starts in it, or inside one).
+const FULL_WARNING=<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access ends after this turn, or when the app or engine restarts.</>;
+// The one place the mode is chosen. The caller asks for confirmation before Full access.
+function ModeChip({mode,modes,disabled,onPick}:{mode:Mode;modes:Record<string,string>;disabled?:boolean;onPick:(mode:Mode)=>void}){
   return <Popover icon={mode==='full'?<TriangleAlert size={14}/>:<ShieldCheck size={14}/>} label={modeLabel(mode)} title={disabled?'Stop the turn and answer waiting approvals before changing mode':'Permission mode'} disabled={disabled} width={360}>
-    {close=><ul className="ag-menu" role="listbox" aria-label="Permission mode">{MODES.map(m=>{const off=m.id==='full'&&!allowFull;return <li key={m.id}>
-      <button type="button" role="option" aria-selected={m.id===mode} disabled={off} className={m.id===mode?'chosen':''} onClick={()=>{close();if(m.id!==mode)onPick(m.id);}}>
-        <span><strong>{m.label}</strong><small>{off?'Switched on inside a started session, with confirmation. It ends after one turn or 30 minutes.':modes[m.id]}</small></span>{m.id===mode&&<Check size={14}/>}
-      </button></li>;})}</ul>}
+    {close=><ul className="ag-menu" role="listbox" aria-label="Permission mode">{MODES.map(m=><li key={m.id}>
+      <button type="button" role="option" aria-selected={m.id===mode} className={m.id===mode?'chosen':''} onClick={()=>{close();if(m.id!==mode)onPick(m.id);}}>
+        <span><strong>{m.label}</strong><small>{modes[m.id]}</small></span>{m.id===mode&&<Check size={14}/>}
+      </button></li>)}</ul>}
   </Popover>;
 }
 
-function ModelChip({models,value,effort,disabled,onPick}:{models:AgentModel[];value:string;effort:string;disabled?:boolean;onPick:(id:string,effort:string)=>void}){
+function ModelChip({models,value,effort,disabled,onPick,onResync}:{models:AgentModel[];value:string;effort:string;disabled?:boolean;onPick:(id:string,effort:string)=>void;onResync:()=>Promise<number>}){
   const current=models.find(m=>m.id===value);
   return <Popover icon={<Cpu size={14}/>} label={current?`${current.name}${effort?` · ${cap(effort)}`:''}`:value||'Choose a model'} title={disabled?'Wait until the agent is done to change the model':'Model'} disabled={disabled} width={640}>
-    {close=><ModelPicker models={models} value={value} effort={effort} onPick={(id,e)=>{close();if(id!==value||e!==effort)onPick(id,e);}}/>}
+    {close=><ModelPicker models={models} value={value} effort={effort} onResync={onResync} onPick={(id,e)=>{close();if(id!==value||e!==effort)onPick(id,e);}}/>}
   </Popover>;
 }
-// Provider first, then the model, with a search over both. Models the agent cannot use right now are listed with the reason.
-function ModelPicker({models,value,effort,onPick}:{models:AgentModel[];value:string;effort:string;onPick:(id:string,effort:string)=>void}){
+// Provider first, then the model, with a search over both. Models the agent cannot use right now are listed with the reason. Resync gives
+// the engine the models added since it started (a new provider, a refreshed catalog).
+function ModelPicker({models,value,effort,onPick,onResync}:{models:AgentModel[];value:string;effort:string;onPick:(id:string,effort:string)=>void;onResync:()=>Promise<number>}){
   const [query,setQuery]=useState('');const [provider,setProvider]=useState(()=>models.find(m=>m.id===value)?.provider||'');
+  const [sync,setSync]=useState<{busy?:boolean;text?:string;bad?:boolean}>({});
   const providers=modelProviders(models);const shown=matchModels(models,provider,query);const current=models.find(m=>m.id===value);
   const pick=(m:AgentModel)=>onPick(m.id,m.efforts.includes(effort)?effort:'');
+  const resync=async()=>{setSync({busy:true});try{const n=await onResync();setSync({text:`The engine has ${n} models`});}catch(e:any){setSync({text:e.message,bad:true});}};
   return <div className="ag-models">
     <label className="ag-models-search"><Search size={15}/><input autoFocus aria-label="Search models" placeholder={provider?`Search ${provider} models`:'Search all models'} value={query} onChange={e=>setQuery(e.target.value)}
       onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();const first=shown.find(m=>m.usable);if(first)pick(first);}}}/></label>
     <div className="ag-models-body">
+      <div className="ag-providers-col">
       <ul className="ag-providers" aria-label="Providers">
         <li><button type="button" className={!provider?'chosen':''} onClick={()=>setProvider('')}><span className="truncate">All providers</span><small>{models.length}</small></button></li>
         {providers.map(p=><li key={p.name}><button type="button" className={provider===p.name?'chosen':''} onClick={()=>setProvider(p.name)} title={p.usable<p.count?`${p.count-p.usable} unavailable to the agent now`:p.name}><span className="truncate">{p.name}</span><small>{p.count}</small></button></li>)}
       </ul>
+      <div className="ag-resync"><button type="button" disabled={sync.busy} onClick={resync} title="Give the agent engine the models added since it started"><RefreshCw size={13} className={sync.busy?'spin':''}/>Resync models</button>
+        {sync.text&&<small className={sync.bad?'red':''}>{sync.text}</small>}</div>
+      </div>
       <ul className="ag-model-list" role="listbox" aria-label="Models">
         {shown.length?shown.slice(0,400).map(m=><li key={m.id}><button type="button" role="option" aria-selected={m.id===value} disabled={!m.usable} className={m.id===value?'chosen':''} title={m.reason||m.id} onClick={()=>pick(m)}>
           <span><strong className="truncate">{m.name}</strong><small className="truncate">{provider?'':`${m.provider} · `}{m.context?`${compact(m.context)} context`:'Context size unknown'}{m.context>0&&m.context<32000?' (small for longer tasks)':''}{m.reasoning?' · reasons':''}{m.usable?'':' · unavailable now'}</small></span>{m.id===value&&<Check size={14}/>}
@@ -236,7 +249,10 @@ function Composer({value,onChange,onSend,canSend,sending,busy,onStop,placeholder
 }
 
 // A new session: a folder, a model, a mode and the first message. Sending creates the session and sends the message to it.
-function NewSession({models,folders,reloadFolders,onCreated}:{models:Models|null;folders:FolderInfo[];reloadFolders:()=>void;onCreated:(s:SessionInfo,opening:Opening)=>void}){
+function NewSession({models,folders,reloadFolders,onResync,onCreated}:{models:Models|null;folders:FolderInfo[];reloadFolders:()=>void;onResync:()=>Promise<number>;onCreated:(s:SessionInfo,opening:Opening)=>void}){
+  const {confirm,dialog}=useConfirm();
+  // Full access is confirmed when it is picked, and never remembered as the mode the next session starts in.
+  const pickMode=async(m:Mode)=>{if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;setMode(m);};
   const [folder,setFolder]=useState(()=>stored('polygate-agent-folder'));
   const [model,setModel]=useState(()=>stored('polygate-agent-model'));const [effort,setEffort]=useState(()=>stored('polygate-agent-effort'));
   const [mode,setMode]=useState<Mode>(()=>{const m=stored('polygate-agent-mode');return MODES.some(x=>x.id===m&&x.id!=='full')?m as Mode:'ask';});
@@ -249,8 +265,8 @@ function NewSession({models,folders,reloadFolders,onCreated}:{models:Models|null
     const t=text.trim();if(!t||!current||!trusted)return;setBusy(true);setError('');
     const chosen=current.efforts.includes(effort)?effort:'';
     let s:SessionInfo;
-    try{s=await api('/admin/agent/session/create',{folder,model:current.id,mode,effort:chosen,title:t.split('\n')[0].slice(0,80)});}catch(e:any){setError(e.message);setBusy(false);return;}
-    store('polygate-agent-model',current.id);store('polygate-agent-effort',chosen);store('polygate-agent-mode',mode);
+    try{s=await api('/admin/agent/session/create',{folder,model:current.id,mode,confirmFull:mode==='full',effort:chosen,title:t.split('\n')[0].slice(0,80)});}catch(e:any){setError(e.message);setBusy(false);return;}
+    store('polygate-agent-model',current.id);store('polygate-agent-effort',chosen);if(mode!=='full')store('polygate-agent-mode',mode);
     // The session exists from here on: if the message cannot be sent, it opens with the message still in its box and the reason.
     let opening:Opening={};
     try{const r=await api('/admin/agent/session/prompt',{id:s.id,text:t});if(r.limited)opening={notice:LIMITED};}catch(e:any){opening={draft:t,error:e.message};}
@@ -264,24 +280,26 @@ function NewSession({models,folders,reloadFolders,onCreated}:{models:Models|null
       {folder&&!report&&trustError&&<div className="pg-error">{trustError}</div>}
       {models&&!usable.length&&<p className="agent-warn"><TriangleAlert size={15}/>No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
       <Composer value={text} onChange={setText} onSend={start} canSend={!!current&&trusted} sending={busy} placeholder={placeholder} autoFocus
-        chips={<><FolderChip folder={folder} folders={folders} onPick={pickFolder}/><ModeChip mode={mode} modes={models?.modes||{}} allowFull={false} onPick={m=>setMode(m)}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
+        chips={<><FolderChip folder={folder} folders={folders} onPick={pickFolder}/><ModeChip mode={mode} modes={models?.modes||{}} onPick={pickMode}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onResync={onResync} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
+      {mode==='full'&&<p className="agent-warn"><TriangleAlert size={15}/>This session starts with Full access: its first turn runs without approval prompts.</p>}
       {error&&<div className="pg-error">{error}</div>}
     </div>
+    {dialog}
   </div>;
 }
 
-function SessionView({start,opening,models:modelData,onChanged,onDeleted}:{start:SessionInfo;opening?:Opening;models:Models|null;onChanged:()=>void;onDeleted:()=>void}){
+function SessionView({start,opening,models:modelData,onResync,onChanged,onDeleted}:{start:SessionInfo;opening?:Opening;models:Models|null;onResync:()=>Promise<number>;onChanged:()=>void;onDeleted:()=>void}){
   const id=start.id,folder=start.folder;const models=modelData?.models||[];
   const [info,setInfo]=useState<SessionInfo>(start);const [items,setItems]=useState<Item[]>([]);const [pending,setPending]=useState<Approval[]>([]);
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>(start.tokens);
   const [error,setError]=useState(opening?.error||'');const [notice,setNotice]=useState(opening?.notice||'');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
   const [text,setText]=useState(opening?.draft||'');const [sending,setSending]=useState(false);
-  const [fullUntil,setFullUntil]=useState(0);const [rules,setRules]=useState(false);
+  const [rules,setRules]=useState(false);
   const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;const deleted=useRef(onDeleted);deleted.current=onDeleted;
   const {data:trust,error:trustError,reload:reloadTrust}=usePoll<TrustReport>('/admin/agent/trust?folder='+encodeURIComponent(folder),10000,!!folder);
   const untrusted=trust&&sameFolder(trust.folder,folder)&&!trust.trusted?trust:null;
   const load=useCallback(async()=>{
-    try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);setInfo(s.session);setFullUntil(s.fullUntil||0);setItems(withChanges(fromHistory(s.messages),changes.turns||[]));setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);}
+    try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);setInfo(s.session);setItems(withChanges(fromHistory(s.messages),changes.turns||[]));setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);}
     catch(e:any){setError(e.message);}
   },[id]);
   // History first, then the live stream. After a dropped connection the history is read again, so nothing missed meanwhile is lost.
@@ -296,7 +314,7 @@ function SessionView({start,opening,models:modelData,onChanged,onDeleted}:{start
       if(e.type==='agent.approval.auto')setPending(p=>p.filter(x=>x.id!==d.requestID));
       if(e.type==='agent.paused'){setPaused(d.message||'The model kept failing.');setBusy(false);return;}
       if(e.type==='agent.undone'){load();return;}
-      if(e.type==='agent.mode'){setInfo(i=>({...i,mode:d.mode}));setFullUntil(d.fullUntil||0);}
+      if(e.type==='agent.mode')setInfo(i=>({...i,mode:d.mode}));
       if(e.type==='session.execution.started'){setBusy(true);setPaused('');}
       if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();api('/admin/agent/session?id='+encodeURIComponent(id)).then(s=>setRequests(s.usage||null),()=>{});}
       if(e.type==='session.usage.updated'&&d.tokens)setUsage(d.tokens);
@@ -317,8 +335,8 @@ function SessionView({start,opening,models:modelData,onChanged,onDeleted}:{start
   const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
   const {confirm,dialog}=useConfirm();
   const changeMode=async(mode:Mode)=>{
-    if(mode==='full'&&!await confirm(<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access ends after this turn, after 30 minutes, or when the app or engine restarts.</>,{title:'Enable Full access',confirm:'Enable Full access'}))return;
-    setError('');try{const r=await api('/admin/agent/session/mode',{id,mode,confirmFull:mode==='full'});setInfo(i=>({...i,mode}));setFullUntil(r.fullUntil||0);}catch(e:any){setError(e.message);}
+    if(mode==='full'&&!await confirm(FULL_WARNING,{title:'Enable Full access',confirm:'Enable Full access',icon:<ShieldAlert size={18}/>}))return;
+    setError('');try{await api('/admin/agent/session/mode',{id,mode,confirmFull:mode==='full'});setInfo(i=>({...i,mode}));}catch(e:any){setError(e.message);}
   };
   const switchModel=async(model:string,effort:string)=>{setError('');try{await api('/admin/agent/session/model',{id,model,effort});setInfo(i=>({...i,model,effort}));if(paused){setPaused('');setNotice('Model changed. Send a message to carry on.');}}catch(e:any){setError(e.message);}};
   // Undo goes back to just before this turn's message: this turn and every later one are undone, and their messages leave the conversation.
@@ -326,16 +344,19 @@ function SessionView({start,opening,models:modelData,onChanged,onDeleted}:{start
   const undo=async(message:string)=>{
     const cards=items.filter((i):i is Extract<Item,{kind:'changes'}>=>i.kind==='changes');const from=cards.findIndex(c=>c.message===message);if(from<0)return;
     const files=[...new Set(cards.slice(from).flatMap(c=>c.files.map(f=>f.file)))];const later=cards.length-from-1;
-    const ok=await confirm(<>Remove this turn's changes from {files.length===1?<code>{files[0]}</code>:`${files.length} files`}.{later>0?` This also undoes the ${later} later turn${later>1?'s':''} that changed files.`:''} The conversation from this message on is removed. Your non-overlapping edits are preserved. If any file cannot be safely merged, nothing is undone.</>,{title:'Undo this turn',confirm:'Undo'});
+    const ok=await confirm(<>Remove this turn's changes from {files.length===1?<code>{files[0]}</code>:`${files.length} files`}.{later>0?` This also undoes the ${later} later turn${later>1?'s':''} that changed files.`:''} The conversation from this message on is removed. Your non-overlapping edits are preserved. If any file cannot be safely merged, nothing is undone.</>,{title:'Undo this turn',confirm:'Undo',icon:<Undo2 size={18}/>});
     if(!ok)return;setError('');setNotice('');
     try{const r=await api('/admin/agent/session/undo',{id,message});setNotice(`Undone: ${r.files.length} file${r.files.length===1?'':'s'} restored.${r.merged?' Your non-overlapping edits were preserved.':''}`);}catch(e:any){setError(e.message);}
   };
   const [naming,setNaming]=useState<string|null>(null);const rename=async()=>{const title=(naming||'').trim();if(!title||title===info.title){setNaming(null);return;}try{await api('/admin/agent/session/rename',{id,title});setInfo(i=>({...i,title}));changed.current();}catch(e:any){setError(e.message);}setNaming(null);};
   const answer=async(p:Approval,decision:'once'|'session'|'project'|'deny')=>{
-    if(decision==='project'&&!await confirm(<>Save this exact {p.action} request for this working folder? It will be allowed in future sessions without asking. It does not match broader command prefixes. Remove it under Project rules.</>,{title:'Save project rule',confirm:'Save and allow'}))return;
+    if(decision==='project'&&!await confirm(<>Save this exact {p.action} request for this working folder? It will be allowed in future sessions without asking. It does not match broader command prefixes. Remove it under Project rules.</>,{title:'Save project rule',confirm:'Save and allow',icon:<ShieldCheck size={18}/>}))return;
     setPending(list=>list.filter(x=>x.id!==p.id));
     try{await api('/admin/agent/session/approve',{id,request:p.id,decision});}catch(e:any){setError(e.message);load();}
   };
+  const shown=useMemo(()=>blocks(items),[items]);const todos=useMemo(()=>latestTodos(items),[items]);
+  // When the current turn started, for the working time under the conversation.
+  const [busySince,setBusySince]=useState(0);useEffect(()=>{setBusySince(busy?Date.now():0);},[busy]);
   const mode=(info.mode||'ask') as Mode;const tokens=usage?usage.input+usage.output+(usage.reasoning||0):0;
   const hint=mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':mode==='accept-edits'?'It changes files without asking and asks before running commands.':mode==='full'?'Full access: it runs commands and changes files without asking, for this turn.':'It reads freely and asks before changing files or running commands.';
   return <>
@@ -352,49 +373,73 @@ function SessionView({start,opening,models:modelData,onChanged,onDeleted}:{start
     </header>
     {rules&&<ProjectRules id={id} mode={mode}/>}
     <div className="ag-thread" ref={thread} aria-live="polite"><div className="ag-column">
-      {mode==='full'&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Full access.</strong> Commands run with your account's access without asking. Ends after this turn or at {new Date(fullUntil).toLocaleTimeString()}. No sandbox.</div></div>}
+      {mode==='full'&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Full access.</strong> Commands run with your account's access without asking, until this turn ends (or the app or engine restarts). No sandbox.</div></div>}
       {untrusted&&<FolderTrust folder={folder} report={untrusted} error={trustError} reload={reloadTrust}/>}
-      {items.length?items.map(i=><Row key={i.key} item={i} folder={folder} busy={busy} blocked={i.kind==='changes'?blocked.get(i.message):undefined} onUndo={undo}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {hint}</p>}
-      {busy&&!pending.length&&<div className="agent-working"><Loader2 className="spin" size={15}/>Working…</div>}
+      {shown.length?shown.map(b=><Row key={b.key} block={b} folder={folder} busy={busy} blocked={b.kind==='changes'?blocked.get(b.message):undefined} onUndo={undo}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {hint}</p>}
+      {busy&&<Working since={busySince} waiting={pending.length>0}/>}
     </div></div>
     <div className="ag-bottom"><div className="ag-column">
+      {todos.length>0&&(busy||todos.some(t=>t.status!=='completed'))&&<TodoCard todos={todos}/>}
       {pending.map(p=><ApprovalCard key={p.id} request={p} answer={answer}/>)}
-      {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {paused} Send a message to try again, or pick another model below.</div></div>}
+      {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {plainError(paused)} Send a message to try again, or pick another model below.</div></div>}
       {notice&&!error&&<div className="agent-notice" role="status">{notice}</div>}
       {error&&<div className="pg-error agent-error">{error}</div>}
       <Composer value={text} onChange={setText} onSend={send} canSend={!untrusted} sending={sending} busy={busy} onStop={stop}
         placeholder={busy?'The agent is working. A message now is queued for when it is done.':'Reply to the agent…'}
-        chips={<><ModeChip mode={mode} modes={modelData?.modes||{}} allowFull disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onPick={switchModel}/></>}/>
+        chips={<><ModeChip mode={mode} modes={modelData?.modes||{}} disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onResync={onResync} onPick={switchModel}/></>}/>
     </div></div>
     {dialog}
   </>;
 }
 
-function Row({item,folder,busy,blocked,onUndo}:{item:Item;folder:string;busy:boolean;blocked?:string;onUndo:(message:string)=>void}){
-  if(item.kind==='changes')return <ChangesCard files={item.files} busy={busy} blocked={blocked} undo={()=>onUndo(item.message)}/>;
-  if(item.kind==='user')return <div className="pg-msg user"><pre>{item.text}</pre></div>;
-  if(item.kind==='text')return item.text?<div className="pg-msg assistant"><pre>{item.text}</pre></div>:null;
-  if(item.kind==='reasoning')return <details className="pg-think"><summary><Brain size={14}/>{item.done?'Reasoning':'Thinking…'}</summary><pre>{item.text}</pre></details>;
-  if(item.kind==='note')return <div className={`agent-note ${item.tone}`}>{item.text}</div>;
-  const subject=toolSubject(item.name,item.input,folder);
-  const icon=item.status==='done'?<Check size={14} className="green"/>:item.status==='failed'?<X size={14} className="red"/>:<Loader2 size={14} className="spin"/>;
-  return <details className={`agent-tool ${item.status}`}><summary>{icon}<strong>{item.name}</strong>{subject&&<code className="truncate" title={subject}>{subject}</code>}</summary>
-    {item.error&&<p className="agent-error-text">{item.error}</p>}
-    {item.output?<pre>{item.output.length>6000?item.output.slice(0,6000)+'\n…':item.output}</pre>:!item.error&&<p className="subtle">{item.status==='done'?'No output.':'Waiting for the result…'}</p>}
+// One piece of the conversation, drawn like a chat app: your messages in a box on the right, the agent's replies as plain text, and
+// what it did as quiet one-line summaries that open to show each step.
+function Row({block,folder,busy,blocked,onUndo}:{block:Block;folder:string;busy:boolean;blocked?:string;onUndo:(message:string)=>void}){
+  if(block.kind==='changes')return <ChangesLine files={block.files} busy={busy} blocked={blocked} undo={()=>onUndo(block.message)}/>;
+  if(block.kind==='user')return <div className="ag-msg-user"><pre>{block.text}</pre></div>;
+  if(block.kind==='text')return block.text?<div className="ag-msg-agent"><Markdown text={block.text}/></div>:null;
+  if(block.kind==='reasoning')return <details className="ag-line"><summary>{block.done?'Thought':<><Loader2 size={13} className="spin"/>Thinking</>}<ChevronRight size={13} className="ag-line-chevron"/></summary><pre className="ag-thought">{block.text}</pre></details>;
+  if(block.kind==='note')return <div className={`agent-note ${block.tone}`}>{block.text}</div>;
+  return <Steps tools={block.tools} folder={folder}/>;
+}
+function Steps({tools,folder}:{tools:Tool[];folder:string}){
+  const working=tools.some(t=>t.status==='running'||t.status==='preparing');
+  return <details className="ag-line"><summary>{working&&<Loader2 size={13} className="spin"/>}{stepsSummary(tools)}<ChevronRight size={13} className="ag-line-chevron"/></summary>
+    <div className="ag-steps">{tools.map(t=><Step key={t.key} tool={t} folder={folder}/>)}</div>
   </details>;
+}
+function Step({tool:t,folder}:{tool:Tool;folder:string}){
+  const subject=toolSubject(t.name,t.input,folder);
+  const icon=t.status==='done'?<Check size={13} className="green"/>:t.status==='failed'?<X size={13} className="red"/>:<Loader2 size={13} className="spin"/>;
+  return <details className={`agent-tool ${t.status}`}><summary>{icon}<strong>{t.name}</strong>{subject&&<code className="truncate" title={subject}>{subject}</code>}</summary>
+    {t.error&&<p className="agent-error-text">{t.error}</p>}
+    {t.output?<pre>{t.output.length>6000?t.output.slice(0,6000)+'\n…':t.output}</pre>:!t.error&&<p className="subtle">{t.status==='done'?'No output.':'Waiting for the result…'}</p>}
+  </details>;
+}
+// "Working 1m 12s" under the conversation while a turn runs.
+function Working({since,waiting}:{since:number;waiting:boolean}){
+  const [now,setNow]=useState(Date.now());useEffect(()=>{const t=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(t);},[]);
+  const s=Math.max(0,Math.round((now-(since||now))/1000));
+  return <div className="ag-working"><Loader2 size={14} className="spin"/>{waiting?'Waiting for your approval':'Working'}<span>{s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s}s`}</span></div>;
+}
+// The agent's own task list (the newest it wrote), above the message box like a chat app's plan.
+function TodoCard({todos}:{todos:Todo[]}){
+  return <ul className="ag-todos" aria-label="The agent's task list">{todos.map((t,i)=><li key={i} className={t.status}>
+    {t.status==='completed'?<CheckCircle2 size={15}/>:t.status==='in_progress'?<Loader2 size={15} className="spin"/>:<Circle size={15}/>}<span>{t.content}</span></li>)}</ul>;
 }
 
 const STATUS:Record<string,string>={added:'Added',deleted:'Deleted',modified:'Changed',renamed:'Renamed'};
-// What one turn changed, file by file, with the patch the engine recorded (a file a command changed may have none). `blocked` says why
-// it cannot be undone, when it cannot.
-function ChangesCard({files,busy,blocked,undo}:{files:Extract<Item,{kind:'changes'}>['files'];busy:boolean;blocked?:string;undo:()=>void}){
+// What one turn changed: one line with the counts that opens to each file and its patch (a file a command changed may have none), and
+// Undo, or why it cannot be undone.
+function ChangesLine({files,busy,blocked,undo}:{files:Extract<Item,{kind:'changes'}>['files'];busy:boolean;blocked?:string;undo:()=>void}){
   const add=files.reduce((s,f)=>s+f.additions,0),del=files.reduce((s,f)=>s+f.deletions,0);
-  return <div className="agent-changes">
-    <div className="agent-changes-head"><FileDiff size={15}/><strong>{files.length} file{files.length===1?'':'s'} changed</strong>{add>0&&<span className="green">+{add}</span>}{del>0&&<span className="red">−{del}</span>}<span className="toolbar-spacer"/>
-      {!blocked&&<button className="text-button" disabled={busy} onClick={undo}><Undo2 size={14}/>Undo this turn</button>}</div>
-    {blocked&&<p className="agent-change-why">{blocked}</p>}
-    {files.map(f=><details key={f.file} className="agent-change"><summary><span className={`agent-change-status ${f.status}`}>{STATUS[f.status]||f.status}</span><code className="truncate" title={f.file}>{f.file}</code>{f.additions>0&&<small className="green">+{f.additions}</small>}{f.deletions>0&&<small className="red">−{f.deletions}</small>}</summary>
-      {f.patch?<Diff patch={f.patch}/>:<p className="subtle">No patch was recorded for this file (it was changed by a command).</p>}</details>)}
+  const names=files.length===1?files[0].file.split(/[\\/]/).pop():`${files.length} files`;
+  return <div className="ag-changes">
+    <details className="ag-line"><summary>Changed {names}{add>0&&<span className="green">+{add}</span>}{del>0&&<span className="red">−{del}</span>}<span className="ag-line-link">View changes</span><ChevronRight size={13} className="ag-line-chevron"/></summary>
+      <div className="agent-changes">{files.map(f=><details key={f.file} className="agent-change"><summary><span className={`agent-change-status ${f.status}`}>{STATUS[f.status]||f.status}</span><code className="truncate" title={f.file}>{f.file}</code>{f.additions>0&&<small className="green">+{f.additions}</small>}{f.deletions>0&&<small className="red">−{f.deletions}</small>}</summary>
+        {f.patch?<Diff patch={f.patch}/>:<p className="subtle">No patch was recorded for this file (it was changed by a command).</p>}</details>)}</div>
+    </details>
+    {blocked?<span className="ag-no-undo" title={blocked}>Can't be undone<small>{blocked}</small></span>:<button className="ag-undo" disabled={busy} onClick={undo}><Undo2 size={13}/>Undo</button>}
   </div>;
 }
 function Diff({patch}:{patch:string}){

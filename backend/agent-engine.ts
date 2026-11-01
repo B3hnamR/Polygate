@@ -446,3 +446,14 @@ export async function stopEngine() {
   child = undefined; setStatus({ state: 'idle', message: '', port: undefined, pid: undefined });
   logEvent('info', 'agent', 'Agent engine stopped');
 }
+// The engine knows the models that were in the catalog when it started. A provider added or a catalog refreshed since: the configuration
+// is written again with the models now usable, and the engine reloads it. The watch is given the new contents first, so this change is
+// not taken for tampering. Returns how many models the engine was given.
+export function syncEngineModels() {
+  if (!child || status.state !== 'running' || !gatewayUrl) throw new GatewayError('Start the agent engine first.', 409, 'agent_engine_not_running');
+  const p = enginePaths(); stopWatching();
+  const { cfg, written } = writeEngineFiles(p, gatewayUrl);
+  watchConfig(p, written);
+  logEvent('info', 'agent', `Agent engine model list updated: ${Object.keys(cfg.providers.polygate.models).length} models`);
+  return Object.keys(cfg.providers.polygate.models).length;
+}

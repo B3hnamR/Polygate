@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, undoBlocked, modelProviders, matchModels, folderName, type Item } from '../src/agent-logic';
+import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, undoBlocked, blocks, stepsSummary, latestTodos, modelProviders, matchModels, folderName, type Item } from '../src/agent-logic';
 // The Agent page's transcript, from a session's history and its live events (shapes as OpenCode 2.0.32 sends them).
 
 test('history becomes the transcript: messages, reasoning, tools with their result, and stops', () => {
@@ -112,4 +112,31 @@ test('the model picker: providers with their counts, and a search over name, id 
   expect(matchModels(models, '', '  free   coder ').map(m => m.id)).toEqual(['b/qwen-coder']);
   expect(matchModels(models, 'Alpha', 'qwen')).toEqual([]);
   expect(folderName('D:\\JB\\project\\')).toBe('project'); expect(folderName('/home/me/app')).toBe('app'); expect(folderName('D:\\')).toBe('D:');
+});
+
+test('runs of tool calls fold into one line of steps, said the way a person would', () => {
+  const tool = (key: string, name: string, input: any = {}, status: any = 'done'): Item => ({ kind: 'tool', key, name, input, status });
+  const items: Item[] = [{ kind: 'user', key: 'u', text: 'go' }, tool('t1', 'read', { filePath: 'C:\\p\\src\\a.ts' }), tool('t2', 'bash', { command: 'npm test' }), tool('t3', 'bash', { command: 'git status' }, 'failed'),
+    { kind: 'text', key: 'x', text: 'Done.' }, tool('t4', 'edit', { filePath: 'src/a.ts' }), tool('t5', 'edit', { filePath: 'src/b.ts' }), tool('t6', 'grep', { pattern: 'x' })];
+  const b = blocks(items);
+  expect(b.map(x => x.kind)).toEqual(['user', 'steps', 'text', 'steps']);
+  expect(stepsSummary((b[1] as any).tools)).toBe('Read a.ts, ran 2 commands (1 failed)');
+  expect(stepsSummary((b[3] as any).tools)).toBe('Edited 2 files, searched the code');
+  expect(stepsSummary([tool('t7', 'mystery') as any])).toBe('Used mystery');
+});
+
+test("the agent's newest task list is read from its todo tool", () => {
+  const write = (key: string, todos: any[]): Item => ({ kind: 'tool', key, name: 'todowrite', input: { todos }, status: 'done' });
+  expect(latestTodos([write('a', [{ content: 'old', status: 'pending' }]), write('b', [{ content: 'Read the code', status: 'completed' }, { content: 'Fix it', status: 'in_progress' }, { content: 'Test', status: 'weird' }])]))
+    .toEqual([{ content: 'Read the code', status: 'completed' }, { content: 'Fix it', status: 'in_progress' }, { content: 'Test', status: 'pending' }]);
+  expect(latestTodos([{ kind: 'text', key: 't', text: 'hi' }])).toEqual([]);
+});
+
+test('a provider error that arrives as raw JSON is shown as its sentence, in the retry note too', () => {
+  const { plainError } = require('../backend/plain-error');
+  expect(plainError('{"code":429,"reason":"TOKEN_LIMIT_EXCEEDED","message":"You have exceeded the token rate limit.","metadata":{}}')).toBe('You have exceeded the token rate limit. (429 TOKEN_LIMIT_EXCEEDED)');
+  expect(plainError('Upstream: {"error":{"message":"Bad key","type":"auth_error"}}')).toBe('Upstream: Bad key (auth_error)');
+  expect(plainError('Gateway is paused.')).toBe('Gateway is paused.');
+  const note = applyEvent([], { type: 'session.retry.scheduled', data: { attempt: 2, error: { message: '{"code":429,"message":"Slow down"}' } } })[0] as any;
+  expect(note.text).toBe('The model request failed: Slow down (429). Trying again (attempt 2).');
 });

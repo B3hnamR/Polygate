@@ -1,5 +1,6 @@
 // The Agent page's transcript: a session's history (from /admin/agent/session) and its live events (from /admin/agent/events), turned
 // into the items the page draws. No React here, so tests/agent-logic.test.ts can check it on its own.
+import { plainError } from '../backend/plain-error';
 
 export type Mode = 'ask' | 'accept-edits' | 'plan' | 'rules' | 'full';
 export const MODES: { id: Mode; label: string }[] = [{ id: 'ask', label: 'Ask for approval' }, { id: 'accept-edits', label: 'Accept edits' }, { id: 'plan', label: 'Plan' }, { id: 'rules', label: 'Rules-based approvals' }, { id: 'full', label: 'Full access' }];
@@ -79,9 +80,9 @@ export function applyEvent(items: Item[], e: any): Item[] {
     case 'agent.approval.blocked': return [...items, { kind: 'note', key: `blocked:${d.requestID}`, tone: 'bad', text: `Blocked by permission rules: ${(d.resources || []).join(', ')}` }];
     case 'agent.mode': return [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: d.mode === 'full' ? 'warn' : 'info', text: d.reason || `Mode: ${modeLabel(d.mode)}` }];
     // One note per turn for model retries, updated in place rather than one line per attempt.
-    case 'session.retry.scheduled': return upsert('retry', () => ({ kind: 'note', key: 'retry', tone: 'warn', text: '' }), x => ({ ...x, text: `The model request failed (${d.error?.message || 'no reason given'}). Trying again (attempt ${d.attempt ?? '?'}).` }));
+    case 'session.retry.scheduled': return upsert('retry', () => ({ kind: 'note', key: 'retry', tone: 'warn', text: '' }), x => ({ ...x, text: `The model request failed: ${d.error?.message ? plainError(d.error.message) : 'no reason given'}. Trying again (attempt ${d.attempt ?? '?'}).` }));
     case 'session.execution.started': return items.filter(x => x.key !== 'retry');
-    case 'session.execution.failed': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `failed:${e.id || items.length}`, tone: 'bad', text: d.error?.message ? `This turn failed: ${d.error.message}` : 'This turn failed.' }];
+    case 'session.execution.failed': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `failed:${e.id || items.length}`, tone: 'bad', text: d.error?.message ? `This turn failed: ${plainError(d.error.message)}` : 'This turn failed.' }];
     case 'session.execution.interrupted': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `stopped:${e.id || items.length}`, tone: 'info', text: 'Stopped.' }];
     // The engine's own word that the mode changed is not shown live: Polygate makes every mode change and says so (agent.mode), with its reason.
     case 'session.agent.selected': return items;
@@ -140,3 +141,54 @@ export function matchModels<T extends PickModel>(models: T[], provider: string, 
 }
 // A folder's last part, for the session list's group headings (the full path is shown on hover).
 export const folderName = (folder: string) => folder.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || folder;
+
+// The transcript as the page draws it: runs of tool calls fold into one line of steps, like a chat app's "Ran 2 commands, read a.ts".
+export type Tool = Extract<Item, { kind: 'tool' }>;
+export type Block = Exclude<Item, Tool> | { kind: 'steps'; key: string; tools: Tool[] };
+export function blocks(items: Item[]): Block[] {
+  const out: Block[] = [];
+  for (const i of items) {
+    if (i.kind !== 'tool') { out.push(i); continue; }
+    const last = out[out.length - 1];
+    if (last?.kind === 'steps') last.tools.push(i); else out.push({ kind: 'steps', key: `steps:${i.key}`, tools: [i] });
+  }
+  return out;
+}
+const base = (p: unknown) => String(p ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+const STEP: [RegExp, string, string, string?][] = [
+  [/^(bash|shell|exec|run)$/, 'ran a command', 'ran {n} commands'],
+  [/^read$/, 'read {file}', 'read {n} files', 'file'],
+  [/^(edit|multiedit|patch|apply_patch)$/, 'edited {file}', 'edited {n} files', 'file'],
+  [/^write$/, 'wrote {file}', 'wrote {n} files', 'file'],
+  [/^(grep|glob|list|ls|codesearch)$/, 'searched the code', 'searched the code {n} times'],
+  [/^webfetch$/, 'fetched a web page', 'fetched {n} web pages'],
+  [/^websearch$/, 'searched the web', 'searched the web {n} times'],
+  [/^(task|subagent)$/, 'ran a helper agent', 'ran {n} helper agents'],
+  [/^todo(write|read)$/, 'updated the task list', 'updated the task list'],
+];
+// One line for a run of steps: what was done, in the order it was first done, with how many failed.
+export function stepsSummary(tools: Tool[]): string {
+  const groups = new Map<string, { one: string; many: string; per?: string; seen: Set<string>; n: number }>();
+  for (const t of tools) {
+    const [, one, many, per] = STEP.find(([re]) => re.test(t.name.toLowerCase())) || [/./, `used ${t.name}`, `used ${t.name} {n} times`];
+    const key = one; const g = groups.get(key) || { one, many, per, seen: new Set<string>(), n: 0 };
+    const file = base(t.input?.filePath ?? t.input?.path); g.n++; if (file) g.seen.add(file); groups.set(key, g);
+  }
+  const parts = [...groups.values()].map(g => {
+    const count = g.per ? g.seen.size || g.n : g.n;
+    return count === 1 ? g.one.replace('{file}', [...g.seen][0] || 'a file') : g.many.replace('{n}', String(count));
+  });
+  const failed = tools.filter(t => t.status === 'failed').length;
+  const text = parts.join(', ') + (failed ? ` (${failed} failed)` : '');
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+// The agent's own task list: the newest one it wrote, as {content, status} items.
+export type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' | 'cancelled' };
+export function latestTodos(items: Item[]): Todo[] {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const t = items[i];
+    if (t.kind === 'tool' && /^todowrite$/i.test(t.name) && Array.isArray(t.input?.todos))
+      return t.input.todos.filter((x: any) => typeof x?.content === 'string').map((x: any) => ({ content: x.content, status: ['in_progress', 'completed', 'cancelled'].includes(x.status) ? x.status : 'pending' }));
+  }
+  return [];
+}

@@ -32,10 +32,11 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
     { type: 'document', path: path.join(configDir, 'opencode.json'), info: config }, { type: 'directory', path: configDir },
     ...(mode === 'project-config' ? [{ type: 'document', path: 'C:\\work\\cloned-repo\\opencode.json', info: {} }] : []),
   ]);
-  if (p === '/api/model') return json({ data: [
-    ...Object.keys(config.providers.polygate.models).map(id => ({ id, providerID: 'polygate', limit: config.providers.polygate.models[id].limit })),
+  // Like the real engine, a configuration written again while it runs is read again: the model list follows the file.
+  if (p === '/api/model') { const live = JSON.parse(readFileSync(path.join(configDir, 'opencode.json'), 'utf8')).providers.polygate.models; return json({ data: [
+    ...Object.keys(live).map(id => ({ id, providerID: 'polygate', limit: live[id].limit })),
     ...(mode === 'other-provider' ? [{ id: 'm', providerID: 'evil' }] : []),
-  ] });
+  ] }); }
   // Like OpenCode 2.0.32: built-in rules, the shared configured ones, the agent's own, then a closing browser rule.
   if (p === '/api/agent') { crashSoon(); return json({ data: ['build', ...Object.keys(config.agents || {})].filter(id => !(mode === 'missing-agent' && id === 'polygate-plan')).map(id => ({ id, permissions: [
     { action: '*', resource: '*', effect: 'allow' }, ...config.permissions, ...(id === 'build' ? [] : config.agents[id].permissions), { action: 'browser', resource: '*', effect: 'deny' },

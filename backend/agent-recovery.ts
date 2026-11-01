@@ -1,6 +1,7 @@
 import { settings } from './state';
 import { keyProblem } from './plan';
 import type { CheckItem } from './checklist';
+import { plainError } from './plain-error';
 import { enginePaths } from './agent-engine';
 import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -22,6 +23,6 @@ export function agentRecoveryItems(engine: { state: string; installed: boolean; 
   if (engine.state === 'failed') items.push({ id: 'agent_engine', severity: 'warning', title: 'The coding agent engine stopped with a problem', detail: engine.message || 'Agent sessions cannot run. Other model clients can still use the gateway.', page: 'Agent', ...(engine.installed ? { fix: { label: 'Start agent engine', endpoint: '/admin/agent/engine/start' } } : {}) });
   const key = settings.keys.find(k => k.agent), why = key ? keyProblem(key) : 'it is missing';
   if (why) items.push({ id: 'agent_key', severity: 'warning', title: 'The agent client key cannot be used', detail: `The agent key cannot make requests because ${why}. Review it in Settings; it is never enabled automatically.`, page: 'Settings' });
-  for (const session of sessions.filter(s => s.paused)) items.push({ id: `agent_paused:${session.id}`, severity: 'warning', title: 'An agent session is paused', detail: session.paused!, page: 'Agent' });
+  for (const session of sessions.filter(s => s.paused)) items.push({ id: `agent_paused:${session.id}`, severity: 'warning', title: 'An agent session is paused', detail: plainError(session.paused), page: 'Agent' });
   return items;
 }
