@@ -617,3 +617,9 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .ag-under-note{display:inline-flex;align-items:center;gap:6px;max-width:300px;padding:0 9px;color:var(--muted);font:600 13px/1 var(--font)}.ag-under-note svg{flex:none}
 .ag-menu-label{padding:8px 10px 3px;font-size:12px;font-weight:600;color:var(--muted)}
 .ag-folder-pick>.ag-menu{flex:1;min-height:0}
+/* The Full access notice (one closable line) and the + beside a folder in the Agent's sidebar. */
+.ag-full-note{display:flex;align-items:center;gap:7px;margin:0;color:var(--amber);font-size:13.5px;line-height:1.45}.ag-full-note svg{flex:none}
+.ag-full-note .icon-button{width:22px;height:22px;flex:none;color:var(--amber);opacity:.8}.ag-full-note .icon-button:hover{opacity:1}
+.ag-group h3{display:flex;align-items:center;gap:2px;padding-right:4px}.ag-group-head{flex:1;min-width:0}
+.ag-group-new{width:24px;height:24px;flex:none;opacity:0}.ag-group:hover .ag-group-new,.ag-group-new:focus-visible{opacity:1}
+@media(max-width:820px){.ag-group-new{opacity:1}}

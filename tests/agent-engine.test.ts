@@ -111,8 +111,9 @@ test('each mode is an engine agent with its own rules, and Polygate\'s folders s
   // The folder rules close every list, after a mode's own rules, and a folder named twice is written once.
   const guard = ['external_directory', 'read', 'edit'].map(action => ({ action, resource: `${folder}/*`, effect: 'deny' }));
   expect(cfg.permissions.slice(-3)).toEqual(guard);
-  for (const agent of Object.keys(cfg.agents).filter(id => id !== 'polygate-full')) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
-  expect(cfg.agents['polygate-full'].permissions).toEqual([{ action: '*', resource: '*', effect: 'ask' }]);
+  for (const agent of Object.keys(cfg.agents)) expect(cfg.agents[agent].permissions.slice(-3)).toEqual(guard);
+  // Full access keeps the shared rules: reads allowed, the rest asks (and only the live controller answers yes).
+  expect(['read', 'edit', 'shell', 'external_directory'].map(a => last(rulesOf('polygate-full'), a))).toEqual(['allow', 'ask', 'ask', 'ask']);
   expect(['edit', 'shell'].map(a => last(rulesOf('polygate-rules'), a))).toEqual(['allow', 'ask']);
 });
 

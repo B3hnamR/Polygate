@@ -140,3 +140,20 @@ test('a provider error that arrives as raw JSON is shown as its sentence, in the
   const note = applyEvent([], { type: 'session.retry.scheduled', data: { attempt: 2, error: { message: '{"code":429,"message":"Slow down"}' } } })[0] as any;
   expect(note.text).toBe('The model request failed: Slow down (429). Trying again (attempt 2).');
 });
+
+test('the model search is forgiving: separators, provider names and prefixes, word starts and short abbreviations, best first', () => {
+  const ms = ['ag/claude-opus-5-5', 'ag/claude-opus-5-5-high', 'ag/claude-sonnet-5-5-high', 'ag/claude-sonnet-5-5-low', 'cx/gpt-6.1-sol', 'cx/gpt-6.1-terra', 'oc/qwen3.6-plus-free']
+    .map(id => ({ id: '9rhit2/' + id, name: id, provider: '9RHit2', usable: true }));
+  ms.push({ id: 'opencode/big-pickle', name: 'Big Pickle', provider: 'OpenCode Free', usable: true }, { id: 'kilo/qwen3-coder', name: 'Qwen3 Coder', provider: 'Kilo Free', usable: false });
+  const names = (q: string) => matchModels(ms, '', q).map(m => m.name);
+  expect(names('opus55')).toEqual(['ag/claude-opus-5-5', 'ag/claude-opus-5-5-high']);
+  expect(names('gpt61')).toEqual(['cx/gpt-6.1-sol', 'cx/gpt-6.1-terra']);
+  expect(names('6.1')).toEqual(['cx/gpt-6.1-sol', 'cx/gpt-6.1-terra']);
+  expect(names('son hi')).toEqual(['ag/claude-sonnet-5-5-high']);
+  expect(names('cx sol')).toEqual(['cx/gpt-6.1-sol']);
+  expect(names('cop')).toEqual(['ag/claude-opus-5-5', 'ag/claude-opus-5-5-high']);
+  expect(names('9rhit2 opus')).toEqual(['ag/claude-opus-5-5', 'ag/claude-opus-5-5-high']);
+  expect(names('kilo qwen')).toEqual(['Qwen3 Coder']);
+  expect(names('qwen')).toEqual(['oc/qwen3.6-plus-free', 'Qwen3 Coder']); // usable first
+  expect(names('xyzzy')).toEqual([]);
+});

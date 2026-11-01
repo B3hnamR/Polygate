@@ -134,7 +134,6 @@ function onEvent(e: any, folder: string) {
   if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) {
     s.busy = false;
     s.pending.clear();
-    if (s.mode === 'full') expireFull(s);
     s.recording = recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`)).finally(prune);
   }
   publish(sid, e);
@@ -434,6 +433,8 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   }
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
     const b = await readJson(req, 1024 * 1024); const s = await known(b.id); const text = String(b.text || '');
+    // While the agent works, a message steers it (taken in at its next step) or waits in the queue for the end of the turn.
+    const delivery = b.delivery === 'queue' ? 'queue' : 'steer';
     if (!text.trim()) throw new GatewayError('Write a message first.', 400);
     requireTrust(s.folder);
     if (s.undoing || s.sending) throw new GatewayError('Wait for the current action to finish before sending another message.', 409, 'agent_busy');
@@ -451,7 +452,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     }
     s.retries = 0; s.paused = undefined; setAgentPause(s.id);
     // limited: the folder is bigger than one backup covers, so the page says that some changes cannot be undone from Polygate.
-    return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text }), ...(s.backup?.limited ? { limited: true } : {}) });
+    return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text, delivery }), ...(s.backup?.limited ? { limited: true } : {}) });
     } finally { s.sending = false; }
   }
   if (pathname === '/admin/agent/session/approve' && method === 'POST') {
@@ -500,7 +501,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     if (s.busy || s.sending || s.undoing || s.pending.size) throw new GatewayError('Stop the turn and resolve pending approvals before changing mode.', 409, 'agent_busy');
     if (mode === 'full' && b.confirmFull !== true) throw new GatewayError(FULL_CONSENT, 400, 'agent_full_consent');
     await engine('POST', `/api/session/${encodeURIComponent(s.id)}/agent`, { agent: ENGINE_MODES[mode].agent });
-    // Full access belongs to this engine run: it ends after the turn, and when the app or the engine restarts. There is no time limit.
+    // Full access belongs to this engine run: it stays until the mode is changed, and ends when the app or the engine restarts. No time limit.
     s.fullEngine = mode === 'full' ? engineConnection()?.url : undefined; s.allowed.clear(); s.mode = mode;
     publish(s.id, { type: 'agent.mode', data: { sessionID: s.id, mode } });
     return json(res, 200, { ok: true, mode });

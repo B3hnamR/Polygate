@@ -76,7 +76,8 @@ export function applyEvent(items: Item[], e: any): Item[] {
     case 'session.tool.called': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'running' as ToolStatus }), x => ({ ...x, input: d.input, status: 'running' }));
     case 'session.tool.success': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'done' as ToolStatus }), x => ({ ...x, status: 'done', output: textOf(d.content) }));
     case 'session.tool.failed': return upsert(d.id, () => ({ kind: 'tool', key: d.id, name: 'tool', status: 'failed' as ToolStatus }), x => ({ ...x, status: 'failed', error: d.error?.message || 'Failed' }));
-    case 'agent.approval.auto': return [...items, { kind: 'note', key: `auto:${d.requestID}`, tone: 'info', text: `${d.reason || 'Allowed for this session'}: ${(d.resources || []).join(', ')}` }];
+    // In Full access every action is answered yes: the steps already show what was done, so there is no note for each.
+    case 'agent.approval.auto': if (d.reason === 'Full access') return items; return [...items, { kind: 'note', key: `auto:${d.requestID}`, tone: 'info', text: `${d.reason || 'Allowed for this session'}: ${(d.resources || []).join(', ')}` }];
     case 'agent.approval.blocked': return [...items, { kind: 'note', key: `blocked:${d.requestID}`, tone: 'bad', text: `Blocked by permission rules: ${(d.resources || []).join(', ')}` }];
     case 'agent.mode': return [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: d.mode === 'full' ? 'warn' : 'info', text: d.reason || `Mode: ${modeLabel(d.mode)}` }];
     // One note per turn for model retries, updated in place rather than one line per attempt.
@@ -126,18 +127,49 @@ export function undoBlocked(items: Item[]): Map<string, string> {
   return out;
 }
 
-// The model picker: providers with how many models each offers, and the models of one provider (or all) matching a search. Every word
-// of the search has to appear in the model's name, id or provider.
+// The model picker: providers with how many models each offers, and the models of one provider (or all) matching a search.
 type PickModel = { id: string; name: string; provider: string; usable: boolean };
 export function modelProviders<T extends PickModel>(models: T[]) {
   const out = new Map<string, { name: string; count: number; usable: number }>();
   for (const m of models) { const p = out.get(m.provider) || { name: m.provider, count: 0, usable: 0 }; p.count++; if (m.usable) p.usable++; out.set(m.provider, p); }
   return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
+// A forgiving search: every word of it has to be found in the model's name, id or provider, as typed, or ignoring separators ("opus55"
+// finds claude-opus-5-5, "gpt61" finds gpt-6.1), or as letters in order within the name or id ("cop" finds claude-opus). Matches that
+// start a name or a word come first, then plain ones, then the letters-in-order ones; usable models before the others.
+const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+// The letters of `needle` in order within a short stretch of `hay` (at most about twice its length), so they read as an abbreviation.
+const inOrder = (needle: string, hay: string) => {
+  for (let start = hay.indexOf(needle[0]); start >= 0; start = hay.indexOf(needle[0], start + 1)) {
+    let i = 1, at = start;
+    while (i < needle.length && (at = hay.indexOf(needle[i], at + 1)) >= 0 && at - start < needle.length * 2 + 2) i++;
+    if (i === needle.length) return true;
+  }
+  return false;
+};
+function matchScore(m: PickModel, words: string[]): number | null {
+  const name = m.name.toLowerCase(), id = m.id.toLowerCase(), all = `${name} ${id} ${m.provider.toLowerCase()}`;
+  // Letters in order are looked for in the name and the id without its provider prefix ("9rhit2/…"), which would match nearly anything.
+  const flat = squash(all), names = [squash(m.name), squash(m.id.split('/').slice(1).join('/') || m.id)];
+  let score = 0;
+  for (const w of words) {
+    const sw = squash(w);
+    if (!sw) continue;
+    if (name.startsWith(w) || id.split('/').pop()!.startsWith(w)) score += 6;
+    else if (new RegExp(`(^|[^a-z0-9])${sw.replace(/[^a-z0-9]/g, '')}`).test(all)) score += 5;
+    // Inside a word only from three letters on: two letters ("hi") turn up inside nearly every name.
+    else if (w.length > 2 && all.includes(w)) score += 4;
+    else if (w.length > 2 && flat.includes(sw)) score += 3;
+    else if (sw.length > 2 && names.some(n => inOrder(sw, n))) score += 1;
+    else return null;
+  }
+  return score;
+}
 export function matchModels<T extends PickModel>(models: T[], provider: string, query: string): T[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const found = models.filter(m => (!provider || m.provider === provider) && words.every(w => `${m.name} ${m.id} ${m.provider}`.toLowerCase().includes(w)));
-  return [...found.filter(m => m.usable), ...found.filter(m => !m.usable)];
+  const found = models.filter(m => !provider || m.provider === provider).map((m, i) => ({ m, i, s: matchScore(m, words) })).filter(x => x.s !== null);
+  found.sort((a, b) => Number(b.m.usable) - Number(a.m.usable) || b.s! - a.s! || a.i - b.i);
+  return found.map(x => x.m);
 }
 // A folder's last part, for the session list's group headings (the full path is shown on hover).
 export const folderName = (folder: string) => folder.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || folder;

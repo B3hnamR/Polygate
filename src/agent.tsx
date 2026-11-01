@@ -45,6 +45,9 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const [busy,setBusy]=useState('');
   const act=async(path:string,label:string)=>{setBusy(label);setProblem('');try{await api(path,{});}catch(e:any){setProblem(e.message);}finally{setBusy('');reloadEngine();}};
   const choose=(id:string)=>{setOpen(id);store('polygate-agent-open',id);if(fresh?.info.id!==id)setFresh(null);};
+  // A new session, empty or (with +) in one folder; seq starts a fresh screen even when the same folder is asked for again.
+  const [start,setStart]=useState<{folder?:string|null;seq:number}>({seq:0});
+  const newSession=(folder?:string|null)=>{choose('');setStart(x=>({folder,seq:x.seq+1}));};
   const sessions=list?.sessions||[];
   const info=sessions.find(s=>s.id===open)||(fresh?.info.id===open?fresh.info:undefined);
   // Sessions grouped by their folder, the folder with the newest session first (the list comes newest first). Sessions started with
@@ -63,14 +66,14 @@ export function AgentApp({onBack}:{onBack:()=>void}){
     :!running?<div className="ag-center"><div className="ag-column"><div className="ag-card"><EngineCard engine={engine} busy={busy} act={act}/></div></div></div>
     :!list&&!listError&&open&&!info?<div className="ag-center"><p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Loading sessions…</p></div>
     :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} scratch={scratch} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
-    :<NewSession models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
+    :<NewSession key={start.seq} startFolder={start.folder} models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
   return <div className="ag-app">
     <aside className="ag-side" aria-label="Agent sessions">
       <div className="ag-side-head"><button className="ag-back" onClick={onBack} title="Back to Polygate"><ArrowLeft size={16}/>Polygate</button><span className="ag-side-title"><Bot size={17}/>Agent</span></div>
-      <button className={`ag-new${running&&!info?' active':''}`} onClick={()=>choose('')} disabled={!running}><Plus size={16}/>New session</button>
+      <button className={`ag-new${running&&!info?' active':''}`} onClick={()=>newSession()} disabled={!running}><Plus size={16}/>New session</button>
       <nav className="ag-sessions">
         {groups.map(([folder,items])=>{const shut=folded.includes(folder);return <section key={folder} className="ag-group">
-          <h3><button type="button" className="ag-group-head" aria-expanded={!shut} title={folder===NO_FOLDER?'Sessions started without a project folder':folder} onClick={()=>fold(folder)}><span className="truncate">{folder===NO_FOLDER?'No folder':folderName(folder)}</span><ChevronDown size={13} className={shut?'shut':''}/></button></h3>
+          <h3><button type="button" className="ag-group-head" aria-expanded={!shut} title={folder===NO_FOLDER?'Sessions started without a project folder':folder} onClick={()=>fold(folder)}><span className="truncate">{folder===NO_FOLDER?'No folder':folderName(folder)}</span><ChevronDown size={13} className={shut?'shut':''}/></button>{running&&<button type="button" className="icon-button ag-group-new" aria-label={`New session in ${folder===NO_FOLDER?'No folder':folderName(folder)}`} title={folder===NO_FOLDER?'New session without a folder':`New session in ${folder}`} onClick={()=>newSession(folder===NO_FOLDER?'':folder)}><Plus size={14}/></button>}</h3>
           {!shut&&<ul>{items.map(s=><li key={s.id} className={s.id===info?.id?'active':''}>
             <button className="ag-session" aria-current={s.id===info?.id?'true':undefined} onClick={()=>choose(s.id)} title={`${s.title}\n${when(s.created||0)}${s.mode?` · ${modeLabel(s.mode)}`:''}\n${s.folder}`}><span className="truncate">{s.title}</span></button>
             <button className="icon-button danger ag-session-delete" aria-label={`Delete session ${s.title}`} title="Delete session" onClick={()=>remove(s)}><Trash2 size={14}/></button>
@@ -184,7 +187,11 @@ function Popover({label,icon,title,disabled,width=320,children}:{label:ReactNode
 }
 
 // What Full access means, said each time it is switched on (when a session starts in it, or inside one).
-const FULL_WARNING=<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access ends after this turn, or when the app or engine restarts.</>;
+const FULL_WARNING=<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access stays on until you change the mode, and ends when the app or engine restarts.</>;
+// The Full access notice: one line of text with a close mark.
+function FullNote({text,onClose}:{text:string;onClose:()=>void}){
+  return <p className="ag-full-note" role="status"><TriangleAlert size={14}/><span>{text}</span><button type="button" className="icon-button" aria-label="Close this notice" title="Close" onClick={onClose}><X size={13}/></button></p>;
+}
 // The one place the mode is chosen. The caller asks for confirmation before Full access.
 function ModeChip({mode,modes,disabled,onPick}:{mode:Mode;modes:Record<string,string>;disabled?:boolean;onPick:(mode:Mode)=>void}){
   return <Popover icon={mode==='full'?<TriangleAlert size={14}/>:<ShieldCheck size={14}/>} label={modeLabel(mode)} title={disabled?'Stop the turn and answer waiting approvals before changing mode':'Permission mode'} disabled={disabled} width={360}>
@@ -255,15 +262,16 @@ function FolderChip({folder,folders,onPick}:{folder:string|null;folders:FolderIn
 }
 
 // The message box, with send (and stop while the agent works) inside it, and the folder, mode and model in a row under it.
-function Composer({value,onChange,onSend,canSend,sending,busy,onStop,placeholder,left,right,autoFocus}:{value:string;onChange:(v:string)=>void;onSend:()=>void;canSend:boolean;sending:boolean;busy?:boolean;onStop?:()=>void;placeholder:string;left?:ReactNode;right:ReactNode;autoFocus?:boolean}){
+// While the agent works, Enter steers it (the message is taken in at its next step) and Ctrl+Enter queues the message for the end of the turn.
+function Composer({value,onChange,onSend,onQueue,canSend,sending,busy,onStop,placeholder,left,right,autoFocus}:{value:string;onChange:(v:string)=>void;onSend:()=>void;onQueue?:()=>void;canSend:boolean;sending:boolean;busy?:boolean;onStop?:()=>void;placeholder:string;left?:ReactNode;right:ReactNode;autoFocus?:boolean}){
   const ready=canSend&&!sending&&!!value.trim();
   return <div className="ag-compose">
     <div className="ag-composer">
       <textarea aria-label="Message to the agent" placeholder={placeholder} value={value} rows={1} autoFocus={autoFocus}
-        onChange={e=>onChange(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();if(ready)onSend();}}}/>
+        onChange={e=>onChange(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();if(ready)(busy&&onQueue&&(e.ctrlKey||e.metaKey)?onQueue:onSend)();}}}/>
       <div className="ag-composer-actions">
         {busy&&onStop&&<button type="button" className="ag-stop" onClick={onStop} title="Stop the agent"><Square size={12}/>Stop</button>}
-        <button type="button" className="ag-send" aria-label={busy?'Queue message':'Send'} title={busy?'Queue: sent when the agent is done':'Send (Enter)'} disabled={!ready} onClick={onSend}>{sending?<Loader2 className="spin" size={16}/>:<ArrowUp size={17}/>}</button>
+        <button type="button" className="ag-send" aria-label={busy?'Steer the agent':'Send'} title={busy?'Steer (Enter): the agent takes it in at its next step. Ctrl+Enter queues it for the end of the turn.':'Send (Enter)'} disabled={!ready} onClick={onSend}>{sending?<Loader2 className="spin" size={16}/>:<ArrowUp size={17}/>}</button>
       </div>
     </div>
     <div className="ag-under">{left}<span className="toolbar-spacer"/>{right}</div>
@@ -271,12 +279,13 @@ function Composer({value,onChange,onSend,canSend,sending,busy,onStop,placeholder
 }
 
 // A new session: a folder, a model, a mode and the first message. Sending creates the session and sends the message to it.
-function NewSession({models,folders,reloadFolders,onResync,onCreated}:{models:Models|null;folders:FolderInfo[];reloadFolders:()=>void;onResync:()=>Promise<number>;onCreated:(s:SessionInfo,opening:Opening)=>void}){
+function NewSession({startFolder,models,folders,reloadFolders,onResync,onCreated}:{startFolder?:string|null;models:Models|null;folders:FolderInfo[];reloadFolders:()=>void;onResync:()=>Promise<number>;onCreated:(s:SessionInfo,opening:Opening)=>void}){
   const {confirm,dialog}=useConfirm();
   // Full access is confirmed when it is picked, and never remembered as the mode the next session starts in.
-  const pickMode=async(m:Mode)=>{if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;setMode(m);};
+  const pickMode=async(m:Mode)=>{if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;setMode(m);if(m==='full')setNoteShut(false);};
+  const [noteShut,setNoteShut]=useState(false);
   // The last project folder, or "Choose…" (null). No folder ("") is never remembered.
-  const [folder,setFolder]=useState<string|null>(()=>stored('polygate-agent-folder')||null);
+  const [folder,setFolder]=useState<string|null>(()=>startFolder!==undefined?startFolder:stored('polygate-agent-folder')||null);
   const [model,setModel]=useState(()=>stored('polygate-agent-model'));const [effort,setEffort]=useState(()=>stored('polygate-agent-effort'));
   const [mode,setMode]=useState<Mode>(()=>{const m=stored('polygate-agent-mode');return MODES.some(x=>x.id===m&&x.id!=='full')?m as Mode:'ask';});
   const [text,setText]=useState('');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
@@ -306,7 +315,7 @@ function NewSession({models,folders,reloadFolders,onResync,onCreated}:{models:Mo
       <Composer value={text} onChange={setText} onSend={start} canSend={!!current&&trusted} sending={busy} placeholder={placeholder} autoFocus
         left={<FolderChip folder={folder} folders={folders} onPick={pickFolder}/>}
         right={<><ModeChip mode={mode} modes={models?.modes||{}} onPick={pickMode}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onResync={onResync} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
-      {mode==='full'&&<p className="agent-warn"><TriangleAlert size={15}/>This session starts with Full access: its first turn runs without approval prompts.</p>}
+      {mode==='full'&&!noteShut&&<FullNote text="This session starts with Full access: commands run without approval prompts." onClose={()=>setNoteShut(true)}/>}
       {error&&<div className="pg-error">{error}</div>}
     </div>
     {dialog}
@@ -319,7 +328,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>(start.tokens);
   const [error,setError]=useState(opening?.error||'');const [notice,setNotice]=useState(opening?.notice||'');const [live,setLive]=useState<'connecting'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
   const [text,setText]=useState(opening?.draft||'');const [sending,setSending]=useState(false);
-  const [rules,setRules]=useState(false);
+  const [rules,setRules]=useState(false);const [fullShut,setFullShut]=useState(false);
   const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;const deleted=useRef(onDeleted);deleted.current=onDeleted;
   const {data:trust,error:trustError,reload:reloadTrust}=usePoll<TrustReport>('/admin/agent/trust?folder='+encodeURIComponent(folder),10000,!!folder);
   const untrusted=trust&&sameFolder(trust.folder,folder)&&!trust.trusted?trust:null;
@@ -339,7 +348,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
       if(e.type==='agent.approval.auto')setPending(p=>p.filter(x=>x.id!==d.requestID));
       if(e.type==='agent.paused'){setPaused(d.message||'The model kept failing.');setBusy(false);return;}
       if(e.type==='agent.undone'){load();return;}
-      if(e.type==='agent.mode')setInfo(i=>({...i,mode:d.mode}));
+      if(e.type==='agent.mode'){setInfo(i=>({...i,mode:d.mode}));if(d.mode==='full')setFullShut(false);}
       if(e.type==='session.execution.started'){setBusy(true);setPaused('');}
       if(/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)){setBusy(false);changed.current();api('/admin/agent/session?id='+encodeURIComponent(id)).then(s=>setRequests(s.usage||null),()=>{});}
       if(e.type==='session.usage.updated'&&d.tokens)setUsage(d.tokens);
@@ -356,7 +365,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   },[id,load]);
   // Follows the newest output while the reader is near the bottom; reading further up is left alone.
   useEffect(()=>{const el=thread.current;if(el&&el.scrollHeight-el.scrollTop-el.clientHeight<160)el.scrollTop=el.scrollHeight;},[items,pending,busy]);
-  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{const r=await api('/admin/agent/session/prompt',{id,text:t});setText('');if(r.limited)setNotice(LIMITED);}catch(e:any){setError(e.message);}finally{setSending(false);}};
+  const send=async(delivery:'steer'|'queue'='steer')=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{const r=await api('/admin/agent/session/prompt',{id,text:t,delivery});setText('');if(r.limited)setNotice(LIMITED);}catch(e:any){setError(e.message);}finally{setSending(false);}};
   const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
   const {confirm,dialog}=useConfirm();
   const changeMode=async(mode:Mode)=>{
@@ -383,7 +392,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   // When the current turn started, for the working time under the conversation.
   const [busySince,setBusySince]=useState(0);useEffect(()=>{setBusySince(busy?Date.now():0);},[busy]);
   const mode=(info.mode||'ask') as Mode;const tokens=usage?usage.input+usage.output+(usage.reasoning||0):0;
-  const hint=mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':mode==='accept-edits'?'It changes files without asking and asks before running commands.':mode==='full'?'Full access: it runs commands and changes files without asking, for this turn.':'It reads freely and asks before changing files or running commands.';
+  const hint=mode==='plan'?'In Plan mode it reads and plans; it does not change files or run commands.':mode==='accept-edits'?'It changes files without asking and asks before running commands.':mode==='full'?'Full access: it runs commands and changes files without asking.':'It reads freely and asks before changing files or running commands.';
   return <>
     <header className="ag-head">
       <div className="ag-head-title">{naming!==null?<input className="agent-rename" aria-label="Session name" autoFocus value={naming} maxLength={120} onChange={e=>setNaming(e.target.value)} onBlur={rename} onKeyDown={e=>{if(e.key==='Enter')rename();if(e.key==='Escape')setNaming(null);}}/>
@@ -398,7 +407,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
     </header>
     {rules&&<ProjectRules id={id} mode={mode}/>}
     <div className="ag-thread" ref={thread} aria-live="polite"><div className="ag-column">
-      {mode==='full'&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Full access.</strong> Commands run with your account's access without asking, until this turn ends (or the app or engine restarts). No sandbox.</div></div>}
+      {mode==='full'&&!fullShut&&<FullNote text="Full access: commands run with your account's access without asking, until you change the mode or the app or engine restarts. No sandbox." onClose={()=>setFullShut(true)}/>}
       {untrusted&&<FolderTrust folder={folder} report={untrusted} error={trustError} reload={reloadTrust}/>}
       {shown.length?shown.map(b=><Row key={b.key} block={b} folder={folder} busy={busy} blocked={b.kind==='changes'?blocked.get(b.message):undefined} onUndo={undo}/>):<p className="subtle agent-hint">Tell the agent what to do in this folder. {hint}</p>}
       {busy&&<Working since={busySince} waiting={pending.length>0}/>}
@@ -409,8 +418,8 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
       {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {plainError(paused)} Send a message to try again, or pick another model below.</div></div>}
       {notice&&!error&&<div className="agent-notice" role="status">{notice}</div>}
       {error&&<div className="pg-error agent-error">{error}</div>}
-      <Composer value={text} onChange={setText} onSend={send} canSend={!untrusted} sending={sending} busy={busy} onStop={stop}
-        placeholder={busy?'The agent is working. A message now is queued for when it is done.':'Reply to the agent…'}
+      <Composer value={text} onChange={setText} onSend={()=>send('steer')} onQueue={()=>send('queue')} canSend={!untrusted} sending={sending} busy={busy} onStop={stop}
+        placeholder={busy?'Steer the agent: Enter sends it now, Ctrl+Enter queues it for after this turn':'Reply to the agent…'}
         left={<span className="ag-under-note" title={folder}><Folder size={14}/><span className="truncate">{noFolder?'No folder':folderName(folder)}</span></span>}
         right={<><ModeChip mode={mode} modes={modelData?.modes||{}} disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onResync={onResync} onPick={switchModel}/></>}/>
     </div></div>

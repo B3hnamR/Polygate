@@ -219,7 +219,7 @@ test('saving an exact project approval survives in another session and can be re
   ui.stop();
 });
 
-test('Full access requires explicit consent, is owned by the controller, has no time limit and ends after the turn', async () => {
+test('Full access requires explicit consent, is owned by the controller, has no time limit and stays on after a turn until the mode changes', async () => {
   const a = await create(); const ui = listen(a); await ui.ready();
   expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full' })).status).toBe(400);
   expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'full' })).status).toBe(400);
@@ -230,12 +230,19 @@ test('Full access requires explicit consent, is owned by the controller, has no 
   await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full/reply')));
   expect((await calls()).find(c => c.path.endsWith('/permission/per_full/reply'))!.body.decision).toBe('once');
   await emit('session.execution.succeeded', { sessionID: a });
-  await until(async () => (await admin('/admin/agent/session?id=' + a)).body.session.mode === 'ask');
+  await until(async () => !(await admin('/admin/agent/session?id=' + a)).body.busy);
+  expect((await admin('/admin/agent/session?id=' + a)).body.session.mode).toBe('full');
+  expect(ui.events.some(e => e.type === 'agent.mode' && e.data.mode === 'ask')).toBe(false);
+  // The next turn is still answered without asking.
+  await emit('permission.asked', { id: 'per_full_next', sessionID: a, action: 'shell', resources: ['npm run build'] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full_next/reply')));
+  expect((await admin('/admin/agent/session/mode', { id: a, mode: 'ask' })).status).toBe(200);
+  expect((await admin('/admin/agent/session?id=' + a)).body.session.mode).toBe('ask');
   expect((await calls()).filter(c => c.path.endsWith('/reply')).every(c => c.body.decision !== 'always')).toBe(true);
   ui.stop();
 });
 
-test('a session can start in Full access when that is confirmed, and its first turn is answered without asking', async () => {
+test('a session can start in Full access when that is confirmed, and its turns are answered without asking', async () => {
   await trustFolder();
   const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'full', confirmFull: true }); expect(r.status).toBe(200);
   const a = r.body.id as string; const ui = listen(a); await ui.ready();
@@ -244,7 +251,8 @@ test('a session can start in Full access when that is confirmed, and its first t
   await emit('permission.asked', { id: 'per_full_start', sessionID: a, action: 'shell', resources: ['npm test'] });
   await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_full_start/reply')));
   await emit('session.execution.succeeded', { sessionID: a });
-  await until(async () => (await admin('/admin/agent/session?id=' + a)).body.session.mode === 'ask');
+  await until(async () => !(await admin('/admin/agent/session?id=' + a)).body.busy);
+  expect((await admin('/admin/agent/session?id=' + a)).body.session.mode).toBe('full');
   ui.stop();
 });
 
@@ -541,6 +549,17 @@ test('"No folder" starts a session in an empty folder of its own, allowed at onc
   expect((await admin('/admin/agent/sessions')).body.sessions.find((s: any) => s.id === r.body.id)).toMatchObject({ folder, title: 'Just a question' });
   const again = await admin('/admin/agent/session/create', { noFolder: true, model: MODEL, mode: 'ask' }); expect(again.body.folder).not.toBe(folder);
   expect((await admin('/admin/agent/session/create', { noFolder: true, model: MODEL, mode: 'full' })).status).toBe(400);
+});
+
+test('a message sent while the agent works steers it by default, or waits in the queue when asked to', async () => {
+  const a = await create(); const ui = listen(a); await ui.ready();
+  await admin('/admin/agent/session/prompt', { id: a, text: 'start' }); await emit('session.execution.started', { sessionID: a });
+  await until(() => ui.events.some(e => e.type === 'session.execution.started'));
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'use tabs, not spaces' })).status).toBe(200);
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'then write the changelog', delivery: 'queue' })).status).toBe(200);
+  const sent = (await calls()).filter(c => c.method === 'POST' && c.path === `/api/session/${a}/prompt`).map(c => [c.body.text, c.body.delivery]);
+  expect(sent).toEqual([['start', 'steer'], ['use tabs, not spaces', 'steer'], ['then write the changelog', 'queue']]);
+  await emit('session.execution.succeeded', { sessionID: a }); ui.stop();
 });
 
 test('a session can switch to another usable model (with its effort), and can be renamed', async () => {

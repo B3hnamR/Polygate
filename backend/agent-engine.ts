@@ -198,9 +198,10 @@ export const ENGINE_MODES: Record<'ask' | 'accept-edits' | 'plan' | 'rules' | 'f
     permissions: [{ action: 'edit', resource: '*', effect: 'deny' }, { action: 'shell', resource: '*', effect: 'deny' }, { action: 'execute', resource: '*', effect: 'deny' }, { action: 'subagent', resource: '*', effect: 'deny' }] },
   rules: { agent: 'polygate-rules', description: 'Rules-based approvals: project edits are allowed; exact hardened inspections and project rules are checked by Polygate. Unknown commands ask.',
     permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
-  // The engine still asks: only the live controller can grant Full access, so persisted engine sessions cannot retain it after restart.
-  full: { agent: 'polygate-full', description: 'Full access: no ordinary approval prompts for this turn, at most 30 minutes. Commands have your account access. Requires explicit consent.',
-    permissions: [{ action: '*', resource: '*', effect: 'ask' }] },
+  // The engine keeps the shared rules (reads and searches allowed, everything else asks): only the live controller answers yes for Full
+  // access, so a persisted engine session cannot keep it after a restart. Polygate's folders stay closed to file tools here too.
+  full: { agent: 'polygate-full', description: 'Full access: no ordinary approval prompts until you change the mode, or the app or engine restarts. Commands have your account access. Requires explicit consent.',
+    permissions: [] },
 };
 const PLUGIN = 'polygate-scrub';
 // Commands the agent runs inherit the engine's environment; this engine plugin drops the engine password and the agent key from it.
@@ -240,7 +241,7 @@ export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; pro
     providers: { polygate: { name: 'Polygate', package: '@ai-sdk/openai-compatible', env: ['POLYGATE_AGENT_KEY'], settings: { baseURL: o.gatewayUrl.replace(/\/+$/, '') + '/v1', apiKey: '{env:POLYGATE_AGENT_KEY}' }, models: Object.fromEntries(entries) } },
     policies: [{ action: 'provider.use', resource: '*', effect: 'deny' }, { action: 'provider.use', resource: 'polygate', effect: 'allow' }],
     permissions: [...ENGINE_PERMISSIONS, ...guard].map(r => ({ ...r })),
-    agents: Object.fromEntries(Object.entries(ENGINE_MODES).map(([mode, m]) => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...(mode === 'full' ? [] : guard)].map(r => ({ ...r })) }])),
+    agents: Object.fromEntries(Object.entries(ENGINE_MODES).map(([mode, m]) => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...guard].map(r => ({ ...r })) }])),
     plugins: [`./${PLUGIN}`],
   } as any;
 }
