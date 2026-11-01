@@ -49,7 +49,8 @@ function listen(id: string) {
   })().catch(() => {});
   return { events, stop: () => ctrl.abort(), ready: () => until(() => open) };
 }
-const create = async (mode = 'ask') => { const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode }); expect(r.status).toBe(200); return r.body.id as string; };
+const trustFolder = async (folder = FOLDER) => { const r = await admin('/admin/agent/trust?folder=' + encodeURIComponent(folder)); expect(r.status).toBe(200); if (!r.body.trusted) expect((await admin('/admin/agent/trust/allow', { folder, fingerprint: r.body.fingerprint })).status).toBe(200); };
+const create = async (mode = 'ask') => { await trustFolder(); const r = await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode }); expect(r.status).toBe(200); return r.body.id as string; };
 
 test('the model picker lists tool-capable models before the engine runs, and sessions need a running engine', async () => {
   const list = (await admin('/admin/agent/models')).body.models as any[];
@@ -82,6 +83,37 @@ test('a reasoning model can be given an effort; other models, and unknown effort
   expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: MODEL, mode: 'ask', effort: 'high' })).status).toBe(400);
   expect((await admin('/admin/agent/session/create', { folder: FOLDER, model: THINKER, mode: 'ask', effort: 'max' })).status).toBe(400);
   expect((await admin('/admin/agent/models')).body.models.find((m: any) => m.id === THINKER).efforts).toEqual(['low', 'medium', 'high']);
+});
+
+test('untrusted folders cannot start sessions and changed instructions block the next prompt', async () => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'pg-new-project-'));
+  const before = (await calls()).filter(c => c.path === '/api/session').length;
+  const blocked = await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'ask' });
+  expect(blocked.status).toBe(409); expect(blocked.body.error.type).toBe('agent_trust_required');
+  expect((await calls()).filter(c => c.path === '/api/session')).toHaveLength(before);
+  await trustFolder(folder);
+  const a = (await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'ask' })).body.id;
+  writeFileSync(path.join(folder, 'AGENTS.md'), 'new instructions');
+  const prompt = await admin('/admin/agent/session/prompt', { id: a, text: 'continue' });
+  expect(prompt.status).toBe(409); expect(prompt.body.error.type).toBe('agent_trust_required');
+  expect((await calls()).some(c => c.path === `/api/session/${a}/prompt`)).toBe(false);
+  await trustFolder(folder); expect((await admin('/admin/agent/session/prompt', { id: a, text: 'continue' })).status).toBe(200);
+  expect((await admin('/admin/agent/trust/revoke', { folder })).status).toBe(200);
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'again' })).status).toBe(409);
+});
+
+test('changed project customization blocks automatic approvals even inside a running session', async () => {
+  const folder = mkdtempSync(path.join(tmpdir(), 'pg-running-trust-'));
+  await trustFolder(folder);
+  const a = (await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'rules' })).body.id;
+  const ui = listen(a); await ui.ready();
+  const inspections = (await admin('/admin/agent/rules?id=' + a)).body.inspections;
+  writeFileSync(path.join(folder, 'opencode.json'), '{"permissions":"allow"}');
+  await emit('permission.asked', { id: 'per_changed_trust', sessionID: a, action: 'shell', resources: [inspections[0]] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_changed_trust/reply')));
+  expect((await calls()).find(c => c.path.endsWith('/permission/per_changed_trust/reply'))!.body.decision).toBe('reject');
+  expect((await admin('/admin/agent/session?id=' + a)).body.paused).toContain('Review and allow');
+  ui.stop();
 });
 
 test('a prompt reaches the engine, and the UI stream carries this session\'s events only', async () => {

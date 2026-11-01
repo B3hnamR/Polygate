@@ -5,12 +5,14 @@ import { engineMode, warpTarget } from './warp';
 import { keyProblem } from './plan';
 import { resetTime } from './exhaustion';
 import type { Model, Provider } from './types';
+import { engineStatus } from './agent-engine';
+import { agentRecoveryItems, pausedAgents } from './agent-recovery';
 
 // The things that stop requests or hurt some of them, each with what it means and where to fix it. It is worked out from the current state on every
 // look, so an item stays until its cause is gone, and it comes back after a restart if the cause does. Nothing here changes a setting: a fix is a
 // button the user presses, and only ones that retry or refresh (never ones that switch something on, such as Direct) are offered as buttons.
 export type Fix = { label: string; endpoint: string; body?: Record<string, unknown> };
-export type CheckItem = { id: string; severity: 'blocking' | 'warning'; title: string; detail: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing'; fix?: Fix };
+export type CheckItem = { id: string; severity: 'blocking' | 'warning'; title: string; detail: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' | 'Agent'; fix?: Fix };
 const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const REFRESH: Fix = { label: 'Refresh catalog', endpoint: '/admin/discover' };
 
@@ -54,5 +56,6 @@ export function checklist(ctx: { providers: Provider[]; known: Model[]; usable: 
     if (r.cooldownUntil && r.cooldownUntil > now) items.push({ id: `rest:${r.id}`, severity: 'warning', title: `${r.name} is resting after errors`, detail: `Requests wait for it until ${clock(r.cooldownUntil)}. If the connection is back, try it again now.`, page: 'Routing', fix: { label: 'Try it again now', endpoint: '/admin/routes/resume', body: { id: r.id } } });
     if (r.exhaustedUntil && r.exhaustedUntil > now) items.push({ id: `used:${r.id}`, severity: 'warning', title: `${r.name} has used up its daily allowance`, detail: `OpenCode Free is not available through this exit until ${resetTime(r.exhaustedUntil)}.`, page: 'Routing' });
   }
+  items.push(...agentRecoveryItems(engineStatus(), pausedAgents()));
   return items.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'blocking' ? -1 : 1));
 }

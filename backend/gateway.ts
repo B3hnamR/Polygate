@@ -201,7 +201,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
 // What could stop a client request right now, and where to fix it. `page` is the dashboard page that has the remedy.
-export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' };
+export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' | 'Agent' };
 // Ready means a client request could succeed right now: not paused, a usable model, a usable client key and a route that would really be chosen
 // (the same selection real requests use, asked without moving the rotation). Paused, Starting, Ready and Needs attention are the four states.
 // `checklist` is everything worth fixing; `issues` are the ones among them that stop requests.

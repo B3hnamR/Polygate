@@ -9,6 +9,8 @@ import { ENGINE_MODES, engineConnection, enginePaths, freeIdentityProblem } from
 import { presentedOpenCodeVersion } from './providers';
 import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, restoreFile, saveBytes, type Backup, type FileBackup } from './agent-backup';
 import { inspectionCommands, permissionDecision, projectRules, removeProjectRule, saveProjectRule } from './agent-permissions';
+import { grantTrust, inspectTrust, revokeTrust } from './agent-trust';
+import { pausedAgents, setAgentPause } from './agent-recovery';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the only part of Polygate that talks to the agent's engine. The Agent page uses it
 // through the desktop-only admin API (admin.ts); the engine's password never reaches the page. It keeps one event stream per working
 // folder open to the engine (opened again after an engine restart), hands each session's events to the page, and answers approvals:
@@ -69,7 +71,7 @@ function watchFolder(folder: string) {
 function session(id: string, folder = '') {
   let s = sessions.get(id);
   if (!s) {
-    s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0, stepFiles: new Set() };
+    s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0, stepFiles: new Set(), paused: pausedAgents().find(s => s.id === id)?.paused };
     try { s.backup = JSON.parse(readFileSync(pendingFile(id), 'utf8')); } catch {}
     sessions.set(id, s);
   }
@@ -95,11 +97,18 @@ function onEvent(e: any, folder: string) {
   const s = session(sid, folder);
   if (e.type === 'permission.asked') {
     const resources = Array.isArray(d.resources) ? d.resources.map(String) : []; const key = keyOf(d.action, resources);
+    try { requireTrust(s.folder); }
+    catch (err: any) {
+      s.paused = err.message; setAgentPause(s.id, s.paused); s.allowed.clear(); if (s.mode === 'full') expireFull(s);
+      reply(sid, d.id, 'reject', 'Working folder consent is missing or project customization changed.').catch(() => {});
+      engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {});
+      publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused } }); return;
+    }
     const full = s.mode === 'full' && !!s.fullUntil && s.fullUntil > Date.now() && s.fullEngine === engineConnection()?.url;
     if (s.mode === 'full' && !full) { expireFull(s); }
     let decision: 'allow' | 'deny' | 'ask' = 'ask';
     try { decision = permissionDecision(full ? 'full' : s.mode || 'ask', d.action, resources, projectRules(s.folder)); }
-    catch (err: any) { s.paused = err.message; engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused } }); reply(sid, d.id, 'reject').catch(() => {}); return; }
+    catch (err: any) { s.paused = err.message; setAgentPause(s.id, s.paused); engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused } }); reply(sid, d.id, 'reject').catch(() => {}); return; }
     if (decision === 'deny') {
       reply(sid, d.id, 'reject', 'Blocked by the current permission mode or a saved project rule.').catch(err => logEvent('warn', 'agent', String(err)));
       publish(sid, { type: 'agent.approval.blocked', data: { sessionID: sid, requestID: d.id, action: d.action, resources } }); return;
@@ -114,7 +123,7 @@ function onEvent(e: any, folder: string) {
     const { save, ...rest } = d; publish(sid, { ...e, data: { ...rest, resources, note: pending.note } }); return;
   }
   if (e.type === 'permission.replied') s.pending.delete(String(d.requestID));
-  if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; s.busy = true; }
+  if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; setAgentPause(s.id); s.busy = true; }
   if (e.type === 'session.step.ended' && Array.isArray(d.files)) for (const f of d.files) if (typeof f === 'string' && f) s.stepFiles.add(f);
   if (/^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)) {
     s.busy = false;
@@ -127,6 +136,7 @@ function onEvent(e: any, folder: string) {
   // so the user can wait, resume or pick another model. A tool action that already ran is never repeated by this.
   if (e.type === 'session.retry.scheduled' && ++s.retries >= MAX_RETRIES && !s.paused) {
     s.paused = String(d.error?.message || 'The model kept failing.');
+    setAgentPause(s.id, s.paused);
     engine('POST', `/api/session/${encodeURIComponent(sid)}/interrupt`).catch(() => {});
     publish(sid, { type: 'agent.paused', data: { sessionID: sid, message: s.paused, status: d.error?.status } });
     logEvent('warn', 'agent', `Agent session paused after ${s.retries} failed model requests: ${s.paused}`);
@@ -248,6 +258,10 @@ function checkFolder(raw: unknown) {
   if ([stateDir, p.root, p.data].some(own => inside(folder, own) || inside(own, folder))) throw new GatewayError('That is Polygate\'s own folder, or holds it. Choose a project folder.', 400, 'agent_folder');
   return path.resolve(folder);
 }
+function requireTrust(folder: string) {
+  const trust = inspectTrust(folder);
+  if (!trust.trusted) throw new GatewayError('Review and allow this working folder before running the agent. Its project instructions or customization may have changed.', 409, 'agent_trust_required');
+}
 const checkMode = (raw: unknown): Mode => { if (typeof raw === 'string' && raw in ENGINE_MODES) return raw as Mode; throw new GatewayError(`Unknown mode. Use one of: ${Object.keys(ENGINE_MODES).join(', ')}.`, 400, 'agent_mode'); };
 const modeOf = (agent: string) => (Object.entries(ENGINE_MODES).find(([, m]) => m.agent === agent)?.[0] || '') as Mode | '';
 const summary = (s: any) => ({ id: s.id, title: s.title, mode: modeOf(s.agent || ''), model: s.model?.id || '', effort: EFFORTS.includes(s.model?.variant) ? s.model.variant : '', folder: s.location?.directory || '', created: s.time?.created, tokens: s.tokens, cost: s.cost, outcome: s.outcome });
@@ -270,6 +284,7 @@ async function createSession(b: any) {
   if (!known) throw new GatewayError('The agent engine does not have that model. Pick one from the list, or start the engine again after the catalog changed.', 400, 'agent_model');
   const entry = agentModels().find(m => m.id === model); if (entry?.reason) throw new GatewayError(entry.reason, 400, 'agent_model');
   const effort = checkEffort(entry, b.effort);
+  requireTrust(folder);
   await clearSavedPermissions();
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
@@ -290,6 +305,9 @@ async function known(id: unknown) {
 
 export async function agentApi(req: IncomingMessage, res: ServerResponse, pathname: string, readJson: (req: IncomingMessage, max?: number) => Promise<any>, json: (res: ServerResponse, status: number, body: unknown) => void) {
   const method = req.method; const url = new URL(req.url || '/', 'http://x');
+  if (pathname === '/admin/agent/trust' && method === 'GET') return json(res, 200, inspectTrust(checkFolder(url.searchParams.get('folder'))));
+  if (pathname === '/admin/agent/trust/allow' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); try { return json(res, 200, grantTrust(folder, String(b.fingerprint || ''))); } catch (e: any) { throw new GatewayError(e.message, 409, 'agent_trust_changed'); } }
+  if (pathname === '/admin/agent/trust/revoke' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); revokeTrust(folder); for (const s of sessions.values()) if (path.resolve(s.folder).toLowerCase() === folder.toLowerCase()) { s.allowed.clear(); s.paused = 'Working folder consent was revoked. Review and allow the folder before continuing.'; setAgentPause(s.id, s.paused); if (s.mode === 'full') expireFull(s); await engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(s.id, { type: 'agent.paused', data: { sessionID: s.id, message: s.paused } }); } return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/models' && method === 'GET') return json(res, 200, { models: agentModels(), modes: Object.fromEntries(Object.entries(ENGINE_MODES).map(([k, m]) => [k, m.description])) });
   if (pathname === '/admin/agent/sessions' && method === 'GET') {
     const folder = checkFolder(url.searchParams.get('folder'));
@@ -305,6 +323,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
     const b = await readJson(req, 1024 * 1024); const s = await known(b.id); const text = String(b.text || '');
     if (!text.trim()) throw new GatewayError('Write a message first.', 400);
+    requireTrust(s.folder);
     if (s.undoing || s.sending) throw new GatewayError('Wait for the current action to finish before sending another message.', 409, 'agent_busy');
     s.sending = true;
     try {
@@ -314,7 +333,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
       mkdirSync(path.dirname(pendingFile(s.id)), { recursive: true });
       writeFileAtomic(pendingFile(s.id), JSON.stringify(s.backup));
     }
-    s.retries = 0; s.paused = undefined;
+    s.retries = 0; s.paused = undefined; setAgentPause(s.id);
     return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text }) });
     } finally { s.sending = false; }
   }
@@ -322,6 +341,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     const b = await readJson(req); const s = await known(b.id); const decision = String(b.decision || '');
     if (!['once', 'session', 'project', 'deny'].includes(decision)) throw new GatewayError('Answer once, session, project or deny.', 400, 'agent_decision');
     const p = s.pending.get(String(b.request || '')); if (!p) throw new GatewayError('That request is no longer waiting for an answer.', 404, 'agent_request_gone');
+    if (decision !== 'deny') requireTrust(s.folder);
     if (s.mode === 'plan' && ['shell', 'edit', 'execute', 'subagent'].includes(p.action) && decision !== 'deny') throw new GatewayError('Leave Plan mode before approving changes or commands.', 409, 'agent_plan');
     if (decision === 'project') saveProjectRule(s.folder, p.action, p.resources, 'allow');
     if (decision === 'deny') { await reply(s.id, p.id, 'reject', typeof b.message === 'string' ? b.message.slice(0, 2000) : undefined); s.pending.delete(p.id); return json(res, 200, { ok: true }); }
@@ -350,7 +370,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     const list = await engine('GET', `/api/model${q(s.folder)}`);
     if (!(Array.isArray(list) ? list : []).some((m: any) => m.providerID === 'polygate' && m.id === model)) throw new GatewayError('The agent engine does not have that model. Start the engine again after the catalog changed.', 400, 'agent_model');
     await engine('POST', `/api/session/${enc(s.id)}/model`, { model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) } });
-    s.paused = undefined; s.retries = 0; return json(res, 200, { ok: true });
+    s.paused = undefined; setAgentPause(s.id); s.retries = 0; return json(res, 200, { ok: true });
   }
   if (pathname === '/admin/agent/session/rename' && method === 'POST') {
     const b = await readJson(req); const s = await known(b.id); const title = String(b.title || '').trim().slice(0, 120);
@@ -360,6 +380,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/cancel' && method === 'POST') { const s = await known((await readJson(req)).id); await engine('POST', `/api/session/${encodeURIComponent(s.id)}/interrupt`); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/session/mode' && method === 'POST') {
     const b = await readJson(req); const mode = checkMode(b.mode); const s = await known(b.id);
+    requireTrust(s.folder);
     if (s.busy || s.sending || s.undoing || s.pending.size) throw new GatewayError('Stop the turn and resolve pending approvals before changing mode.', 409, 'agent_busy');
     if (mode === 'full' && b.confirmFull !== true) throw new GatewayError('Full access needs explicit confirmation: commands can access your files, network and Polygate data with your account access.', 400, 'agent_full_consent');
     await engine('POST', `/api/session/${encodeURIComponent(s.id)}/agent`, { agent: ENGINE_MODES[mode].agent });

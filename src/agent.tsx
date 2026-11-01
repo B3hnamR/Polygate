@@ -13,6 +13,7 @@ type Models={models:AgentModel[];modes:Record<string,string>};
 type RouteUsage={requests:number;errors:number;input:number;output:number;last:number;routes:{route:string;requests:number}[]};
 type SessionInfo={id:string;title:string;mode:Mode|'';model:string;effort:string;folder:string;created?:number;tokens?:{input:number;output:number;reasoning?:number;cache?:{read:number;write:number}}};
 const cap=(s:string)=>s.charAt(0).toUpperCase()+s.slice(1);
+const sameFolder=(a:string,b:string)=>a.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase()===b.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase();
 // Remembered on this computer only: the last folder, recent folders, the open session per folder and the last model.
 const stored=(key:string)=>{try{return localStorage.getItem(key)||'';}catch{return '';}};
 const store=(key:string,value:string)=>{try{localStorage.setItem(key,value);}catch{/* storage can be off */}};
@@ -59,6 +60,9 @@ function Workspace(){
   const [recent,setRecent]=useState<string[]>(()=>storedList('polygate-agent-recent'));
   const [selected,setSelected]=useState(()=>folder?stored('polygate-agent-session:'+folder):'');const [fresh,setFresh]=useState('');
   const {data:models}=usePoll<Models>('/admin/agent/models',60000);
+  const trustPath=folder?'/admin/agent/trust?folder='+encodeURIComponent(folder):'/admin/agent/models';
+  const {data:trust,error:trustError,reload:reloadTrust}=usePoll<TrustReport>(trustPath,5000,!!folder);
+  const trusted=!!folder&&!!trust&&sameFolder(trust.folder,folder)&&trust.trusted;
   const sessionsPath=folder?`/admin/agent/sessions?folder=${encodeURIComponent(folder)}`:'/admin/agent/models';
   const {data:list,error:listError,reload}=usePoll<{sessions:SessionInfo[]}>(sessionsPath,10000,!!folder);
   const pick=(f:string)=>{setFolder(f);store('polygate-agent-folder',f);const next=[f,...recent.filter(x=>x!==f)].slice(0,6);setRecent(next);store('polygate-agent-recent',JSON.stringify(next));setSelected(stored('polygate-agent-session:'+f));};
@@ -70,10 +74,11 @@ function Workspace(){
         <h3>Working folder</h3>
         {folder?<p className="agent-folder mono" title={folder}>{folder}</p>:<p className="subtle">Choose the project folder the agent works in.</p>}
         <FolderPicker onPick={pick}/>
+        {folder&&<FolderTrust folder={folder} report={trust&&sameFolder(trust.folder,folder)?trust:null} error={trustError} reload={reloadTrust}/>}
         {recent.filter(f=>f!==folder).length>0&&<div className="agent-recent">{recent.filter(f=>f!==folder).map(f=><button key={f} className="text-button truncate" title={f} onClick={()=>pick(f)}>{f}</button>)}</div>}
         {folder&&listError&&<div className="pg-error">{listError}</div>}
       </div>
-      {folder&&!listError&&models&&<NewSession folder={folder} data={models} onCreated={id=>{setFresh(id);select(id);reload();}}/>}
+      {folder&&!listError&&models&&trusted&&<NewSession folder={folder} data={models} onCreated={id=>{setFresh(id);select(id);reload();}}/>}
       {folder&&!listError&&<div className="agent-side-block"><h3>Sessions</h3>
         {sessions.length?<ul className="agent-sessions">{sessions.map(s=><li key={s.id}><button className={`agent-session-item${s.id===selected?' active':''}`} aria-current={s.id===selected?'true':undefined} onClick={()=>select(s.id)}>
           <span className="truncate">{s.title}</span><small>{when(s.created||0)}{s.mode?` · ${modeLabel(s.mode)}`:''}</small></button></li>)}</ul>:<p className="subtle">No sessions in this folder yet.</p>}
@@ -83,6 +88,27 @@ function Workspace(){
       {folder&&selected&&(selected===fresh||sessions.some(s=>s.id===selected))?<SessionView key={selected} id={selected} folder={folder} models={models?.models||[]} onChanged={reload}/>
         :<Empty icon={Bot} title={folder?'No session open':'Choose a working folder'}>{folder?'Start a session, or open one from the list.':'The agent reads, edits and runs commands in the folder you choose, and asks first where its mode says so.'}</Empty>}
     </div>
+  </div>;
+}
+
+type TrustReport={folder:string;fingerprint:string;trusted:boolean;complete:boolean;files:{path:string;behavior:'disabled'|'instructions';bytes:number}[];problems:string[]};
+function FolderTrust({folder,report,error,reload}:{folder:string;report:TrustReport|null;error:string;reload:()=>void}){
+  const [busy,setBusy]=useState(false);const [problem,setProblem]=useState('');const {confirm,dialog}=useConfirm();
+  const allow=async()=>{
+    if(!report||!await confirm(<>Allow the agent to work in <code>{folder}</code>? It may read project instructions. Approved commands run project code with your account's access. Project plugins, commands and permission overrides remain disabled; this consent does not enable them. This is not a sandbox.</>,{title:'Allow working folder',confirm:'Allow this folder'}))return;
+    setBusy(true);setProblem('');try{await api('/admin/agent/trust/allow',{folder,fingerprint:report.fingerprint});reload();}catch(e:any){setProblem(e.message);reload();}finally{setBusy(false);}
+  };
+  const revoke=async()=>{
+    if(!await confirm('Stop running turns in this folder and require consent again before another message? Saved project rules remain stored.',{title:'Revoke folder trust',confirm:'Revoke and stop'}))return;
+    setBusy(true);try{await api('/admin/agent/trust/revoke',{folder});reload();}catch(e:any){setProblem(e.message);}finally{setBusy(false);}
+  };
+  return <div className="agent-folder-trust">
+    <p className={report?.trusted?'subtle':'agent-warn'}><ShieldCheck size={14}/>{report?.trusted?'Working folder allowed':report?'Review this folder before running the agent':'Checking project customization…'}</p>
+    {report&&<><details><summary>Project customization ({report.files.length})</summary><p className="subtle">Instructions may affect the agent. Repository plugins, commands and permission settings remain disabled.</p>
+      {report.files.length?<ul>{report.files.map(f=><li key={f.path}><code>{f.path}</code><small>{f.behavior==='instructions'?'Project instructions':'Not loaded'}</small></li>)}</ul>:<p className="subtle">No customization was found in the checked project locations.</p>}
+      {report.problems.map(p=><p className="agent-error-text" key={p}>{p}</p>)}</details>
+      {report.trusted?<button className="text-button" disabled={busy} onClick={revoke}>Revoke folder trust</button>:<Button variant="primary" disabled={busy||!report.complete} onClick={allow}>{busy?'Working…':'Review and allow'}</Button>}</>}
+    {(error||problem)&&<p className="pg-error">{problem||error}</p>}{dialog}
   </div>;
 }
 
