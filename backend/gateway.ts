@@ -204,7 +204,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
 export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' | 'Agent' };
 // Ready means a client request could succeed right now: not paused, a usable model, a usable client key and a route that would really be chosen
 // (the same selection real requests use, asked without moving the rotation). Paused, Starting, Ready and Needs attention are the four states.
-// `checklist` is everything worth fixing; `issues` are the ones among them that stop requests.
+// `checklist` is everything worth fixing, less the warnings the user acknowledged (while their text is unchanged: a different reset time or
+// error shows it again); `acknowledged` counts those. `issues` are the ones that stop requests, which cannot be acknowledged away.
 export function readiness(){
   const now=Date.now();const providers=settings.providers.filter(p=>p.enabled);
   // `known` models are listed and not gone; `usable` ones can also be asked right now (not resting).
@@ -212,10 +213,11 @@ export function readiness(){
   const usable=known.filter(m=>m.cooldownUntil<=now);
   const routes=settings.routes.filter(r=>r.enabled&&(!r.cooldownUntil||r.cooldownUntil<now)).length;
   const starting=process.uptime()<30&&!known.length;
-  const items=checklist({providers,known,usable,starting});
+  const all=checklist({providers,known,usable,starting});const ack=settings.checklistAck||{};
+  const items=all.filter(i=>!(i.severity==='warning'&&ack[i.id]===i.detail));
   const issues:ReadyIssue[]=items.filter(i=>i.severity==='blocking').map(i=>({code:i.id,message:i.detail,page:i.page}));
   const state:'paused'|'starting'|'ready'|'attention'=!settings.enabled?'paused':starting&&!issues.length?'starting':issues.length?'attention':'ready';
-  return {ready:state==='ready',state,issues,checklist:items,enabled:settings.enabled,models:usable.length,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
+  return {ready:state==='ready',state,issues,checklist:items,acknowledged:all.length-items.length,enabled:settings.enabled,models:usable.length,routes,queue:{active:queue.active,waiting:queue.waiting.length}};
 }
 export async function probeModel(id:string){
   const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);

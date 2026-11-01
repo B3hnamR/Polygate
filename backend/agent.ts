@@ -9,7 +9,7 @@ import { ENGINE_MODES, engineConnection, enginePaths, freeIdentityProblem } from
 import { presentedOpenCodeVersion } from './providers';
 import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, pruneBackups, restoreFile, saveBytes, type Backup, type FileBackup } from './agent-backup';
 import { inspectionCommands, permissionDecision, projectRules, removeProjectRule, saveProjectRule } from './agent-permissions';
-import { grantTrust, inspectTrust, revokeTrust } from './agent-trust';
+import { grantTrust, inspectTrust, revokeTrust, trustedFolders } from './agent-trust';
 import { pausedAgents, setAgentPause } from './agent-recovery';
 import { mergeUndo } from './agent-merge';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the only part of Polygate that talks to the agent's engine. The Agent page uses it
@@ -159,7 +159,8 @@ function expireFull(s: Session) {
 // exact pre/post-turn bytes. Undo reverses turns in private scratch copies, merging non-overlapping user edits, then checks the working
 // files before writing. Engine snapshots are not used because their Git index can normalize working-tree content.
 type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after: string | null; before?: FileBackup };
-type Turn = { message: string; at: number; files: FileChange[] };
+// noBackup: no backup was taken before the turn, because folder backups were off or the message was queued while the agent was working.
+type Turn = { message: string; at: number; files: FileChange[]; noBackup?: 'off' | 'busy' };
 const enc = encodeURIComponent;
 const turnsFile = (sid: string) => path.join(enginePaths().root, 'turns', `${sid.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
 const pendingFile = (sid: string) => turnsFile(sid) + '.pending';
@@ -177,21 +178,28 @@ function referencedCopies(): Set<string> | null {
   }
   return refs;
 }
-// Old backup copies are removed after a turn or an undo, at most every ten minutes.
+// Old backup copies are removed after a turn or an undo, at most every ten minutes (or now, when folder backups were switched off). With
+// folder backups off, the folders' last backups are dropped too: only the copies turn records still need are kept.
 let prunedAt = 0;
-function prune() {
-  if (Date.now() - prunedAt < 600000) return; prunedAt = Date.now();
-  pruneBackups(referencedCopies()).catch(err => logEvent('warn', 'agent', `Old agent backups could not be removed: ${err?.message || err}`));
+export function pruneAgentBackups(now = false) {
+  if (!now && Date.now() - prunedAt < 600000) return; prunedAt = Date.now();
+  pruneBackups(referencedCopies(), Date.now(), settings.agentBackups === true).catch(err => logEvent('warn', 'agent', `Old agent backups could not be removed: ${err?.message || err}`));
 }
+const prune = () => pruneAgentBackups();
 function loadTurns(s: Session): Turn[] { if (!s.turns) { try { const v = JSON.parse(readFileSync(turnsFile(s.id), 'utf8')); s.turns = Array.isArray(v) ? v : []; } catch { s.turns = []; } } return s.turns!; }
 function saveTurns(s: Session) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(s.turns || [])); }
 const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch { return null; } };
-const publicTurn = (t: Turn) => ({ message: t.message, at: t.at, files: t.files.map(({ after, before, ...f }) => f) });
+// undoable: every file the turn changed has an exact copy from before it; when not, `why` says so in plain words.
+const NO_BACKUP = { off: 'Folder backups were off when this turn ran, so it cannot be undone from Polygate.', busy: 'This message was sent while the agent was still working, so no backup was taken before it and it cannot be undone from Polygate.' };
+function publicTurn(t: Turn) {
+  const why = t.noBackup ? NO_BACKUP[t.noBackup] : t.files.some(f => f.before === undefined) ? 'Some of these files were not in the backup (the folder is bigger than one backup covers, or the file is left out of backups), so this turn cannot be undone from Polygate.' : '';
+  return { message: t.message, at: t.at, undoable: !why, ...(why ? { why } : {}), files: t.files.map(({ after, before, ...f }) => f) };
+}
 // The engine's diff route answers for the latest turn that changed something, so a turn that changed nothing could be handed the previous
 // turn's files: which files a turn changed comes from its own steps, and only the patches from the diff.
 async function recordTurn(s: Session) {
   const changed = [...s.stepFiles]; s.stepFiles.clear();
-  const backup = s.backup;
+  const backup = s.backup, noBackup = backup ? undefined : settings.agentBackups === true ? 'busy' as const : 'off' as const;
   s.backup = undefined;
   try { unlinkSync(pendingFile(s.id)); } catch {}
   if (!changed.length) return;
@@ -214,7 +222,7 @@ async function recordTurn(s: Session) {
   });
   const turns = loadTurns(s); const known = turns.find(t => t.message === message);
   // A message can take more than one run (sent again after a pause): its record keeps every file, with the newest state of each.
-  const turn = known ? Object.assign(known, { at: Date.now(), files: [...known.files.filter(f => !files.some(n => n.file === f.file)), ...files.map(f => { const old = known.files.find(x => x.file === f.file); return old ? { ...f, before: old.before } : f; })] }) : { message, at: Date.now(), files };
+  const turn: Turn = known ? Object.assign(known, { at: Date.now(), ...(noBackup && !known.noBackup ? { noBackup } : {}), files: [...known.files.filter(f => !files.some(n => n.file === f.file)), ...files.map(f => { const old = known.files.find(x => x.file === f.file); return old ? { ...f, before: old.before } : f; })] }) : { message, at: Date.now(), files, ...(noBackup ? { noBackup } : {}) };
   if (!known) turns.push(turn);
   saveTurns(s); publish(s.id, { type: 'agent.changes', data: { sessionID: s.id, turn: publicTurn(turn) } });
 }
@@ -225,6 +233,9 @@ async function undoTurn(s: Session, message: string) {
   await s.recording;
   const turns = loadTurns(s); const from = turns.findIndex(t => t.message === message);
   if (from < 0) throw new GatewayError('Polygate has no recorded changes for that turn.', 404, 'agent_undo_unknown');
+  // Undo goes back through every later turn too, so one of them without a backup stops it as well.
+  const unbacked = turns.slice(from).find(t => t.noBackup);
+  if (unbacked) throw new GatewayError(`${NO_BACKUP[unbacked.noBackup!]}${unbacked.message !== message ? ' (A later turn, which undo would have to go back through.)' : ''}${unbacked.noBackup === 'off' ? ' Switch on folder backups in Agent settings to be able to undo later turns.' : ''}`, 409, 'agent_undo_unavailable');
   const files = [...new Set(turns.slice(from).flatMap(t => t.files.map(f => f.file)))];
   const rollback = new Map(files.map(file => { const full = filePath(s.folder, file); return [file, existsSync(full) ? { hash: saveBytes(readFileSync(full)), mode: statSync(full).mode & 0o777 } : null] as const; }));
   const target = new Map<string, FileBackup>(), conflicts: { file: string; reason: string }[] = [];
@@ -293,6 +304,25 @@ function checkFolder(raw: unknown) {
   if ([stateDir, p.root, p.data].some(own => inside(folder, own) || inside(own, folder))) throw new GatewayError('That is Polygate\'s own folder, or holds it. Choose a project folder.', 400, 'agent_folder');
   return path.resolve(folder);
 }
+// Folders sessions were started in, so every session can be listed whatever its folder. Folders given consent before this list existed
+// come from the consent records. Gone folders are left out.
+const foldersFile = () => path.join(enginePaths().root, 'folders.json');
+function knownFolders(): string[] {
+  let saved: unknown = [];
+  try { saved = JSON.parse(readFileSync(foldersFile(), 'utf8')); } catch {}
+  const out = new Map<string, string>();
+  for (const f of [...(Array.isArray(saved) ? saved : []), ...trustedFolders()]) {
+    if (typeof f !== 'string' || out.has(f.toLowerCase())) continue;
+    try { if (statSync(f).isDirectory()) out.set(f.toLowerCase(), f); } catch {}
+  }
+  return [...out.values()];
+}
+function rememberFolder(folder: string) {
+  let saved: unknown = [];
+  try { saved = JSON.parse(readFileSync(foldersFile(), 'utf8')); } catch {}
+  const list = [folder, ...(Array.isArray(saved) ? saved : []).filter((f): f is string => typeof f === 'string' && f.toLowerCase() !== folder.toLowerCase())].slice(0, 100);
+  mkdirSync(path.dirname(foldersFile()), { recursive: true }); writeFileAtomic(foldersFile(), JSON.stringify(list));
+}
 function requireTrust(folder: string) {
   const trust = inspectTrust(folder);
   if (!trust.trusted) throw new GatewayError('Review and allow this working folder before running the agent. Its project instructions or customization may have changed.', 409, 'agent_trust_required');
@@ -321,6 +351,7 @@ async function createSession(b: any) {
   const effort = checkEffort(entry, b.effort);
   requireTrust(folder);
   await clearSavedPermissions();
+  rememberFolder(folder);
   await watchFolder(folder);
   const title = String(b.title || '').trim().slice(0, 120) || `New session ${new Date().toLocaleString()}`;
   const info = await engine('POST', '/api/session', { title, agent: ENGINE_MODES[mode].agent, model: { providerID: 'polygate', id: model, ...(effort ? { variant: effort } : {}) }, location: { directory: folder } });
@@ -343,11 +374,29 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/trust' && method === 'GET') return json(res, 200, inspectTrust(checkFolder(url.searchParams.get('folder'))));
   if (pathname === '/admin/agent/trust/allow' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); try { return json(res, 200, grantTrust(folder, String(b.fingerprint || ''))); } catch (e: any) { throw new GatewayError(e.message, 409, 'agent_trust_changed'); } }
   if (pathname === '/admin/agent/trust/revoke' && method === 'POST') { const b = await readJson(req), folder = checkFolder(b.folder); revokeTrust(folder); for (const s of sessions.values()) if (path.resolve(s.folder).toLowerCase() === folder.toLowerCase()) { s.allowed.clear(); s.paused = 'Working folder consent was revoked. Review and allow the folder before continuing.'; setAgentPause(s.id, s.paused); if (s.mode === 'full') expireFull(s); await engine('POST', `/api/session/${enc(s.id)}/interrupt`).catch(() => {}); publish(s.id, { type: 'agent.paused', data: { sessionID: s.id, message: s.paused } }); } return json(res, 200, { ok: true }); }
+  // The folders sessions can be started in (and listed from), with whether the agent may work in each now.
+  if (pathname === '/admin/agent/folders' && method === 'GET') return json(res, 200, { folders: knownFolders().map(folder => ({ folder, trusted: inspectTrust(folder).trusted })) });
   if (pathname === '/admin/agent/models' && method === 'GET') return json(res, 200, { models: agentModels(), modes: Object.fromEntries(Object.entries(ENGINE_MODES).map(([k, m]) => [k, m.description])) });
+  // One folder's sessions, or (no folder) every session in every folder the agent has worked in, newest first.
   if (pathname === '/admin/agent/sessions' && method === 'GET') {
-    const folder = checkFolder(url.searchParams.get('folder'));
-    const list = await engine('GET', `/api/session${q(folder)}`);
-    return json(res, 200, { sessions: (Array.isArray(list) ? list : []).map(summary).sort((a, b) => (b.created || 0) - (a.created || 0)) });
+    const one = url.searchParams.get('folder');
+    const lists = await Promise.all((one ? [checkFolder(one)] : knownFolders()).map(folder => engine('GET', `/api/session${q(folder)}`).catch(() => [])));
+    const seen = new Set<string>();
+    const all = lists.flatMap(list => Array.isArray(list) ? list : []).filter((s: any) => s?.id && !seen.has(s.id) && seen.add(s.id));
+    return json(res, 200, { sessions: all.map(summary).sort((a, b) => (b.created || 0) - (a.created || 0)) });
+  }
+  if (pathname === '/admin/agent/session/delete' && method === 'POST') {
+    const s = await known((await readJson(req)).id);
+    if (s.busy || s.sending || s.undoing) throw new GatewayError('Stop the agent before deleting this session.', 409, 'agent_busy');
+    await engine('DELETE', `/api/session/${enc(s.id)}`);
+    // Polygate's own records of it go too: its turns (and their undo), a waiting backup and a pause.
+    if (s.fullTimer) clearTimeout(s.fullTimer);
+    sessions.delete(s.id); setAgentPause(s.id);
+    for (const f of [turnsFile(s.id), pendingFile(s.id)]) { try { unlinkSync(f); } catch {} }
+    pruneAgentBackups(true);
+    publish(s.id, { type: 'agent.deleted', data: { sessionID: s.id } });
+    logEvent('info', 'agent', 'Agent session deleted');
+    return json(res, 200, { ok: true });
   }
   if (pathname === '/admin/agent/session/create' && method === 'POST') return json(res, 200, await createSession(await readJson(req)));
   if (pathname === '/admin/agent/session' && method === 'GET') {
@@ -363,10 +412,14 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     s.sending = true;
     try {
     await s.recording;
-    if (!s.busy) {
+    // Folder backups (for Undo) are off unless switched on: then nothing is copied, and turns are recorded without undo.
+    if (!s.busy && settings.agentBackups === true) {
       s.backup = await captureBackup(s.folder);
       mkdirSync(path.dirname(pendingFile(s.id)), { recursive: true });
       writeFileAtomic(pendingFile(s.id), JSON.stringify(s.backup));
+    } else if (!s.busy) {
+      // A backup left from before (switched off since, or from before a restart) must not stand for this turn's starting point.
+      s.backup = undefined; try { unlinkSync(pendingFile(s.id)); } catch {}
     }
     s.retries = 0; s.paused = undefined; setAgentPause(s.id);
     // limited: the folder is bigger than one backup covers, so the page says that some changes cannot be undone from Polygate.

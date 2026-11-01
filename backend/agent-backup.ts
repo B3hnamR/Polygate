@@ -127,18 +127,18 @@ export async function captureBackup(folder: string): Promise<Backup> {
 }
 // Removes saved copies nothing refers to any more: not in a folder's last backup, a turn's record or a backup waiting for its turn (`refs`,
 // from agent.ts). Copies saved or used in the last hour are spared, so one being recorded right now is never lost. refs is null when a record
-// could not be read; then nothing is removed.
+// could not be read; then nothing is removed. keepBaselines false (folder backups switched off) drops every folder's last backup as well.
 let pruning = false;
-export async function pruneBackups(refs: Set<string> | null, now = Date.now()) {
+export async function pruneBackups(refs: Set<string> | null, now = Date.now(), keepBaselines = true) {
   if (!refs || pruning || capturing) return 0;
   pruning = true;
   try {
-    const keep = new Set(refs);
+    const keep = new Set(refs), kept = keepBaselines ? KEEP_BASELINES : 0;
     let names: string[] = [];
     try { names = readdirSync(baselineDir()).filter(n => n.endsWith('.json')); } catch (e: any) { if (e.code !== 'ENOENT') return 0; }
     const dated = names.map(n => { const f = path.join(baselineDir(), n); try { return { f, t: statSync(f).mtimeMs }; } catch { return { f, t: 0 }; } }).sort((a, b) => b.t - a.t);
-    for (const { f } of dated.slice(KEEP_BASELINES)) { try { unlinkSync(f); } catch { /* removed next time */ } }
-    for (const { f } of dated.slice(0, KEEP_BASELINES)) {
+    for (const { f } of dated.slice(kept)) { try { unlinkSync(f); } catch { /* removed next time */ } }
+    for (const { f } of dated.slice(0, kept)) {
       try { for (const s of Object.values<any>(JSON.parse(readFileSync(f, 'utf8')).files || {})) if (typeof s?.hash === 'string') keep.add(s.hash); }
       catch { return 0; }
     }

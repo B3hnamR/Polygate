@@ -72,3 +72,20 @@ test('the same problems keep the same ids from one look to the next, so a screen
   settings.routes.push({ id: 'ck-rest', name: 'Resting route', kind: 'proxy', url: 'socks5://127.0.0.1:1', enabled: true, models: [], cooldownUntil: Date.now() + 600000 } as any);
   expect(ids()).toEqual(ids()); expect(readiness().checklist[0].severity).toBe('blocking'); // what stops requests comes first
 });
+test('an acknowledged warning stays off the list until its text changes; what stops requests cannot be acknowledged', async () => {
+  try {
+    settings.providers = [own({ id: 'ck' })] as any; settings.enabled = true;
+    modelsStatus = 500; await discover().catch(() => {});
+    expect(ids()).toContain('catalog:ck');
+    expect((await post('/admin/checklist/ack', { id: 'catalog:ck' })).status).toBe(200);
+    expect(ids()).not.toContain('catalog:ck'); expect(readiness().acknowledged).toBe(1);
+    await discover().catch(() => {}); expect(ids()).not.toContain('catalog:ck');
+    modelsStatus = 403; await discover().catch(() => {});
+    expect(ids()).toContain('catalog:ck'); expect(readiness().acknowledged).toBe(0);
+    expect((await post('/admin/checklist/ack', { id: 'catalog:ck' })).status).toBe(200); expect(ids()).not.toContain('catalog:ck');
+    expect((await post('/admin/checklist/ack', { clear: true })).status).toBe(200); expect(ids()).toContain('catalog:ck');
+    expect((await post('/admin/checklist/ack', { id: 'no_such_alert' })).status).toBe(404);
+    settings.providers = [] as any; expect(ids()).toContain('no_provider');
+    expect((await post('/admin/checklist/ack', { id: 'no_provider' })).status).toBe(400); expect(ids()).toContain('no_provider');
+  } finally { modelsStatus = 200; delete settings.checklistAck; }
+});

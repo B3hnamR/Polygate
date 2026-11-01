@@ -46,6 +46,12 @@ export function grantTrust(folder: string, fingerprint: string, root?: string) {
   writeFileAtomic(file, JSON.stringify({ folder: report.folder, fingerprint, acceptedAt: Date.now() }));
   return inspectTrust(folder, root);
 }
+// Every folder consent was given for (a consent revoked since leaves none): where agent sessions can have been started.
+export function trustedFolders(root = enginePaths().root): string[] {
+  let names: string[] = [];
+  try { names = readdirSync(path.join(root, 'trust')).filter(n => n.endsWith('.json')); } catch { return []; }
+  return names.flatMap(n => { try { const f = JSON.parse(readFileSync(path.join(root, 'trust', n), 'utf8')).folder; return typeof f === 'string' && f ? [f] : []; } catch { return []; } });
+}
 export function revokeTrust(folder: string, root?: string) {
   const file = trustFile(folder, root); mkdirSync(path.dirname(file), { recursive: true }); writeFileAtomic(file, '{}');
 }

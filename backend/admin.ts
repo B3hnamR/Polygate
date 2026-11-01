@@ -24,7 +24,7 @@ import { cleanChain, MAX_CHAINS } from './chains';
 import { version } from './version';
 import { checkForUpdates } from './updates';
 import * as agentEngine from './agent-engine';
-import { agentApi } from './agent';
+import { agentApi, pruneAgentBackups } from './agent';
 import { queryEvents, exportEvents, clearEvents, parseLogQuery, logEvent } from './logbook';
 import { mcpConfig, mcpState, serverStatus, cleanServer, parseImport, slug, testServer, saveServers, settle, reconnect, callTool, canManageLocal, syncMcp } from './mcp';
 // The MCP page: hub settings, servers, their tools, connection tests and trying a tool.
@@ -128,7 +128,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/diagnostics'&&method==='GET'){const q=new URL(req.url||'','http://x').searchParams;return json(res,200,{failures:recentFailureDetails(Math.max(1,Math.min(100,Math.floor(Number(q.get('failures')))||20))),baseline:recentBaselineDetails(Math.max(1,Math.min(20,Math.floor(Number(q.get('baseline')))||5)))});}
   if(pathname==='/admin/settings'&&method==='POST'){
     const b=await readJson(req);const next:Partial<Settings>={};
-    for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','trimTools','exhaustedFailover','relayRecheck','catalogDirect','spreadDirect'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
+    for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','trimTools','exhaustedFailover','relayRecheck','catalogDirect','spreadDirect','agentBackups'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
     for(const [key,lo,hi] of [['maxConcurrent',1,64],['maxQueue',0,512],['timeoutMs',1000,600000],['retries',0,2],['refreshMinutes',5,1440],['warpProxyPort',1024,65535],['queueWaitMs',0,120000],['relayRotations',0,10]] as const)if(key in b)(next as any)[key]=bounded(b[key],lo,hi);
     if(b.strategy){if(!['single','round_robin','random','fastest'].includes(b.strategy))throw new GatewayError('Unknown selection strategy',400);next.strategy=b.strategy;}
     if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
@@ -138,6 +138,19 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     // Turning cooldowns off also releases models that are cooling down now, so the change takes effect immediately.
     if(next.cooldowns===false)for(const m of models.values())if(m.cooldownUntil||m.state==='cooldown'){m.cooldownUntil=0;m.failCount=0;if(m.state==='cooldown')m.state='unchecked';saveModel(m);}
     Object.assign(settings,next);queue.max=settings.maxConcurrent;queue.capacity=settings.maxQueue;queue.drain();
+    // Folder backups switched off: the copies only they kept are removed (once an hour old); turn records keep theirs.
+    if(next.agentBackups===false)pruneAgentBackups(true);
+    persist();return json(res,200,{ok:true});
+  }
+  // Acknowledging a checklist warning hides it until its text changes; {clear:true} shows every acknowledged one again.
+  if(pathname==='/admin/checklist/ack'&&method==='POST'){
+    const b=await readJson(req);
+    if(b.clear===true){delete settings.checklistAck;persist();return json(res,200,{ok:true});}
+    const item=readiness().checklist.find(i=>i.id===String(b.id||''));
+    if(!item)throw new GatewayError('That alert is no longer on the checklist.',404);
+    if(item.severity!=='warning')throw new GatewayError('This one stops requests, so it stays on the list until it is fixed.',400);
+    // The newest 200 are kept; an older one only ever matched text that has since changed.
+    settings.checklistAck=Object.fromEntries([...Object.entries(settings.checklistAck||{}).filter(([id])=>id!==item.id),[item.id,item.detail]].slice(-200));
     persist();return json(res,200,{ok:true});
   }
   // Fallback chains: a named, ordered list of models that a client asks for like any model.
@@ -347,7 +360,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // so it answers at once and the dashboard follows the status.
   if(pathname.startsWith('/admin/agent/')&&!serverConfig().desktop)throw new GatewayError('The agent runs in the desktop app only',404);
   // freeIdentity says whether the agent can use OpenCode Free now (the bridge presents the engine's OpenCode version).
-  if(pathname==='/admin/agent/engine'&&method==='GET'){const presented=presentedOpenCodeVersion();return json(res,200,{...agentEngine.engineStatus(),freeIdentity:{presented,engine:agentEngine.ENGINE_VERSION,usable:!agentEngine.freeIdentityProblem(presented)}});}
+  if(pathname==='/admin/agent/engine'&&method==='GET'){const presented=presentedOpenCodeVersion();return json(res,200,{...agentEngine.engineStatus(),backups:settings.agentBackups===true,freeIdentity:{presented,engine:agentEngine.ENGINE_VERSION,usable:!agentEngine.freeIdentityProblem(presented)}});}
   if(pathname==='/admin/agent/engine/install'&&method==='POST'){await readJson(req);agentEngine.installEngine().catch(()=>{/* the status carries the reason */});return json(res,202,agentEngine.engineStatus());}
   if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);return json(res,200,await agentEngine.startEngine());}
   if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}

@@ -13,16 +13,17 @@ export type Item =
   | { kind: 'reasoning'; key: string; text: string; done: boolean }
   | { kind: 'tool'; key: string; name: string; input?: any; status: ToolStatus; output?: string; error?: string }
   | { kind: 'note'; key: string; tone: 'info' | 'warn' | 'bad'; text: string }
-  | { kind: 'changes'; key: string; message: string; files: FileChange[] };
+  | { kind: 'changes'; key: string; message: string; files: FileChange[]; undoable: boolean; why?: string };
 export type Approval = { id: string; action: string; resources: string[]; note: string };
 export type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string };
-export type Turn = { message: string; at: number; files: FileChange[] };
+// undoable false (and why) when Polygate kept no exact backup from before the turn, e.g. while folder backups were off.
+export type Turn = { message: string; at: number; files: FileChange[]; undoable?: boolean; why?: string };
 
 // A turn's changed files go at the end of that turn: just before the next message the user sent, or at the end.
 export function withChanges(items: Item[], turns: Turn[]): Item[] {
   let out: Item[] = items.filter(i => i.kind !== 'changes');
   for (const t of turns) {
-    const card: Item = { kind: 'changes', key: `changes:${t.message}`, message: t.message, files: t.files };
+    const card: Item = { kind: 'changes', key: `changes:${t.message}`, message: t.message, files: t.files, undoable: t.undoable !== false, ...(t.why ? { why: t.why } : {}) };
     const at = out.findIndex(i => i.key === t.message);
     const next = at < 0 ? -1 : out.findIndex((i, n) => n > at && i.kind === 'user');
     out = next < 0 ? [...out, card] : [...out.slice(0, next), card, ...out.slice(next)];
@@ -87,7 +88,7 @@ export function applyEvent(items: Item[], e: any): Item[] {
     // Polygate's record of what a turn changed (at the end of the turn; again, merged, if the same message runs once more).
     case 'agent.changes': {
       const t = d.turn; if (!t?.message) return items;
-      const key = `changes:${t.message}`; const card: Item = { kind: 'changes', key, message: t.message, files: t.files || [] };
+      const key = `changes:${t.message}`; const card: Item = { kind: 'changes', key, message: t.message, files: t.files || [], undoable: t.undoable !== false, ...(t.why ? { why: t.why } : {}) };
       return items.some(x => x.key === key) ? items.map(x => x.key === key ? card : x) : [...items, card];
     }
     default: return items;
@@ -111,3 +112,31 @@ export function toolSubject(name: string, input: any, folder = '') {
   }
   return v;
 }
+
+// Undoing a turn goes back through every later turn as well, so a turn can be undone only when it and every later one can. Returns why
+// not, per turn message, for those that cannot.
+export function undoBlocked(items: Item[]): Map<string, string> {
+  const out = new Map<string, string>(); let later = '';
+  const cards = items.filter((i): i is Extract<Item, { kind: 'changes' }> => i.kind === 'changes');
+  for (const c of [...cards].reverse()) {
+    if (!c.undoable) { out.set(c.message, c.why || 'This turn cannot be undone from Polygate.'); later = later || 'Undo also goes back through the later turns, and a later turn cannot be undone.'; }
+    else if (later) out.set(c.message, later);
+  }
+  return out;
+}
+
+// The model picker: providers with how many models each offers, and the models of one provider (or all) matching a search. Every word
+// of the search has to appear in the model's name, id or provider.
+type PickModel = { id: string; name: string; provider: string; usable: boolean };
+export function modelProviders<T extends PickModel>(models: T[]) {
+  const out = new Map<string, { name: string; count: number; usable: number }>();
+  for (const m of models) { const p = out.get(m.provider) || { name: m.provider, count: 0, usable: 0 }; p.count++; if (m.usable) p.usable++; out.set(m.provider, p); }
+  return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+export function matchModels<T extends PickModel>(models: T[], provider: string, query: string): T[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const found = models.filter(m => (!provider || m.provider === provider) && words.every(w => `${m.name} ${m.id} ${m.provider}`.toLowerCase().includes(w)));
+  return [...found.filter(m => m.usable), ...found.filter(m => !m.usable)];
+}
+// A folder's last part, for the session list's group headings (the full path is shown on hover).
+export const folderName = (folder: string) => folder.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || folder;

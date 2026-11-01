@@ -1,9 +1,10 @@
-import {useState,useEffect,useCallback,useRef,useId,Children,Fragment,isValidElement,type ReactNode,type KeyboardEvent} from 'react';
+import {useState,useEffect,useLayoutEffect,useCallback,useRef,useId,Children,Fragment,isValidElement,type CSSProperties,type ReactNode,type KeyboardEvent} from 'react';
+import {createPortal} from 'react-dom';
 import {Activity,Box,Check,ChevronDown} from 'lucide-react';
 import {api} from './api';
 import type {LogRow,Model,Settings} from '../backend/types';
 export type CheckItem={id:string;severity:'blocking'|'warning';title:string;detail:string;page:string;fix?:{label:string;endpoint:string;body?:Record<string,unknown>}};
-export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;state:'paused'|'starting'|'ready'|'attention';issues:{code:string;message:string;page:string}[];checklist:CheckItem[];models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
+export type Snapshot={settings:Settings;models:Model[];logs:LogRow[];stats:any;queue:{active:number;waiting:number};identity:any;proxy:any;ready:{ready:boolean;state:'paused'|'starting'|'ready'|'attention';issues:{code:string;message:string;page:string}[];checklist:CheckItem[];acknowledged?:number;models:number;routes:number};notices:number;server:{platform:string;mode:string};version:string;runtime:string;routeInfo:Record<string,{role:'active'|'backup'|'off';label:string;tone:string;detail:string}>;backup:{id:string;name:string;usable:boolean;why:string}[]};
 // The Polygate mark (assets/logo.svg): a hexagon with a lit gate archway. Gradient ids are unique per instance so several can share a page.
 // The same Night sea mark as the app icon and favicon (assets/logo.svg).
 export function Logo({size=36}:{size?:number}){
@@ -72,14 +73,30 @@ function readOptions(children:ReactNode,out:Opt[]=[]):Opt[]{
 }
 export function Select({value,onChange,children,className='',disabled,...rest}:{value:string|number|undefined;onChange:(value:string)=>void;children:ReactNode;className?:string;disabled?:boolean;'aria-label'?:string;title?:string}){
   const options=readOptions(children);const current=String(value??'');const selected=options.find(o=>o.value===current);
-  const [open,setOpen]=useState(false);const [active,setActive]=useState(-1);const [up,setUp]=useState(false);
+  const [open,setOpen]=useState(false);const [active,setActive]=useState(-1);const [up,setUp]=useState(false);const [place,setPlace]=useState<CSSProperties>({});
   const root=useRef<HTMLDivElement>(null);const list=useRef<HTMLUListElement>(null);const typed=useRef({text:'',at:0});const id=useId();
   const enabled=(i:number)=>i>=0&&i<options.length&&!options[i].disabled;
-  const openMenu=()=>{if(disabled)return;const box=root.current?.getBoundingClientRect();setUp(!!box&&window.innerHeight-box.bottom<Math.min(300,options.length*34+12)&&box.top>window.innerHeight-box.bottom);setActive(Math.max(0,options.findIndex(o=>o.value===current)));setOpen(true);};
+  // The menu is drawn over the whole page (in <body>, at the trigger's place on screen), so a card that hides its overflow cannot cut it off.
+  const openMenu=()=>{
+    if(disabled||!root.current)return;const box=root.current.getBoundingClientRect();const below=window.innerHeight-box.bottom,above=box.top;
+    const flip=below<Math.min(300,options.length*34+12)&&above>below;setUp(flip);
+    setPlace({position:'fixed',left:box.left,minWidth:box.width,maxHeight:Math.max(120,Math.min(288,(flip?above:below)-14)),...(flip?{top:'auto',bottom:window.innerHeight-box.top+6}:{top:box.bottom+6,bottom:'auto'})});
+    setActive(Math.max(0,options.findIndex(o=>o.value===current)));setOpen(true);
+  };
   const close=()=>setOpen(false);
   const pick=(i:number)=>{if(!enabled(i))return;const o=options[i];close();if(o.value!==current)onChange(o.value);};
-  useEffect(()=>{if(!open)return;const away=(e:MouseEvent)=>{if(!root.current?.contains(e.target as Node))close();};document.addEventListener('mousedown',away);return()=>document.removeEventListener('mousedown',away);},[open]);
-  useEffect(()=>{if(open)list.current?.querySelector('[data-active="true"]')?.scrollIntoView({block:'nearest'});},[open,active]);
+  // Closes on a click elsewhere, and when the page scrolls or resizes under it (scrolling the menu's own list is fine).
+  useEffect(()=>{
+    if(!open)return;
+    const away=(e:MouseEvent)=>{const t=e.target as Node;if(!root.current?.contains(t)&&!list.current?.contains(t))close();};
+    const scrolled=(e:Event)=>{if(!(e.target instanceof Node&&list.current?.contains(e.target)))close();};
+    document.addEventListener('mousedown',away);window.addEventListener('scroll',scrolled,true);window.addEventListener('resize',close);
+    return()=>{document.removeEventListener('mousedown',away);window.removeEventListener('scroll',scrolled,true);window.removeEventListener('resize',close);};
+  },[open]);
+  // A menu wider than the room to its right moves left to stay on screen.
+  useLayoutEffect(()=>{if(!open||!list.current)return;const m=list.current.getBoundingClientRect();if(m.right>window.innerWidth-8)setPlace(p=>({...p,left:Math.max(8,window.innerWidth-8-m.width)}));},[open]);
+  // Only the menu's own list scrolls to the highlighted option: scrollIntoView also scrolled the cards and the page sideways.
+  useEffect(()=>{const l=list.current,a=l?.querySelector<HTMLElement>('[data-active="true"]');if(!open||!l||!a)return;if(a.offsetTop<l.scrollTop)l.scrollTop=a.offsetTop;else if(a.offsetTop+a.offsetHeight>l.scrollTop+l.clientHeight)l.scrollTop=a.offsetTop+a.offsetHeight-l.clientHeight;},[open,active]);
   const move=(from:number,step:number)=>{let i=from;for(let n=0;n<options.length;n++){i=(i+step+options.length)%options.length;if(enabled(i))return i;}return from;};
   function onKey(e:KeyboardEvent<HTMLButtonElement>){
     if(disabled)return;
@@ -97,8 +114,8 @@ export function Select({value,onChange,children,className='',disabled,...rest}:{
     <button type="button" className="select-trigger" role="combobox" aria-haspopup="listbox" aria-expanded={open} aria-controls={open?id:undefined} aria-activedescendant={open&&active>=0?`${id}-${active}`:undefined} disabled={disabled} {...rest} onClick={e=>{e.preventDefault();open?close():openMenu();}} onKeyDown={onKey}>
       <span className="select-value">{selected?.label??current}</span><ChevronDown size={15} className="select-chevron" aria-hidden="true"/>
     </button>
-    {open&&<ul ref={list} id={id} className="select-menu" role="listbox" aria-label={rest['aria-label']}>
+    {open&&createPortal(<ul ref={list} id={id} className="select-menu" role="listbox" aria-label={rest['aria-label']} style={place}>
       {options.map((o,i)=><li key={o.value+i} id={`${id}-${i}`} role="option" aria-selected={o.value===current} aria-disabled={o.disabled||undefined} data-active={i===active} className={`${o.value===current?'chosen':''} ${o.disabled?'disabled':''}`.trim()} onMouseEnter={()=>enabled(i)&&setActive(i)} onMouseDown={e=>e.preventDefault()} onClick={e=>{e.preventDefault();pick(i);}}><span>{o.label}</span>{o.value===current&&<Check size={14} aria-hidden="true"/>}</li>)}
-    </ul>}
+    </ul>,document.body)}
   </div>;
 }

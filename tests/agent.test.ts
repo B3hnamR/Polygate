@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the desktop-only API the Agent page uses, in front of the engine. A stand-in engine
@@ -12,7 +12,7 @@ const { settings, saveModel, models, db, stateDir } = await import('../backend/s
 const { startGateway } = await import('../backend/main');
 const FAKE = [process.execPath, path.join(import.meta.dir, 'fixtures', 'fake-opencode.ts')];
 const MODEL = 'kilo/agent-test-model'; const TOOLLESS = 'kilo/agent-test-chat'; const THINKER = 'kilo/agent-test-thinker';
-const saved = { token: process.env.POLYGATE_ADMIN_TOKEN, desktop: process.env.POLYGATE_DESKTOP, providers: settings.providers };
+const saved = { token: process.env.POLYGATE_ADMIN_TOKEN, desktop: process.env.POLYGATE_DESKTOP, providers: settings.providers, backups: settings.agentBackups };
 const keysBefore = settings.keys.map(k => k.id);
 let gateway: Awaited<ReturnType<typeof startGateway>>; let base = '';
 const model = (id: string, tools: boolean, reasoning = false) => ({ id, upstreamId: id.split('/').pop()!, providerId: 'kilo', name: id, context: 128000, output: 8192, reasoning, tools, state: 'available' as const, latency: 0, score: 50, priority: 100, failCount: 0, cooldownUntil: 0, checkedAt: 0, error: '' });
@@ -21,12 +21,14 @@ beforeAll(async () => {
   process.env.POLYGATE_ADMIN_TOKEN = 'agent-controller-secret'; process.env.POLYGATE_DESKTOP = '1';
   settings.providers = settings.providers.map(p => p.id === 'kilo' ? { ...p, enabled: true } : p);
   saveModel(model(MODEL, true)); saveModel(model(TOOLLESS, false)); saveModel(model(THINKER, true, true));
+  // Folder backups are off by default; the undo tests below need them, and the tests at the end check the default.
+  settings.agentBackups = true;
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
 afterAll(async () => {
   await engine.stopEngine(); await gateway?.close();
   for (const id of [MODEL, TOOLLESS, THINKER]) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); }
-  settings.providers = saved.providers; settings.keys = settings.keys.filter(k => keysBefore.includes(k.id));
+  settings.providers = saved.providers; settings.keys = settings.keys.filter(k => keysBefore.includes(k.id)); settings.agentBackups = saved.backups;
   for (const [k, v] of [['POLYGATE_ADMIN_TOKEN', saved.token], ['POLYGATE_DESKTOP', saved.desktop]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   delete process.env.FAKE_OPENCODE_SAVED; delete process.env.POLYGATE_AGENT_DIR;
 });
@@ -415,6 +417,90 @@ test('undo refuses, and changes nothing, when a file changed after the agent lef
   await emit('session.execution.succeeded', { sessionID: a });
   expect((await admin('/admin/agent/session/undo', { id: a, message: 'msg_unknown' })).status).toBe(404);
   ui.stop();
+});
+
+const AGENT = process.env.POLYGATE_AGENT_DIR!;
+const listDir = (dir: string) => { try { return readdirSync(dir); } catch { return []; } };
+test('with folder backups off (the default) nothing is copied, the turn is recorded without undo, and undo says why', async () => {
+  settings.agentBackups = undefined;
+  try {
+    expect((await admin('/admin/agent/engine')).body.backups).toBe(false);
+    const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+    const baselines = listDir(path.join(AGENT, 'baselines')).length;
+    put('src/off.js', 'original');
+    await turn(a, ui, 'change off', () => put('src/off.js', 'agent'), [{ file: 'src/off.js', status: 'modified', additions: 1, deletions: 1, patch: '-original\n+agent\n' }]);
+    expect(listDir(path.join(AGENT, 'baselines'))).toHaveLength(baselines);
+    expect(existsSync(path.join(AGENT, 'turns', a + '.json.pending'))).toBe(false);
+    const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+    expect(turns).toHaveLength(1); expect(turns[0]).toMatchObject({ undoable: false }); expect(turns[0].why).toMatch(/backups were off/);
+    expect(turns[0].files[0]).toMatchObject({ file: 'src/off.js', patch: '-original\n+agent\n' });
+    const r = await admin('/admin/agent/session/undo', { id: a, message: 'msg_' + a + '_0' });
+    expect(r.status).toBe(409); expect(r.body.error.type).toBe('agent_undo_unavailable'); expect(r.body.error.message).toMatch(/Folder backups were off.*Agent settings/);
+    expect(readFileSync(inFolder('src/off.js'), 'utf8')).toBe('agent');
+    expect((await calls()).some(c => c.path === '/api/session/' + a + '/revert/stage')).toBe(false);
+    ui.stop();
+  } finally { settings.agentBackups = true; }
+});
+
+test('a turn whose message was queued while the agent worked has no backup of its own, and an earlier turn cannot be undone through it', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/q.js', 'original');
+  await turn(a, ui, 'first', () => put('src/q.js', 'first'), [{ file: 'src/q.js', status: 'modified', patch: '' }]);
+  await emit('session.execution.started', { sessionID: a }); await until(() => ui.events.filter(e => e.type === 'session.execution.started').length >= 2);
+  await turn(a, ui, 'queued', () => put('src/q.js', 'second'), [{ file: 'src/q.js', status: 'modified', patch: '' }]);
+  const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+  expect(turns.map((t: any) => t.undoable)).toEqual([true, false]); expect(turns[1].why).toMatch(/still working/);
+  const r = await admin('/admin/agent/session/undo', { id: a, message: 'msg_' + a + '_0' });
+  expect(r.status).toBe(409); expect(r.body.error.message).toMatch(/later turn/);
+  expect(readFileSync(inFolder('src/q.js'), 'utf8')).toBe('second');
+  ui.stop();
+});
+
+test('folder backups are switched in settings; switching them off removes the folder baselines', async () => {
+  try {
+    expect((await admin('/admin/settings', { agentBackups: 'yes' })).status).toBe(400);
+    expect((await admin('/admin/settings', { agentBackups: true })).status).toBe(200);
+    expect((await admin('/admin/agent/engine')).body.backups).toBe(true);
+    const a = await create(); await admin('/admin/agent/session/prompt', { id: a, text: 'back up first' });
+    expect(listDir(path.join(AGENT, 'baselines')).length).toBeGreaterThan(0);
+    await emit('session.execution.succeeded', { sessionID: a });
+    expect((await admin('/admin/settings', { agentBackups: false })).status).toBe(200);
+    expect((await admin('/admin/agent/engine')).body.backups).toBe(false);
+    await until(() => listDir(path.join(AGENT, 'baselines')).length === 0);
+  } finally { settings.agentBackups = true; }
+});
+
+test("deleting a session removes it from the engine and Polygate's own records of it", async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('src/gone.js', 'original');
+  await turn(a, ui, 'change gone', () => put('src/gone.js', 'agent'), [{ file: 'src/gone.js', status: 'modified', patch: '' }]);
+  expect(existsSync(path.join(AGENT, 'turns', a + '.json'))).toBe(true);
+  await emit('session.execution.started', { sessionID: a }); await until(() => ui.events.filter(e => e.type === 'session.execution.started').length >= 2);
+  expect((await admin('/admin/agent/session/delete', { id: a })).status).toBe(409);
+  await emit('session.execution.succeeded', { sessionID: a }); await until(async () => !(await admin('/admin/agent/session?id=' + a)).body.busy);
+  expect((await admin('/admin/agent/session/delete', { id: a })).status).toBe(200);
+  expect((await calls()).some(c => c.method === 'DELETE' && c.path === '/api/session/' + a)).toBe(true);
+  expect(existsSync(path.join(AGENT, 'turns', a + '.json'))).toBe(false);
+  await until(() => ui.events.some(e => e.type === 'agent.deleted'));
+  expect((await admin('/admin/agent/session?id=' + a)).status).toBe(404);
+  expect((await admin('/admin/agent/sessions')).body.sessions.some((s: any) => s.id === a)).toBe(false);
+  ui.stop();
+});
+
+test("every folder's sessions are listed together, each with its folder, and the folders with their consent", async () => {
+  const other = mkdtempSync(path.join(tmpdir(), 'pg-project-two-'));
+  await trustFolder(other);
+  const r = await admin('/admin/agent/session/create', { folder: other, model: MODEL, mode: 'ask', title: 'In the other folder' }); expect(r.status).toBe(200);
+  const mine = await create();
+  const all = (await admin('/admin/agent/sessions')).body.sessions as any[];
+  expect(all.find(s => s.id === r.body.id)).toMatchObject({ folder: other, title: 'In the other folder' });
+  expect(all.find(s => s.id === mine)).toMatchObject({ folder: FOLDER });
+  expect((await admin('/admin/agent/sessions?folder=' + encodeURIComponent(other))).body.sessions.map((s: any) => s.id)).toEqual([r.body.id]);
+  const folders = (await admin('/admin/agent/folders')).body.folders as any[];
+  expect(folders.find(f => f.folder === other)).toEqual({ folder: other, trusted: true });
+  expect(folders.find(f => f.folder === FOLDER)).toEqual({ folder: FOLDER, trusted: true });
+  await admin('/admin/agent/trust/revoke', { folder: other });
+  expect((await admin('/admin/agent/folders')).body.folders.find((f: any) => f.folder === other)).toEqual({ folder: other, trusted: false });
 });
 
 test('a session can switch to another usable model (with its effort), and can be renamed', async () => {

@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, type Item } from '../src/agent-logic';
+import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, undoBlocked, modelProviders, matchModels, folderName, type Item } from '../src/agent-logic';
 // The Agent page's transcript, from a session's history and its live events (shapes as OpenCode 2.0.32 sends them).
 
 test('history becomes the transcript: messages, reasoning, tools with their result, and stops', () => {
@@ -86,4 +86,30 @@ test('the transcript distinguishes saved rules, blocks, and Full access from ses
   items = applyEvent(items, { type: 'agent.mode', data: { mode: 'full' } });
   expect(items.map(i => (i as any).text)).toEqual(['Permission rule: npm test', 'Blocked by permission rules: pwsh -enc x', 'Mode: Full access']);
   expect(items[2]).toMatchObject({ tone: 'warn' });
+});
+
+test('a turn can be undone only when it and every later turn have a backup, and the card says why not', () => {
+  const card = (message: string, undoable: boolean, why?: string): Item => ({ kind: 'changes', key: `changes:${message}`, message, files: [], undoable, ...(why ? { why } : {}) });
+  const blocked = undoBlocked([card('m1', true), { kind: 'user', key: 'u', text: 'next' }, card('m2', false, 'Folder backups were off.'), card('m3', true)]);
+  expect(blocked.get('m3')).toBeUndefined();
+  expect(blocked.get('m2')).toBe('Folder backups were off.');
+  expect(blocked.get('m1')).toMatch(/later turn/);
+  const fromRecord = withChanges([{ kind: 'user', key: 'msg_1', text: 'go' }], [{ message: 'msg_1', at: 1, files: [], undoable: false, why: 'Off.' }]);
+  expect(fromRecord[1]).toMatchObject({ kind: 'changes', undoable: false, why: 'Off.' });
+  expect(applyEvent([], { type: 'agent.changes', data: { turn: { message: 'msg_2', files: [] } } })[0]).toMatchObject({ undoable: true });
+});
+
+test('the model picker: providers with their counts, and a search over name, id and provider with usable models first', () => {
+  const models = [
+    { id: 'a/gpt-5', name: 'GPT-5', provider: 'Alpha', usable: true },
+    { id: 'b/free-gpt', name: 'Free GPT', provider: 'OpenCode Free', usable: false },
+    { id: 'b/qwen-coder', name: 'Qwen Coder', provider: 'OpenCode Free', usable: true },
+    { id: 'a/claude', name: 'Sonnet', provider: 'Alpha', usable: true },
+  ];
+  expect(modelProviders(models)).toEqual([{ name: 'Alpha', count: 2, usable: 2 }, { name: 'OpenCode Free', count: 2, usable: 1 }]);
+  expect(matchModels(models, '', 'gpt').map(m => m.id)).toEqual(['a/gpt-5', 'b/free-gpt']);
+  expect(matchModels(models, 'OpenCode Free', '').map(m => m.id)).toEqual(['b/qwen-coder', 'b/free-gpt']);
+  expect(matchModels(models, '', '  free   coder ').map(m => m.id)).toEqual(['b/qwen-coder']);
+  expect(matchModels(models, 'Alpha', 'qwen')).toEqual([]);
+  expect(folderName('D:\\JB\\project\\')).toBe('project'); expect(folderName('/home/me/app')).toBe('app'); expect(folderName('D:\\')).toBe('D:');
 });

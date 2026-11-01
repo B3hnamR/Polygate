@@ -63,6 +63,7 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
     const [, id, rest] = m; if (!sessions.has(id)) return json({ _tag: 'SessionNotFound', message: 'Session not found' }, 404);
     if (!rest && req.method === 'GET') return json({ data: sessions.get(id) });
     if (!rest && req.method === 'PATCH') { Object.assign(sessions.get(id), { title: body.title }); return json({ data: sessions.get(id) }); }
+    if (!rest && req.method === 'DELETE') { sessions.delete(id); prompts.delete(id); return new Response(null, { status: 204 }); }
     if (rest === 'diff') return json({ data: scripted.get(id)?.diff || [] });
     if (rest === 'revert/stage') {
       const kept: { file: string; content: string | null }[] = [];

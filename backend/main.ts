@@ -22,7 +22,7 @@ import { closeSocksBridges } from './socks-bridge';
 import { logEvent, captureConsole, adminAction } from './logbook';
 import { handleMcp, syncMcp, stopMcp } from './mcp';
 import { setEngineGateway, stopEngine } from './agent-engine';
-import { stopAgent } from './agent';
+import { pruneAgentBackups, stopAgent } from './agent';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
   const token=process.env.POLYGATE_ADMIN_TOKEN||randomBytes(32).toString('hex');rememberAdminToken(token);
@@ -112,6 +112,8 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
   let actual=server.port as number;
   // The agent engine sends its model requests to this gateway, on loopback, whatever address the listener has.
   setEngineGateway(`http://127.0.0.1:${actual}`);
+  // Agent backup copies nothing needs any more (folder backups are off by default) are cleaned up a minute after the start.
+  if(serverConfig().desktop)setTimeout(()=>pruneAgentBackups(true),60000).unref?.();
   let current:{port:number;host:string;tls?:{cert:string;key:string}}={port:actual,host:firstHost,tls:secure.tls};
   // Swaps the listener (new certificate, new port, HTTPS on or off). The new socket is up before the old one stops accepting, so requests are not refused.
   // Where the port cannot be shared (same port, no reusePort), the old socket closes first; if the new bind then fails too, the previous
