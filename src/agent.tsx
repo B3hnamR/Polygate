@@ -195,9 +195,9 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   const undo=async(message:string)=>{
     const cards=items.filter((i):i is Extract<Item,{kind:'changes'}>=>i.kind==='changes');const from=cards.findIndex(c=>c.message===message);if(from<0)return;
     const files=[...new Set(cards.slice(from).flatMap(c=>c.files.map(f=>f.file)))];const later=cards.length-from-1;
-    const ok=await confirm(<>Restore {files.length===1?<code>{files[0]}</code>:`${files.length} files`} to how {files.length===1?'it was':'they were'} before this turn.{later>0?` This also undoes the ${later} later turn${later>1?'s':''} that changed files.`:''} The conversation from this message on is removed. If a file was changed after the agent changed it, nothing is undone.</>,{title:'Undo this turn',confirm:'Undo'});
+    const ok=await confirm(<>Remove this turn's changes from {files.length===1?<code>{files[0]}</code>:`${files.length} files`}.{later>0?` This also undoes the ${later} later turn${later>1?'s':''} that changed files.`:''} The conversation from this message on is removed. Your non-overlapping edits are preserved. If any file cannot be safely merged, nothing is undone.</>,{title:'Undo this turn',confirm:'Undo'});
     if(!ok)return;setError('');setNotice('');
-    try{const r=await api('/admin/agent/session/undo',{id,message});setNotice(`Undone: ${r.files.length} file${r.files.length===1?'':'s'} restored.`);}catch(e:any){setError(e.message);}
+    try{const r=await api('/admin/agent/session/undo',{id,message});setNotice(`Undone: ${r.files.length} file${r.files.length===1?'':'s'} restored.${r.merged?' Your non-overlapping edits were preserved.':''}`);}catch(e:any){setError(e.message);}
   };
   const [nextModel,setNextModel]=useState('');const switchModel=async()=>{if(!nextModel)return;try{await api('/admin/agent/session/model',{id,model:nextModel});setInfo(i=>i&&{...i,model:nextModel,effort:''});setPaused('');setNotice('Model changed. Send a message to carry on.');}catch(e:any){setError(e.message);}};
   const [naming,setNaming]=useState<string|null>(null);const rename=async()=>{const title=(naming||'').trim();if(!title){setNaming(null);return;}try{await api('/admin/agent/session/rename',{id,title});setInfo(i=>i&&{...i,title});changed.current();}catch(e:any){setError(e.message);}setNaming(null);};

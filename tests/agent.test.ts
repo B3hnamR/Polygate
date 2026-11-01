@@ -324,17 +324,60 @@ test('a failed history commit restores the exact post-agent files and retains th
   ui.stop();
 });
 
-test('undoing multiple turns refuses to remove a user change made between those turns', async () => {
+test('undoing multiple turns keeps a non-overlapping user change made between those turns', async () => {
   const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
-  put('src/between.js', 'original\r\n');
-  await turn(a, ui, 'first', () => put('src/between.js', 'agent one\r\n'), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
-  put('src/between.js', 'agent one\r\nuser line\r\n');
-  await turn(a, ui, 'second', () => put('src/between.js', 'agent two\r\nuser line\r\n'), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
+  const suffix = 'two\r\nthree\r\nfour\r\nfive\r\n';
+  put('src/between.js', 'original\r\n' + suffix);
+  await turn(a, ui, 'first', () => put('src/between.js', 'agent one\r\n' + suffix), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
+  put('src/between.js', 'agent one\r\n' + suffix + 'user line\r\n');
+  await turn(a, ui, 'second', () => put('src/between.js', 'agent two\r\n' + suffix + 'user line\r\n'), [{ file: 'src/between.js', status: 'modified', patch: '' }]);
   const r = await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` });
-  expect(r.status).toBe(409); expect(r.body.error.message).toContain('between agent turns');
-  expect(readFileSync(inFolder('src/between.js'), 'utf8')).toContain('user line');
-  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_1` })).status).toBe(200);
-  expect(readFileSync(inFolder('src/between.js'), 'utf8')).toBe('agent one\r\nuser line\r\n');
+  expect(r.status).toBe(200);
+  expect(readFileSync(inFolder('src/between.js'), 'utf8')).toBe('original\r\n' + suffix + 'user line\r\n');
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toEqual([]);
+  ui.stop();
+});
+
+test('undo merges a non-overlapping user edit and still refuses overlaps without staging history', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  const original = 'one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n';
+  put('src/merge.js', original);
+  await turn(a, ui, 'edit first line', () => put('src/merge.js', original.replace('one', 'ONE')), [{ file: 'src/merge.js', status: 'modified', patch: '' }]);
+  put('src/merge.js', original.replace('one', 'USER'));
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(409);
+  expect(readFileSync(inFolder('src/merge.js'), 'utf8')).toContain('USER');
+  expect((await calls()).some(c => c.path === `/api/session/${a}/revert/stage`)).toBe(false);
+  put('src/merge.js', original.replace('one', 'ONE').replace('five', 'FIVE'));
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(200);
+  expect(readFileSync(inFolder('src/merge.js'))).toEqual(Buffer.from(original.replace('five', 'FIVE')));
+  ui.stop();
+});
+
+test('a conflict in any file leaves all files and history untouched, including a mergeable file', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  const before = 'one\ntwo\nthree\nfour\nfive\n', after = before.replace('one', 'ONE');
+  put('src/all-one.js', before); put('src/all-two.js', before);
+  await turn(a, ui, 'edit both', () => { put('src/all-one.js', after); put('src/all-two.js', after); },
+    [{ file: 'src/all-one.js', status: 'modified', patch: '' }, { file: 'src/all-two.js', status: 'modified', patch: '' }]);
+  put('src/all-one.js', after.replace('five', 'USER')); put('src/all-two.js', before.replace('one', 'OVERLAP'));
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(409);
+  expect(readFileSync(inFolder('src/all-one.js'), 'utf8')).toBe(after.replace('five', 'USER'));
+  expect(readFileSync(inFolder('src/all-two.js'), 'utf8')).toContain('OVERLAP');
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toHaveLength(1);
+  expect((await calls()).some(c => c.path === `/api/session/${a}/revert/stage`)).toBe(false);
+  ui.stop();
+});
+
+test('failed history commit rolls a merged file back to the user-edited current bytes', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  const before = 'one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n';
+  put('src/merge-rollback.js', before);
+  await turn(a, ui, 'edit', () => put('src/merge-rollback.js', before.replace('one', 'ONE')), [{ file: 'src/merge-rollback.js', status: 'modified', patch: '' }]);
+  const user = before.replace('one', 'ONE').replace('five', 'USER'); put('src/merge-rollback.js', user);
+  await fake('/test/session', { sessionID: a, commitFails: true });
+  expect((await admin('/admin/agent/session/undo', { id: a, message: `msg_${a}_0` })).status).toBe(502);
+  expect(readFileSync(inFolder('src/merge-rollback.js'))).toEqual(Buffer.from(user));
+  expect((await admin('/admin/agent/session/changes?id=' + a)).body.turns).toHaveLength(1);
   ui.stop();
 });
 

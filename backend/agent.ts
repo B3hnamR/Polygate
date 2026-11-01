@@ -11,6 +11,7 @@ import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, restoreFile
 import { inspectionCommands, permissionDecision, projectRules, removeProjectRule, saveProjectRule } from './agent-permissions';
 import { grantTrust, inspectTrust, revokeTrust } from './agent-trust';
 import { pausedAgents, setAgentPause } from './agent-recovery';
+import { mergeUndo } from './agent-merge';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the only part of Polygate that talks to the agent's engine. The Agent page uses it
 // through the desktop-only admin API (admin.ts); the engine's password never reaches the page. It keeps one event stream per working
 // folder open to the engine (opened again after an engine restart), hands each session's events to the page, and answers approvals:
@@ -152,8 +153,8 @@ function expireFull(s: Session) {
 
 // --- Changes and undo ---
 // What each turn changed, kept per session in the agent's folder so it outlives a restart: the files the engine's steps reported, the
-// exact pre-turn bytes and a hash of every changed file as the agent left it. Undo checks those hashes before writing; engine snapshots
-// are not used for restoration because their Git index can normalize working-tree content.
+// exact pre/post-turn bytes. Undo reverses turns in private scratch copies, merging non-overlapping user edits, then checks the working
+// files before writing. Engine snapshots are not used because their Git index can normalize working-tree content.
 type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after: string | null; before?: FileBackup };
 type Turn = { message: string; at: number; files: FileChange[] };
 const enc = encodeURIComponent;
@@ -179,7 +180,11 @@ async function recordTurn(s: Session) {
     const after = hashOf(s.folder, file);
     let patch = { additions: Number(f.additions) || 0, deletions: Number(f.deletions) || 0, patch: String(f.patch || '').slice(0, 200000) };
     if (before !== undefined) {
-      try { patch = byteDiff(file, before === null ? Buffer.alloc(0) : backupBytes(before), after === null ? Buffer.alloc(0) : readFileSync(filePath(s.folder, file))); }
+      try {
+        const content = after === null ? Buffer.alloc(0) : readFileSync(filePath(s.folder, file));
+        if (content.length > 256 * 1024 * 1024 || after !== null && saveBytes(content) !== after) throw new Error('The changed file cannot be recorded safely.');
+        patch = byteDiff(file, before === null ? Buffer.alloc(0) : backupBytes(before), content);
+      }
       catch { return { file, status: String(f.status || 'modified'), ...patch, after }; }
     }
     return { file, status: before === null ? 'added' : before !== undefined && after === null ? 'deleted' : String(f.status || 'modified'), ...patch, after, ...(before !== undefined ? { before } : {}) };
@@ -197,27 +202,34 @@ async function undoTurn(s: Session, message: string) {
   await s.recording;
   const turns = loadTurns(s); const from = turns.findIndex(t => t.message === message);
   if (from < 0) throw new GatewayError('Polygate has no recorded changes for that turn.', 404, 'agent_undo_unknown');
-  const latest = new Map<string, string | null>(); for (const t of turns) for (const f of t.files) latest.set(f.file, f.after);
-  const target = new Map<string, FileBackup | undefined>();
-  for (const t of turns.slice(from)) for (const f of t.files) if (!target.has(f.file)) target.set(f.file, f.before);
-  const files = [...target.keys()];
-  const between = new Set<string>(), previous = new Map<string, string | null>();
-  for (const t of turns.slice(from)) for (const f of t.files) {
-    if (previous.has(f.file) && f.before !== undefined && previous.get(f.file) !== (f.before?.hash ?? null)) between.add(f.file);
-    previous.set(f.file, f.after);
-  }
-  const conflicts = files.flatMap(file => target.get(file) === undefined ? [{ file, reason: 'No exact backup exists for this file. Older turns cannot be safely undone.' }]
-    : between.has(file) ? [{ file, reason: 'It changed between agent turns. Undoing the earlier turn would also remove that change.' }]
-    : hashOf(s.folder, file) !== latest.get(file) ? [{ file, reason: 'It changed after the agent last changed it.' }] : []);
-  if (conflicts.length) return { conflicts };
-  // Resolve every backup and validate every path before changing either history or files.
-  const restore = new Map(files.map(file => { filePath(s.folder, file); const saved = target.get(file)!; return [file, saved === null ? undefined : backupBytes(saved)] as const; }));
+  const files = [...new Set(turns.slice(from).flatMap(t => t.files.map(f => f.file)))];
   const rollback = new Map(files.map(file => { const full = filePath(s.folder, file); return [file, existsSync(full) ? { hash: saveBytes(readFileSync(full)), mode: statSync(full).mode & 0o777 } : null] as const; }));
+  const target = new Map<string, FileBackup>(), conflicts: { file: string; reason: string }[] = [];
+  let merged = 0;
+  for (const file of files) {
+    try {
+      let saved: FileBackup = rollback.get(file) ?? null;
+      let current: Buffer | null = saved === null ? null : backupBytes(saved);
+      for (const turn of turns.slice(from).reverse()) {
+        const change = turn.files.find(f => f.file === file); if (!change) continue;
+        if (change.before === undefined) throw new Error('No exact backup exists for this file. Older turns cannot be safely undone.');
+        const before = change.before === null ? null : backupBytes(change.before);
+        const exact = change.after === (current === null ? null : saveBytes(current));
+        const after = exact ? current : change.after === null ? null : backupBytes({ hash: change.after, mode: 0o600 });
+        current = mergeUndo(before, after, current);
+        if (!exact) merged++;
+        saved = current === null ? null : { hash: saveBytes(current), mode: saved?.mode ?? change.before?.mode ?? 0o644 };
+      }
+      target.set(file, saved);
+    } catch (e: any) { conflicts.push({ file, reason: e.message || 'The file could not be safely merged.' }); }
+  }
+  if (conflicts.length) return { conflicts };
+  const restore = new Map(files.map(file => { const saved = target.get(file)!; return [file, saved === null ? undefined : backupBytes(saved)] as const; }));
   try {
     // Stage history only. OpenCode's file snapshots can contain normalized rather than actual bytes.
     await engine('POST', `/api/session/${enc(s.id)}/revert/stage`, { messageID: message, files: false });
     for (const file of files) {
-      if (hashOf(s.folder, file) !== latest.get(file)) throw new GatewayError('A file changed while undo was starting. Nothing was committed.', 409, 'agent_undo_conflict');
+      if (hashOf(s.folder, file) !== (rollback.get(file)?.hash ?? null)) throw new GatewayError('A file changed while undo was starting. Nothing was committed.', 409, 'agent_undo_conflict');
     }
     const written: string[] = [];
     try {
@@ -231,8 +243,8 @@ async function undoTurn(s: Session, message: string) {
   } catch (err) { await engine('DELETE', `/api/session/${enc(s.id)}/revert`).catch(() => {}); throw err; }
   s.turns = turns.slice(0, from); saveTurns(s);
   publish(s.id, { type: 'agent.undone', data: { sessionID: s.id, message, files } });
-  logEvent('info', 'agent', `Agent turn undone: ${files.length} file(s) restored`);
-  return { files };
+  logEvent('info', 'agent', `Agent turn undone: ${files.length} file(s) restored${merged ? ', non-overlapping edits preserved' : ''}`);
+  return { files, merged: merged > 0 };
   } finally { s.undoing = false; }
 }
 
@@ -358,7 +370,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/undo' && method === 'POST') {
     const b = await readJson(req); const s = await known(b.id); const out = await undoTurn(s, String(b.message || ''));
     if (out.conflicts) return json(res, 409, { error: { type: 'agent_undo_conflict', message: `Nothing was undone. ${out.conflicts.map(c => `${c.file}: ${c.reason}`).join(' ')} Undoing would overwrite that.` }, conflicts: out.conflicts });
-    return json(res, 200, { ok: true, files: out.files });
+    return json(res, 200, { ok: true, files: out.files, merged: out.merged });
   }
   // Another model for a session, typically one that is paused because its model keeps failing. Same checks as a new session.
   if (pathname === '/admin/agent/session/model' && method === 'POST') {
