@@ -1,24 +1,43 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs';
+import { lstat, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { enginePaths } from './agent-engine';
 import { writeFileAtomic } from './state';
 
 type SavedFile = { hash: string; mode: number };
 export type FileBackup = SavedFile | null;
-export type Backup = { files: Record<string, SavedFile>; excluded: string[] };
-const MAX_BYTES = 256 * 1024 * 1024, MAX_FILES = 20000;
+// limited: the folder is bigger than one backup covers, so the limits below left files out (not only skipped folders and links).
+export type Backup = { files: Record<string, SavedFile>; excluded: string[]; limited?: boolean };
+// A file as the last backup of its folder saw it: the same size and times mean its saved copy is still exact, so it is not read again.
+type Seen = SavedFile & { size: number; mtimeMs: number; ctimeMs: number };
+let MAX_BYTES = 256 * 1024 * 1024, MAX_FILES = 20000;
+const MAX_FILE = 8 * 1024 * 1024;
+// For tests: smaller limits, so a folder cut short can be built from a few files.
+export function __setBackupLimits(files = 20000, bytes = 256 * 1024 * 1024) { MAX_FILES = files; MAX_BYTES = bytes; }
 const SKIP = new Set(['.git', 'node_modules', '.venv', 'venv']);
-const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const store = () => path.join(enginePaths().root, 'backups');
 const blob = (hash: string) => {
   if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid agent backup checksum.');
   return path.join(store(), hash);
 };
+// A saved copy used again gets a fresh time: pruning spares recent copies, so it cannot remove one before the record that needs it is written.
+const touch = (dest: string) => { try { const now = new Date(); utimesSync(dest, now, now); } catch { /* best effort */ } };
 export function saveBytes(bytes: Buffer) {
   const hash = digest(bytes), dest = blob(hash);
   mkdirSync(store(), { recursive: true });
-  if (!existsSync(dest)) writeFileAtomic(dest, bytes);
+  if (!existsSync(dest)) writeFileAtomic(dest, bytes); else touch(dest);
+  return hash;
+}
+async function saveBytesAsync(bytes: Buffer) {
+  const hash = digest(bytes), dest = blob(hash);
+  if (existsSync(dest)) { touch(dest); return hash; }
+  mkdirSync(store(), { recursive: true });
+  // Not flushed to disk one by one (thousands of copies): a copy cut short by a power loss fails its checksum and is never restored.
+  const temp = `${dest}.${randomBytes(6).toString('hex')}.tmp`;
+  await writeFile(temp, bytes, { mode: 0o600 });
+  try { await rename(temp, dest); } catch (e) { await rm(temp, { force: true }); if (!existsSync(dest)) throw e; }
   return hash;
 }
 export function backupBytes(file: SavedFile) {
@@ -38,33 +57,109 @@ export function filePath(folder: string, file: string) {
   }
   return full;
 }
-export function captureBackup(folder: string): Backup {
-  const files: Backup['files'] = Object.create(null), excluded: string[] = [];
-  let bytes = 0, count = 0;
-  const visit = (dir: string) => {
+// The last backup of each folder stays on disk: the next one reads only the files that changed since, and pruning keeps its copies.
+const KEEP_BASELINES = 5;
+const baselineDir = () => path.join(enginePaths().root, 'baselines');
+const baselineFile = (folder: string) => path.join(baselineDir(), digest(path.resolve(folder).replace(/\\/g, '/').toLowerCase()) + '.json');
+function baseline(folder: string): Record<string, Seen> {
+  try {
+    const saved = JSON.parse(readFileSync(baselineFile(folder), 'utf8'));
+    if (saved?.folder === path.resolve(folder) && saved.files && typeof saved.files === 'object') return saved.files;
+  } catch { /* none yet, or unreadable: every file is read again */ }
+  return Object.create(null);
+}
+// Backups running now: pruning does not run meanwhile, so a copy a backup is about to reuse is never removed.
+let capturing = 0;
+// Does not hold up the gateway: reads and writes are asynchronous (up to 16 files of a folder at once), and files unchanged since the last
+// backup are not read. Folders are taken one at a time, depth first, so a folder too big for the limits is covered project by project.
+export async function captureBackup(folder: string): Promise<Backup> {
+  const files: Backup['files'] = Object.create(null), seen: Record<string, Seen> = Object.create(null), excluded: string[] = [], last = baseline(folder);
+  let bytes = 0, count = 0, limited = false;
+  const atLimit = () => count >= MAX_FILES || bytes >= MAX_BYTES;
+  // File checks that finish one after another can keep the event loop from timers (and the gateway's own work) for over a second: after
+  // every 20 ms of work the backup waits a moment, so other work goes first.
+  let worked = performance.now();
+  const breathe = async () => { if (performance.now() - worked > 20) { await Bun.sleep(1); worked = performance.now(); } };
+  const file = async (full: string, rel: string) => {
+    try {
+      const st = await lstat(full);
+      // The limits are claimed in one step, between awaits, so parallel reads cannot overshoot them.
+      if (++count > MAX_FILES) { excluded.push(rel); limited = true; return; }
+      if (st.size > MAX_FILE || bytes + st.size > MAX_BYTES) { excluded.push(rel); limited = true; return; }
+      bytes += st.size;
+      const mode = st.mode & 0o777, old = last[rel];
+      let hash: string;
+      if (old && old.size === st.size && old.mtimeMs === st.mtimeMs && old.ctimeMs === st.ctimeMs && /^[a-f0-9]{64}$/.test(old.hash) && existsSync(blob(old.hash))) hash = old.hash;
+      else {
+        const content = await readFile(full); bytes += content.length - st.size;
+        if (content.length > MAX_FILE || bytes > MAX_BYTES) { excluded.push(rel); limited = true; return; }
+        hash = await saveBytesAsync(content);
+      }
+      files[rel] = { hash, mode }; seen[rel] = { hash, mode, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
+    } catch { excluded.push(rel); }
+  };
+  const relOf = (full: string) => path.relative(folder, full).replace(/\\/g, '/');
+  // A folder the limits cut short is excluded as a whole: what it holds beyond the files already saved is unknown (never "did not exist").
+  const visit = async (dir: string): Promise<void> => {
+    await breathe();
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { excluded.push(path.relative(folder, dir).replace(/\\/g, '/')); return; }
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { excluded.push(relOf(dir)); return; }
+    const found: string[] = [], dirs: string[] = [];
     for (const entry of entries) {
-      const full = path.join(dir, entry.name), rel = path.relative(folder, full).replace(/\\/g, '/');
-      try {
-        if (entry.isSymbolicLink() || (entry.isDirectory() && SKIP.has(entry.name))) { excluded.push(rel); continue; }
-        if (entry.isDirectory()) { if (count >= MAX_FILES || bytes >= MAX_BYTES) excluded.push(rel); else visit(full); continue; }
-        if (!entry.isFile() || ++count > MAX_FILES) { excluded.push(rel); continue; }
-        const st = lstatSync(full);
-        if (bytes + st.size > MAX_BYTES) { excluded.push(rel); continue; }
-        const content = readFileSync(full); bytes += content.length;
-        if (bytes > MAX_BYTES) { excluded.push(rel); continue; }
-        files[rel] = { hash: saveBytes(content), mode: st.mode & 0o777 };
-      } catch { excluded.push(rel); }
+      if (entry.isSymbolicLink() || (entry.isDirectory() && SKIP.has(entry.name)) || !entry.isDirectory() && !entry.isFile()) excluded.push(relOf(path.join(dir, entry.name)));
+      else (entry.isDirectory() ? dirs : found).push(path.join(dir, entry.name));
+    }
+    for (let i = 0; i < found.length; i += 16) {
+      if (atLimit()) { excluded.push(relOf(dir)); limited = true; return; }
+      await Promise.all(found.slice(i, i + 16).map(f => file(f, relOf(f))));
+      await breathe();
+    }
+    for (const f of dirs) {
+      if (atLimit()) { excluded.push(relOf(dir)); limited = true; return; }
+      await visit(f);
     }
   };
-  visit(folder);
-  return { files, excluded };
+  capturing++;
+  try { await visit(folder); }
+  finally { capturing--; }
+  try { mkdirSync(baselineDir(), { recursive: true }); writeFileAtomic(baselineFile(folder), JSON.stringify({ folder: path.resolve(folder), files: seen })); } catch { /* the next backup reads every file again */ }
+  return { files, excluded, ...(limited ? { limited } : {}) };
+}
+// Removes saved copies nothing refers to any more: not in a folder's last backup, a turn's record or a backup waiting for its turn (`refs`,
+// from agent.ts). Copies saved or used in the last hour are spared, so one being recorded right now is never lost. refs is null when a record
+// could not be read; then nothing is removed.
+let pruning = false;
+export async function pruneBackups(refs: Set<string> | null, now = Date.now()) {
+  if (!refs || pruning || capturing) return 0;
+  pruning = true;
+  try {
+    const keep = new Set(refs);
+    let names: string[] = [];
+    try { names = readdirSync(baselineDir()).filter(n => n.endsWith('.json')); } catch (e: any) { if (e.code !== 'ENOENT') return 0; }
+    const dated = names.map(n => { const f = path.join(baselineDir(), n); try { return { f, t: statSync(f).mtimeMs }; } catch { return { f, t: 0 }; } }).sort((a, b) => b.t - a.t);
+    for (const { f } of dated.slice(KEEP_BASELINES)) { try { unlinkSync(f); } catch { /* removed next time */ } }
+    for (const { f } of dated.slice(0, KEEP_BASELINES)) {
+      try { for (const s of Object.values<any>(JSON.parse(readFileSync(f, 'utf8')).files || {})) if (typeof s?.hash === 'string') keep.add(s.hash); }
+      catch { return 0; }
+    }
+    let blobs: string[] = [];
+    try { blobs = readdirSync(store()); } catch { return 0; }
+    let removed = 0;
+    for (const name of blobs) {
+      if (!/^[a-f0-9]{64}$/.test(name) || keep.has(name)) continue;
+      const f = path.join(store(), name);
+      try { if (now - statSync(f).mtimeMs < 3600000) continue; unlinkSync(f); removed++; } catch { /* in use or already gone */ }
+      if (removed % 200 === 199) await Bun.sleep(0);
+    }
+    return removed;
+  } finally { pruning = false; }
 }
 export function beforeFile(backup: Backup | undefined, file: string): FileBackup | undefined {
   const rel = file.replace(/\\/g, '/');
-  if (!backup || rel.split('/').some(x => SKIP.has(x)) || backup.excluded.some(x => !x || rel === x || rel.startsWith(x + '/'))) return undefined;
-  return Object.hasOwn(backup.files, rel) ? backup.files[rel] : null;
+  if (!backup || rel.split('/').some(x => SKIP.has(x))) return undefined;
+  // A saved file first: a folder the limits cut short is excluded, though the files saved before the cut are exact.
+  if (Object.hasOwn(backup.files, rel)) return backup.files[rel];
+  return backup.excluded.some(x => !x || rel === x || rel.startsWith(x + '/')) ? undefined : null;
 }
 export function restoreFile(folder: string, file: string, saved: FileBackup, bytes?: Buffer) {
   const full = filePath(folder, file);

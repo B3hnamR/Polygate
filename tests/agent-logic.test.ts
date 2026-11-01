@@ -45,8 +45,12 @@ test('retries keep one note that a new turn clears; stops, failures, auto-approv
   items = applyEvent(items, { type: 'agent.approval.auto', data: { requestID: 'per_1', resources: ['npm test'] } });
   items = applyEvent(items, { id: 'e1', type: 'session.execution.failed', data: { error: { message: 'boom' } } });
   items = applyEvent(items, { id: 'e2', type: 'session.execution.interrupted', data: {} });
-  items = applyEvent(items, { id: 'e3', type: 'session.agent.selected', data: { agent: 'polygate-accept-edits' } });
-  expect(items.map(i => (i as any).text)).toEqual(['Allowed for this session: npm test', 'This turn failed: boom', 'Stopped.', 'Mode: Accept edits']);
+  // A mode change is noted once: Polygate's agent.mode, not also the engine's session.agent.selected that follows it.
+  items = applyEvent(items, { id: 'pg_1', type: 'agent.mode', data: { mode: 'full', fullUntil: 1 } });
+  expect(applyEvent(items, { id: 'e3', type: 'session.agent.selected', data: { agent: 'polygate-full' } })).toBe(items);
+  items = applyEvent(items, { id: 'pg_2', type: 'agent.mode', data: { mode: 'ask', reason: 'Full access ended. Ask for approval is active.' } });
+  expect(items.map(i => (i as any).text)).toEqual(['Allowed for this session: npm test', 'This turn failed: boom', 'Stopped.', 'Mode: Full access', 'Full access ended. Ask for approval is active.']);
+  expect(new Set(items.map(i => i.key)).size).toBe(items.length);
   expect(applyEvent(items, { type: 'server.heartbeat', data: {} })).toBe(items);
 });
 

@@ -184,7 +184,7 @@ function SessionView({id,folder,models,onChanged}:{id:string;folder:string;model
   },[id,load]);
   // Follows the newest output while the reader is near the bottom; reading further up is left alone.
   useEffect(()=>{const el=thread.current;if(el&&el.scrollHeight-el.scrollTop-el.clientHeight<160)el.scrollTop=el.scrollHeight;},[items,pending,busy]);
-  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{await api('/admin/agent/session/prompt',{id,text:t});setText('');}catch(e:any){setError(e.message);}finally{setSending(false);}};
+  const send=async()=>{const t=text.trim();if(!t)return;setSending(true);setError('');setNotice('');try{const r=await api('/admin/agent/session/prompt',{id,text:t});setText('');if(r.limited)setNotice('This folder is bigger than one backup covers (20,000 files, 256 MB, files up to 8 MB each). Changes to the files left out cannot be undone from Polygate.');}catch(e:any){setError(e.message);}finally{setSending(false);}};
   const stop=async()=>{try{await api('/admin/agent/session/cancel',{id});}catch(e:any){setError(e.message);}};
   const changeMode=async(mode:Mode)=>{
     if(mode==='full'&&!await confirm(<>The agent will run commands and access files and the internet without ordinary approval prompts, with your account's access, including access to Polygate's data. This is not a sandbox. Full access ends after this turn, after 30 minutes, or when the app or engine restarts.</>,{title:'Enable Full access',confirm:'Enable Full access'}))return;

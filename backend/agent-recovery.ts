@@ -18,7 +18,8 @@ export function setAgentPause(id: string, message?: string) {
 export function agentRecoveryItems(engine: { state: string; installed: boolean; message: string }, sessions: { id: string; paused?: string }[]): CheckItem[] {
   if (process.env.POLYGATE_DESKTOP !== '1' || !engine.installed && !['running', 'failed'].includes(engine.state)) return [];
   const items: CheckItem[] = [];
-  if (['installed', 'failed', 'not_installed'].includes(engine.state)) items.push({ id: 'agent_engine', severity: 'warning', title: 'The coding agent engine is stopped', detail: engine.message || 'Agent sessions cannot run. Other model clients can still use the gateway.', page: 'Agent', ...(engine.installed ? { fix: { label: 'Start agent engine', endpoint: '/admin/agent/engine/start' } } : {}) });
+  // Only a failure is a problem: the engine is off after every app start until the Agent page starts it, and the user may stop it.
+  if (engine.state === 'failed') items.push({ id: 'agent_engine', severity: 'warning', title: 'The coding agent engine stopped with a problem', detail: engine.message || 'Agent sessions cannot run. Other model clients can still use the gateway.', page: 'Agent', ...(engine.installed ? { fix: { label: 'Start agent engine', endpoint: '/admin/agent/engine/start' } } : {}) });
   const key = settings.keys.find(k => k.agent), why = key ? keyProblem(key) : 'it is missing';
   if (why) items.push({ id: 'agent_key', severity: 'warning', title: 'The agent client key cannot be used', detail: `The agent key cannot make requests because ${why}. Review it in Settings; it is never enabled automatically.`, page: 'Settings' });
   for (const session of sessions.filter(s => s.paused)) items.push({ id: `agent_paused:${session.id}`, severity: 'warning', title: 'An agent session is paused', detail: session.paused!, page: 'Agent' });

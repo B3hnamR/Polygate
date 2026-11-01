@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { models, sessionUsage, settings, stateDir, writeFileAtomic } from './state';
@@ -7,7 +7,7 @@ import { GatewayError } from './queue';
 import { logEvent } from './logbook';
 import { ENGINE_MODES, engineConnection, enginePaths, freeIdentityProblem } from './agent-engine';
 import { presentedOpenCodeVersion } from './providers';
-import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, restoreFile, saveBytes, type Backup, type FileBackup } from './agent-backup';
+import { backupBytes, beforeFile, byteDiff, captureBackup, filePath, pruneBackups, restoreFile, saveBytes, type Backup, type FileBackup } from './agent-backup';
 import { inspectionCommands, permissionDecision, projectRules, removeProjectRule, saveProjectRule } from './agent-permissions';
 import { grantTrust, inspectTrust, revokeTrust } from './agent-trust';
 import { pausedAgents, setAgentPause } from './agent-recovery';
@@ -53,10 +53,11 @@ function watchFolder(folder: string) {
       try {
         const r = await fetch(`${c.url}/api/event${q(folder)}`, { headers: { authorization: c.auth }, signal: abort.signal });
         if (!r.ok || !r.body) throw new Error(`events answered ${r.status}`);
-        const reader = r.body.getReader(); let buf = '';
+        // One decoder for the whole stream: a character split across two chunks is joined, not turned into a replacement mark.
+        const reader = r.body.getReader(), decoder = new TextDecoder(); let buf = '';
         for (;;) {
           const { value, done } = await reader.read(); if (done) break;
-          buf += new TextDecoder().decode(value, { stream: true }); let i;
+          buf += decoder.decode(value, { stream: true }); let i;
           while ((i = buf.indexOf('\n\n')) >= 0) {
             const lines = buf.slice(0, i).split('\n').filter(l => l.startsWith('data:')); buf = buf.slice(i + 2);
             if (!lines.length) continue; opened();
@@ -89,8 +90,10 @@ export function noteFor(action: string, resources: string[]) {
   if (action === 'webfetch' || action === 'websearch') return 'This goes to the internet.';
   return '';
 }
-function publish(sid: string, event: unknown) {
-  const text = `data: ${JSON.stringify(event)}\n\n`;
+// Polygate's own events get an id like the engine's, so the page keeps each one apart.
+let published = 0;
+function publish(sid: string, event: any) {
+  const text = `data: ${JSON.stringify(event && typeof event === 'object' && !event.id ? { id: `pg_${++published}`, ...event } : event)}\n\n`;
   for (const res of listeners.get(sid) || []) { try { res.write(text); } catch { /* the page went away; its close handler removes it */ } }
 }
 function onEvent(e: any, folder: string) {
@@ -130,7 +133,7 @@ function onEvent(e: any, folder: string) {
     s.busy = false;
     s.pending.clear();
     if (s.mode === 'full') expireFull(s);
-    s.recording = recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`));
+    s.recording = recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`)).finally(prune);
   }
   publish(sid, e);
   // The engine retries a failing model request for a long time on its own; after a few tries the turn is stopped and the page told why,
@@ -160,6 +163,26 @@ type Turn = { message: string; at: number; files: FileChange[] };
 const enc = encodeURIComponent;
 const turnsFile = (sid: string) => path.join(enginePaths().root, 'turns', `${sid.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
 const pendingFile = (sid: string) => turnsFile(sid) + '.pending';
+// Every saved copy a turn record or a backup waiting for its turn refers to; null when one cannot be read, and then nothing is pruned.
+function referencedCopies(): Set<string> | null {
+  const dir = path.join(enginePaths().root, 'turns'), refs = new Set<string>();
+  let names: string[] = [];
+  try { names = readdirSync(dir); } catch (e: any) { if (e.code !== 'ENOENT') return null; }
+  for (const name of names.filter(n => n.endsWith('.json') || n.endsWith('.json.pending'))) {
+    try {
+      const v = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+      if (name.endsWith('.pending')) { for (const f of Object.values<any>(v?.files || {})) if (typeof f?.hash === 'string') refs.add(f.hash); }
+      else for (const t of Array.isArray(v) ? v : []) for (const f of t?.files || []) { if (typeof f?.before?.hash === 'string') refs.add(f.before.hash); if (typeof f?.after === 'string') refs.add(f.after); }
+    } catch { return null; }
+  }
+  return refs;
+}
+// Old backup copies are removed after a turn or an undo, at most every ten minutes.
+let prunedAt = 0;
+function prune() {
+  if (Date.now() - prunedAt < 600000) return; prunedAt = Date.now();
+  pruneBackups(referencedCopies()).catch(err => logEvent('warn', 'agent', `Old agent backups could not be removed: ${err?.message || err}`));
+}
 function loadTurns(s: Session): Turn[] { if (!s.turns) { try { const v = JSON.parse(readFileSync(turnsFile(s.id), 'utf8')); s.turns = Array.isArray(v) ? v : []; } catch { s.turns = []; } } return s.turns!; }
 function saveTurns(s: Session) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(s.turns || [])); }
 const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch { return null; } };
@@ -241,7 +264,7 @@ async function undoTurn(s: Session, message: string) {
       throw err;
     }
   } catch (err) { await engine('DELETE', `/api/session/${enc(s.id)}/revert`).catch(() => {}); throw err; }
-  s.turns = turns.slice(0, from); saveTurns(s);
+  s.turns = turns.slice(0, from); saveTurns(s); prune();
   publish(s.id, { type: 'agent.undone', data: { sessionID: s.id, message, files } });
   logEvent('info', 'agent', `Agent turn undone: ${files.length} file(s) restored${merged ? ', non-overlapping edits preserved' : ''}`);
   return { files, merged: merged > 0 };
@@ -341,12 +364,13 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     try {
     await s.recording;
     if (!s.busy) {
-      s.backup = captureBackup(s.folder);
+      s.backup = await captureBackup(s.folder);
       mkdirSync(path.dirname(pendingFile(s.id)), { recursive: true });
       writeFileAtomic(pendingFile(s.id), JSON.stringify(s.backup));
     }
     s.retries = 0; s.paused = undefined; setAgentPause(s.id);
-    return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text }) });
+    // limited: the folder is bigger than one backup covers, so the page says that some changes cannot be undone from Polygate.
+    return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text }), ...(s.backup?.limited ? { limited: true } : {}) });
     } finally { s.sending = false; }
   }
   if (pathname === '/admin/agent/session/approve' && method === 'POST') {

@@ -124,6 +124,10 @@ test('a prompt reaches the engine, and the UI stream carries this session\'s eve
   await until(() => ui.events.some(e => e.type === 'session.text.delta'));
   expect(ui.events.filter(e => e.type === 'session.text.delta').map(e => e.data.delta)).toEqual(['for you']);
   expect((await admin('/admin/agent/session?id=' + a)).body.messages.map((m: any) => m.text)).toEqual(['hello there']);
+  // A character the engine's stream splits across two chunks arrives whole.
+  await fake('/test/emit', { event: { type: 'session.text.delta', data: { sessionID: a, delta: 'سلام 👋' } }, split: true });
+  await until(() => ui.events.filter(e => e.type === 'session.text.delta').length === 2);
+  expect(ui.events.filter(e => e.type === 'session.text.delta').at(-1).data.delta).toBe('سلام 👋');
   ui.stop();
 });
 

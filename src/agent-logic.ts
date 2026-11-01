@@ -82,7 +82,8 @@ export function applyEvent(items: Item[], e: any): Item[] {
     case 'session.execution.started': return items.filter(x => x.key !== 'retry');
     case 'session.execution.failed': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `failed:${e.id || items.length}`, tone: 'bad', text: d.error?.message ? `This turn failed: ${d.error.message}` : 'This turn failed.' }];
     case 'session.execution.interrupted': return [...items.filter(x => x.key !== 'retry'), { kind: 'note', key: `stopped:${e.id || items.length}`, tone: 'info', text: 'Stopped.' }];
-    case 'session.agent.selected': return AGENT_MODES[d.agent] ? [...items, { kind: 'note', key: `mode:${e.id || items.length}`, tone: 'info', text: `Mode: ${modeLabel(AGENT_MODES[d.agent])}` }] : items;
+    // The engine's own word that the mode changed is not shown live: Polygate makes every mode change and says so (agent.mode), with its reason.
+    case 'session.agent.selected': return items;
     // Polygate's record of what a turn changed (at the end of the turn; again, merged, if the same message runs once more).
     case 'agent.changes': {
       const t = d.turn; if (!t?.message) return items;

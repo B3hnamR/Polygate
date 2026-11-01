@@ -19,8 +19,9 @@ const sessions = new Map<string, any>(); const prompts = new Map<string, string[
 const scripted = new Map<string, { diff?: any[]; stage?: any[]; revert?: { file: string; content: string | null }[]; commitFails?: boolean }>();
 const staged = new Map<string, { file: string; content: string | null }[]>();
 let saved = process.env.FAKE_OPENCODE_SAVED === '1' ? [{ id: 'psv_planted', projectID: 'p', action: 'shell', resource: 'node *' }] : [];
-const streams = new Set<{ directory: string; send: (text: string) => void }>();
-const broadcast = (event: any, directory: string) => { for (const s of streams) if (s.directory === directory) s.send(`data: ${JSON.stringify({ id: 'evt_' + ++next, created: Date.now(), location: { directory }, ...event })}\n\n`); };
+const streams = new Set<{ directory: string; send: (text: string, split?: boolean) => void }>();
+// split: the event goes out in two chunks cut inside its first multi-byte character, as a real stream can deliver it.
+const broadcast = (event: any, directory: string, split = false) => { for (const s of streams) if (s.directory === directory) s.send(`data: ${JSON.stringify({ id: 'evt_' + ++next, created: Date.now(), location: { directory }, ...event })}\n\n`, split); };
 const folderOf = (id: string) => sessions.get(id)?.location?.directory || '';
 Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
   if (!process.env.OPENCODE_PASSWORD || req.headers.get('authorization') !== expected) return new Response('unauthorized', { status: 401 });
@@ -45,7 +46,10 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
   if (p === '/api/event') {
     const directory = url.searchParams.get('directory') || ''; let entry: any;
     return new Response(new ReadableStream({ start(ctrl) {
-      entry = { directory, send: (text: string) => { try { ctrl.enqueue(new TextEncoder().encode(text)); } catch { streams.delete(entry); } } }; streams.add(entry);
+      entry = { directory, send: (text: string, split = false) => { try {
+        const bytes = new TextEncoder().encode(text), cut = split ? bytes.findIndex(b => b >= 0x80) + 1 : 0;
+        if (cut > 0) { ctrl.enqueue(bytes.slice(0, cut)); setTimeout(() => { try { ctrl.enqueue(bytes.slice(cut)); } catch { streams.delete(entry); } }, 30); } else ctrl.enqueue(bytes);
+      } catch { streams.delete(entry); } } }; streams.add(entry);
       entry.send(`data: ${JSON.stringify({ id: 'evt_0', type: 'server.connected', data: {} })}\n\n`);
     }, cancel() { streams.delete(entry); } }), { headers: { 'content-type': 'text/event-stream' } });
   }
@@ -79,7 +83,7 @@ Bun.serve({ hostname: '127.0.0.1', port, idleTimeout: 0, async fetch(req) {
     const reply = /^permission\/([^/]+)\/reply$/.exec(rest || '');
     if (reply) { broadcast({ type: 'permission.replied', data: { sessionID: id, requestID: reply[1], reply: body.decision } }, folderOf(id)); return new Response(null, { status: 204 }); }
   }
-  if (p === '/test/emit') { broadcast(body.event, body.directory || folderOf(body.event?.data?.sessionID)); return json({ ok: true }); }
+  if (p === '/test/emit') { broadcast(body.event, body.directory || folderOf(body.event?.data?.sessionID), body.split === true); return json({ ok: true }); }
   if (p === '/test/calls') return json(calls);
   if (p === '/test/session') { scripted.set(body.sessionID, { ...scripted.get(body.sessionID), ...body }); return json({ ok: true }); }
   return new Response('not found', { status: 404 });
