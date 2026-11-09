@@ -138,6 +138,8 @@ const DEFAULT_RECIPE = Object.freeze({
   client: "cli",
   sessionPrefix: "ses_",
   sessionCharset: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  // Body length (without the 4-char `ses_` prefix): 26 => 30 total, the exact
+  // length the gate accepts. Measured 2026-11-09.
   sessionLength: 26,
   sessionMultiplier: 0x1000,
   userAgentTemplate: "opencode/${app.channel}/${app.version}/${app.name}",
@@ -1406,7 +1408,8 @@ function extractRecipe(files = {}) {
     const length = identifier.match(/const\s+length\s*=\s*(\d+)/);
     if (length) {
       const n = parseInt(length[1], 10);
-      if (n >= 16 && n <= 64) out.sessionLength = n;
+      // Body 26 => 30-char id with the `ses_` prefix, the exact length accepted (measured 2026-11-09).
+      if (n === 26) out.sessionLength = n;
     }
 
     const multiplier = identifier.match(
@@ -1600,8 +1603,7 @@ function applyRecipe(update = {}, tag = null) {
 
   if (
     Number.isInteger(update.sessionLength) &&
-    update.sessionLength >= 16 &&
-    update.sessionLength <= 64 &&
+    update.sessionLength === 26 &&
     update.sessionLength !== next.sessionLength
   ) {
     next.sessionLength = update.sessionLength;
@@ -2152,9 +2154,14 @@ function nextRandomChars(chars, count) {
 function createId(descending = true, timestamp = Date.now()) {
   const {
     sessionCharset: chars,
-    sessionLength: length,
     sessionMultiplier: mult,
   } = recipe;
+  // `createId` returns the body only; `createSessionId` prepends the 4-char
+  // `ses_`. Measured 2026-11-09: the gate accepts a TOTAL of exactly 30 chars
+  // (4 prefix + 12 hex + 14 base62). Body 26 => total 30. Body 30 => total 34,
+  // which is refused with `429 FreeUsageLimitError`. The derived recipe value is
+  // therefore ignored here — a bad derivation was the whole failure.
+  const length = 26;
 
   if (timestamp !== lastTimestamp) {
     lastTimestamp = timestamp;

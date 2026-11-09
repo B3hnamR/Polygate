@@ -2171,6 +2171,7 @@ function handleRequest(req, res) {
         // consumed it, the generic error path below must reuse the text instead
         // of reading an empty stream and reporting "Upstream error <status>".
         let consumedErrorText = null;
+        let retried429 = false;
         if (!upstreamRes.ok && (upstreamRes.status === 404 || upstreamRes.status === 410)) {
           const staleUrl = upstreamUrl;
           let moveText = "";
@@ -2234,6 +2235,34 @@ function handleRequest(req, res) {
           upstreamRes = await upstreamFetch(upstreamUrl, {
             method: "POST",
             headers: retry5xxHeaders,
+            body: JSON.stringify(upstreamBody),
+            signal: abortController.signal,
+          });
+          consumedErrorText = null;
+        }
+
+        // Transient 429. Measured 2026-11-09 on a clean egress: 1 of 12
+        // otherwise-identical requests answered `429 FreeUsageLimitError` with a
+        // ~6-hour Retry-After, and the same request with a fresh session answered
+        // 200 about 400 ms later. The Retry-After on this status is therefore not
+        // a reliable "spent allowance" signal, so retry once before reporting it.
+        // A genuinely spent egress answers 429 again and falls through below.
+        if (!upstreamRes.ok && upstreamRes.status === 429 && !retried429) {
+          retried429 = true;
+          const first429LogId = upstreamLogIdOf(upstreamRes);
+          try {
+            await upstreamRes.text();
+          } catch {}
+          const retry429Sid = regenerateSessionId(req, body, sessionId);
+          const retry429Headers = buildUpstreamHeaders(req, retry429Sid);
+          console.warn(
+            `[opencode-free-bridge] Upstream returned 429` +
+              (first429LogId ? ` [x-opencode-log-id: ${first429LogId}]` : "") +
+              `; retrying once with a fresh session before treating it as a spent allowance`
+          );
+          upstreamRes = await upstreamFetch(upstreamUrl, {
+            method: "POST",
+            headers: retry429Headers,
             body: JSON.stringify(upstreamBody),
             signal: abortController.signal,
           });
