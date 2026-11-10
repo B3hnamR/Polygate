@@ -34,6 +34,13 @@ async function run(){
     const {publicSettings}=await import('./state');const out=publicSettings();
     console.log(JSON.stringify({...out,keys:out.keys.map(k=>({...k,value:'[redacted]'}))},null,2));return;
   }
+  // Installer-only reconciliation, before the service starts; never downgrade a live listener this way.
+  if(command==='https-disable-offline'){
+    if(!process.argv.includes('--service-stopped'))throw new Error('Stop the service before using https-disable-offline --service-stopped');
+    const {httpsConfig}=await import('./https');
+    settings.https={...httpsConfig(),mode:'off',lastError:''};persist();
+    console.log('Saved HTTP access mode; existing certificates are retained.');return;
+  }
   if(command==='request'){
     const raw=await Bun.stdin.text();let body:unknown;if(raw.trim())body=JSON.parse(raw);
     const r=await call(process.argv[3]||'/healthz',body);console.log(r.text);if(!r.ok)process.exitCode=1;return;

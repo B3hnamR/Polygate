@@ -24,7 +24,7 @@ test('a relay that stays used up is asked twice, then left alone, and says when 
   __setCanarySender(async () => { asked++; return usedUp(); });
   expect(await rerollRelay(r as any, 0)).toBe(false);
   expect(asked).toBe(2); expect(r.exhaustedUntil!).toBeGreaterThan(Date.now()); expect(r.recheckedAt!).toBeGreaterThan(0);
-  expect(describeRoutes()['rr-stuck'].detail).toContain('asked again');
+  expect(describeRoutes()['rr-stuck'].detail).toContain('checked');
   asked = 0; expect(await rerollRelay(r as any, 0)).toBe(false); expect(asked).toBe(0); // not again within the gap
 });
 

@@ -1,5 +1,5 @@
 import {useEffect,useRef,useState,type ReactNode} from 'react';
-import {Check,Cloud,Diamond,ExternalLink,Rocket,TriangleAlert,X} from 'lucide-react';
+import {Check,Cloud,Diamond,ExternalLink,CloudUpload,TriangleAlert,X} from 'lucide-react';
 import {api} from './api';
 import {Button,Field,Select} from './ui';
 // One-click relay deployment. The platform's API token goes to the local gateway for this one call; the gateway deploys the bundled relay,
@@ -96,7 +96,7 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
         <p className="subtle">It was added under Relays as a route with its generated access token. Select it on Routing to use it, or on a provider to send that provider through it.</p>
         {spec.verdict.text&&<div className={`dialog-note ${spec.verdict.tone}`}>{spec.verdict.tone==='good'?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{spec.verdict.text}</p></div>}
         {spec.id==='vercel'&&<div className="more-regions">{planNote}<strong>Another region?</strong><p className="subtle">Each region sends from its own pool of addresses, and a relay that is used up in one region can hand over to the next. Deploy them one at a time: each is a separate Vercel project and counts toward your Vercel plan's limits, so nothing is deployed until you press the button.</p>
-          {free.length?<div className="more-row"><Select value={next||free[0][0]} onChange={setNext}>{free.map(([v,l])=><option key={v} value={v}>{l}</option>)}</Select><Button disabled={busy} onClick={()=>void deploy(next||free[0][0],form.name.trim()?`${form.name.trim()}-${next||free[0][0]}`:'')}><Rocket size={14}/>{busy?'Deploying…':`Deploy ${next||free[0][0]}`}</Button></div>:<p className="subtle">Every listed region already has a relay.</p>}
+          {free.length?<div className="more-row"><Select value={next||free[0][0]} onChange={setNext}>{free.map(([v,l])=><option key={v} value={v}>{l}</option>)}</Select><Button disabled={busy} onClick={()=>void deploy(next||free[0][0],form.name.trim()?`${form.name.trim()}-${next||free[0][0]}`:'')}><CloudUpload size={14}/>{busy?'Deploying…':`Deploy ${next||free[0][0]}`}</Button></div>:<p className="subtle">Every listed region already has a relay.</p>}
           {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}</div>}
         <div className="dialog-actions"><Button variant="primary" disabled={busy} onClick={onClose}>Done</Button></div>
       </div>:<form className="dialog-body" onSubmit={e=>{e.preventDefault();if(!ready||busy)return;if(spec.id!=='vercel')void deploy();else if(chosen.length>1)void deployMany();else void deploy(chosen[0]);}} autoComplete="off">
@@ -115,7 +115,7 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
           <small>Each region sends from its own pool of addresses. Tick one to deploy it, or several to deploy them one after another. Every region is a separate Vercel project and counts toward your plan’s limits{chosen.length>1?`, so ${chosen.length} projects will be created`:''}.</small></div>}
         {spec.id==='vercel'&&<Field label="Runtime" hint="Bun is the default and stays accepted if OpenCode's check changes. Node sends Bun's TLS cipher list itself and works the same today; use it if Vercel's Bun runtime gives you trouble."><Select value={form.runtime} onChange={v=>setForm({...form,runtime:v})}><option value="bun">Bun (recommended)</option><option value="node">Node</option></Select></Field>}
         {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-        <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!ready||busy}><Rocket size={14}/>{busy?'Deploying…':chosen.length>1?`Deploy ${chosen.length} relays`:'Deploy'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
+        <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!ready||busy}><CloudUpload size={14}/>{busy?'Deploying…':chosen.length>1?`Deploy ${chosen.length} relays`:'Deploy'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
       </form>}
     </div>
   </div>;

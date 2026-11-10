@@ -5,9 +5,9 @@ import { randomBytes } from 'node:crypto';
 import { settings, models, stateDir, equal, redactError, saveModel } from './state';
 import { admin } from './admin';
 import { GatewayError } from './queue';
-import { inference, clientKey, readJson, json, probeModel, queue, readiness } from './gateway';
+import { inference, clientKey, readJson, json, readiness } from './gateway';
+import { startAutoChecks } from './model-checks';
 import { initBridge, discover, stopBridge } from './providers';
-import { KILO_ID } from './kilo';
 import { serve } from './serve';
 import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPassword, verifyPassword, createSession, sessionValid, sessionCookie, readSession, changePassword, resetPassword, signOutEverywhere, passwordManagedByEnv, rememberAdminToken } from './auth';
 import { startWarp, stopWarp } from './warp';
@@ -141,15 +141,13 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
   if(!desktop)startHttps(rebind,{port:secure.tls?port:actual,host}).catch(e=>console.error('[https]',redactError(String(e))));
   const stopNotifier=startNotifier();
   const stopRecheck=startExitRecheck();
-  // Models whose probe never reached a verdict (full queue, no route) keep an old checkedAt, so attempts are tracked separately.
-  let last=Date.now();let probing=false;const attempted=new Map<string,number>();const timer=setInterval(()=>{
+  const stopAutoChecks=startAutoChecks();let last=Date.now();const timer=setInterval(()=>{
     if(Date.now()-last>=settings.refreshMinutes*60000){last=Date.now();discover().catch(()=>{});}
-    if(settings.autoProbe&&settings.enabled&&!probing&&queue.active===0){const due=Date.now()-settings.refreshMinutes*60000;const candidate=[...models.values()].find(m=>m.state!=='unavailable'&&m.providerId!==KILO_ID&&m.cooldownUntil<=Date.now()&&Math.max(m.checkedAt,attempted.get(m.id)||0)<due&&settings.providers.some(p=>p.id===m.providerId&&p.enabled));if(candidate){probing=true;attempted.set(candidate.id,Date.now());probeModel(candidate.id).catch(()=>{}).finally(()=>{probing=false;});}}
   },60000);timer.unref();
   if(password.generated)console.log(JSON.stringify({polygateDashboardPassword:{file:password.file}}));
   logEvent('info','gateway',`Polygate ${version} started on ${secure.tls?'https':'http'}://${firstHost.includes(':')?`[${firstHost}]`:firstHost}:${actual}`,{version,runtime:Bun.version,platform:process.platform,mode:desktop?'desktop':'server',state:stateDir});
   console.log(JSON.stringify({polygateReady:true,port:actual,host,https:!!secure.tls}));
-  return {get server(){return server;},get port(){return actual;},token,close:async()=>{clearInterval(timer);stopNotifier();stopRecheck();stopPool();await close();}};
+  return {get server(){return server;},get port(){return actual;},token,close:async()=>{clearInterval(timer);stopAutoChecks();stopNotifier();stopRecheck();stopPool();await close();}};
 }
 if(import.meta.main){
   // A forgotten promise (a cancelled body, a background check) must not end a gateway that is serving other requests: log it instead.

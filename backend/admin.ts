@@ -1,15 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { settings, publicSettings, persist, models, logs, stats, saveModel, removeModels, requestDetail, recentFailureDetails, recentBaselineDetails } from './state';
-import { json, readJson, queue, probeModel, readiness } from './gateway';
+import { json, readJson, queue, probeResult, probeSummary, readiness } from './gateway';
+import { AUTO_CHECK_CHOICES, checkRuns, startCheck, stopCheck } from './model-checks';
 import { discover, identityState, syncIdentity, rankedModels, presentedOpenCodeVersion } from './providers';
 import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
 import { PROXY_SOURCES } from './proxy-sources';
-import { testRoute, describeRoutes, backupChain, providerRoutes } from './transport';
+import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
+import { ZAI_BASE, ZAI_ID, exportAccount, importAccount, publicAccounts, refreshQuota, removeAccount, updateAccount, zaiAccounts } from './zai';
 import { deployRelay, inspectVercel, removeFromPlatform } from './relay-deploy';
 import { relayReport } from './metrics';
 import { metrics, usage } from './metrics';
@@ -82,17 +84,24 @@ function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
   if (raw === null || (Array.isArray(raw.ids) && !raw.ids.length)) return undefined;
   if (typeof raw !== 'object' || !Array.isArray(raw.ids)) throw new GatewayError('Choose the routes as a list of route ids', 400);
   const ids = [...new Set<string>(raw.ids.map(String))]; if (ids.length > 50) throw new GatewayError('At most 50 routes', 400);
+  if (b.kind === 'zai') {
+    if (ids.length > 1) throw new GatewayError('Z.ai uses one route at a time.', 400);
+    const route = settings.routes.find(r => r.id === ids[0]);
+    if (route && !steadyExit(route)) throw new GatewayError('Z.ai keeps one steady address, so it can use Direct or a proxy of your own, not a relay, the proxy pool or WARP.', 400);
+    if (ids[0] === 'direct') return undefined;
+  }
   for (const id of ids) {
     const route = settings.routes.find(r => r.id === id);
     if (!route) throw new GatewayError('Provider route does not exist', 400);
     if (route.only && route.only !== b.kind && !(route.only === 'kilo' && b.kind === 'openai')) throw new GatewayError('This relay cannot carry that provider: OpenCode refuses a Cloudflare Worker. Choose a Vercel or Netlify relay, Direct, a proxy or WARP.', 400);
   }
-  return { ids, spread: raw.spread === true, backups: b.kind === 'free' && raw.backups === true };
+  const paused = Array.isArray(raw.paused) ? [...new Set<string>(raw.paused.map(String))].filter(id => ids.includes(id)) : [];
+  return { ids, spread: raw.spread === true, backups: b.kind === 'free' && raw.backups === true, ...(paused.length ? { paused } : {}) };
 }
 // Providers for which this route is the last enabled one in their list: switching it off or deleting it would leave them nowhere to go.
 const soleRouteOf = (routeId: string) => settings.providers.filter(p => { const set = providerRoutes(p); return !!set && set.ids.includes(routeId) && !set.ids.some(id => id !== routeId && settings.routes.some(r => r.id === id && r.enabled)); });
 // The text before the slash in every model of a provider ("test1/gpt-4"). The user picks it; without one it comes from the provider's name.
-const PREFIX_RESERVED = new Set(['opencode', 'kilo', 'free', 'auto', 'chain']);
+const PREFIX_RESERVED = new Set(['opencode', 'kilo', 'zai', 'free', 'auto', 'chain']);
 function providerPrefix(b: any): string {
   const typed = String(b.idPrefix ?? '').trim().toLowerCase();
   if (typed) {
@@ -108,7 +117,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   const method=req.method;
   if(pathname==='/admin/updates'&&method==='GET')return json(res,200,await checkForUpdates());
   if(pathname==='/admin/updates/check'&&method==='POST'){await readJson(req);return json(res,200,await checkForUpdates(true));}
-  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain()});
+  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain(),checks:checkRuns()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
   if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
@@ -129,7 +138,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/settings'&&method==='POST'){
     const b=await readJson(req);const next:Partial<Settings>={};
     for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','trimTools','exhaustedFailover','relayRecheck','catalogDirect','spreadDirect','agentBackups'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
-    for(const [key,lo,hi] of [['maxConcurrent',1,64],['maxQueue',0,512],['timeoutMs',1000,600000],['retries',0,2],['refreshMinutes',5,1440],['warpProxyPort',1024,65535],['queueWaitMs',0,120000],['relayRotations',0,10]] as const)if(key in b)(next as any)[key]=bounded(b[key],lo,hi);
+    for(const [key,lo,hi] of [['maxConcurrent',0,64],['maxQueue',0,512],['timeoutMs',1000,600000],['retries',0,2],['refreshMinutes',5,1440],['warpProxyPort',1024,65535],['queueWaitMs',0,120000],['relayRotations',0,10]] as const)if(key in b)(next as any)[key]=bounded(b[key],lo,hi);
     if(b.strategy){if(!['single','round_robin','random','fastest'].includes(b.strategy))throw new GatewayError('Unknown selection strategy',400);next.strategy=b.strategy;}
     if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
       // Remember where requests went, so making the pool "standby only" can give the route back.
@@ -175,20 +184,34 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   }
   if(pathname==='/admin/discover'&&method==='POST'){await discover();return json(res,200,{ok:true,count:models.size});}
   if(pathname==='/admin/identity/refresh'&&method==='POST')return json(res,200,await syncIdentity());
-  if(pathname==='/admin/probe'&&method==='POST'){const b=await readJson(req);return json(res,200,await probeModel(String(b.id)));}
+  if(pathname==='/admin/probe/provider'&&method==='POST'){const b=await readJson(req);if(b.stop){stopCheck(String(b.id));return json(res,200,{ok:true});}return json(res,200,startCheck(String(b.id)));}
+  if(pathname==='/admin/probe'&&method==='POST'){const b=await readJson(req);const r=await probeResult(String(b.id));return json(res,200,{...r.model,summary:probeSummary(r.model,r.status)});}
   if(pathname==='/admin/model'&&method==='POST'){const b=await readJson(req);const m=models.get(b.id);if(!m)throw new GatewayError('Model not found',404);const priority=b.priority!==undefined?bounded(b.priority,0,1000):m.priority;const score=b.score!==undefined?bounded(b.score,0,100):m.score;m.priority=priority;m.score=score;saveModel(m);return json(res,200,{ok:true});}
   if(pathname==='/admin/providers'&&method==='POST'){
     const b=await readJson(req);const old=settings.providers.find(p=>p.id===b.id);
-    if(!['free','openai','opencode','kilo'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
+    if(!['free','openai','opencode','kilo','zai'].includes(b.kind))throw new GatewayError('Unknown provider type',400);
+    if(b.kind==='zai'&&!old)throw new GatewayError('Z.ai (ZCode) is built in: switch it on and import accounts there',400);
     if(old&&b.kind!==old.kind)throw new GatewayError("A provider's type cannot be changed. Add a new provider instead.",400);
     const routes=chosenRoutes(b,old);
+    if(b.autoCheckMinutes!==undefined&&!AUTO_CHECK_CHOICES.includes(Number(b.autoCheckMinutes)))throw new GatewayError('Choose how often to check from the list',400);
     if(b.kind==='kilo'&&!old&&settings.providers.some(x=>x.kind==='kilo'))throw new GatewayError('Only one Kilo provider is supported',400);
-    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:routes?.ids[0]||'',...(routes?{routes}:{})};
+    const p:Provider={id:old?.id||(b.kind==='kilo'?KILO_ID:b.kind==='zai'?ZAI_ID:providerPrefix(b)),name:String(b.name||(b.kind==='kilo'?'Kilo Free':'New provider')).slice(0,80),kind:b.kind,enabled:b.enabled!==false,baseUrl:b.kind==='free'?'':b.kind==='zai'?ZAI_BASE:b.kind==='kilo'&&!b.baseUrl?KILO_BASE:url(b.baseUrl),apiKey:b.apiKey===mask?(old?.apiKey||''):String(b.apiKey||''),models:Array.isArray(b.models)?b.models.filter((x:any)=>typeof x==='string'&&x.length<200).slice(0,500):[],routeId:routes?.ids[0]||'',...(routes?{routes}:{}),...(b.autoCheckMinutes!==undefined?{autoCheckMinutes:Number(b.autoCheckMinutes)}:{})};
     if(p.kind==='free'&&settings.providers.some(x=>x.kind==='free'&&x.id!==p.id))throw new GatewayError('Only one adaptive Free provider is supported',400);
     if(old&&b.apiKey===mask&&old.apiKey&&p.baseUrl&&old.baseUrl&&!sameServer(p.baseUrl,old.baseUrl))throw new GatewayError('You changed the server address. Enter the API key again so the saved key is not sent to the new server.',400);
     if(old){if(!routes)delete old.routes;Object.assign(old,p);}else settings.providers.push(p);persist();return json(res,200,{ok:true,id:p.id});
   }
-  if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode'||b.id===KILO_ID)throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
+  if(pathname==='/admin/providers/delete'&&method==='POST'){const b=await readJson(req);if(b.id==='opencode'||b.id===KILO_ID||b.id===ZAI_ID)throw new GatewayError('Disable the built-in provider instead of deleting it',400);settings.providers=settings.providers.filter(p=>p.id!==b.id);removeModels(String(b.id));persist();return json(res,200,{ok:true});}
+  // Z.ai (ZCode) accounts: listed without their tokens; a token leaves only through an explicit copy for sharing.
+  if(pathname.startsWith('/admin/zai')){
+    const run=async<T>(f:()=>T|Promise<T>)=>{try{return await f();}catch(e:any){if(e instanceof GatewayError)throw e;throw new GatewayError(e.message||String(e),e.status||400,'zai_account');}};
+    const known=(id:unknown)=>{if(!zaiAccounts().some(a=>a.id===id))throw new GatewayError('That Z.ai account is not in the list',404);return String(id);};
+    if(pathname==='/admin/zai'&&method==='GET')return json(res,200,publicAccounts());
+    if(pathname==='/admin/zai/import'&&method==='POST'){const b=await readJson(req);const r=await run(()=>importAccount(b.text));return json(res,200,{...r,...publicAccounts()});}
+    if(pathname==='/admin/zai/account'&&method==='POST'){const b=await readJson(req);await run(()=>updateAccount(known(b.id),b));return json(res,200,publicAccounts());}
+    if(pathname==='/admin/zai/refresh'&&method==='POST'){const b=await readJson(req);const a=zaiAccounts().find(x=>x.id===known(b.id))!;await run(()=>refreshQuota(a));return json(res,200,publicAccounts());}
+    if(pathname==='/admin/zai/remove'&&method==='POST'){const b=await readJson(req);removeAccount(known(b.id));return json(res,200,publicAccounts());}
+    if(pathname==='/admin/zai/export'&&method==='POST'){const b=await readJson(req);res.setHeader('cache-control','no-store, private');return json(res,200,exportAccount(known(b.id)));}
+  }
   if(pathname==='/admin/routes'&&method==='POST'){
     const b=await readJson(req);if(!['proxy','relay','warp'].includes(b.kind))throw new GatewayError('Choose proxy, relay, or WARP',400);
     const old=settings.routes.find(r=>r.id===b.id);if(old&&(old.id==='direct'||old.id==='proxy-pool'||old.managed))throw new GatewayError('This route is managed by Polygate and cannot be edited',409);
@@ -362,8 +385,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   // freeIdentity says whether the agent can use OpenCode Free now (the bridge presents the engine's OpenCode version).
   if(pathname==='/admin/agent/engine'&&method==='GET'){const presented=presentedOpenCodeVersion();return json(res,200,{...agentEngine.engineStatus(),backups:settings.agentBackups===true,freeIdentity:{presented,engine:agentEngine.ENGINE_VERSION,usable:!agentEngine.freeIdentityProblem(presented)}});}
   if(pathname==='/admin/agent/engine/install'&&method==='POST'){await readJson(req);agentEngine.installEngine().catch(()=>{/* the status carries the reason */});return json(res,202,agentEngine.engineStatus());}
-  if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);return json(res,200,await agentEngine.startEngine());}
-  if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}
+  if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);if(agentEngine.freeIdentityProblem(presentedOpenCodeVersion()))await syncIdentity();return json(res,200,await agentEngine.startEngine());}
+  if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);const {stopAllTerminals}=await import('./agent-terminal');stopAllTerminals();await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}
   // Sessions, messages, approvals and the event stream of the Agent page (agent.ts).
   if(pathname.startsWith('/admin/agent/'))return await agentApi(req,res,pathname,readJson,json);
   // --- HTTPS ---
@@ -375,4 +398,3 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/https/disable'&&method==='POST')return json(res,200,await httpsDisable());
   throw new GatewayError('Admin endpoint not found',404);
 }
-

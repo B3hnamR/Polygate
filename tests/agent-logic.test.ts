@@ -1,6 +1,13 @@
 import { test, expect } from 'bun:test';
-import { fromHistory, applyEvent, approvalTitle, toolSubject, withChanges, undoBlocked, blocks, stepsSummary, latestTodos, modelProviders, matchModels, folderName, type Item } from '../src/agent-logic';
-// The Agent page's transcript, from a session's history and its live events (shapes as OpenCode 2.0.32 sends them).
+
+test('attachments survive live inbox events and reopening message history', () => {
+  const files = [{ name: 'screen.png', mime: 'image/png', data: 'iVBORw0KGgo=', source: { type: 'inline' as const } }];
+  const item = { kind: 'user' as const, key: 'message', text: '', files };
+  expect(fromHistory([{ id: 'message', type: 'user', text: '', files }])).toEqual([item]);
+  expect(applyEvent([], { type: 'session.inbox.enqueued', data: { inboxID: 'message', item: { type: 'user', payload: { text: '', files } } } })).toEqual([item]);
+});
+import { fromHistory, fromInbox, applyEvent, approvalTitle, toolSubject, withChanges, undoBlocked, blocks, stepsSummary, latestTodos, modelProviders, matchModels, folderName, type Item } from '../src/agent-logic';
+// The Agent page's transcript, from a session's history and its live events (OpenCode 2.x shapes).
 
 test('history becomes the transcript: messages, reasoning, tools with their result, and stops', () => {
   const items = fromHistory([
@@ -45,11 +52,11 @@ test('retries keep one note that a new turn clears; stops, failures, auto-approv
   items = applyEvent(items, { type: 'agent.approval.auto', data: { requestID: 'per_1', resources: ['npm test'] } });
   items = applyEvent(items, { id: 'e1', type: 'session.execution.failed', data: { error: { message: 'boom' } } });
   items = applyEvent(items, { id: 'e2', type: 'session.execution.interrupted', data: {} });
-  // A mode change is noted once: Polygate's agent.mode, not also the engine's session.agent.selected that follows it.
+  // Entering Full access stays quiet; changes away from it are still noted.
   items = applyEvent(items, { id: 'pg_1', type: 'agent.mode', data: { mode: 'full', fullUntil: 1 } });
   expect(applyEvent(items, { id: 'e3', type: 'session.agent.selected', data: { agent: 'polygate-full' } })).toBe(items);
   items = applyEvent(items, { id: 'pg_2', type: 'agent.mode', data: { mode: 'ask', reason: 'Full access ended. Ask for approval is active.' } });
-  expect(items.map(i => (i as any).text)).toEqual(['Allowed for this session: npm test', 'This turn failed: boom', 'Stopped.', 'Mode: Full access', 'Full access ended. Ask for approval is active.']);
+  expect(items.map(i => (i as any).text)).toEqual(['Allowed for this session: npm test', 'This turn failed: boom', 'Stopped.', 'Full access ended. Ask for approval is active.']);
   expect(new Set(items.map(i => i.key)).size).toBe(items.length);
   expect(applyEvent(items, { type: 'server.heartbeat', data: {} })).toBe(items);
 });
@@ -84,8 +91,8 @@ test('the transcript distinguishes saved rules, blocks, and Full access from ses
   let items = applyEvent([], { type: 'agent.approval.auto', data: { requestID: 'r', reason: 'Permission rule', resources: ['npm test'] } });
   items = applyEvent(items, { type: 'agent.approval.blocked', data: { requestID: 'b', resources: ['pwsh -enc x'] } });
   items = applyEvent(items, { type: 'agent.mode', data: { mode: 'full' } });
-  expect(items.map(i => (i as any).text)).toEqual(['Permission rule: npm test', 'Blocked by permission rules: pwsh -enc x', 'Mode: Full access']);
-  expect(items[2]).toMatchObject({ tone: 'warn' });
+  expect(items.map(i => (i as any).text)).toEqual(['Permission rule: npm test', 'Blocked by permission rules: pwsh -enc x']);
+  expect(fromHistory([{ id: 'full', type: 'agent-switched', agent: 'polygate-full' }])).toEqual([]);
 });
 
 test('a turn can be undone only when it and every later turn have a backup, and the card says why not', () => {
@@ -141,6 +148,28 @@ test('a provider error that arrives as raw JSON is shown as its sentence, in the
   expect(note.text).toBe('The model request failed: Slow down (429). Trying again (attempt 2).');
 });
 
+test('history parts and live final events use matching keys across reconnect snapshots',()=>{
+ let items=fromHistory([{id:'assistant_fixture',type:'assistant',content:[{type:'text',text:'Partial'},{type:'reasoning',text:'Thinking'}]}]);
+ items=applyEvent(items,{type:'session.text.ended',data:{assistantMessageID:'assistant_fixture',ordinal:0,text:'Complete answer'}});
+ items=applyEvent(items,{type:'session.reasoning.ended',data:{assistantMessageID:'assistant_fixture',ordinal:0,text:'Finished thought'}});
+ expect(items).toHaveLength(2);expect(items[0]).toMatchObject({kind:'text',text:'Complete answer'});expect(items[1]).toMatchObject({kind:'reasoning',text:'Finished thought'});
+});
+
+test('the plan restores explicit checklists and ignores quoted/code examples',()=>{
+  const text='Plan:\n- [x] Inspect files\n- [/] Implement\n- [ ] Verify\n- [-] Cancelled\n\n```md\n- [x] Example only\n```\n> - [x] Quoted example';
+  expect(latestTodos(fromHistory([{id:'a',type:'assistant',content:[{type:'text',text}]}]))).toEqual([{content:'Inspect files',status:'completed'},{content:'Implement',status:'in_progress'},{content:'Verify',status:'pending'},{content:'Cancelled',status:'cancelled'}]);
+  expect(latestTodos([{kind:'text',key:'a',text},{kind:'text',key:'b',text:'- [x] Finish'}])).toEqual([{content:'Finish',status:'completed'}]);
+  expect(latestTodos([{kind:'text',key:'a',text:'- Ordinary list\n- Another item'}])).toEqual([]);
+});
+test('nested task updates restore from Code Mode metadata; failed direct updates do not replace them',()=>{
+  const todos=[{content:'Nested task',status:'completed' as const}];const metadata={toolCalls:[{tool:'tools.todowrite',status:'completed',input:{todos}}]};
+  let items=applyEvent([],{type:'session.tool.input.started',data:{id:'exec',name:'execute'}});
+  items=applyEvent(items,{type:'session.tool.progress',data:{id:'exec',metadata}});expect(latestTodos(items)).toEqual(todos);
+  expect(latestTodos(fromHistory([{id:'a',type:'assistant',content:[{type:'tool',id:'exec',name:'execute',state:{status:'completed',metadata}}]}]))).toEqual(todos);
+  items.push({kind:'tool',key:'bad',name:'todowrite',status:'failed',input:{todos:[{content:'Rejected',status:'pending'}]}});expect(latestTodos(items)).toEqual(todos);
+  items.push({kind:'tool',key:'clear',name:'todowrite',status:'done',input:{todos:[]}});expect(latestTodos(items)).toEqual([]);
+});
+
 test('the model search is forgiving: separators, provider names and prefixes, word starts and short abbreviations, best first', () => {
   const ms = ['ag/claude-opus-5-5', 'ag/claude-opus-5-5-high', 'ag/claude-sonnet-5-5-high', 'ag/claude-sonnet-5-5-low', 'cx/gpt-6.1-sol', 'cx/gpt-6.1-terra', 'oc/qwen3.6-plus-free']
     .map(id => ({ id: '9rhit2/' + id, name: id, provider: '9RHit2', usable: true }));
@@ -156,4 +185,34 @@ test('the model search is forgiving: separators, provider names and prefixes, wo
   expect(names('kilo qwen')).toEqual(['Qwen3 Coder']);
   expect(names('qwen')).toEqual(['oc/qwen3.6-plus-free', 'Qwen3 Coder']); // usable first
   expect(names('xyzzy')).toEqual([]);
+});
+
+test('question forms: shown fields follow earlier answers, required ones gate sending, and "(Recommended)" becomes a badge', async () => {
+  const { formActive, formAnswer, formReady, splitRecommended } = await import('../src/agent-logic');
+  const fields = [{ key: 'q0', type: 'string', options: [{ value: 'Terminal', label: 'Terminal (Recommended)' }], custom: true, required: true },
+    { key: 'q1', type: 'multiselect', options: [{ value: 'a', label: 'A' }], when: [{ key: 'q0', op: 'eq', value: 'Web' }] },
+    { key: 'q2', type: 'external', required: true }, { key: 'q3', type: 'string' }];
+  expect(formReady(fields, {})).toBe(false);
+  expect(formReady(fields, { q0: 'My own answer' })).toBe(true);
+  expect(formActive(fields[1], { q0: 'Terminal' })).toBe(false); expect(formActive(fields[1], { q0: 'Web' })).toBe(true);
+  // Hidden, external and empty answers are not sent.
+  expect(formAnswer(fields, { q0: 'Terminal', q1: ['a'], q2: 'x', q3: '' })).toEqual({ q0: 'Terminal' });
+  expect(formAnswer(fields, { q0: 'Web', q1: ['a', 'typed'] })).toEqual({ q0: 'Web', q1: ['a', 'typed'] });
+  expect(splitRecommended('Terminal dashboard (Recommended)')).toEqual({ label: 'Terminal dashboard', recommended: true });
+  expect(splitRecommended('Local files only')).toEqual({ label: 'Local files only', recommended: false });
+});
+test('a queued message waits outside the conversation until the agent takes it in, steers, or is taken back', () => {
+  const q = (id: string, text: string, delivery = 'queue') => ({ type: 'session.inbox.enqueued', data: { inboxID: id, item: { type: 'user', delivery, payload: { text } } } });
+  let items: Item[] = [{ kind: 'user', key: 'u0', text: 'start' }];
+  for (const e of [q('q1', 'then the changelog'), q('s1', 'use tabs', 'steer'), q('q2', 'and the README'), q('q3', 'never mind')]) items = applyEvent(items, e);
+  expect(items.map(i => [i.kind, i.key])).toEqual([['user', 'u0'], ['queued', 'q1'], ['user', 's1'], ['queued', 'q2'], ['queued', 'q3']]);
+  items = applyEvent(items, { type: 'session.inbox.cancelled', data: { inboxID: 'q3' } });
+  items = applyEvent(items, { type: 'session.inbox.delivery.changed', data: { inboxID: 'q2', delivery: 'steer' } });
+  items = applyEvent(items, { type: 'session.inbox.delivered', data: { inboxID: 'q1' } });
+  expect(items.map(i => [i.kind, i.key])).toEqual([['user', 'u0'], ['user', 's1'], ['user', 'q2'], ['user', 'q1']]);
+  // Delivered again, or unknown: nothing changes.
+  expect(applyEvent(items, { type: 'session.inbox.delivered', data: { inboxID: 'q1' } })).toBe(items);
+  // Reopened: the engine's inbox list gives back what still waits; only user messages.
+  expect(fromInbox([{ id: 'q9', type: 'user', delivery: 'queue', payload: { text: 'later' } }, { id: 'c1', type: 'compaction', delivery: 'queue', payload: {} }, { id: 's9', type: 'user', delivery: 'steer', payload: { text: 'now' } }]))
+    .toEqual([{ kind: 'queued', key: 'q9', text: 'later' }, { kind: 'user', key: 's9', text: 'now' }]);
 });

@@ -24,21 +24,38 @@ const configPath = path.join(stateDir, 'settings.vault');
 export const KILO_ID = 'kilo';
 export const KILO_BASE = 'https://api.kilo.ai/api/gateway';
 const kiloProvider = (): Provider => ({ id: KILO_ID, name: 'Kilo Free', kind: 'kilo', enabled: true, baseUrl: KILO_BASE, apiKey: '', models: [], routeId: '' });
-// Settings saved before a built-in provider existed get it added (enabled, behind OpenCode in auto) without touching anything else.
-export const withBuiltIns = (s: Settings): Settings => s.providers.some(p => p.id === KILO_ID) ? s : { ...s, providers: [...s.providers, kiloProvider()] };
+// Z.ai's coding plan (backend/zai.ts): built in, but off until an account is imported and it is switched on.
+export const ZAI_ID = 'zai';
+export const ZAI_BASE = 'https://zcode.z.ai/api/v1';
+const zaiProvider = (): Provider => ({ id: ZAI_ID, name: 'Z.ai (ZCode)', kind: 'zai', enabled: false, baseUrl: ZAI_BASE, apiKey: '', models: [], routeId: '' });
+// Settings saved before a built-in provider existed get it added (Kilo enabled, behind OpenCode in auto; Z.ai off) without touching anything else.
+// The built-ins always come first, in this order (OpenCode, Kilo, Z.ai), then the providers the user added, in the order they were added.
+const BUILT_IN_ORDER: Record<string, number> = { free: 0, kilo: 1, zai: 2 };
+const builtInRank = (p: Provider) => BUILT_IN_ORDER[p.kind] ?? 3;
+export const withBuiltIns = (s: Settings): Settings => {
+  const missing = [...(s.providers.some(p => p.id === KILO_ID) ? [] : [kiloProvider()]), ...(s.providers.some(p => p.id === ZAI_ID) ? [] : [zaiProvider()])];
+  const providers = [...s.providers, ...missing].map((p, i) => ({ p, i })).sort((a, b) => builtInRank(a.p) - builtInRank(b.p) || a.i - b.i).map(x => x.p);
+  return missing.length || providers.some((p, i) => p !== s.providers[i]) ? { ...s, providers } : s;
+};
 export const initialSettings = (): Settings => ({
-  enabled: true, maxConcurrent: 4, maxQueue: 32, timeoutMs: 120000, retries: 1, fallback: true,
+  enabled: true, maxConcurrent: 0, noLimitDefaults: true, maxQueue: 32, timeoutMs: 120000, retries: 1, fallback: true,
   strategy: 'single', rotate: false, routeId: 'direct', refreshMinutes: 60, autoProbe: false, warpProxyPort: 40000,
-  providers: [{ id: 'opencode', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '' }, kiloProvider()],
+  providers: [{ id: 'opencode', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '' }, kiloProvider(), zaiProvider()],
   routes: [{ id: 'direct', name: 'Direct connection', kind: 'direct', url: '', enabled: true, models: [] }],
-  keys: [{ id: crypto.randomUUID(), name: 'Local client', value: 'pg_' + randomBytes(24).toString('hex'), enabled: true, limit: 4 }]
+  keys: [{ id: crypto.randomUUID(), name: 'Local client', value: 'pg_' + randomBytes(24).toString('hex'), enabled: true, limit: 0 }]
 });
+// Concurrency is unlimited by default (0 = no limit). Settings saved while the default was 4 still hold that 4, for the gateway and for each
+// key: those are moved to no limit once. Any other number was chosen by hand and is kept, and so is a 4 set after this change.
+export function noLimitDefaults(s: any) {
+  if (!s || s.noLimitDefaults) return s;
+  return { ...s, noLimitDefaults: true, ...(s.maxConcurrent === 4 ? { maxConcurrent: 0 } : {}), ...(Array.isArray(s.keys) ? { keys: s.keys.map((k: any) => k?.limit === 4 ? { ...k, limit: 0 } : k) } : {}) };
+}
 function load(): Settings {
   if (!existsSync(configPath)) return initialSettings();
   try {
     const raw = readFileSync(configPath); const iv = raw.subarray(0, 12); const tag = raw.subarray(12, 28);
     const d = createDecipheriv('aes-256-gcm', master, iv); d.setAuthTag(tag);
-    return withBuiltIns({ ...initialSettings(), ...JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString()) });
+    return withBuiltIns({ ...initialSettings(), ...noLimitDefaults(JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString())) });
   } catch (e: any) {
     // The vault key and the vault no longer belong together (one was replaced or deleted) or the file is damaged. Starting with a clear message and a
     // copy kept aside is better than failing on every launch with a raw crypto error.
@@ -88,7 +105,11 @@ export function tallyRoute(routeId: string, outcome: 'ok' | 'refused' | 'used_up
 }
 export const models = new Map<string, Model>();
 for (const row of db.query('SELECT data FROM models').all() as {data: string}[]) { try { const m = JSON.parse(row.data); models.set(m.id, m); } catch { /* a damaged row is skipped; the next catalog refresh adds the model again */ } }
-export function saveModel(m: Model) { models.set(m.id, m); db.query('INSERT OR REPLACE INTO models VALUES (?,?)').run(m.id, JSON.stringify(m)); }
+const modelGenerations = new Map<string, number>();
+const modelInstanceGenerations = new WeakMap<Model, number>();
+for (const m of models.values()) modelInstanceGenerations.set(m, 0);
+export function saveModel(m: Model) { const generation = modelGenerations.get(m.id) || 0; const previous = modelInstanceGenerations.get(m); if (previous !== undefined && previous !== generation) return; modelInstanceGenerations.set(m, generation); models.set(m.id, m); db.query('INSERT OR REPLACE INTO models VALUES (?,?)').run(m.id, JSON.stringify(m)); }
+export function removeModel(id: string) { db.query('DELETE FROM models WHERE id=?').run(id); modelGenerations.set(id, (modelGenerations.get(id) || 0) + 1); models.delete(id); }
 export function removeModels(providerId: string) { for (const [id, m] of models) if (m.providerId === providerId) { models.delete(id); db.query('DELETE FROM models WHERE id=?').run(id); } }
 let lastPrune = 0;
 export function record(row: LogRow) {
@@ -113,7 +134,7 @@ export function recentFailureDetails(limit = 20) { return (db.query('SELECT id,t
 export function recentBaselineDetails(limit = 5) { return (db.query('SELECT id,time,model,protocol,route,status,ms,detail FROM requests WHERE status<400 AND detail IS NOT NULL ORDER BY time DESC LIMIT ?').all(limit) as any[]).map(({ detail, ...row }) => ({ ...row, detail: JSON.parse(detail) })); }
 export function stats() { return db.query('SELECT COUNT(*) total, SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) success, COALESCE(AVG(ms),0) latency, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output FROM requests WHERE time > ?').get(Date.now() - 86400000) as any; }
 export function usagePenalties() { const out = new Map<string, number>(); for (const x of db.query('SELECT model,COUNT(*) n,SUM(fault) errors FROM requests WHERE time>? AND (fault=1 OR status<400) GROUP BY model').all(Date.now()-7*86400000) as {model: string, n: number, errors: number}[]) out.set(x.model, x.n < 5 ? 0 : x.errors/x.n >= .8 ? 8 : x.errors/x.n >= .5 ? 4 : 0); return out; }
-export function publicSettings() { const { admin, ...rest } = settings; return { ...rest, deployTokens: settings.deployTokens ? Object.fromEntries(Object.entries(settings.deployTokens).filter(([, v]) => v).map(([k]) => [k, '••••••••'])) : undefined, notify: settings.notify ? { ...settings.notify, webhookUrl: settings.notify.webhookUrl ? '••••••••' : '' } : undefined, providers: settings.providers.map(p => ({ ...p, apiKey: p.apiKey ? '••••••••' : '' })), routes: settings.routes.map(r => ({ ...r, token: r.token ? '••••••••' : '', url: redactUrl(r.url) })), mcp: settings.mcp ? { ...settings.mcp, servers: settings.mcp.servers.map(maskMcp) } : undefined }; }
+export function publicSettings() { const { admin, zai, ...rest } = settings; return { ...rest, deployTokens: settings.deployTokens ? Object.fromEntries(Object.entries(settings.deployTokens).filter(([, v]) => v).map(([k]) => [k, '••••••••'])) : undefined, notify: settings.notify ? { ...settings.notify, webhookUrl: settings.notify.webhookUrl ? '••••••••' : '' } : undefined, providers: settings.providers.map(p => ({ ...p, apiKey: p.apiKey ? '••••••••' : '' })), routes: settings.routes.map(r => ({ ...r, token: r.token ? '••••••••' : '', url: redactUrl(r.url) })), mcp: settings.mcp ? { ...settings.mcp, servers: settings.mcp.servers.map(maskMcp) } : undefined }; }
 const maskValues = (o?: Record<string, string>) => o ? Object.fromEntries(Object.keys(o).map(k => [k, '••••••••'])) : undefined;
 // Remote MCP addresses often carry their key in the query (?api_key=…): those values are secrets too.
 const SECRET_PARAM = /key|token|secret|auth|pass|sig|credential/i;
@@ -121,4 +142,4 @@ export const secretParams = (raw?: string) => { try { return [...new URL(raw || 
 export const maskUrl = (raw: string) => { try { const u = new URL(redactUrl(raw)); for (const [k, v] of [...u.searchParams]) if (SECRET_PARAM.test(k) && v) u.searchParams.set(k, '••••••••'); return u.toString(); } catch { return raw; } };
 export const maskMcp = (s: McpServer): McpServer => ({ ...s, url: s.url ? maskUrl(s.url) : s.url, headers: maskValues(s.headers), env: maskValues(s.env) });
 export function redactUrl(raw: string) { try { const u = new URL(raw); if (u.username || u.password) { u.username='redacted'; u.password='redacted'; } return u.toString(); } catch { return raw; } }
-export function redactError(raw: string, max = 800) { let s = raw; for (const v of [...settings.providers.map(p=>p.apiKey),...settings.routes.flatMap(r=>[r.token||'',r.url]),...settings.keys.map(k=>k.value),...Object.values(settings.deployTokens||{}),...(settings.mcp?.servers||[]).flatMap(m=>[...Object.values(m.headers||{}),...Object.values(m.env||{}),...secretParams(m.url)])]) if(v.length>5) s=s.split(v).join('[redacted]'); return s.replace(/(Bearer\s+)[^\s"']+/gi,'$1[redacted]').slice(0,max); }
+export function redactError(raw: string, max = 800) { let s = raw; for (const v of [...settings.providers.map(p=>p.apiKey),...settings.routes.flatMap(r=>[r.token||'',r.url]),...settings.keys.map(k=>k.value),...Object.values(settings.deployTokens||{}),...(settings.mcp?.servers||[]).flatMap(m=>[...Object.values(m.headers||{}),...Object.values(m.env||{}),...secretParams(m.url)]),...(settings.zai?.accounts||[]).map(a=>a.token)]) if(v.length>5) s=s.split(v).join('[redacted]'); return s.replace(/(Bearer\s+)[^\s"']+/gi,'$1[redacted]').slice(0,max); }

@@ -53,9 +53,10 @@ exports.handler = async (event) => {
       res.on("error", (e) => resolve(json(502, { error: e.message || "Relay upstream read failed" })));
       res.on("end", () => {
         const out = { "x-relay-runtime": RUNTIME };
-        for (const [k, v] of Object.entries(res.headers)) if (!DROP.test(k) && k !== "content-encoding") out[k] = Array.isArray(v) ? v.join(", ") : v;
+        for (const [k, v] of Object.entries(res.headers)) if (!DROP.test(k)) out[k] = Array.isArray(v) ? v.join(", ") : v;
         const type = String(res.headers["content-type"] || "");
-        const isText = /^(text\/|[^;]*json|[^;]*event-stream|[^;]*javascript|[^;]*xml|[^;]*urlencoded)/i.test(type);
+        // node:https returns wire bytes, not a decoded fetch body. Encoded text is binary too.
+        const isText = !res.headers["content-encoding"] && /^(text\/|[^;]*json|[^;]*event-stream|[^;]*javascript|[^;]*xml|[^;]*urlencoded)/i.test(type);
         const raw = Buffer.concat(chunks);
         resolve({ statusCode: res.statusCode, headers: out, body: isText ? raw.toString("utf8") : raw.toString("base64"), isBase64Encoded: !isText });
       });

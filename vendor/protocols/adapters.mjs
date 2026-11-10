@@ -266,6 +266,7 @@ function injectPreamble(messages) {
 
 // An opencode tool call rewritten as the caller's tool call.
 function remapAgentTool(name, rawArgs) {
+  if (!config.agentTools) return null
   const spec = AGENT_TOOL_MAP[name]
   if (!spec) return null
   let args = {}
@@ -981,7 +982,7 @@ function responsesInputToMessages(input) {
         const parts = []
         for (const p of content) {
           if (typeof p === "string") { if (p) parts.push({ type: "text", text: p }) }
-          else if ((p?.type === "input_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
+          else if ((p?.type === "input_text" || p?.type === "output_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
           else if (p?.type === "input_image" && (p.image_url ?? p.url)) parts.push({ type: "image_url", image_url: p.image_url ?? p.url })
         }
         if (parts.length) messages.push({ role, content: parts })
@@ -1069,6 +1070,8 @@ function responsesInputToChatBody(body) {
 // on /chat/completions.
 function chatToResponses(content, requested, servedBy) {
   const msg = content?.choices?.[0]?.message ?? {}
+  const finish = content?.choices?.[0]?.finish_reason
+  const incompleteReason = finish === "length" ? "max_output_tokens" : finish === "content_filter" ? "content_filter" : null
   const output = []
   if (msg.reasoning_content) output.push({ type: "reasoning", summary: [{ text: msg.reasoning_content }] })
   const text = typeof msg.content === "string" ? msg.content : textOf(msg.content)
@@ -1087,7 +1090,8 @@ function chatToResponses(content, requested, servedBy) {
     id: content?.id ? `resp_${content.id.replace(/^resp_/, "")}` : `resp_${randomBytes(12).toString("hex")}`,
     object: "response",
     created_at: content?.created ?? Math.floor(Date.now() / 1000),
-    status: "completed",
+    status: incompleteReason ? "incomplete" : "completed",
+    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
     model: requested,
     ...output.length ? { output } : { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] }] },
     usage: {
@@ -2740,6 +2744,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
     calls: new Map(), // chat index -> { index, id, callId, name, args }
     usage: null,
     finished: false, // a finish chunk or [DONE] was seen upstream
+    finishReason: null,
     dropped: new Set(), // pinned-filter: chat indices that name a stray call
   }
 
@@ -2780,6 +2785,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         if (d?.usage) st.usage = d.usage
         const choice = d?.choices?.[0]
         if (!choice) continue
+        if (choice.finish_reason != null) st.finishReason = choice.finish_reason
         const delta = choice.delta ?? {}
         if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
           evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
@@ -2830,7 +2836,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
           }
         }
       }
-      // Stream complete: close what was opened in output order, then completed.
+      // Stream complete: close what was opened in output order, then report its status.
       if (!st.finished) {
         // The chat-chunk stream never reached a finish chunk (measured: hostile
         // mid-cut): emitting response.completed would tell the caller a turn
@@ -2840,32 +2846,35 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         res.end()
         return
       }
+      const incompleteReason = st.finishReason === "length" ? "max_output_tokens" : st.finishReason === "content_filter" ? "content_filter" : null
+      const status = incompleteReason ? "incomplete" : "completed"
       const output = items.map((item) => {
         if (item.type === "message") {
           item.id = `msg_${id}`
-          item.status = "completed"
+          item.status = status
           item.content = [{ type: "output_text", text: st.message?.text ?? "", annotations: [] }]
         }
         if (item.type === "function_call") {
           const entry = [...st.calls.values()].find((e) => e.item === item)
-          item.status = "completed"
+          item.status = status
           item.arguments = entry?.args ?? item.arguments
         }
         return item
       })
       if (st.message) evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
       for (const entry of st.calls.values()) {
-        evt("response.function_call_arguments.done", { item_id: entry.id, output_index: entry.index, arguments: entry.args })
+        evt("response.function_call_arguments.done", { item_id: entry.item.id, output_index: entry.index, arguments: entry.args })
       }
       items.forEach((item, i) => {
         evt("response.output_item.done", { output_index: i, item })
       })
-      evt("response.completed", {
+      evt(incompleteReason ? "response.incomplete" : "response.completed", {
         response: {
           id,
           object: "response",
           created_at: created,
-          status: "completed",
+          status,
+          ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
           model: requested,
           output,
           usage: {
@@ -2880,6 +2889,8 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
       // The 200 is on the wire already: announce the collapse in-band.
       if (!clientGone(req)) evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
       res.end()
+    } finally {
+      cleanup()
     }
   }
   return pump()

@@ -633,9 +633,23 @@ async function refreshCliVersion() {
 // Single-flight: concurrent callers share one in-flight fetch.
 // The CLI-version feed refreshes in parallel (fire-and-forget) so a slow
 // 5s feed never delays the model list.
-async function discoverModels() {
-  if (discoveryInFlight) return discoveryInFlight;
+async function discoverModels({ strict = false } = {}) {
+  if (discoveryInFlight) {
+    if (!strict) return discoveryInFlight;
+    // A background discovery may be using cached facts. A strict caller needs
+    // its own fresh catalog after that discovery has finished.
+    await discoveryInFlight.catch(() => {});
+    return discoverModels({ strict: true });
+  }
   discoveryInFlight = (async () => {
+    if (strict) {
+      const catalog = await identity.extractCatalog({ strict: true });
+      identity.applyRecipe(catalog, null, { catalogOnly: true });
+      activeModels = catalog.freeModels.map((id) => ({ id, object: "model", owned_by: "opencode" }));
+      rebuildDiscoveryPayloads();
+      lastDiscoveryTime = Date.now();
+      return { ok: true, authoritative: true, models: activeModels.slice() };
+    }
     refreshCliVersion().catch(() => {});
     checkAndApplyUpdate().catch(() => {});
     try {
@@ -1588,7 +1602,16 @@ function upstreamLogIdOf(upstreamRes) {
  * client verbatim; `X-OpenCode-Gate: ip-abuse` lets callers and `verify.js`
  * tell it apart from the shape gate without parsing the message.
  */
-function respondIpAbuse(res, status, errType, errMsg, logId, model) {
+// Forward only diagnostics, never upstream cookies, authentication, hop-by-hop or content framing headers.
+function upstreamDiagnosticHeaders(response) {
+  const headers = {};
+  for (const name of ["retry-after", "x-relay-runtime", "x-relay-egress", "x-relay-instance", "x-opencode-log-id", "cf-ray", "cf-placement", "x-vercel-id", "x-request-id"]) {
+    const value = response?.headers?.get?.(name);
+    if (value) headers[name] = value;
+  }
+  return headers;
+}
+function respondIpAbuse(res, status, errType, errMsg, logId, model, response) {
   lastIpAbuseAt = Date.now();
   lastGateDiagnostic = {
     at: lastIpAbuseAt,
@@ -1603,6 +1626,7 @@ function respondIpAbuse(res, status, errType, errMsg, logId, model) {
       (logId ? ` [x-opencode-log-id: ${logId}]` : "")
   );
   res.writeHead(status, {
+    ...upstreamDiagnosticHeaders(response),
     "Content-Type": "application/json",
     "X-OpenCode-Gate": "ip-abuse",
     ...(logId ? { "X-OpenCode-Log-Id": logId } : {}),
@@ -2094,10 +2118,26 @@ function handleRequest(req, res) {
       const abortController = new AbortController();
       let timedOut = false;
       let clientDisconnected = false;
-      const timeoutId = setTimeout(() => {
+      const expire = (message) => {
         timedOut = true;
-        abortController.abort(new Error("Upstream request timed out"));
+        abortController.abort(new Error(message));
+      };
+      let timeoutId = setTimeout(() => {
+        expire(`Upstream sent no response bytes within ${UPSTREAM_TIMEOUT_MS}ms`);
       }, UPSTREAM_TIMEOUT_MS);
+      let ceilingId;
+      // Headers alone do not satisfy the first-byte deadline. Once bytes arrive,
+      // only silence counts, with a separate one-hour streaming ceiling.
+      const onUpstreamChunk = () => {
+        if (abortController.signal.aborted) return;
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => {
+          expire(`Upstream sent no data for ${UPSTREAM_TIMEOUT_MS}ms`);
+        }, UPSTREAM_TIMEOUT_MS);
+        ceilingId ??= setTimeout(() => {
+          expire("Upstream stream exceeded the 3600000ms deadline");
+        }, 3600000);
+      };
 
       const onClose = () => {
         if (!res.writableEnded) {
@@ -2310,7 +2350,8 @@ function handleRequest(req, res) {
               errType,
               rawMsg,
               upstreamLogIdOf(upstreamRes),
-              targetModel
+              targetModel,
+              upstreamRes
             );
           }
 
@@ -2344,7 +2385,7 @@ function handleRequest(req, res) {
                   (cfPlacement ? ` [cf-placement: ${cfPlacement}]` : "")
               );
             }
-            const errHeaders = { "Content-Type": "application/json" };
+            const errHeaders = { ...upstreamDiagnosticHeaders(upstreamRes), "Content-Type": "application/json" };
             if (upstreamLogId) errHeaders["X-OpenCode-Log-Id"] = upstreamLogId;
             if (upstreamRes.status >= 500) errHeaders["X-OpenCode-Gate"] = "upstream-error";
             res.writeHead(upstreamRes.status, errHeaders);
@@ -2473,7 +2514,8 @@ function handleRequest(req, res) {
                 retryType,
                 retryMsg,
                 upstreamLogIdOf(upstreamRes),
-                targetModel
+                targetModel,
+                upstreamRes
               );
             }
             const retryFreeTierMsg = /freetiererror|free tier|free models|only available in opencode/i.test(retryMsg);
@@ -2538,10 +2580,10 @@ function handleRequest(req, res) {
             const outStatus = resolveIpThrottleStatus(upstreamRes.status, retryFreeTierMsg && !capacity);
             res.writeHead(
               outStatus,
-              buildIpThrottleHeaders(retryFreeTierMsg && !capacity, {
+              { ...buildIpThrottleHeaders(retryFreeTierMsg && !capacity, {
                 shapeOk,
                 logId: upstreamLogId,
-              })
+              }), ...upstreamDiagnosticHeaders(upstreamRes) }
             );
             return res.end(
               JSON.stringify({
@@ -2729,13 +2771,19 @@ function handleRequest(req, res) {
               } catch {}
             };
 
-            await consumeSseLines(reader, decoder, handleResponsesStreamLine);
+            await consumeSseLines(reader, decoder, handleResponsesStreamLine, onUpstreamChunk);
+            abortController.signal.throwIfAborted();
             if (streamAbortedByError) {
               if (!res.writableEnded) res.end();
               return;
             }
 
-            const finalFinishReason = upstreamFinishReason || (hasToolCalls ? "tool_calls" : "stop");
+            if (!upstreamFinishReason) {
+              emitStreamError("Upstream Responses stream ended without a terminal event", "upstream_error");
+              if (!res.writableEnded) res.end();
+              return;
+            }
+            const finalFinishReason = upstreamFinishReason;
             writeSse(
               `data: ${JSON.stringify({
                 id: completionId,
@@ -2809,7 +2857,8 @@ function handleRequest(req, res) {
               }
             };
 
-            await consumeSseLines(reader, decoder, handleChatStreamLine);
+            await consumeSseLines(reader, decoder, handleChatStreamLine, onUpstreamChunk);
+            abortController.signal.throwIfAborted();
             if (!res.writableEnded) {
               if (!sseHeadersSent) writeSse("data: [DONE]\n\n");
               res.end();
@@ -2941,7 +2990,11 @@ function handleRequest(req, res) {
           } catch {}
         };
 
-        await consumeSseLines(reader, decoder, handleNonStreamLine);
+        await consumeSseLines(reader, decoder, handleNonStreamLine, onUpstreamChunk);
+        abortController.signal.throwIfAborted();
+        if (useResponses && !upstreamFinishReason && !streamError) {
+          streamError = "Upstream Responses stream ended without a terminal event";
+        }
 
         if (streamError) {
           console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamError}`);
@@ -2997,7 +3050,7 @@ function handleRequest(req, res) {
             return res.end(
               JSON.stringify({
                 error: {
-                  message: `Upstream request timed out after ${UPSTREAM_TIMEOUT_MS}ms`,
+                  message: abortController.signal.reason?.message || `Upstream request timed out after ${UPSTREAM_TIMEOUT_MS}ms`,
                   type: "timeout_error",
                   code: 504,
                 },
@@ -3018,6 +3071,7 @@ function handleRequest(req, res) {
         return res.end();
       } finally {
         clearTimeout(timeoutId);
+        clearTimeout(ceilingId);
         res.off("close", onClose);
       }
     })();
@@ -3028,7 +3082,7 @@ function handleRequest(req, res) {
   res.end(JSON.stringify({ error: { message: "Not found", type: "invalid_request_error" } }));
 }
 
-async function consumeSseLines(reader, decoder, onLine) {
+async function consumeSseLines(reader, decoder, onLine, onChunk) {
   let buffer = "";
   while (true) {
     const { done, value } = await reader.read();
@@ -3053,6 +3107,7 @@ async function consumeSseLines(reader, decoder, onLine) {
       }
       break;
     }
+    if (value?.byteLength) onChunk?.();
     buffer += decoder.decode(value, { stream: true });
     let start = 0;
     for (let i = 0; i < buffer.length; i++) {
@@ -3175,6 +3230,7 @@ module.exports = {
   getPersistentSessionId,
   discoverModels,
   handleRequest,
+  upstreamDiagnosticHeaders,
   server,
   shortText,
   messageSignatureSample,

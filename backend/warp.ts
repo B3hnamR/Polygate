@@ -3,6 +3,7 @@ import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync,
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { settings, persist, stateDir, redactError } from './state';
 import { GatewayError } from './queue';
 import { socksBridge, socksConnect } from './socks-bridge';
@@ -24,7 +25,7 @@ export async function freePort(from: number, avoid: Set<number> = new Set()): Pr
   throw new GatewayError(`No free local port was found from ${from} up. Free one or choose another SOCKS port.`, 503, 'warp_no_port');
 }
 export type WarpEngine = 'embedded' | 'disabled';
-type Tunnel = { port: number; index: number; proc: ChildProcess; identity: string; endpoint: string; split: boolean; startedAt: number; egress?: Egress; egressIp?: string; lastProbe?: number; failures: number; cooldownUntil: number; restarts: number };
+type Tunnel = { port: number; index: number; proc: ChildProcess; identity: string; endpoint: string; split: boolean; startedAt: number; egress?: Egress; egressIp?: string; lastProbe?: number; failures: number; probeFailures?: number; cooldownUntil: number; restarts: number };
 type Egress = { ip: string; colo: string; warp: string; loc?: string };
 export type WarpState = 'disabled' | 'not_installed' | 'not_registered' | 'disconnected' | 'connecting' | 'connected' | 'error';
 const defaults: WarpSettings = { engine: 'embedded', autoStart: false, pool: 2, rotateMinutes: 0, helperPath: '', endpoint: '', split: 'auto' };
@@ -132,10 +133,11 @@ function socksAlive(host: string, port: number, timeoutMs = 2500): Promise<boole
 // A real request through the tunnel is the only readiness signal that matters. Port-open is not enough: usque opens its SOCKS
 // listener before the MASQUE handshake, and a network can accept TCP while dropping the TLS ClientHello.
 // 1.1.1.1/cdn-cgi/trace answers through WARP and reports the exit IP; its trace page does not always include warp=on.
-export async function traceVia(host: string, port: number, timeoutMs = 20000): Promise<Egress | null> {
+export async function traceVia(host: string, port: number, timeoutMs = 20000, signal?: AbortSignal): Promise<Egress | null> {
   try {
     const proxy = await socksBridge({ host, port });
-    const r = await fetch(process.env.POLYGATE_WARP_TRACE_URL || 'https://1.1.1.1/cdn-cgi/trace', { proxy, signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'curl/8.0' } } as any);
+    signal?.throwIfAborted();
+    const r = await fetch(process.env.POLYGATE_WARP_TRACE_URL || 'https://1.1.1.1/cdn-cgi/trace', { proxy, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'curl/8.0' } } as any);
     if (!r.ok) return null;
     const text = await r.text(); const pick = (k: string) => text.match(new RegExp(`^${k}=(.+)$`, 'm'))?.[1]?.trim() || '';
     const ip = pick('ip'); if (!ip) return null;
@@ -143,22 +145,24 @@ export async function traceVia(host: string, port: number, timeoutMs = 20000): P
   } catch { return null; }
 }
 // --- identities (the helper owns Cloudflare registration; Polygate only keeps the resulting config) ---
-async function registerIdentity(file: string): Promise<void> {
+async function registerIdentity(file: string, signal: AbortSignal): Promise<void> {
   const helper = findWarpHelper();
   if (!helper) throw new GatewayError(helperMissing(), 503, 'warp_not_installed');
   if (Date.now() < registerBackoffUntil) throw new GatewayError(`Cloudflare is rate limiting WARP registrations; waiting ${Math.ceil((registerBackoffUntil - Date.now()) / 60000)} more minute(s).`, 429, 'warp_rate_limited');
-  const wait = 12000 - (Date.now() - lastRegistration); if (wait > 0) await Bun.sleep(wait); lastRegistration = Date.now();
+  const wait = 12000 - (Date.now() - lastRegistration); if (wait > 0) await delay(wait, undefined, { signal }); signal.throwIfAborted(); lastRegistration = Date.now();
   mkdirSync(warpDir, { recursive: true }); rmSync(file, { force: true });
   let output = '';
   try {
-    const r: any = await run(helper, ['-c', file, 'register', '--accept-tos'], { timeout: 90000, windowsHide: true, env: helperEnv(), maxBuffer: 1024 * 1024 });
+    const r: any = await run(helper, ['-c', file, 'register', '--accept-tos'], { timeout: 90000, windowsHide: true, env: helperEnv(), maxBuffer: 1024 * 1024, signal });
     output = `${r?.stdout || ''}\n${r?.stderr || ''}`;
   } catch (e: any) {
+    signal.throwIfAborted();
     output = `${e?.stdout || ''}\n${e?.stderr || ''}\n${e?.message || e}`;
     const text = redactError(output);
     if (/\b429\b|1015|rate.?limit|too many/i.test(text)) { registerBackoffUntil = Date.now() + 15 * 60000; throw new GatewayError('Cloudflare is rate limiting WARP registrations; try again in 15 minutes.', 429, 'warp_rate_limited'); }
     throw new GatewayError(`WARP registration failed: ${helperProblem(text)}`, 502, 'warp_register_failed');
   }
+  signal.throwIfAborted();
   if (!validIdentity(file)) throw new GatewayError(`WARP registration finished without a usable identity${output ? ': ' + lastLine(output) : ''}`, 502, 'warp_register_failed');
   try { chmodSync(file, 0o600); } catch { /* Windows has no mode bits */ }
 }
@@ -166,20 +170,22 @@ const endpointCandidates = (preferred: string) => [...new Set([preferred, ...H2_
 // --- tunnel lifecycle ---
 // Waits for a real request to pass through the new tunnel. The helper prints "Failed to connect tunnel" as soon as its connection is
 // refused or reset, so that ends the wait at once instead of after the full time.
-async function tunnelUp(port: number, output: () => string, exited: () => boolean): Promise<Egress | null> {
+async function tunnelUp(port: number, output: () => string, exited: () => boolean, signal: AbortSignal): Promise<Egress | null> {
   const until = Date.now() + 15000;
   while (Date.now() < until && !exited()) {
     if (/Failed to connect tunnel/i.test(output())) return null;
-    const egress = await traceVia('127.0.0.1', port, 4000); if (egress?.ip) return egress;
-    await Bun.sleep(400);
+    signal.throwIfAborted();
+    const egress = await traceVia('127.0.0.1', port, 4000, signal); signal.throwIfAborted(); if (egress?.ip) return egress;
+    await delay(400, undefined, { signal });
   }
   return null;
 }
-async function startTunnel(port: number, index: number, preferredEndpoint: string): Promise<Tunnel> {
+async function startTunnel(port: number, index: number, preferredEndpoint: string, scheduled = epoch, signal = lifecycle.signal): Promise<Tunnel> {
   const helper = findWarpHelper(); if (!helper) throw new GatewayError(helperMissing(), 503, 'warp_not_installed');
   const identity = identityFile(index); const tried: string[] = []; const mode = warpConfig().split;
   for (const split of splitOrder(mode, workingSplit)) {
     for (const endpoint of endpointCandidates(preferredEndpoint)) {
+      checkLifecycle(scheduled, signal);
       writeIdentityEndpoint(identity, endpoint);
       const label = `${endpoint} ${split ? 'split' : 'plain'}`; progress(55, 'starting', `Trying ${label}…`);
       let proc: ChildProcess, spawnError = '', output = '', exited = false;
@@ -187,29 +193,38 @@ async function startTunnel(port: number, index: number, preferredEndpoint: strin
         proc = spawn(helper, ['-c', identity, 'socks', '--http2', '-b', '127.0.0.1', '-p', String(port), '-d', '8.8.8.8', '-d', '9.9.9.9', '--keepalive-period', '10s', '--always-reconnect'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: helperEnv(split) });
       } catch (e: any) { throw new GatewayError(`WARP helper could not be started (${helper}): ${e?.message || e}`, 503, 'warp_not_installed'); }
       proc.once('error', e => { spawnError = e.message || String(e); exited = true; });
-      proc.stdout?.on('data', d => { output = (output + d).slice(-1600); });
-      proc.stderr?.on('data', d => { output = (output + d).slice(-1600); });
-      proc.once('exit', () => { exited = true; });
-      let alive = false;
-      for (let i = 0; i < 60 && !exited; i++) { await Bun.sleep(250); if (await socksAlive('127.0.0.1', port, 800)) { alive = true; break; } }
-      // Spawn failures are asynchronous: the 'error' event arrives after spawn() returns, so read it here, not on the next line.
-      if (spawnError) throw new GatewayError(`WARP helper could not be started (${helper}): ${spawnError}`, 503, 'warp_not_installed');
-      const egress = alive ? await tunnelUp(port, () => output, () => exited) : null;
-      if (egress?.ip) {
-        const epochAtStart = epoch; const tunnel: Tunnel = { port, index, proc, identity, endpoint, split: !!split, startedAt: Date.now(), egressIp: egress.ip, egress, failures: 0, cooldownUntil: 0, restarts: 0 };
-        proc.once('exit', code => tunnelExited(port, proc, code, index, epochAtStart));
-        if (split && mode === 'auto' && workingSplit !== split) notify('WARP splits its handshake', 'This network resets a plain connection to Cloudflare, so WARP sends the first part of its secure handshake in small pieces.', 'info', 'warp-split', 3600000);
-        workingSplit = split; return tunnel;
-      }
-      tried.push(`${label}: ${alive ? shortReason(output) : exited ? 'helper stopped' : 'no SOCKS port opened'}`);
-      console.warn(`[warp] ${label} failed: ${lastLine(output) || (alive ? 'no request passed through' : 'helper did not start')}`);
-      stopProcess(proc);
+      const cancel = () => stopProcess(proc); signal.addEventListener('abort', cancel, { once: true });
+      let handedOver = false;
+      try {
+        proc.stdout?.on('data', d => { output = (output + d).slice(-1600); });
+        proc.stderr?.on('data', d => { output = (output + d).slice(-1600); });
+        proc.once('exit', () => { exited = true; });
+        let alive = false;
+        for (let i = 0; i < 60 && !exited; i++) { await delay(250, undefined, { signal }); if (await socksAlive('127.0.0.1', port, 800)) { alive = true; break; } }
+        checkLifecycle(scheduled, signal);
+        // Spawn failures are asynchronous: the 'error' event arrives after spawn() returns, so read it here, not on the next line.
+        if (spawnError) throw new GatewayError(`WARP helper could not be started (${helper}): ${spawnError}`, 503, 'warp_not_installed');
+        const egress = alive ? await tunnelUp(port, () => output, () => exited, signal) : null;
+        checkLifecycle(scheduled, signal);
+        if (egress?.ip && !exited) {
+          const epochAtStart = scheduled; const tunnel: Tunnel = { port, index, proc, identity, endpoint, split: !!split, startedAt: Date.now(), egressIp: egress.ip, egress, failures: 0, probeFailures: 0, cooldownUntil: 0, restarts: 0 };
+          proc.once('exit', code => tunnelExited(port, proc, code, index, epochAtStart));
+          if (split && mode === 'auto' && workingSplit !== split) notify('WARP splits its handshake', 'This network resets a plain connection to Cloudflare, so WARP sends the first part of its secure handshake in small pieces.', 'info', 'warp-split', 3600000);
+          workingSplit = split; handedOver = true; return tunnel;
+        }
+        tried.push(`${label}: ${alive ? shortReason(output) : exited ? 'helper stopped' : 'no SOCKS port opened'}`);
+        console.warn(`[warp] ${label} failed: ${lastLine(output) || (alive ? 'no request passed through' : 'helper did not start')}`);
+      } finally { signal.removeEventListener('abort', cancel); if (!handedOver) stopProcess(proc); }
     }
   }
   throw new GatewayError(explainTunnelFailure(tried), 502, 'warp_error');
 }
 // Every stop, disconnect or rotation starts a new epoch: a restart that was scheduled before it belongs to a connection the user already ended.
-let epoch = 0; const restarting = new Set<number>();
+let epoch = 0; let lifecycle = new AbortController(); const restarting = new Set<number>();
+function checkLifecycle(scheduled: number, signal: AbortSignal) {
+  signal.throwIfAborted();
+  if (scheduled !== epoch || stopping || engineMode() === 'disabled') throw new GatewayError('WARP setup was cancelled', 409, 'warp_cancelled');
+}
 // The one place a tunnel's process end is handled: it leaves the pool and, unless WARP is being stopped on purpose, comes back after a pause.
 // A deliberate stop removes the entry first, so the check below finds nothing and no restart is scheduled. The health monitor only kills the
 // process of a tunnel that stopped answering and leaves the rest to this.
@@ -221,17 +236,20 @@ function tunnelExited(port: number, proc: ChildProcess, code: number | null, ind
   setTimeout(() => void restartTunnel(port, index, tunnel.restarts + 1, epochAtStart), Math.min(60000, 5000 * 2 ** tunnel.restarts)).unref();
 }
 async function restartTunnel(port: number, index: number, restarts: number, scheduled = epoch) {
-  if (scheduled !== epoch || stopping || status.busy || restarting.has(index) || [...tunnels.values()].some(t => t.index === index) || engineMode() !== 'embedded') return;
+  if (scheduled !== epoch || stopping || restarting.has(index) || [...tunnels.values()].some(t => t.index === index) || engineMode() !== 'embedded') return;
+  if (status.busy) { setTimeout(() => void restartTunnel(port, index, restarts, scheduled), 5000).unref(); return; }
   restarting.add(index);
   try {
     if (!await portFree(port)) port = await freePort(port + 1, new Set(tunnels.keys()));
-    const t = await startTunnel(port, index, warpConfig().endpoint);
+    checkLifecycle(scheduled, lifecycle.signal);
+    const t = await startTunnel(port, index, warpConfig().endpoint, scheduled);
     if (scheduled !== epoch || stopping) { stopProcess(t.proc); return; } // disconnected while it was starting
     t.restarts = restarts; tunnels.set(port, t); ensureRoute();
   } catch { if (scheduled === epoch && restarts < 6) setTimeout(() => void restartTunnel(port, index, restarts + 1, scheduled), Math.min(120000, 5000 * 2 ** restarts)).unref(); }
   finally { restarting.delete(index); }
 }
 async function embeddedConnect(fresh = false) {
+  const scheduled = epoch; const signal = lifecycle.signal; checkLifecycle(scheduled, signal);
   // Without the helper nothing can start, so do not register identities (or wait out the registration pause) first.
   if (!findWarpHelper()) throw new GatewayError(helperMissing(), 503, 'warp_not_installed');
   const want = Math.max(1, Math.min(4, warpConfig().pool));
@@ -240,17 +258,23 @@ async function embeddedConnect(fresh = false) {
   for (let i = 0; i < want; i++) {
     if ([...tunnels.values()].some(t => t.index === i)) continue;
     const wanted = basePort() + i; const port = await freePort(wanted, new Set(tunnels.keys()));
+    checkLifecycle(scheduled, signal);
     if (port !== wanted) notify('WARP uses another local port', `Port ${wanted} is used by another program on this machine, so WARP tunnel ${i + 1} listens on ${port} instead. The other program is not touched.`, 'info', 'warp-port-' + wanted, 3600000);
     const file = identityFile(i);
     if (fresh) rmSync(file, { force: true });
-    if (!validIdentity(file)) { progress(25 + i * 10, 'registering', `Registering WARP identity ${i + 1}/${want}…`); try { await registerIdentity(file); } catch (e) { if (tunnels.size) break; throw e; } }
+    if (!validIdentity(file)) { progress(25 + i * 10, 'registering', `Registering WARP identity ${i + 1}/${want}…`); try { await registerIdentity(file, signal); } catch (e) { checkLifecycle(scheduled, signal); if (tunnels.size) break; throw e; } }
+    checkLifecycle(scheduled, signal);
     progress(50 + i * 10, 'starting', `Starting WARP tunnel ${i + 1}/${want} on port ${port}…`);
-    try { tunnels.set(port, await startTunnel(port, i, warpConfig().endpoint)); } catch (e) { if (!tunnels.size) throw e; }
+    try {
+      const t = await startTunnel(port, i, warpConfig().endpoint, scheduled, signal);
+      try { checkLifecycle(scheduled, signal); } catch (e) { stopProcess(t.proc); throw e; }
+      tunnels.set(port, t);
+    } catch (e) { checkLifecycle(scheduled, signal); if (!tunnels.size) throw e; }
     ensureRoute();
   }
   if (!tunnels.size) throw new GatewayError('No WARP tunnel could be started.', 502, 'warp_error');
 }
-async function stopTunnels() { epoch++; for (const [, t] of tunnels) stopProcess(t.proc); tunnels.clear(); await Bun.sleep(150); }
+async function stopTunnels() { epoch++; lifecycle.abort(); lifecycle = new AbortController(); const live = [...tunnels.values()]; tunnels.clear(); for (const t of live) stopProcess(t.proc); await Bun.sleep(150); }
 // --- public API ---
 export type WarpTarget = { host: string; port: number };
 export function warpTarget(): WarpTarget | null {
@@ -278,23 +302,29 @@ export function ensureRoute() {
 // The SOCKS port being open says nothing about the tunnel: usque listens before the MASQUE handshake completes, and a
 // NAT box can black-hole an idle outer connection while the port still accepts. So the periodic monitor pushes one tiny
 // real request through the least-recently-probed tunnel (round-robin): it warms the connection through NAT, refreshes the
-// exit IP shown in the dashboard, and counts a dead tunnel toward its failure cooldown.
+// exit IP shown in the dashboard, and retires a dead tunnel after three failed real probes.
 let probing = false;
 export async function refreshStatus(force = false, probe = false): Promise<void> {
   if (!force && Date.now() - status.checkedAt < 2500) return; status.checkedAt = Date.now();
-  const engine = engineMode(); const before = status.state;
+  const engine = engineMode(); const before = status.state; const scheduled = epoch;
   if (engine === 'disabled') { status.state = 'disabled'; }
   else {
-    for (const [port, t] of [...tunnels]) if (!(await socksAlive('127.0.0.1', port, 1500))) { t.failures++; if (t.failures >= 3) stopProcess(t.proc); } // the exit handler removes the tunnel and schedules its restart: one path owns both
+    for (const [port, t] of [...tunnels]) {
+      const alive = await socksAlive('127.0.0.1', port, 1500);
+      if (scheduled !== epoch) return;
+      if (!alive) { t.failures++; if (t.failures >= 3) stopProcess(t.proc); } // the exit handler owns removal and restart
+    }
     status.state = tunnels.size ? 'connected' : (findWarpHelper() ? (status.busy ? 'connecting' : 'disconnected') : 'not_installed');
   }
-  if (status.state === 'connected' && !status.egress) { const t = [...tunnels.values()].find(x => x.egress); if (t?.egress) status.egress = t.egress; else { const target = warpTarget(); if (target) status.egress = await traceVia(target.host, target.port, 20000) || undefined; } }
+  if (status.state === 'connected' && !status.egress) { const t = [...tunnels.values()].find(x => x.egress); if (t?.egress) status.egress = t.egress; else { const target = warpTarget(); if (target) { const egress = await traceVia(target.host, target.port, 20000, lifecycle.signal); if (scheduled !== epoch) return; status.egress = egress || undefined; } } }
   if (probe && status.state === 'connected' && !status.busy && tunnels.size && !probing) {
     probing = true;
     try {
       const t = [...tunnels.values()].sort((a, b) => (a.lastProbe || 0) - (b.lastProbe || 0))[0]; t.lastProbe = Date.now();
-      const egress = await traceVia('127.0.0.1', t.port, 10000);
-      if (egress?.ip) { t.egress = egress; t.egressIp = egress.ip; t.failures = 0; status.egress = egress; } else warpFailure(t.port);
+      const egress = await traceVia('127.0.0.1', t.port, 10000, lifecycle.signal);
+      if (scheduled !== epoch || tunnels.get(t.port) !== t || engineMode() === 'disabled') return;
+      if (egress?.ip) { t.egress = egress; t.egressIp = egress.ip; t.probeFailures = 0; t.failures = 0; status.egress = egress; }
+      else { t.probeFailures = (t.probeFailures || 0) + 1; warpFailure(t.port); if (t.probeFailures >= 3) stopProcess(t.proc); }
     } finally { probing = false; }
   }
   if (status.state !== 'connected') status.egress = undefined; else if (status.state !== before) progress(100, 'connected', 'Cloudflare WARP is connected');
@@ -313,13 +343,15 @@ export async function warpStatus() {
 }
 export async function warpConnect() {
   if (status.busy) throw new GatewayError('WARP setup is already running', 409);
-  status.busy = true; status.lastError = ''; stopping = false;
+  status.busy = true; status.lastError = ''; stopping = false; const scheduled = epoch; const signal = lifecycle.signal;
   try {
     if (engineMode() === 'disabled') throw new GatewayError('WARP is turned off. Turn it on in the WARP settings first.', 400);
     await embeddedConnect();
+    checkLifecycle(scheduled, signal);
     // Every tunnel start already pushed a real request through the tunnel, so the exit it reports is trusted here.
     progress(90, 'verifying', 'Verifying a request through WARP…');
-    const t = warpTarget(); const egress = [...tunnels.values()].find(x => x.egress)?.egress || (t ? await traceVia(t.host, t.port, 30000) : null);
+    const t = warpTarget(); const egress = [...tunnels.values()].find(x => x.egress)?.egress || (t ? await traceVia(t.host, t.port, 30000, signal) : null);
+    checkLifecycle(scheduled, signal);
     if (!egress?.ip) { await stopTunnels(); throw new Error('The WARP helper is running but no request could pass through it. Check the helper and try another MASQUE endpoint.'); }
     if (egress.warp === 'off') { await stopTunnels(); throw new Error('Traffic reaches Cloudflare but is not tunnelled through WARP (warp=off).'); }
     status.egress = egress; status.state = 'connected'; status.checkedAt = Date.now();
@@ -339,8 +371,8 @@ export async function warpRotate() {
   if (status.busy) throw new GatewayError('WARP setup is running', 409);
   if (engineMode() === 'disabled') throw new GatewayError('WARP is turned off', 400);
   if (!findWarpHelper()) throw new GatewayError(helperMissing(), 503, 'warp_not_installed');
-  status.busy = true; stopping = true;
-  try { await stopTunnels(); stopping = false; progress(10, 'rotating', 'Creating new WARP identities…'); await embeddedConnect(true); status.egress = [...tunnels.values()].find(t => t.egress)?.egress; status.state = 'connected'; status.checkedAt = Date.now(); progress(100, 'connected', 'WARP identity rotated'); clearExhausted(); notify('WARP identity rotated', 'New WARP tunnels are running.', 'info', 'warp-rotate', 0); }
+  status.busy = true; stopping = true; const scheduled = epoch + 1;
+  try { await stopTunnels(); stopping = false; const signal = lifecycle.signal; checkLifecycle(scheduled, signal); progress(10, 'rotating', 'Creating new WARP identities…'); await embeddedConnect(true); checkLifecycle(scheduled, signal); status.egress = [...tunnels.values()].find(t => t.egress)?.egress; status.state = 'connected'; status.checkedAt = Date.now(); progress(100, 'connected', 'WARP identity rotated'); clearExhausted(); notify('WARP identity rotated', 'New WARP tunnels are running.', 'info', 'warp-rotate', 0); }
   catch (e: any) { fail(String(e.message || e)); throw new GatewayError(status.lastError, 502, 'warp_error'); } finally { stopping = false; status.busy = false; }
   return warpStatus();
 }
@@ -373,7 +405,7 @@ export async function setWarpSettings(patch: Partial<WarpSettings>, port?: numbe
   settings.warp = { engine: next.engine, autoStart: !!next.autoStart, pool: next.pool, rotateMinutes: next.rotateMinutes, helperPath: next.helperPath, endpoint: next.endpoint, split: next.split };
   if (port !== undefined) settings.warpProxyPort = port;
   persist(); status.checkedAt = 0; startTimers();
-  if (next.engine === 'disabled' && tunnels.size) await stopTunnels(); // a disabled engine must not leave helper processes running
+  if (next.engine === 'disabled') await stopTunnels(); // also cancels registration and helpers not yet admitted to the pool
   // Only move an existing managed route: saving settings must not create an enabled route before WARP has ever connected.
   if (port !== undefined && settings.routes.some(r => r.id === 'warp')) ensureRoute();
   await refreshStatus(true);

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { ApplyTag, Toggle } from './ui';
+import { useCallback, useEffect, useState } from 'react';
+import { ApplyTag, Button, Toggle } from './ui';
 
 type DesktopPrefs = { closeToTray: boolean };
 export type DesktopView = { compact: boolean; pinned: boolean };
@@ -10,16 +10,20 @@ export function DesktopPanel() {
   const bridge = window.polygateDesktop;
   const [prefs, setPrefs] = useState<DesktopPrefs | null>(null);
   const [error, setError] = useState('');
-  useEffect(() => { bridge?.getPrefs().then(setPrefs).catch(() => setError('Could not read the app preferences.')); }, [bridge]);
-  if (!bridge || !prefs) return null;
+  const [loading, setLoading] = useState(false);
+  const load = useCallback(async () => { if (!bridge) return; setError(''); setLoading(true); try { setPrefs(await bridge.getPrefs()); } catch { setError('Could not read the app preferences.'); } finally { setLoading(false); } }, [bridge]);
+  useEffect(() => { void load(); }, [load]);
+  if (!bridge) return null;
   const change = async (value: boolean) => {
+    if (!prefs) return;
     setError(''); setPrefs({ ...prefs, closeToTray: value });
     try { setPrefs(await bridge.setCloseToTray(value)); } catch { setPrefs(prefs); setError('Could not save this preference. Try again.'); }
   };
   return <section className="section-block form-section" aria-labelledby="desktop-heading">
     <h2 id="desktop-heading">Desktop app <ApplyTag when="now" /></h2>
-    <Toggle checked={prefs.closeToTray} onChange={v => void change(v)} label="Keep running in the tray when the window is closed" detail={prefs.closeToTray ? 'Closing the window hides it; your clients keep working. Right-click the tray icon and choose Exit to stop Polygate.' : 'Closing the window stops Polygate and its API.'} />
+    {prefs ? <Toggle checked={prefs.closeToTray} onChange={v => void change(v)} label="Keep running in the tray when the window is closed" detail={prefs.closeToTray ? 'Closing the window hides it; your clients keep working. Right-click the tray icon and choose Exit to stop Polygate.' : 'Closing the window stops Polygate and its API.'} /> : loading ? <p className="subtle" role="status">Loading app preferences…</p> : null}
     {error && <p className="update-error" role="alert">{error}</p>}
+    {!prefs && error && <Button disabled={loading} onClick={() => void load()}>Try again</Button>}
   </section>;
 }
 // The compact portrait view exists only in the Windows app (it is a window of its own); in a browser `available` is false.

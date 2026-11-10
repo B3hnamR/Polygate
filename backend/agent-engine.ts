@@ -5,6 +5,8 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { isDeepStrictEqual } from 'node:util';
+import {agentChains} from './agent-chains';
 import { createGunzip } from 'node:zlib';
 import { models, settings, stateDir, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
@@ -16,10 +18,13 @@ import { logEvent } from './logbook';
 
 // The version Polygate's OpenCode Free identity presents (vendor/bridge/identity.js), so the agent's own tools pass the bridge untouched.
 // The integrity values are the ones npm published for these exact packages.
-export const ENGINE_VERSION = '2.0.32';
+export const ENGINE_VERSION = '2.2.6';
+export const BUILTIN_ENGINE_SKILLS = ['opencode', 'report', 'browser'] as const;
+export const isBuiltinEngineSkill = (skill: any) => BUILTIN_ENGINE_SKILLS.some(id => skill?.id === id &&
+  (skill.path === `skill://${id}/SKILL.md` || skill.path === `/builtin/${id}.md`));
 export const ENGINE_PACKAGES: Record<string, { name: string; integrity: string }> = {
-  x64: { name: '@opencode/cli-windows-x64', integrity: 'sha512-5VdKolj2/NkSk3BuM4qeiYpnNnGRT7szmd2RIv3+aSDPMwD9yRySYkJ2f1WIM7dTDfO5lZHAXVoipt6+i6AD4A==' },
-  arm64: { name: '@opencode/cli-windows-arm64', integrity: 'sha512-T1UGNtrcgDoovpRD3nLqpfZoUh8+pDPlEewALD3QIUOLvuHyy4kUAFra6lLl5kitzqHN5Lm+2iQKX5F81A5hGw==' },
+  x64: { name: '@opencode/cli-windows-x64', integrity: 'sha512-Wcmduf9DaGQgJG3GMliHilaI+YvdckW7O6aLzRwz1r3iIkP82MSoUlSU+ovlOEDj8O+Gy5Ywy5LL6Iv77YuzFw==' },
+  arm64: { name: '@opencode/cli-windows-arm64', integrity: 'sha512-efXFT4J8p9KLVQ3+e4s9EQRZkskvcRZABd3W9sIsZ+zcMuLrZ77CU0YyeeSLrYcHpdpgcRFRVnD2AiF4yLlRPA==' },
 };
 const REGISTRY = 'registry.npmjs.org';
 const MAX_DOWNLOAD = 300 * 1024 * 1024;
@@ -42,7 +47,7 @@ export function enginePaths(root = process.env.POLYGATE_AGENT_DIR || path.join(s
   if (data.length > MAX_DATA_PATH) data = path.join(process.env.LOCALAPPDATA || os.homedir(), 'PolygateAgent');
   if (data.length > MAX_DATA_PATH) data = path.join(path.parse(root).root, 'PolygateAgent');
   return { root, bin, exe: path.join(bin, 'opencode.exe'), manifest: path.join(bin, 'manifest.json'), home, config, configDir: path.join(config, 'opencode'),
-    cache: path.join(home, 'cache'), state: path.join(home, 'state'), userhome: path.join(home, 'userhome'), data, log: path.join(root, 'engine.log') };
+    cache: path.join(home, 'cache'), state: path.join(home, 'state'), userhome: path.join(home, 'userhome'), data, log: path.join(root, 'engine.log'), skills: path.join(root, 'skills') };
 }
 type Paths = ReturnType<typeof enginePaths>;
 type Manifest = { version: string; package: string; integrity: string; exeSha256: string; installedAt: number };
@@ -184,7 +189,10 @@ export const ENGINE_PERMISSIONS = [
   { action: 'glob', resource: '*', effect: 'allow' }, { action: 'grep', resource: '*', effect: 'allow' },
   { action: 'question', resource: '*', effect: 'allow' }, { action: 'skill', resource: '*', effect: 'allow' },
   { action: 'edit', resource: '*', effect: 'ask' }, { action: 'shell', resource: '*', effect: 'ask' },
-  { action: 'external_directory', resource: '*', effect: 'ask' }, { action: 'webfetch', resource: '*', effect: 'ask' }, { action: 'websearch', resource: '*', effect: 'ask' },
+  { action: 'external_directory', resource: '*', effect: 'ask' },
+  // Searching and reading web pages run in every mode without asking (the owner's choice): a search sends its query to the search service
+  // (Exa, set in engineConfig); reading sends a request to the address the model picked.
+  { action: 'webfetch', resource: '*', effect: 'allow' }, { action: 'websearch', resource: '*', effect: 'allow' },
   { action: 'subagent', resource: '*', effect: 'ask' },
 ] as const;
 type Rule = { action: string; resource: string; effect: 'allow' | 'ask' | 'deny' };
@@ -195,7 +203,7 @@ export const ENGINE_MODES: Record<'ask' | 'accept-edits' | 'plan' | 'rules' | 'f
   'accept-edits': { agent: 'polygate-accept-edits', description: 'Accept edits: reading and edits are allowed; commands and anything outside the working folder ask first.',
     permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
   plan: { agent: 'polygate-plan', description: 'Plan: reading only; no edits and no commands until the plan is approved.',
-    permissions: [{ action: 'edit', resource: '*', effect: 'deny' }, { action: 'shell', resource: '*', effect: 'deny' }, { action: 'execute', resource: '*', effect: 'deny' }, { action: 'subagent', resource: '*', effect: 'deny' }] },
+    permissions: [{ action: 'edit', resource: '*', effect: 'deny' }, { action: 'shell', resource: '*', effect: 'deny' }, { action: 'subagent', resource: '*', effect: 'deny' }, { action: 'polygate_shared_*', resource: '*', effect: 'deny' }] },
   rules: { agent: 'polygate-rules', description: 'Rules-based approvals: project edits are allowed; exact hardened inspections and project rules are checked by Polygate. Unknown commands ask.',
     permissions: [{ action: 'edit', resource: '*', effect: 'allow' }] },
   // The engine keeps the shared rules (reads and searches allowed, everything else asks): only the live controller answers yes for Full
@@ -215,26 +223,29 @@ export default {
   },
 };
 `;
-type EngineModel = { id: string; name: string; context: number; output: number };
+type EngineModel = { id: string; name: string; context: number; output: number; reasoning?: boolean };
 // The agent's shell, chosen by Polygate rather than left to the engine (which follows the environment: Git Bash when SHELL is set).
 // PowerShell 7 when it is installed, Windows PowerShell otherwise; both come with every Windows the desktop app supports.
 export function chooseShell(which: (name: string) => string | null = name => Bun.which(name)) {
   return which('pwsh') || path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 }
-// OpenCode Free must see the agent's tools exactly as the CLI sends them, and the bridge passes them untouched only while it presents the
-// OpenCode version the engine runs. When the gate has made the bridge move on, the agent's OpenCode Free requests are refused with this
-// reason (other providers still work) until Polygate updates its engine. An unknown version is not a reason to refuse.
+// A different bridge version does not prove an upstream requirement, but its tool
+// translation is not verified against this pinned engine. Keep the local guard explicit.
 export function freeIdentityProblem(presented: string) {
-  return presented && presented !== ENGINE_VERSION ? `OpenCode Free now expects OpenCode ${presented}, and the agent runs OpenCode ${ENGINE_VERSION}, so its tools would be changed on the way. Choose a model from another provider for the agent until Polygate updates its engine.` : '';
+  return presented && presented !== ENGINE_VERSION ? `OpenCode Free is blocked by Polygate's Agent compatibility check: the bridge reports OpenCode ${presented}, but the Agent engine is pinned to ${ENGINE_VERSION}. Resync models does not change engine versions. Use another provider until a validated engine update is available.` : '';
 }
 // File tools never reach Polygate's own folders (its vault, keys, logs and the engine's files) in these modes; a command can, since
 // permissions are consent and not a sandbox. OpenCode names a folder outside the working one as `C:/path/*` (forward slashes), and
 // these rules come last, after a mode's own, so Accept edits does not reopen them.
 export const protectedRules = (folders: string[]): Rule[] => [...new Set(folders.map(f => path.resolve(f).replace(/\\/g, '/').replace(/\/+$/, '')))]
   .flatMap(f => (['external_directory', 'read', 'edit'] as const).map(action => ({ action, resource: `${f}/*`, effect: 'deny' as const })));
-export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; protect?: string[]; shell?: string }) {
-  // A model whose limits Polygate does not know yet gets conservative ones; OpenCode needs both to plan its context.
-  const entries = o.models.map(m => [m.id, { name: m.name || m.id, limit: { context: m.context > 0 ? m.context : 32000, output: m.output > 0 ? m.output : 4096 }, capabilities: { tools: true } }]);
+export const UNKNOWN_OUTPUT = 32000;
+export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; protect?: string[]; shell?: string; mcp?: boolean; skills?: string }) {
+  // A model whose limits Polygate does not know yet gets assumed ones; OpenCode needs both to plan its context. An unknown output limit is
+  // the engine's own fallback (32k), never more than half the window: 4k cut long replies short and made compaction summaries fail
+  // ("Compaction summary reached the output token limit"). A provider that refuses it is retried with its own limit (providers.ts).
+  const window = (m: EngineModel) => m.context > 0 ? m.context : 32000;
+  const entries = o.models.map(m => [m.id, { name: m.name || m.id, limit: { context: window(m), output: m.output > 0 ? m.output : Math.min(UNKNOWN_OUTPUT, Math.floor(window(m) / 2)) }, capabilities: { tools: true }, ...(m.reasoning ? { variants: ['low','medium','high'].map(id=>({id,body:{reasoning_effort:id}})) } : {}) }]);
   const guard = protectedRules(o.protect || []);
   return {
     $schema: 'https://opencode.ai/config.json', update: 'disable', share: 'disabled', snapshots: true, ...(o.shell ? { shell: o.shell } : {}),
@@ -243,19 +254,25 @@ export function engineConfig(o: { gatewayUrl: string; models: EngineModel[]; pro
     permissions: [...ENGINE_PERMISSIONS, ...guard].map(r => ({ ...r })),
     agents: Object.fromEntries(Object.entries(ENGINE_MODES).map(([mode, m]) => [m.agent, { description: m.description, mode: 'primary', permissions: [...m.permissions, ...guard].map(r => ({ ...r })) }])),
     plugins: [`./${PLUGIN}`],
+    // Web search through Exa without the engine's first-search question: Exa answers without an API key (the engine has none for any
+    // search service), and "random" could land on one that needs a key, which fails rather than moving on.
+    websearch: { provider: 'exa' },
+    // Polygate's skill library (agent-library.ts): the only skills besides the engine's own.
+    ...(o.skills ? { skills: [o.skills] } : {}),
+    ...(o.mcp ? { mcp: { servers: { polygate_shared: { type: 'remote', url: o.gatewayUrl.replace(/\/+$/, '') + '/mcp', headers: { Authorization: 'Bearer {env:POLYGATE_AGENT_KEY}' }, oauth: false, codemode: false } } } } : {}),
   } as any;
 }
 // The rules each engine agent must end with: the shared ones, then the agent's own.
 const expectedRules = (cfg: any): Record<string, Rule[]> => ({ build: cfg.permissions, ...Object.fromEntries(Object.entries<any>(cfg.agents).map(([id, a]) => [id, [...cfg.permissions, ...a.permissions]])) });
 // Models the agent can use: from enabled providers, able to call tools, not known to be gone.
-const agentModels = (): EngineModel[] => [...models.values()]
+const agentModels = (): EngineModel[] => [...[...models.values()]
   .filter(m => m.tools && m.state !== 'unavailable' && settings.providers.some(x => x.id === m.providerId && x.enabled))
-  .map(m => ({ id: m.id, name: m.name, context: m.context, output: m.output }));
+  .map(m => ({ id: m.id, name: m.name, context: m.context, output: m.output, reasoning:m.reasoning })),...agentChains().filter(c=>c.usable)];
 const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 // Writes the engine's configuration and returns it, with the hash of every file written (the configuration watch compares against them).
 function writeEngineFiles(p: Paths, gatewayUrl: string) {
-  for (const dir of [p.configDir, path.join(p.configDir, PLUGIN), p.cache, p.state, p.userhome, p.data]) mkdirSync(dir, { recursive: true });
-  const cfg = engineConfig({ gatewayUrl, models: agentModels(), protect: [stateDir, p.root, p.data], shell: process.platform === 'win32' ? chooseShell() : undefined });
+  for (const dir of [p.configDir, path.join(p.configDir, PLUGIN), p.cache, p.state, p.userhome, p.data, p.skills]) mkdirSync(dir, { recursive: true });
+  const cfg = engineConfig({ gatewayUrl, models: agentModels(), protect: [stateDir, p.root, p.data], shell: process.platform === 'win32' ? chooseShell() : undefined, mcp: !!settings.mcp?.agentTools?.length, skills: p.skills });
   const files: [string, string][] = [
     [path.join(p.configDir, 'opencode.json'), JSON.stringify(cfg, null, 1)],
     [path.join(p.configDir, PLUGIN, 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0', type: 'module', main: 'index.js', exports: { '.': './index.js' } }, null, 1)],
@@ -316,7 +333,14 @@ export async function selfTest(url: string, auth: string, p: Paths, cfg: any, di
   const problems: string[] = [];
   const info = await get('/api/info'); if (info?.version !== ENGINE_VERSION) problems.push(`it is OpenCode ${info?.version}, not ${ENGINE_VERSION}`);
   const norm = (f: string) => path.resolve(String(f || '')).toLowerCase(); const ours = new Set([p.configDir, path.join(p.configDir, 'opencode.json')].map(norm));
-  for (const doc of (await get('/api/config')) as any[]) if (!ours.has(norm(doc?.path))) problems.push(`it read configuration from ${doc?.path}`);
+  for (const doc of (await get('/api/config')) as any[]) {
+    if (!ours.has(norm(doc?.path))) problems.push(`it read configuration from ${doc?.path}`);
+    const expectedMcp = cfg.mcp ? { ...cfg.mcp, servers: { polygate_shared: { ...cfg.mcp.servers.polygate_shared, headers: { Authorization: `Bearer ${ensureAgentKey().value}` } } } } : {};
+    if (norm(doc?.path) === norm(path.join(p.configDir, 'opencode.json')) && !isDeepStrictEqual(doc?.info?.mcp || {}, expectedMcp)) problems.push('its MCP connections are not the ones Polygate configured');
+  }
+  // Skills only from Polygate's library folder, besides the engine's own (which are not files).
+  const skillRoot = norm(p.skills) + path.sep;
+  for (const k of ((await get('/api/skill')).data || []) as any[]) if (!norm(k?.path).startsWith(skillRoot) && !isBuiltinEngineSkill(k)) problems.push(`it offers the skill ${k?.id} from ${k?.path}, outside Polygate's skills`);
   for (const m of ((await get('/api/model')).data || []) as any[]) if (m?.providerID !== 'polygate') problems.push(`it offers ${m?.providerID}/${m?.id}, a provider Polygate did not configure`);
   const agents = ((await get('/api/agent')).data || []) as any[];
   const key = (r: any) => `${r?.action} ${r?.resource} ${r?.effect}`;

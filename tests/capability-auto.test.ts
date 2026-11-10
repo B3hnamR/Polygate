@@ -1,4 +1,6 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { preserveTestState } from './setup';
+const restore = preserveTestState();
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 process.env.POLYGATE_ADMIN_TOKEN = 'capability-secret';
 const { startGateway } = await import('../backend/main');
@@ -13,14 +15,14 @@ const up = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
   return new Response(sse({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] }) + sse({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
 } });
 const add = (id: string, priority: number, extra: Partial<any> = {}) => saveModel({ id, upstreamId: id.split('/')[1], providerId: 'cap', name: id, context: 0, output: 0, tools: true, reasoning: false, state: 'available', latency: 0, score: 50, priority, failCount: 0, cooldownUntil: 0, checkedAt: 0, error: '', ...extra } as any);
-const saved: any = {};
 beforeAll(async () => {
-  Object.assign(saved, { providers: settings.providers, chains: settings.chains, fallback: settings.fallback, retries: settings.retries });
   settings.retries = 0; settings.fallback = true; settings.chains = [];
+  models.clear(); settings.enabled = true; settings.rotate = false; settings.routeId = 'direct';
+  settings.routes = [{ id: 'direct', name: 'Fixture direct', kind: 'direct', url: '', enabled: true, models: [] }];
   settings.providers = [{ id: 'cap', name: 'Cap', kind: 'openai', enabled: true, baseUrl: `http://127.0.0.1:${up.port}/v1`, apiKey: '', models: [], routeId: 'direct' }] as any;
   gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
-afterAll(async () => { await gateway?.close(); up.stop(true); settings.providers = saved.providers; settings.chains = saved.chains; settings.fallback = saved.fallback; settings.retries = saved.retries; for (const id of [...models.keys()]) if (id.startsWith('cap/')) models.delete(id); });
+afterAll(async () => { try { await gateway?.close(); } finally { up.stop(true); restore(); } });
 const tool = { type: 'function', function: { name: 'read_file', description: 'x', parameters: { type: 'object', properties: {} } } };
 const ask = async (body: any) => { const r = await fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer ' + settings.keys[0].value, 'content-type': 'application/json' }, body: JSON.stringify({ stream: false, messages: [{ role: 'user', content: 'hi' }], ...body }) }); await r.text(); return { status: r.status, model: r.headers.get('x-polygate-model'), skipped: decodeURIComponent(r.headers.get('x-polygate-skipped') || '') }; };
 const reset = () => { for (const id of [...models.keys()]) if (id.startsWith('cap/')) models.delete(id); };
@@ -47,6 +49,7 @@ test('auto skips a model without tool support when the request uses tools, and s
   expect(r.status).toBe(200); expect(r.model).toBe('cap/b'); expect(r.skipped).toBe('cap/a (no tool support)');
 });
 test('the same model is used when the request needs no tools', async () => {
+  reset(); add('cap/a', 1, { tools: false }); add('cap/b', 2); add('cap/c', 3);
   const r = await ask({ model: 'auto' });
   expect(r.model).toBe('cap/a'); expect(r.skipped).toBe('');
 });

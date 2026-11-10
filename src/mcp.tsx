@@ -3,6 +3,7 @@ import { AlertTriangle, Check, ChevronRight, Copy, Download, Globe, Loader2, Pla
 import { api, BASE } from './api';
 import { Button, Empty, Field, Select, Toggle, type Snapshot } from './ui';
 import type { McpServer } from '../backend/types';
+import { useConfirm } from './confirm';
 
 type ToolInfo = { name: string; hubName: string; title?: string; description?: string; inputSchema?: any; readOnly?: boolean; disabled?: boolean };
 type Status = { state: 'off' | 'connecting' | 'ready' | 'error'; error?: string; serverInfo?: { name?: string; version?: string }; protocol?: string; connectedAt?: number; calls: number; failures: number; avgMs: number; lastCallAt?: number; tools: ToolInfo[] };
@@ -34,19 +35,47 @@ function skeleton(schema: any): unknown {
   if (type === 'object' || schema.properties) return Object.fromEntries(Object.entries(schema.properties || {}).map(([k, v]) => [k, skeleton(v)]));
   return type === 'string' ? '' : type === 'number' || type === 'integer' ? 0 : type === 'boolean' ? false : type === 'array' ? [] : null;
 }
+const dialogs: { box: HTMLDivElement; opener: HTMLElement | null }[] = [];
 export function Dialog({ title, icon, onClose, busy, wide, children }: { title: string; icon: ReactNode; onClose: () => void; busy?: boolean; wide?: boolean; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null); const closing = useRef(onClose);
+  const opener = useRef(typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null);
   useEffect(() => { closing.current = onClose; });
-  useEffect(() => { const opener = document.activeElement as HTMLElement | null; box.current?.querySelector<HTMLElement>('input,textarea,button.select-trigger')?.focus(); return () => opener?.focus(); }, []);
+  const focusable = () => [...(box.current?.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]') || [])].filter(el => el.tabIndex >= 0 && !el.matches(':disabled') && !el.closest('[hidden],[inert],[aria-hidden="true"]') && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+  const topmost = () => dialogs.at(-1)?.box === box.current;
+  useEffect(() => {
+    const element = box.current!;
+    const entry = { box: element, opener: opener.current };
+    dialogs.push(entry);
+    // Stay below the Select menu's portal layer (80), but above other dialogs (60).
+    element.parentElement!.style.zIndex = String(60 + dialogs.length);
+    const targets = focusable();
+    (targets.find(el => el.hasAttribute('data-autofocus')) || targets.find(el => el.matches('input,textarea,select,button.select-trigger')) || targets[0] || element).focus();
+    const contain = (e: FocusEvent) => { if (topmost() && !element.contains(e.target as Node)) (focusable()[0] || element).focus(); };
+    document.addEventListener('focusin', contain);
+    return () => {
+      document.removeEventListener('focusin', contain);
+      const wasTop = dialogs.at(-1) === entry;
+      dialogs.splice(dialogs.indexOf(entry), 1);
+      dialogs.forEach((other, index) => { other.box.parentElement!.style.zIndex = String(61 + index); });
+      // If an underlying dialog was removed first, its opener is the surviving return target.
+      for (const other of dialogs) if (other.opener && element.contains(other.opener)) other.opener = entry.opener;
+      if (wasTop) {
+        const active = dialogs.at(-1)?.box;
+        if (entry.opener?.isConnected && (!active || active.contains(entry.opener))) entry.opener.focus();
+        else active?.focus();
+      }
+    };
+  }, []);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { if (!busy && !e.defaultPrevented) closing.current(); }
-      else if (e.key === 'Tab' && box.current) { const f = [...box.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled])')]; const i = f.indexOf(document.activeElement as HTMLElement); if (!f.length) e.preventDefault(); else if (e.shiftKey ? i <= 0 : (i < 0 || i === f.length - 1)) { e.preventDefault(); f[e.shiftKey ? f.length - 1 : 0].focus(); } }
+      if (!topmost() || e.defaultPrevented) return;
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (!busy) closing.current(); }
+      else if (e.key === 'Tab' && box.current) { const f = focusable(); const i = f.indexOf(document.activeElement as HTMLElement); if (!f.length) { e.preventDefault(); box.current.focus(); } else if (e.shiftKey ? i <= 0 : (i < 0 || i === f.length - 1)) { e.preventDefault(); f[e.shiftKey ? f.length - 1 : 0].focus(); } }
     };
     document.addEventListener('keydown', key); return () => document.removeEventListener('keydown', key);
   }, [busy]);
-  return <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
-    <div ref={box} className={`dialog${wide ? ' dialog-wide' : ''}`} role="dialog" aria-modal="true" aria-label={title}>
+  return <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy && topmost()) onClose(); }}>
+    <div ref={box} className={`dialog${wide ? ' dialog-wide' : ''}`} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
       <header className="dialog-head">{icon}<h2>{title}</h2><span className="toolbar-spacer" /><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16} /></button></header>
       <div className="dialog-body">{children}</div>
     </div>
@@ -130,7 +159,7 @@ function TryDialog({ server, tool, onClose }: { server: { id: string; name: stri
   const props = Object.entries((tool.inputSchema?.properties || {}) as Record<string, any>);
   return <Dialog title={`Try ${server.name === 'polygate' ? 'polygate' : server.name} · ${tool.name}`} icon={<Wrench size={16} />} onClose={onClose} busy={busy} wide>
     {tool.description && <p className="subtle mcp-tool-description">{tool.description}</p>}
-    {props.length > 0 && <dl className="log-facts mcp-args">{props.map(([k, v]) => <Fragment key={k}><dt>{k}{tool.inputSchema?.required?.includes(k) ? ' *' : ''}</dt><dd>{[Array.isArray(v?.type) ? v.type.join(' or ') : v?.type, v?.description].filter(Boolean).join(' · ') || '—'}</dd></Fragment>)}</dl>}
+    {props.length > 0 && <dl className="log-facts mcp-args">{props.map(([k, v]) => <Fragment key={k}><dt>{k}{tool.inputSchema?.required?.includes(k) ? ' *' : ''}</dt><dd>{[Array.isArray(v?.type) ? v.type.join(' or ') : v?.type, v?.description].filter(Boolean).join(' · ') || '-'}</dd></Fragment>)}</dl>}
     <Field label="Arguments (JSON)"><textarea rows={Math.min(14, Math.max(4, args.split('\n').length + 1))} className="mono" value={args} spellCheck={false} onChange={e => setArgs(e.target.value)} /></Field>
     {result && <div className={`dialog-note ${result.isError ? 'warn' : 'good'}`} role="status">{result.isError ? <AlertTriangle size={16} /> : <Check size={16} />}<div className="mcp-result">
       <p>{result.isError ? 'The tool reported an error' : 'Done'} in {result.ms} ms</p>
@@ -165,7 +194,7 @@ function snippets(url: string, key: string) {
   ];
 }
 function ConnectPanel({ hub, data, copy, onToggle }: { hub: HubState; data: Snapshot; copy: (s: string) => void; onToggle: (v: boolean) => void }) {
-  const keys = data.settings.keys.filter(k => k.enabled);
+  const keys = data.settings.keys.filter(k => k.enabled && (!k.expiresAt || k.expiresAt > Date.now()) && !(k.budget && (k.used || 0) >= k.budget));
   const [keyId, setKeyId] = useState(keys[0]?.id || ''); const [tab, setTab] = useState(() => { try { return localStorage.getItem('polygate-mcp-client') || 'claude'; } catch { return 'claude'; } });
   const key = keys.find(k => k.id === keyId) || keys[0]; const url = location.origin + BASE + '/mcp';
   const list = snippets(url, key?.value || 'YOUR_CLIENT_KEY'); const current = list.find(s => s.id === tab) || list[0];
@@ -191,12 +220,13 @@ function ToolRows({ server, tools, onToggle, onTry, busy }: { server: { id: stri
   </li>)}</ul>;
 }
 function ServerCard({ s, data, hub, onEdit, onChanged, onTry, notice }: { s: ServerView; data: Snapshot; hub: HubState; onEdit: () => void; onChanged: () => void; onTry: (t: ToolInfo) => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
-  const [open, setOpen] = useState(false); const [busy, setBusy] = useState('');
+  const [open, setOpen] = useState(false); const [busy, setBusy] = useState(''); const { confirm, dialog } = useConfirm();
   const act = async (what: string, path: string, body: unknown, done?: string) => { setBusy(what); try { await api(path, body); if (done) notice(done); onChanged(); } catch (e: any) { notice(e?.message || 'That did not work', 'error'); } finally { setBusy(''); } };
   const st = s.status; const route = data.settings.routes.find(r => r.id === (s.routeId || 'direct'));
   const where = s.transport === 'stdio' ? [s.command, ...(s.args || [])].join(' ') : s.url;
   const offered = st.tools.filter(t => !t.disabled).length;
   return <article className={`mcp-server state-${st.state}`} aria-label={s.name}>
+    {dialog}
     <div className="mcp-server-head">
       <span className={`mcp-dot ${st.state}`} aria-hidden="true" />
       <div className="mcp-server-title">
@@ -207,7 +237,7 @@ function ServerCard({ s, data, hub, onEdit, onChanged, onTry, notice }: { s: Ser
         <input type="checkbox" role="switch" aria-label={`${s.name} on`} checked={s.enabled} disabled={!!busy || !hub.enabled} onChange={e => void act('toggle', '/admin/mcp/servers/toggle', { id: s.id, enabled: e.target.checked }, e.target.checked ? `${s.name} switched on` : `${s.name} switched off`)} />
         <Button onClick={() => void act('reconnect', '/admin/mcp/servers/reconnect', { id: s.id }, `${s.name} reconnected`)} disabled={!!busy || !s.enabled || !hub.enabled} title="Reconnect and reload its tools"><RefreshCw size={13} className={busy === 'reconnect' ? 'spin' : ''} /></Button>
         <Button onClick={onEdit} disabled={!!busy} title="Edit"><Pencil size={13} /></Button>
-        <Button onClick={() => { if (confirm(`Remove ${s.name}? Clients lose its tools.`)) void act('delete', '/admin/mcp/servers/delete', { id: s.id }, `${s.name} removed`); }} disabled={!!busy} title="Remove"><Trash2 size={13} /></Button>
+        <Button onClick={async () => { if (await confirm(<>Remove <strong>{s.title || s.name}</strong>? Clients lose its tools.</>, { title: 'Remove MCP server', confirm: 'Remove' })) void act('delete', '/admin/mcp/servers/delete', { id: s.id }, `${s.name} removed`); }} disabled={!!busy} title="Remove"><Trash2 size={13} /></Button>
       </div>
     </div>
     <div className="mcp-server-meta">

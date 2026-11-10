@@ -48,7 +48,7 @@ test('The Vercel Bun template needs the token, reaches any public HTTPS host but
 test('The Netlify relay calls OpenCode over Node with Bun\'s cipher list, drops identity headers, keeps the answer intact and reports its runtime', async () => {
   process.env.POLYGATE_RELAY_TOKEN = 'secret';
   const https = (await import('node:https')).default as any; const { EventEmitter } = await import('node:events'); const real = https.request; let opts: any; let sent: any; let calls = 0;
-  https.request = (o: any, cb: any) => { calls++; opts = o; const req: any = new EventEmitter(); req.destroy = () => {}; req.end = (b: any) => { sent = b; const res: any = new EventEmitter(); res.statusCode = 200; res.headers = { 'content-type': 'text/event-stream', 'content-encoding': 'gzip', 'x-up': '1' }; cb(res); res.emit('data', Buffer.from('data: hi\n\n')); res.emit('end'); }; return req; };
+  https.request = (o: any, cb: any) => { calls++; opts = o; const req: any = new EventEmitter(); req.destroy = () => {}; req.end = (b: any) => { sent = b; const res: any = new EventEmitter(); res.statusCode = 200; res.headers = { 'content-type': 'text/event-stream', 'x-up': '1' }; cb(res); res.emit('data', Buffer.from('data: hi\n\n')); res.emit('end'); }; return req; };
   try {
     const { handler } = (await import('node:module')).createRequire(import.meta.url)('../relays/netlify-relay.js?cjs');
     const event = (key: string, extra: Record<string, string> = {}) => ({ httpMethod: 'POST', body: '{}', isBase64Encoded: false, headers: { ...KEEP, ...PLATFORM, ...RELAY, 'accept-encoding': 'gzip', 'x-relay-key': key, ...extra } });

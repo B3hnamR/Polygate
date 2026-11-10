@@ -1,47 +1,92 @@
-// Starts a throwaway gateway, signs in, visits every page and clicks every button, switch and tab on it, and reports what broke:
-// page errors, console errors, failed requests (4xx/5xx), error banners and buttons that do nothing visible.
-// Buttons that would change the outside world are skipped (deploys, WARP set-up, proxy scans, HTTPS issuance, sign-out everywhere).
-// Usage: node scripts/ui-crawl.mjs   (needs `bun run build:ui` first and Playwright's Chromium)
+// Read-only UI crawl. Controls are explicitly allowlisted, never selected by a stale index.
+// Usage: node scripts/ui-crawl.mjs (requires a built UI and Playwright Chromium).
 import { chromium } from '@playwright/test';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-const state = mkdtempSync(path.join(os.tmpdir(), 'polygate-crawl-')); const token = 'crawl-admin-token';
-const child = spawn('bun', ['backend/main.ts'], { env: { ...process.env, POLYGATE_STATE: state, POLYGATE_NO_DISCOVERY: '1', POLYGATE_ADMIN_TOKEN: token, POLYGATE_PORT: '0', POLYGATE_HOST: '127.0.0.1', POLYGATE_UI_DIST: path.resolve('dist') }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-const port = await new Promise((resolve, reject) => { let buf = ''; const t = setTimeout(() => reject(new Error('gateway did not start')), 30000); child.stdout.on('data', d => { buf += d; const m = /"polygateReady":true,"port":(\d+)/.exec(buf); if (m) { clearTimeout(t); resolve(Number(m[1])); } }); child.on('exit', () => reject(new Error('gateway exited'))); });
-const base = `http://127.0.0.1:${port}`;
-const SKIP = /sign out|everywhere|install|reconnect|set up|connect$|find working|re-test|check these|deploy|apply|renew|remove all|delete|shutdown|new identity|disconnect|rotate|scan|get a token|open cloudflare|copy|download/i;
-const problems = []; const log = []; let current = '';
-const browser = await chromium.launch({ headless: true }); const page = await (await browser.newContext({ viewport: { width: 1360, height: 900 } })).newPage();
-page.on('pageerror', e => problems.push(`[${current}] PAGE ERROR: ${String(e).slice(0, 200)}`));
-page.on('console', m => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) problems.push(`[${current}] console error: ${m.text().slice(0, 200)}`); });
-page.on('response', r => { if (r.status() >= 400 && !/favicon/.test(r.url())) problems.push(`[${current}] ${r.status()} ${r.request().method()} ${r.url().replace(base, '')}`); });
-await page.goto(base); await page.waitForLoadState('networkidle').catch(() => {});
-const pw = page.locator('input[type=password]').first(); if (await pw.count()) { await pw.fill(token); await page.keyboard.press('Enter'); await page.waitForTimeout(1500); }
-const navItems = await page.locator('nav button, .sidebar button').evaluateAll(els => els.map(e => (e.textContent || e.getAttribute('aria-label') || '').trim()).filter(Boolean));
-const pages = [...new Set(navItems.filter(t => !/sign out|pause|resume|reconnect/i.test(t)).map(t => t.replace(/Built in$/, '').trim()))];
-log.push('pages: ' + pages.join(' | '));
-async function visit(name) {
-  current = name; await page.locator('nav button, .sidebar button', { hasText: name }).first().click().catch(() => {}); await page.waitForTimeout(900);
-  const labels = await page.locator('main button:visible, .page-content button:visible, [role=switch]:visible, [role=tab]:visible, select:visible').evaluateAll(els => els.map((e, i) => ({ i, tag: e.tagName, text: (e.getAttribute('aria-label') || e.textContent || e.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 60), role: e.getAttribute('role') })));
-  let clicked = 0, skipped = 0; const idle = [];
-  for (const l of labels) {
-    if (SKIP.test(l.text)) { skipped++; continue; }
-    const loc = page.locator('main button:visible, .page-content button:visible, [role=switch]:visible, [role=tab]:visible, select:visible').nth(l.i);
-    if (!(await loc.count())) continue;
-    const before = await page.evaluate(() => document.body.innerText.length + '|' + document.querySelectorAll('[role=dialog],dialog,.dialog').length);
-    try { if (l.tag === 'SELECT') { await loc.selectOption({ index: 1 }).catch(() => {}); } else await loc.click({ timeout: 2500 }); clicked++; } catch (e) { problems.push(`[${name}] could not click "${l.text}": ${String(e).split('\n')[0].slice(0, 100)}`); continue; }
-    await page.waitForTimeout(350);
-    const banner = await page.locator('[role=alert]:visible, .error-banner:visible, .dialog-note.error:visible').allInnerTexts(); if (banner.length) problems.push(`[${name}] "${l.text}" -> error shown: ${banner.join(' / ').replace(/\s+/g, ' ').slice(0, 160)}`);
-    const after = await page.evaluate(() => document.body.innerText.length + '|' + document.querySelectorAll('[role=dialog],dialog,.dialog').length);
-    if (before === after && !/^(|Try .*|Check|Test|Use route|Selected)$/.test(l.text)) idle.push(l.text);
-    await page.keyboard.press('Escape').catch(() => {}); await page.waitForTimeout(120);
-    // a click may have navigated or opened a dialog: get back to this page
-    if (!(await page.locator('nav button, .sidebar button', { hasText: name }).first().evaluate(e => e.className + e.getAttribute('aria-current')).catch(() => '')).match(/active|on|page|true/i)) await page.locator('nav button, .sidebar button', { hasText: name }).first().click().catch(() => {});
+const state = mkdtempSync(path.join(os.tmpdir(), 'polygate-crawl-'));
+const token = 'crawl-admin-token';
+const problems = [], log = [];
+let child, browser, current = 'Sign in';
+const pages = ['Overview', 'Models', 'Providers', 'Relays', 'Routing', 'Playground', 'Requests', 'Proxies', 'Settings'];
+const safeButtons = new Set(['New key', 'New chain', 'Preview routing']);
+const safeTabs = new Set(['List', 'Map', 'Model-ready', 'Failed', 'All', 'Server IP address', 'My domain', 'Own certificate']);
+const tabName = label => new RegExp('^' + label + '(?:\\s+\\d[\\d,]*)?$');
+const identity = loc => loc.evaluate(e => JSON.stringify([e.tagName, e.getAttribute('role'), e.getAttribute('aria-label'), e.textContent?.replace(/\s+/g, ' ').trim(), e.getAttribute('type')]));
+try {
+  child = spawn(process.env.BUN_EXE || 'bun', ['--preload', './tests/setup.ts', 'backend/main.ts'], { env: { ...process.env, POLYGATE_HARNESS: '1', POLYGATE_STATE: state, POLYGATE_NO_DISCOVERY: '1', POLYGATE_ADMIN_TOKEN: token, POLYGATE_PORT: '0', POLYGATE_HOST: '127.0.0.1', POLYGATE_UI_DIST: path.resolve('dist') }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const port = await new Promise((resolve, reject) => {
+    let buf = ''; const timer = setTimeout(() => reject(new Error('gateway did not start')), 30000);
+    const fail = error => { clearTimeout(timer); reject(error); };
+    child.on('error', fail); child.on('exit', () => fail(new Error('gateway exited')));
+    child.stdout.on('data', d => { buf += d; const m = /"polygateReady":true,"port":(\d+)/.exec(buf); if (m) { clearTimeout(timer); resolve(Number(m[1])); } });
+  });
+  const base = `http://127.0.0.1:${port}`;
+  browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1360, height: 900 }, serviceWorkers: 'block' });
+  // Defense in depth: even an accidentally allowlisted button cannot issue a
+  // certificate, deploy, scan public proxies, or submit another mutating action.
+  await context.route('**/*', async route => {
+    const req = route.request(), url = new URL(req.url());
+    if (url.origin !== base || (!['GET', 'HEAD'].includes(req.method()) && !['/admin/login', '/admin/session', '/admin/route-preview'].includes(url.pathname))) {
+      problems.push(`[${current}] blocked unsafe request: ${req.method()} ${url.pathname}`);
+      return route.abort('blockedbyclient');
+    }
+    return route.continue();
+  });
+  const page = await context.newPage();
+  page.on('pageerror', e => problems.push(`[${current}] PAGE ERROR: ${String(e).slice(0, 200)}`));
+  page.on('console', m => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) problems.push(`[${current}] console error: ${m.text().slice(0, 200)}`); });
+  page.on('response', r => { if (r.status() >= 400 && !/favicon/.test(r.url())) problems.push(`[${current}] ${r.status()} ${r.request().method()} ${r.url().replace(base, '')}`); });
+  await page.goto(base);
+  await page.getByLabel('Password', { exact: true }).fill(token);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('heading', { name: 'Overview', exact: true }).waitFor();
+  const nav = name => page.locator('.sidebar').getByRole('button', { name: name === 'Proxies' ? /^Proxies(?:\s|$)/ : name, exact: name !== 'Proxies' });
+  for (const name of pages) {
+    current = name;
+    await nav(name).click();
+    await page.getByRole('heading', { name, exact: true }).waitFor();
+    const controls = [];
+    for (const label of safeButtons) {
+      const loc = page.locator('main').getByRole('button', { name: label, exact: true });
+      if (await loc.count() === 1 && await loc.isVisible()) controls.push({ role: 'button', label, identity: await identity(loc) });
+    }
+    for (const label of safeTabs) {
+      const loc = page.locator('main').getByRole('tab', { name: tabName(label) });
+      if (await loc.count() === 1 && await loc.isVisible()) controls.push({ role: 'tab', label, identity: await identity(loc) });
+    }
+    let clicked = 0;
+    for (const control of controls) {
+      const loc = page.locator('main').getByRole(control.role, { name: control.role === 'tab' ? tabName(control.label) : control.label, exact: control.role !== 'tab' });
+      // Re-resolve by semantic identity after each prior action. A changed or
+      // ambiguous control is a failure, not a reason to click its replacement.
+      if (await loc.count() !== 1 || !await loc.isVisible() || await identity(loc) !== control.identity) {
+        problems.push(`[${name}] control changed: ${control.role} ${control.label}`); continue;
+      }
+      if (!await loc.isEnabled()) continue;
+      const alerts = new Set(await page.locator('[role=alert]:visible').allTextContents());
+      await loc.click(); clicked++;
+      if (control.role === 'tab') await loc.evaluate(e => { if (e.getAttribute('aria-selected') !== 'true') throw new Error('Tab was not selected'); });
+      else if (control.label === 'New key') await page.getByRole('button', { name: 'Create key', exact: true }).waitFor();
+      else await page.getByRole('dialog').waitFor();
+      for (const error of await page.locator('[role=alert]:visible').allTextContents()) if (!alerts.has(error)) problems.push(`[${name}] ${control.label}: ${error}`);
+      if (control.label === 'New key') await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      else { await page.keyboard.press('Escape'); await page.getByRole('dialog').waitFor({ state: 'hidden' }); }
+      await nav(name).click();
+      await page.getByRole('heading', { name, exact: true }).waitFor();
+    }
+    log.push(`${name}: ${clicked} allowlisted controls exercised`);
   }
-  log.push(`${name}: ${labels.length} controls, clicked ${clicked}, skipped ${skipped}${idle.length ? ', no visible change: ' + [...new Set(idle)].join(', ') : ''}`);
+} catch (error) { problems.push(`[${current}] ${error.stack || error}`); }
+finally {
+  try { await browser?.close(); } catch (error) { problems.push(`browser cleanup: ${error}`); }
+  if (child && child.exitCode === null) {
+    await new Promise(resolve => { child.once('exit', resolve); child.kill(); setTimeout(resolve, 5000).unref(); });
+  }
+  try { rmSync(state, { recursive: true, force: true }); } catch (error) { problems.push(`state cleanup: ${error}`); }
 }
-for (const p of pages) await visit(p);
-console.log(log.join('\n')); console.log(problems.length ? '\nPROBLEMS (' + problems.length + '):\n' + [...new Set(problems)].join('\n') : '\nno problems found');
-await browser.close(); child.kill(); try { rmSync(state, { recursive: true, force: true }); } catch {} process.exit(0);
+console.log(log.join('\n'));
+console.log(problems.length ? `\nPROBLEMS (${problems.length}):\n${[...new Set(problems)].join('\n')}` : '\nno problems found');
+process.exitCode = problems.length ? 1 : 0;

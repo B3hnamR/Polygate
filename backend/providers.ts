@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { stateDir, settings, models, saveModel, usagePenalties, redactError } from './state';
+import { stateDir, settings, models, saveModel, removeModel, usagePenalties, redactError } from './state';
 import { networkFetch, routeContext, routeForProvider, providerRoutes } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
 import { kiloCatalog, kiloChat } from './kilo';
+import { zaiCatalog, zaiChat } from './zai';
 import { logEvent } from './logbook';
 import type { Provider, Model } from './types';
 process.env.AUTO_UPDATE='0';
@@ -38,7 +39,7 @@ export async function discover(){
     for(const p of settings.providers.filter(p=>p.enabled)){
       try{
         let found:any[]=[];let authoritative=true;
-        if(p.kind==='free'){await bridge.discoverModels();found=bridge.__getDiscoveryState().activeModels.map((x:any)=>typeof x==='string'?{id:x}:x);}
+        if(p.kind==='free'){await bridge.discoverModels({strict:true});found=bridge.__getDiscoveryState().activeModels.map((x:any)=>typeof x==='string'?{id:x}:x);}
         else if(p.kind==='openai'){
           try{const r=await networkFetch(p.baseUrl.replace(/\/$/,'')+'/models',{headers:p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{},signal:AbortSignal.timeout(15000)},catalogRoute(p));if(!r.ok)throw new Error(`Catalog HTTP ${r.status}`);const data:any=await r.json();const list=data.data||data.models;if(!Array.isArray(list))throw new Error('Catalog response has no model list');found=list;}
           catch(e){if(!p.models.length)throw e;authoritative=false;}
@@ -46,9 +47,13 @@ export async function discover(){
         }
         // A failed fetch leaves the catalog and the models already listed untouched (the error is reported below).
         else if(p.kind==='kilo')found=await kiloCatalog(p,catalogRoute(p));
+        else if(p.kind==='zai')found=zaiCatalog();
         else found=p.models.map(id=>({id}));
-        if(!found.length&&p.models.length)found=p.models.map(id=>({id}));
-        if(!found.length)throw new Error(p.kind==='opencode'?'List this OpenCode server\'s provider/model IDs in Model IDs':'Provider returned an empty catalog; existing models were kept');
+        const freeCatalog=p.kind==='free'||p.kind==='kilo';
+        if(!found.length&&p.models.length&&!freeCatalog)found=p.models.map(id=>({id}));
+        if(!found.length&&!freeCatalog)throw new Error(p.kind==='opencode'?'List this OpenCode server\'s provider/model IDs in Model IDs':'Provider returned an empty catalog; existing models were kept');
+        // A malformed response must not partially replace a previously usable free catalog.
+        if(freeCatalog&&found.some(x=>typeof(x?.id??x)!=='string'||!(x?.id??x).trim()))throw new Error('Provider catalog contains an invalid model ID');
         const seen=new Set<string>();
         for(const x of found){const upstreamId=x.id||x;if(typeof upstreamId!=='string')continue;const id=p.id+'/'+upstreamId;seen.add(id);const prior=models.get(id);const facts=p.kind==='free'?bridge.identity.getModelFacts(upstreamId):null;
           // Whether it takes images is known only when the catalog lists its input kinds; otherwise it stays unknown (and never excludes the model).
@@ -59,7 +64,12 @@ export async function discover(){
           const returned=prior.state==='unavailable'&&prior.error===ABSENT;
           saveModel({...prior,...info,context:info.context||prior.context,output:info.output||prior.output,reasoning:info.reasoning||prior.reasoning,...(returned?{state:'unchecked' as const,error:''}:{})});
         }
-        if(authoritative)for(const m of models.values())if(m.providerId===p.id&&!seen.has(m.id)){m.state='unavailable';m.error=ABSENT;saveModel(m);}
+        if(authoritative)for(const m of models.values())if(m.providerId===p.id&&!seen.has(m.id)){
+          if(freeCatalog){removeModel(m.id);continue;}
+          // OpenAI-compatible catalogs can be partial. Don't let an omission override a recent successful chat/check.
+          if(p.kind==='openai'&&m.state==='available'&&m.checkedAt>Date.now()-7*86400000)continue;
+          m.state='unavailable';m.error=ABSENT;saveModel(m);
+        }
         catalogErrors.delete(p.id);
       }catch(e){catalogErrors.set(p.id,redactError(String(e)).slice(0,240));errors.push(p.name+': '+String(e));logEvent('warn','models',`${p.name} catalog could not be read: ${String(e)}`,{provider:p.id});}
     }
@@ -70,11 +80,37 @@ export async function discover(){
 }
 // The route a provider's model list is read through: the one its chat would use, or the first in its list when none can be used right now.
 const catalogRoute=(p:Provider)=>{try{return routeForProvider(p,'').id;}catch{return providerRoutes(p)?.ids[0]||settings.routeId;}};
-export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId=''):Promise<Response>{
+// Optional inference-only accounting. before() is synchronous and may reject dispatch; failed()
+// preserves usage from a consumed refusal before the adapter changes/retries its payload.
+export type GenerationAccounting={before:(chat:any)=>void;failed:(usage?:unknown)=>void};
+export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId='',accounting?:GenerationAccounting):Promise<Response>{
   if(p.kind==='free')return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
   if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined},()=>realOpenCode(p,model,body,signal,routeId));
-  if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined},()=>kiloChat(p,model,body,signal,routeId));
-  return routeContext.run({routeId,requestId:requestId||undefined},()=>networkFetch(p.baseUrl.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',...(p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal},routeId));
+  if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined},()=>kiloChat(p,model,body,signal,routeId,accounting));
+  // Z.ai chooses its own exit (zai.ts): Direct or the one proxy set for it, whatever the route's failover would pick.
+  if(p.kind==='zai')return zaiChat(p,model,body,signal,accounting);
+  const send=(b:any)=>{accounting?.before(b);return networkFetch(p.baseUrl.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',...(p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{})},body:JSON.stringify({...b,model:model.upstreamId,stream:true}),signal},routeId);};
+  return routeContext.run({routeId,requestId:requestId||undefined},()=>withOutputLimit(model,body,send,accounting));
+}
+const OUTPUT_KEYS=['max_tokens','max_completion_tokens','max_output_tokens'];
+// The output limit a refusal names ("at most 16384 completion tokens", "maximum is 8192"), or 0.
+export function namedOutputLimit(text:string){const m=text.match(/(?:at most|maximum(?:\s+(?:of|is|value is|allowed is))?|up to|no more than|less than or equal to|<=)\s*:?\s*(\d{3,7})/i);return m?Number(m[1]):0;}
+const refusesOutput=(text:string)=>/max_(?:completion_|output_)?tokens|max.?tokens|(?:output|completion) tokens/i.test(text);
+// A request asking for more output than the model allows is refused with 400. It is asked once more with the limit the refusal names
+// (or 8k when it names none), and the limit that worked is kept on the model, so later requests are sent within it from the start.
+export async function withOutputLimit(m:Model,body:any,send:(b:any)=>Promise<Response>,accounting?:GenerationAccounting){
+  const key=OUTPUT_KEYS.find(k=>typeof body[k]==='number');
+  const first=key&&m.output>0&&body[key]>m.output?{...body,[key]:m.output}:body;
+  const r=await send(first);
+  if(r.status!==400||!key)return r;
+  const text=await r.text().catch(()=>'');const again=()=>new Response(text,{status:400,headers:{'content-type':r.headers.get('content-type')||'application/json'}});
+  if(accounting){let usage;try{usage=JSON.parse(text)?.usage;}catch{}accounting.failed(usage);}
+  if(!refusesOutput(text))return again();
+  const named=namedOutputLimit(text),next=named>0&&named<first[key]?named:Math.min(8192,first[key]-1);
+  if(next<256||next>=first[key])return again();
+  const retry=await send({...first,[key]:next});
+  if(retry.ok){m.output=next;saveModel(m);logEvent('info','models',`${m.id} refused ${first[key]} output tokens; it was asked again with ${next}, and Polygate keeps that limit for it`,{model:m.id});}
+  return retry;
 }
 async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,routeId:string){
   const slash=m.upstreamId.indexOf('/');if(slash<0)throw new GatewayError('OpenCode server models must be provider/model IDs',400);

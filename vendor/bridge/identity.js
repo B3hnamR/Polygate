@@ -273,6 +273,9 @@ let recipe = { ...DEFAULT_RECIPE };
 let toolProfile = null;
 let toolProfileSource = "default";
 let toolProfileVersion = DEFAULT_RECIPE.version;
+// The source ref the tool profile was extracted from (null for the built-in
+// defaults). Reported next to the version so provenance is checkable.
+let toolProfileRef = null;
 // The gate allowlist: tool names upstream accepts. Derived from the tool plugin
 // sources at the release SHA; the wire sends these names (schema is not
 // fingerprinted). Empty = fall back to the tool profile's own key order.
@@ -1145,7 +1148,13 @@ function readCachedSource(expectedRef = null) {
   return null;
 }
 
-function writeCachedSource(ref, extracted) {
+/**
+ * `version` is the release the extracted source belongs to. It is stored with
+ * the cache because `extracted` carries no version of its own: without it a
+ * cold start would label these tools with whatever version the recipe happens
+ * to hold (the built-in default), which is not where they came from.
+ */
+function writeCachedSource(ref, extracted, version = null) {
   if (!ref || !extracted || typeof extracted !== "object") return;
   try {
     const dir = getCatalogCacheDir();
@@ -1154,9 +1163,17 @@ function writeCachedSource(ref, extracted) {
     const fs = require("fs");
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify({ ref, extracted, savedAt: Date.now() }));
+    const release = typeof version === "string" && /^\d+\.\d+\.\d+$/.test(version) ? version : null;
+    fs.writeFileSync(tmp, JSON.stringify({ ref, ...(release ? { version: release } : {}), extracted, savedAt: Date.now() }));
     fs.renameSync(tmp, file);
   } catch {}
+}
+
+/** The release a cached source says it belongs to, or null when it does not say. */
+function cachedSourceVersion(cached) {
+  return cached && typeof cached.version === "string" && /^\d+\.\d+\.\d+$/.test(cached.version)
+    ? cached.version
+    : null;
 }
 
 function isTrustedCatalogBaseUrl(url) {
@@ -1166,7 +1183,11 @@ function isTrustedCatalogBaseUrl(url) {
 function parseCatalogData(json) {
   const out = {};
   const oc = json?.opencode;
-  if (!oc || typeof oc !== "object") return out;
+  if (!oc || typeof oc !== "object" || Array.isArray(oc)) return out;
+  const hasModels = oc.models && typeof oc.models === "object" && !Array.isArray(oc.models) &&
+    Object.entries(oc.models).every(([id, m]) => /^[A-Za-z0-9._:-]+$/.test(id) && m && typeof m === "object" && !Array.isArray(m));
+  const models = hasModels ? oc.models : {};
+  if (hasModels) out.catalogAuthoritative = true;
   const api = typeof oc.api === "string" ? oc.api.replace(/\/+$/, "") : null;
   if (api && isTrustedCatalogBaseUrl(api)) {
     out.catalogBase = api;
@@ -1182,7 +1203,7 @@ function parseCatalogData(json) {
   // only when the model's SDK is OpenAI-compatible; an anthropic-only route is
   // left alone rather than silently misrouted.
   const overrides = {};
-  for (const [id, m] of Object.entries(oc.models || {})) {
+  for (const [id, m] of Object.entries(models)) {
     const mp = m?.provider?.api;
     if (typeof mp !== "string" || !isTrustedCatalogBaseUrl(mp)) continue;
     const npm = String(m?.provider?.npm || oc.npm || "");
@@ -1190,7 +1211,7 @@ function parseCatalogData(json) {
     const base = mp.replace(/\/+$/, "");
     if (base !== api) overrides[id.toLowerCase()] = base;
   }
-  if (Object.keys(overrides).length > 0) out.modelEndpoints = overrides;
+  if (hasModels) out.modelEndpoints = overrides;
   // The free-tier list is a catalog fact, not a naming convention. Deriving it
   // from `cost` + `status` is what the CLI itself does (models-dev.ts maps
   // `status ?? "active"` and keeps zero-cost models), so a model that stops
@@ -1204,7 +1225,7 @@ function parseCatalogData(json) {
   const freeModels = [];
   const verdicts = {};
   const modelFacts = {};
-  for (const [id, m] of Object.entries(oc?.models || {})) {
+  for (const [id, m] of Object.entries(models)) {
     const zeroCost = Number(m?.cost?.input) === 0 && Number(m?.cost?.output) === 0;
     const deprecated = m?.status === "deprecated";
     const usable = m?.tool_call !== false;
@@ -1221,9 +1242,11 @@ function parseCatalogData(json) {
       };
     }
   }
-  if (freeModels.length > 0) out.freeModels = freeModels;
-  if (Object.keys(verdicts).length > 0) out.catalogVerdicts = verdicts;
-  if (Object.keys(modelFacts).length > 0) out.modelFacts = modelFacts;
+  if (hasModels) {
+    out.freeModels = freeModels;
+    out.catalogVerdicts = verdicts;
+    out.modelFacts = modelFacts;
+  }
 
   // Shorthand aliases, derived from the catalog's own `family` field instead of
   // a hand-maintained table. `family` groups revisions of one model
@@ -1231,24 +1254,32 @@ function parseCatalogData(json) {
   // member answers the family name — and when a revision is retired the alias
   // follows automatically.
   const families = {};
-  for (const [id, m] of Object.entries(oc.models || {})) {
+  for (const [id, m] of Object.entries(models)) {
     if (verdicts[id.toLowerCase()] !== "free") continue;
     const family = typeof m?.family === "string" ? m.family.trim().toLowerCase() : "";
     if (!family) continue;
     if (!families[family]) families[family] = id;
   }
-  if (Object.keys(families).length > 0) out.modelFamilies = families;
+  if (hasModels) out.modelFamilies = families;
 
   return out;
 }
 
-async function extractCatalog() {
+async function extractCatalog({ strict = false } = {}) {
   let json;
   let fromCache = false;
   try {
     json = await fetchJson(CATALOG_URL, SOURCE_TIMEOUT_MS);
+    if (strict && !parseCatalogData(json).catalogAuthoritative) {
+      throw new Error("Catalog response has no valid opencode.models map");
+    }
+    if (strict && Object.values(json.opencode.models).some(m => m.status !== 'deprecated' &&
+      [m.cost?.input, m.cost?.output].some(v => (typeof v !== 'number' && typeof v !== 'string') || String(v).trim() === '' || !Number.isFinite(Number(v)) || Number(v) < 0))) {
+      throw new Error("Catalog response contains invalid model pricing");
+    }
     writeCachedCatalog(json);
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     // Network unavailable: fall back to the last catalog this machine saw, so
     // aliases and the free list keep working offline instead of going empty.
     json = readCachedCatalog();
@@ -1585,7 +1616,18 @@ function getUserAgent() {
   return buildUserAgent(recipe);
 }
 
-function applyRecipe(update = {}, tag = null) {
+/**
+ * `toolsVersion` / `toolsRef` say where `update.tools` came from when that is
+ * not the release being applied (a cache written for another ref, or read at
+ * boot before any release is known). They only label the tool profile; the
+ * presented version is still set by `update.version` alone. `null` means the
+ * release is not known (a cache written before the version was stored).
+ */
+function applyRecipe(update = {}, tag = null, { catalogOnly = false, toolsVersion, toolsRef } = {}) {
+  if (catalogOnly) {
+    update = Object.fromEntries(Object.entries(update).filter(([key]) =>
+      ["catalogAuthoritative", "chatUrl", "responsesUrl", "modelsUrl", "catalogBase", "freeModels", "catalogVerdicts", "modelFacts", "modelFamilies", "modelEndpoints"].includes(key)));
+  }
   const next = { ...recipe };
   const changed = [];
 
@@ -1656,9 +1698,9 @@ function applyRecipe(update = {}, tag = null) {
     optionalHeaders = update.optionalHeaders.map(String);
   }
 
-  if (Array.isArray(update.freeModels) && update.freeModels.length > 0) {
+  if (Array.isArray(update.freeModels) && (update.freeModels.length > 0 || update.catalogAuthoritative)) {
     const incoming = update.freeModels.map(String).filter((n) => /^[A-Za-z0-9._:-]+$/.test(n));
-    if (incoming.length > 0 && stableStringify(incoming) !== stableStringify(freeModels)) {
+    if ((incoming.length > 0 || update.catalogAuthoritative) && stableStringify(incoming) !== stableStringify(freeModels)) {
       freeModels = incoming;
       changed.push("freeModels");
     }
@@ -1687,7 +1729,7 @@ function applyRecipe(update = {}, tag = null) {
         maxOutput: Number(f.maxOutput) > 0 ? Number(f.maxOutput) : null,
       };
     }
-    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(modelFacts)) {
+    if ((Object.keys(next).length > 0 || update.catalogAuthoritative) && stableStringify(next) !== stableStringify(modelFacts)) {
       modelFacts = next;
       changed.push("modelFacts");
     }
@@ -1700,7 +1742,7 @@ function applyRecipe(update = {}, tag = null) {
         next[String(family).toLowerCase()] = id;
       }
     }
-    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(modelFamilies)) {
+    if ((Object.keys(next).length > 0 || update.catalogAuthoritative) && stableStringify(next) !== stableStringify(modelFamilies)) {
       modelFamilies = next;
       changed.push("modelFamilies");
     }
@@ -1711,7 +1753,7 @@ function applyRecipe(update = {}, tag = null) {
     for (const [id, v] of Object.entries(update.catalogVerdicts)) {
       if (v === "free" || v === "paid" || v === "deprecated") next[String(id).toLowerCase()] = v;
     }
-    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(catalogVerdicts)) {
+    if ((Object.keys(next).length > 0 || update.catalogAuthoritative) && stableStringify(next) !== stableStringify(catalogVerdicts)) {
       catalogVerdicts = next;
       changed.push("catalogVerdicts");
     }
@@ -1724,7 +1766,7 @@ function applyRecipe(update = {}, tag = null) {
         nextMap[String(id).toLowerCase()] = base;
       }
     }
-    if (Object.keys(nextMap).length > 0) {
+    if (Object.keys(nextMap).length > 0 || update.catalogAuthoritative) {
       if (stableStringify(nextMap) !== stableStringify(modelEndpoints)) {
         modelEndpoints = nextMap;
         changed.push("modelEndpoints");
@@ -1757,14 +1799,17 @@ function applyRecipe(update = {}, tag = null) {
       }
       toolProfile = nextTools;
       toolProfileSource = "source";
-      toolProfileVersion = next.version;
+      toolProfileVersion = toolsVersion !== undefined ? toolsVersion : next.version;
+      toolProfileRef = toolsRef !== undefined ? toolsRef : tag || toolProfileRef;
     }
   }
 
   if (changed.length > 0) {
     recipe = next;
-    stateEpoch++;
-    lastForcedRefreshTime = 0;
+    if (!catalogOnly) {
+      stateEpoch++;
+      lastForcedRefreshTime = 0;
+    }
   }
   if (tag) lastSourceTag = tag;
   return changed;
@@ -1824,10 +1869,11 @@ async function refresh({ force = false, recheck = false } = {}) {
       const shouldAdopt = cmp > 0 && (isForced || updateMode === "always" || forcedByUpstream);
 
       if (cmp === 0 && !isForced) {
-        // Even when the CLI version has not moved, populate the catalog once if
-        // this process still has no free-model list (cold boot without cache).
-        if (freeModels.length === 0) {
+        // Catalog changes are independent of CLI releases. Explicit rechecks
+        // refresh it; ordinary requests still use the existing freshness guard.
+        if (recheck || freeModels.length === 0) {
           const catalog = await extractCatalog();
+          if (myGen !== refreshGen) return { updated: false, reason: "reset" };
           applyRecipe(catalog);
         }
         return {
@@ -1839,8 +1885,9 @@ async function refresh({ force = false, recheck = false } = {}) {
       if (cmp > 0 && !shouldAdopt) {
         // Reactive mode: remember that a release exists without adopting it.
         // The next gate rejection forces a refresh, which flips shouldAdopt.
-        if (freeModels.length === 0) {
+        if (recheck || freeModels.length === 0) {
           const catalog = await extractCatalog();
+          if (myGen !== refreshGen) return { updated: false, reason: "reset" };
           applyRecipe(catalog);
         }
         lastAvailable = latest;
@@ -1856,6 +1903,8 @@ async function refresh({ force = false, recheck = false } = {}) {
       const ref = sourceRef(release);
       const update = { version: latest };
       let sourceRead = false;
+      // Set only when the tools applied below were cached for a different ref.
+      let toolsOrigin = {};
 
       const diskCachedSource =
         (global.fetch === BOOT_FETCH || process.env.OPENCODE_CACHE_DIR)
@@ -1975,13 +2024,16 @@ async function refresh({ force = false, recheck = false } = {}) {
           if (allCoreFetched && allSettledOk) {
             lastSyncedSource = { ref, extracted, fetchRef: global.fetch };
             if (extracted.tools && Object.keys(extracted.tools).length > 0) {
-              writeCachedSource(ref, extracted);
+              writeCachedSource(ref, extracted, latest);
             }
           }
         } else {
           const fallbackSource = readCachedSource(ref) || readCachedSource();
           if (fallbackSource && fallbackSource.extracted) {
             Object.assign(update, fallbackSource.extracted);
+            if (fallbackSource.ref !== ref) {
+              toolsOrigin = { toolsVersion: cachedSourceVersion(fallbackSource), toolsRef: fallbackSource.ref };
+            }
           }
         }
       }
@@ -1993,7 +2045,7 @@ async function refresh({ force = false, recheck = false } = {}) {
       Object.assign(update, catalog);
 
       if (myGen !== refreshGen) return { updated: false, reason: "reset" };
-      const changed = applyRecipe(update, ref);
+      const changed = applyRecipe(update, ref, toolsOrigin);
       if (isForced && sourceRead && !release.stale) {
         lastForcedRefreshTime = Date.now();
       }
@@ -2495,6 +2547,7 @@ function getState() {
     tools: {
       source: toolProfileSource,
       version: toolProfileVersion,
+      ref: toolProfileRef,
       toolNames: Object.keys(getTools()),
     },
   };
@@ -2505,6 +2558,7 @@ function __reset() {
   toolProfile = null;
   toolProfileSource = "default";
   toolProfileVersion = DEFAULT_RECIPE.version;
+  toolProfileRef = null;
   toolNames = [];
   modelEndpoints = {};
   freeModels = [];
@@ -2547,6 +2601,7 @@ function __setToolProfile(tools, source = "test") {
   toolProfile = tools;
   toolProfileSource = source;
   toolProfileVersion = recipe.version;
+  toolProfileRef = null;
   lastForcedRefreshTime = 0;
   stateEpoch++;
 }
@@ -2558,7 +2613,10 @@ function __setToolProfile(tools, source = "test") {
   if (bootCatalog) applyRecipe(parseCatalogData(bootCatalog));
   const bootSource = readCachedSource();
   if (bootSource && bootSource.extracted) {
-    applyRecipe(bootSource.extracted, bootSource.ref);
+    applyRecipe(bootSource.extracted, bootSource.ref, {
+      toolsVersion: cachedSourceVersion(bootSource),
+      toolsRef: bootSource.ref,
+    });
     lastSyncedSource = {
       ref: bootSource.ref,
       extracted: bootSource.extracted,

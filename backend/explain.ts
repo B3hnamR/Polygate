@@ -22,18 +22,18 @@ export function explainError(c: ErrorContext): Explained | undefined {
   const up = upstreamFields(c.message);
   if (c.exhausted?.refused) {
     return { code: 'relay_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },
-      message: `OpenCode Free refused requests through "${c.route}" and no other network exit could serve this one. A relay is the TLS client the provider sees, and the Free tier only accepts Bun's; this relay did not report that it runs Bun, so the refusal is probably its TLS identity and not a used-up allowance. Deploy the Bun relay template (relays/vercel-bun), or choose Direct, WARP or a proxy route.` };
+      message: `OpenCode Free returned a limit/access error through "${c.route}". The relay's outbound runtime could not be verified, so Polygate cannot distinguish an allowance limit from an access or client restriction. Missing runtime information does not prove the relay is broken or its TLS identity was rejected. Check the relay diagnostics and the provider response before changing deployments.` };
   }
   if (c.exhausted) {
     const seconds = Math.max(0, Math.ceil((c.exhausted.until - Date.now()) / 1000));
-    const tried = c.switches ? ` Polygate already moved to ${c.switches} other network exit${c.switches > 1 ? 's' : ''} and none had allowance left.` : '';
+    const tried = c.switches ? ` Polygate tried ${c.switches} other network exit${c.switches > 1 ? 's' : ''} without a successful answer.` : '';
     return { code: 'egress_exhausted', retryAfter: seconds,
       extra: { resets_at: new Date(c.exhausted.until).toISOString(), retry_after_seconds: seconds, route: c.route, upstream: { status: c.status, ...up } },
-      message: `OpenCode Free: the daily allowance for this network exit (${c.route || 'direct'}) is used up. It resets at ${resetTime(c.exhausted.until)} (in ${human(seconds)}).${tried} This is a limit on the IP address, not a problem with your request or key.${largeRequestNote(c.requestBytes, c.messages)} To continue now, use a different IP (VPN or another network), or add verified proxies or a WARP route in Polygate so it can switch automatically.` };
+      message: `OpenCode Free returned a limit/access error through ${c.route || 'direct'}, including for a small check request. The provider's Retry-After says to retry after ${resetTime(c.exhausted.until)} (in ${human(seconds)}); this is not a guaranteed daily reset. The response does not prove whether the cause is an exhausted allowance or another access restriction.${tried}${largeRequestNote(c.requestBytes, c.messages)} Wait for the advertised retry time, use a provider you have access to, or contact OpenCode with its request identifier. This is not evidence of a relay transport failure.` };
   }
   if (c.status === 429 && /FreeUsageLimit|Free usage limit/i.test(c.message + (up.type || ''))) {
     return { code: 'request_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },
-      message: `OpenCode Free refused this request (HTTP 429). ${c.confirmedClean ? 'A small test request through the same network exit was accepted, so the exit still has allowance and this request itself was refused.' : 'It did not give a reset time, so this does not look like a used-up daily allowance.'} The usual causes are the shape of the request (tools, session, system prompt) or the TLS client in use. Open Requests in Polygate, select this request and read "Request shape" to see what was sent${up.logId ? ` (provider log id ${up.logId})` : ''}.` };
+      message: `OpenCode Free returned a limit/access error (HTTP 429). ${c.confirmedClean ? 'A small check through the same network exit was accepted, but this request was not.' : 'No confirmed retry time is available; this alone cannot distinguish a quota limit from an access restriction.'} This does not establish a relay failure or a TLS problem. Open Requests in Polygate, select this request and inspect the provider error and "Request shape"${up.logId ? ` (provider log id ${up.logId})` : ''}.` };
   }
   // The relay's own answer to a wrong access token: nothing to do with the exit address or with OpenCode.
   if (c.status === 401 && /Unauthorized relay request/i.test(up.text || '')) {

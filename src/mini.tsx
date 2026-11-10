@@ -50,9 +50,9 @@ export function MiniView({ data, base, apiKey, busy, copy, notice, onToggle, onR
     </section>
     <section className="mini-stats" aria-label="Last 24 hours">
       <div className="mini-stat"><span>Requests</span><strong>{total.toLocaleString()}</strong></div>
-      <div className="mini-stat"><span>Success rate</span><strong className={rate === null ? '' : rate >= 90 ? 'good' : 'bad'}>{rate === null ? '—' : rate + '%'}</strong></div>
+      <div className="mini-stat"><span>Success rate</span><strong className={rate === null ? '' : rate >= 90 ? 'good' : 'bad'}>{rate === null ? '-' : rate + '%'}</strong></div>
       <div className="mini-stat"><span>Average time</span><strong>{ms(latency)}</strong></div>
-      <div className="mini-stat"><span>Speed</span><strong>{metrics?.tokensPerSecond ? metrics.tokensPerSecond + ' tok/s' : '—'}</strong></div>
+      <div className="mini-stat"><span>Speed</span><strong>{metrics?.tokensPerSecond ? metrics.tokensPerSecond + ' tok/s' : '-'}</strong></div>
     </section>
     <section className="mini-recent" aria-label="Recent requests">
       <h2>Recent requests</h2>

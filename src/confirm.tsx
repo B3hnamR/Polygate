@@ -13,7 +13,8 @@ export function useConfirm(){
   const answer=(value:boolean)=>{ask?.resolve(value);setAsk(null);};
   const dialog=ask?<Dialog title={ask.title} icon={ask.icon||<Trash2 size={18}/>} onClose={()=>answer(false)}>
     <p>{ask.message}</p>
-    <div className="dialog-actions"><Button onClick={()=>answer(false)}>Cancel</Button><Button variant="primary" onClick={()=>answer(true)}>{ask.confirm}</Button></div>
+    {/* Focus starts on Cancel, so Enter on a confirmation never deletes by accident; Tab reaches the action, Escape closes. */}
+    <div className="dialog-actions"><button type="button" className="button" data-autofocus onClick={()=>answer(false)}>Cancel</button><Button variant="primary" onClick={()=>answer(true)}>{ask.confirm}</Button></div>
   </Dialog>:null;
   return {confirm,dialog};
 }

@@ -206,7 +206,7 @@ Responses continuation through `previous_response_id` is not implemented; send c
 | **OpenCode server** | an OpenCode you run yourself (`opencode serve`), reached over its own REST API | uses the providers and logins configured in that OpenCode; model ids are `provider/model` as that server lists them; text conversation only (no tool calls) |
 
 Built-in providers can be switched off but not deleted. A model's priority and score can be changed on the Models page, which can also show one provider's models at a time. Models are not probed in the
-background by default (a probe is a real request that uses up allowance); press *Check* on a model to test it.
+background by default (a probe is a real request that uses up allowance); press *Check* on a model to test it, or *Check all* for every model of one provider. A run stops as soon as the provider asks to slow down. Each provider can also be checked automatically every hour, 6 hours or day: one model at a time, waiting 15 minutes after a slow-down, and including unavailable models so one that comes back is found.
 
 ## MCP hub
 
@@ -225,6 +225,8 @@ The page has ready-to-paste settings for Claude Code, Cursor, Codex, OpenCode, V
 ## Network routes and relays
 
 A *route* is the path a request takes to the provider. Pick one on the Routing page, and give a provider its own route if it needs one.
+
+The Routing page has two views of the same settings. *List* shows the exits and switches one under another. *Map* shows providers and exits as nodes joined by lines: drag from a provider to an exit (or back) to join them, drag the dot near a line's end to move it to another exit, click a line to pause or remove it, and pause any node from its own button. A paused line keeps its place and is not used. Z.ai keeps one steady address: Direct, or one proxy of your own. Relays, the proxy pool and WARP change address between requests, so they are not offered for it. The map works from the keyboard through its side panel.
 
 - **Direct**: your own connection.
 - **HTTP / SOCKS proxy**: your own proxy, or the **verified proxy pool**: Polygate downloads public lists, tests them with real model requests, and keeps the ones that work. Under **My proxies and lists** you can paste proxies and links to lists (plain `ip:port`, `socks5://…`, `user:pass@ip:port`, `ip:port:user:pass`, web-page tables, JSON), or save list links that every search downloads before (or instead of) the public lists.

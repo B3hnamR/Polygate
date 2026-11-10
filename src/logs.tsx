@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type React
 import { AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Copy, Info, Loader2, Play, RefreshCw, ScrollText, Search, Trash2, X } from 'lucide-react';
 import { api, at } from './api';
 import { Button, Empty, Select } from './ui';
+import { useConfirm } from './confirm';
 import type { Level, LogEntry } from '../backend/logbook';
 
 type Result = { entries: LogEntry[]; more: boolean; levels: Partial<Record<Level, number>>; sources: { source: string; count: number }[]; total: number };
@@ -24,7 +25,7 @@ function Marked({ text, query }: { text: string; query: string }) {
   return <>{parts.map((p, i) => i % 2 ? <mark key={i}>{p}</mark> : <Fragment key={i}>{p}</Fragment>)}</>;
 }
 function DetailValue({ value }: { value: unknown }): ReactNode {
-  if (value === null || value === undefined) return <span className="subtle">—</span>;
+  if (value === null || value === undefined) return <span className="subtle">-</span>;
   if (Array.isArray(value)) return value.length ? value.map(v => typeof v === 'object' ? JSON.stringify(v) : String(v)).join(', ') : <span className="subtle">none</span>;
   if (typeof value === 'object') return <code>{JSON.stringify(value)}</code>;
   if (typeof value === 'number' && value > 1e12 && value < 1e13) return new Date(value).toLocaleString();
@@ -65,7 +66,10 @@ export function LogsPage() {
   const [older, setOlder] = useState(false);
   const [error, setError] = useState('');
   const [exportFormat, setExportFormat] = useState('');
+  const { confirm, dialog } = useConfirm();
   const newest = useRef(0);
+  const generation = useRef(0); const liveGeneration = useRef(0);
+  const loadingNow = useRef(false); const olderNow = useRef(false);
   // The search box waits for a pause in typing before asking the gateway.
   useEffect(() => { const t = setTimeout(() => setQuery(input.trim()), 250); return () => clearTimeout(t); }, [input]);
   const params = useCallback((extra: Record<string, string | number> = {}) => {
@@ -78,40 +82,44 @@ export function LogsPage() {
     return p;
   }, [levels, sources, query, range]);
   const load = useCallback(async () => {
-    setLoading(true); setError('');
-    try { const r: Result = await api('/admin/events?' + params({ limit: PAGE })); setData(r); setRows(r.entries); newest.current = r.entries[0]?.id || 0; setFresh(new Set()); }
-    catch (e: any) { setError(e?.message || 'Could not read the logs.'); }
-    finally { setLoading(false); }
+    const request = ++generation.current;
+    loadingNow.current = true; olderNow.current = false; setLoading(true); setOlder(false); setError('');
+    try { const r: Result = await api('/admin/events?' + params({ limit: PAGE })); if (request !== generation.current) return; setData(r); setRows(r.entries); newest.current = r.entries[0]?.id || 0; setFresh(new Set()); }
+    catch (e: any) { if (request === generation.current) setError(e?.message || 'Could not read the logs.'); }
+    finally { if (request === generation.current) { loadingNow.current = false; setLoading(false); } }
   }, [params]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void load(); return () => { generation.current++; }; }, [load]);
   // Live view: only entries newer than the last one shown are fetched, then added on top.
   useEffect(() => {
     if (!live) return;
+    const liveRequest = ++liveGeneration.current;
     let busy = false;
     const tick = async () => {
-      if (busy || document.hidden) return; busy = true;
+      if (busy || loadingNow.current || document.hidden) return; busy = true;
+      const request = generation.current;
       try {
         const r: Result = await api('/admin/events?' + params({ after: newest.current, limit: 500 }));
+        if (request !== generation.current || liveRequest !== liveGeneration.current) return;
         setData(prev => prev ? { ...prev, levels: r.levels, sources: r.sources, total: r.total } : r);
         if (r.entries.length) {
           newest.current = r.entries[0].id;
-          setRows(prev => [...r.entries, ...prev].slice(0, MAX_ROWS));
+          setRows(prev => [...r.entries, ...prev.filter(e => !r.entries.some(n => n.id === e.id))].slice(0, MAX_ROWS));
           setFresh(new Set(r.entries.map(e => e.id)));
         }
       } catch { /* the next tick tries again */ } finally { busy = false; }
     };
     const id = setInterval(() => void tick(), LIVE_MS);
-    return () => clearInterval(id);
+    return () => { clearInterval(id); liveGeneration.current++; };
   }, [live, params]);
   const loadOlder = async () => {
-    const last = rows[rows.length - 1]; if (!last) return;
-    setOlder(true);
-    try { const r: Result = await api('/admin/events?' + params({ before: last.id, limit: PAGE })); setRows(prev => [...prev, ...r.entries].slice(0, MAX_ROWS + PAGE)); setData(prev => prev ? { ...prev, more: r.more } : r); }
-    catch (e: any) { setError(e?.message || 'Could not read older entries.'); }
-    finally { setOlder(false); }
+    const last = rows[rows.length - 1]; if (!last || loadingNow.current || olderNow.current) return;
+    const request = generation.current; olderNow.current = true; setOlder(true);
+    try { const r: Result = await api('/admin/events?' + params({ before: last.id, limit: PAGE })); if (request !== generation.current) return; setRows(prev => [...prev, ...r.entries.filter(e => !prev.some(n => n.id === e.id))].slice(0, MAX_ROWS + PAGE)); setData(prev => prev ? { ...prev, more: r.more } : r); }
+    catch (e: any) { if (request === generation.current) setError(e?.message || 'Could not read older entries.'); }
+    finally { if (request === generation.current) { olderNow.current = false; setOlder(false); } }
   };
   const clearAll = async () => {
-    if (!confirm('Delete every log entry? This cannot be undone.')) return;
+    if (!await confirm('Delete every log entry? This cannot be undone.', { title: 'Clear logs', confirm: 'Clear logs' })) return;
     try { await api('/admin/events/clear', {}); await load(); } catch (e: any) { setError(e?.message || 'Could not clear the logs.'); }
   };
   const download = (format: string) => {
@@ -125,17 +133,18 @@ export function LogsPage() {
   const sourceList = useMemo(() => { const list = [...(data?.sources || [])]; for (const s of sources) if (!list.some(x => x.source === s)) list.push({ source: s, count: 0 }); return list; }, [data, sources]);
   const rangeLabel = RANGES.find(([v]) => v === range)?.[1].toLowerCase() || '';
   return <section className="section-block logs-page" aria-label="Logs">
+    {dialog}
     <div className="section-top logs-head">
       <p className="muted">Requests, model and route changes, dashboard actions, sign-ins, WARP, proxies and HTTPS in one timeline. Secrets are removed before anything is saved; entries are kept for 7 days.</p>
       <div className="logs-head-actions">
-        <button className={`live-toggle${live ? ' on' : ''}`} aria-pressed={live} title={live ? 'New entries appear as they happen. Click to pause.' : 'Click to show new entries as they happen.'} onClick={() => { setLive(!live); remember('live', live ? '0' : '1'); if (!live) void load(); }}>
+        <button className={`live-toggle${live ? ' on' : ''}`} aria-pressed={live} title={live ? 'New entries appear as they happen. Click to pause.' : 'Click to show new entries as they happen.'} onClick={() => { liveGeneration.current++; setLive(!live); remember('live', live ? '0' : '1'); if (!live) void load(); }}>
           {live ? <i aria-hidden="true" /> : <Play size={13} />}{live ? 'Live' : 'Paused'}
         </button>
         <Button onClick={() => void load()} disabled={loading} title="Reload"><RefreshCw size={14} className={loading ? 'spin' : ''} />Refresh</Button>
       </div>
     </div>
     <div className="section-toolbar logs-toolbar">
-      <div className="search"><Search size={16} /><input aria-label="Search logs" placeholder="Search messages and details…" value={input} onChange={e => setInput(e.target.value)} />{input && <button className="icon-button" aria-label="Clear search" onClick={() => setInput('')}><X size={14} /></button>}</div>
+      <div className="search"><Search size={16} /><input aria-label="Search logs" placeholder="Search logs…" value={input} onChange={e => setInput(e.target.value)} />{input && <button className="icon-button" aria-label="Clear search" onClick={() => setInput('')}><X size={14} /></button>}</div>
       <Select aria-label="Time range" value={range} onChange={v => { setRange(v); remember('range', v); }}>{RANGES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</Select>
       <span className="toolbar-spacer" />
       <Select aria-label="Export logs" value={exportFormat} onChange={download}><option value="" disabled>Export…</option><option value="txt">Download as text (.log)</option><option value="json">Download as JSON lines (.ndjson)</option></Select>
@@ -158,7 +167,7 @@ export function LogsPage() {
         <ol className="log-list" aria-label="Log entries">{rows.map(e => <Row key={e.id} entry={e} open={open === e.id} toggle={() => setOpen(open === e.id ? null : e.id)} query={query} fresh={fresh.has(e.id)} />)}</ol>
         <div className="logs-foot">
           <span className="subtle">Showing {rows.length.toLocaleString()} of {(data?.total ?? rows.length).toLocaleString()} {filtered ? 'matching ' : ''}entries from the {rangeLabel}</span>
-          {data?.more && rows.length < MAX_ROWS + PAGE && <Button onClick={() => void loadOlder()} disabled={older}>{older ? <Loader2 size={14} className="spin" /> : <ChevronDown size={14} />}Load older</Button>}
+          {data?.more && rows.length < MAX_ROWS + PAGE && <Button onClick={() => void loadOlder()} disabled={older || loading}>{older ? <Loader2 size={14} className="spin" /> : <ChevronDown size={14} />}Load older</Button>}
         </div>
       </>}
   </section>;

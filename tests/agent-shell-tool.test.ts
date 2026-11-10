@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-// The agent workspace runs the real OpenCode CLI (2.0.32) on Windows. Its tools must reach OpenCode Free unchanged: the bridge keeps a
+// The agent workspace runs the real OpenCode CLI on Windows. Its tools must reach OpenCode Free unchanged: the bridge keeps a
 // client tool only when it matches the identity profile, and the profile renders OpenCode's `shell` description for Linux ("Commands run
 // on Linux using bash."), while the real CLI on Windows says "Commands run on Windows using pwsh." So the genuine tool was renamed to
 // `shell_client` and a placeholder `shell` was added, with a note telling the model not to call it.
@@ -16,6 +16,22 @@ const MODEL = 'deepseek-v4.1-flash-free';
 const names = (tools: any[]) => tools.map(t => t.function?.name ?? t.name);
 const shellOf = (tools: any[]) => tools.find(t => (t.function?.name ?? t.name) === 'shell');
 const withShellDescription = (description: string) => real.map(t => t.function?.name === 'shell' ? { ...t, function: { ...t.function, description } } : t);
+
+test('OpenCode 2.2.5 Windows tools pass unchanged with the identity extracted from its release sources', () => {
+  const captured = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures', 'opencode-2.2.5-windows-tools.json'), 'utf8'));
+  bridge.identity.__setToolProfile(captured.fingerprint, 'captured-2.2.5-source');
+  try {
+    const out = bridge.prepareToolsWithFingerprint(captured.tools, false, null, 'beam-free');
+    expect(names(out.tools)).toEqual(names(captured.tools));
+    expect(out.appended).toEqual([]);
+    expect(out.originalToAlias.size).toBe(0);
+    expect(out.placeholderNote).toBe('');
+    expect(shellOf(out.tools).function.description).toBe(shellOf(captured.tools).function.description);
+    const write = captured.tools.find((t: any) => t.function.name === 'write');
+    expect(write.function.parameters.required).toContain('path');
+    expect(write.function.parameters.properties.filePath).toBeUndefined();
+  } finally { bridge.identity.__reset(); }
+});
 
 test('The real OpenCode CLI on Windows reaches OpenCode Free with its own tools, nothing renamed or added', () => {
   const out = bridge.prepareToolsWithFingerprint(real, false, null, MODEL);

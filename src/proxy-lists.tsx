@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertCircle, Check, CheckCircle2, Download, Link2, Loader2, Plus, Save, Trash2, Zap } from 'lucide-react';
+import { AlertCircle, Check, CheckCircle2, Download, Link2, Loader2, Plus, Save, Trash2, Activity } from 'lucide-react';
 import { api } from './api';
 import { Button, Select, Toggle, when } from './ui';
 import type { Notice } from './panels';
 import type { ProxySource } from '../backend/types';
+import { useConfirm } from './confirm';
 
 type Sources = { builtin: boolean; builtinCount: number; sources: ProxySource[] };
 type Proto = ProxySource['proto'];
@@ -13,7 +14,7 @@ const protoLabel = (p: Proto) => PROTOS.find(([v]) => v === p)?.[1] || p;
 const linksIn = (text: string) => [...new Set(text.split(/[\r\n]+/).map(l => l.trim()).filter(l => /^https?:\/\/\S+$/i.test(l) && !/^https?:\/\/(?:[^\s:@/]+:[^\s@/]*@)?[^\s/:]+:\d{1,5}\/?$/i.test(l)))];
 // Your own proxies and lists: check a pasted list (proxies and links mixed) once, or keep list links that every "Find working proxies" run downloads.
 export function ProxyLists({ select, disabled, notice, onStarted }: { select: boolean; disabled: boolean; notice: Notice; onStarted: () => void }) {
-  const [text, setText] = useState(''); const [proto, setProto] = useState<Proto>('all'); const [busy, setBusy] = useState('');
+  const [text, setText] = useState(''); const [proto, setProto] = useState<Proto>('all'); const [busy, setBusy] = useState(''); const { confirm, dialog } = useConfirm();
   const [lists, setLists] = useState<Sources | null>(null); const [newUrl, setNewUrl] = useState(''); const [newProto, setNewProto] = useState<Proto>('all');
   const [preview, setPreview] = useState<{ url: string; count: number; byProtocol: Record<string, number>; error?: string } | null>(null);
   const files = useRef<HTMLInputElement>(null);
@@ -47,6 +48,7 @@ export function ProxyLists({ select, disabled, notice, onStarted }: { select: bo
   };
   const update = (id: string, patch: Partial<ProxySource>, done: string) => lists && void save({ sources: lists.sources.map(s => s.id === id ? { ...s, ...patch } : s) }, done);
   return <div className="proxy-lists">
+    {dialog}
     <div className="section-block form-section">
       <h3>Check a list now</h3>
       <p className="muted">Paste proxies, links to lists, or both. Proxies can be <code>ip:port</code>, <code>socks5://ip:port</code>, <code>user:password@ip:port</code> or <code>ip:port:user:password</code>; web pages with a table and JSON lists work too. Only proxies that reach the OpenCode API in time are kept.</p>
@@ -57,7 +59,7 @@ export function ProxyLists({ select, disabled, notice, onStarted }: { select: bo
         <input ref={files} hidden type="file" multiple accept=".txt,.csv,.list,.json,.html,.htm" onChange={async e => { const picked = [...(e.target.files || [])]; e.target.value = ''; if (picked.length) setText([text, ...(await Promise.all(picked.map(f => f.text())))].filter(Boolean).join('\n')); }} />
         <span className="toolbar-spacer" />
         {links.length > 0 && <Button disabled={!!busy || !lists} onClick={() => void keepLinks()} title="Keep these links: every Find working proxies run downloads them"><Save size={15} />Save {links.length} link{links.length > 1 ? 's' : ''} for every search</Button>}
-        <Button variant="primary" disabled={!text.trim() || !!busy || disabled} onClick={() => void check()}>{busy === 'check' ? <Loader2 size={15} className="spin" /> : <Zap size={15} />}Check these now</Button>
+        <Button variant="primary" disabled={!text.trim() || !!busy || disabled} onClick={() => void check()}>{busy === 'check' ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}Check these now</Button>
       </div>
     </div>
     <div className="section-block form-section">
@@ -71,7 +73,7 @@ export function ProxyLists({ select, disabled, notice, onStarted }: { select: bo
             <small className="subtle"><span className="protocol">{protoLabel(s.proto)}</span> {s.lastAt ? s.lastError && !s.lastCount ? <span className="bad-text"><AlertCircle size={12} /> {s.lastError} · {when(s.lastAt)}</span> : <span><CheckCircle2 size={12} /> {s.lastCount?.toLocaleString()} addresses · {when(s.lastAt)}</span> : 'Not downloaded yet'}</small></div>
           <Select aria-label={`Type of ${s.url}`} value={s.proto} onChange={v => update(s.id, { proto: v as Proto }, 'Type changed')}>{PROTOS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</Select>
           <Button disabled={!!busy} onClick={() => void test(s.url, s.proto)} title="Download it now and count what is inside">{busy === 'test:' + s.url ? <Loader2 size={13} className="spin" /> : <Link2 size={13} />}Test</Button>
-          <button className="icon-button" aria-label={`Remove ${s.url}`} disabled={!!busy} onClick={() => { if (confirm(`Remove ${s.url}?`)) void save({ sources: lists.sources.filter(x => x.id !== s.id) }, 'Link removed'); }}><Trash2 size={14} /></button>
+          <button className="icon-button" aria-label={`Remove ${s.url}`} disabled={!!busy} onClick={async () => { if (await confirm(<>Remove the list <strong>{s.url}</strong>?</>, { title: 'Remove proxy list', confirm: 'Remove' })) void save({ sources: lists.sources.filter(x => x.id !== s.id) }, 'Link removed'); }}><Trash2 size={14} /></button>
         </li>)}</ul>}
         <div className="source-add">
           <Select aria-label="Type of the new list" value={newProto} onChange={v => setNewProto(v as Proto)}>{PROTOS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</Select>

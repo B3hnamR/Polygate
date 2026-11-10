@@ -3,6 +3,7 @@ import { routeForProvider, providerRoutes } from './transport';
 import { catalogProblems } from './providers';
 import { engineMode, warpTarget } from './warp';
 import { keyProblem } from './plan';
+import { modelAllowed } from './keys';
 import { resetTime } from './exhaustion';
 import type { Model, Provider } from './types';
 import { engineStatus } from './agent-engine';
@@ -37,9 +38,15 @@ export function checklist(ctx: { providers: Provider[]; known: Model[]; usable: 
     if (why) items.push({ id: `key:${k.id}`, severity: 'warning', title: `Client key "${k.name}" ${why}`, detail: 'Requests that use this key are rejected.', page: 'Settings' });
   }
   if (usable.length) {
-    let reason = ''; let routed = false;
-    for (const p of providers) { const m = usable.find(x => x.providerId === p.id); if (!m) continue; try { routeForProvider(p, m.id, true); routed = true; break; } catch (e: any) { reason ||= String(e?.message || e); } }
-    if (!routed) items.push({ id: 'no_route', severity: 'blocking', title: 'No route can take requests', detail: reason || 'No route can take a request right now.', page: 'Routing' });
+    let reason = ''; let routed = false; let allowed = false;
+    // A valid key, model and route must work together. Preview every eligible model, without advancing either route rotation.
+    outer: for (const p of providers) for (const m of usable) {
+      if (m.providerId !== p.id || (usableKeys.length && !usableKeys.some(k => modelAllowed(k, m.id) && (!k.agent || m.tools === true)))) continue;
+      allowed = true;
+      try { routeForProvider(p, m.id, true); routed = true; break outer; } catch (e: any) { reason ||= String(e?.message || e); }
+    }
+    if (usableKeys.length && !allowed) items.push({ id: 'no_allowed_model', severity: 'blocking', title: 'No client key can use the available models', detail: 'No usable client API key allows a model that can be used right now. Review the key model allow-lists in Settings; the Agent key also needs a model with tool support.', page: 'Settings' });
+    else if (!routed) items.push({ id: 'no_route', severity: 'blocking', title: 'No route can take requests', detail: reason || 'No route can take a request right now.', page: 'Routing' });
   }
   // ---- what hurts some requests
   for (const p of providers) {

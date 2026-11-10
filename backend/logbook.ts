@@ -72,7 +72,7 @@ export function clearEvents() { db.exec('DELETE FROM events'); }
 const actions: Record<string, [string, string]> = {
   '/admin/settings': ['settings', 'Gateway settings saved'], '/admin/chains/save': ['chains', 'Model chain saved'], '/admin/chains/delete': ['chains', 'Model chain deleted'], '/admin/password': ['auth', 'Dashboard password changed'], '/admin/signout-all': ['auth', 'Sign-out on every device'],
   '/admin/shutdown': ['gateway', 'Shutdown requested'], '/admin/identity/refresh': ['providers', 'OpenCode identity refreshed'],
-  '/admin/discover': ['models', 'Model catalog refreshed'], '/admin/probe': ['models', 'Model availability checked'], '/admin/model': ['models', 'Model settings changed'],
+  '/admin/discover': ['models', 'Model catalog refreshed'], '/admin/probe': ['models', 'Model availability checked'], '/admin/probe/provider': ['models', 'Provider model check started or stopped'], '/admin/model': ['models', 'Model settings changed'],
   '/admin/providers': ['providers', 'Provider saved'], '/admin/providers/delete': ['providers', 'Provider removed'],
   '/admin/routes': ['routes', 'Route saved'], '/admin/routes/delete': ['routes', 'Route removed'], '/admin/routes/toggle': ['routes', 'Route switched on or off'], 
   '/admin/relays/deploy': ['relays', 'Relay deployed'], '/admin/relays/inspect': ['relays', 'Relay checked'],

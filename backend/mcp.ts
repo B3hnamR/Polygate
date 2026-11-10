@@ -11,7 +11,7 @@ import { readiness, json } from './gateway';
 import { authenticate } from './keys';
 import { serverConfig, clientIp } from './auth';
 import { version } from './version';
-import type { ApiKey, McpServer, McpSettings } from './types';
+import type { AgentMcpSelection, ApiKey, McpServer, McpSettings } from './types';
 // The MCP hub. Clients connect once to /mcp with a Polygate client API key and get the tools of every MCP server added on the MCP page,
 // named "<server>__<tool>", plus Polygate's own tools (polygate__…). /mcp/<server> offers one server with its tools' own names.
 // Remote servers are reached through a Polygate route (direct, a proxy, the proxy pool or WARP); local servers are programs started here.
@@ -297,23 +297,52 @@ const BUILTIN: { def: McpTool; run: (a: any) => Promise<unknown> | unknown }[] =
   { def: { name: 'list_mcp_servers', title: 'List MCP servers', description: 'The MCP servers this hub connects to, whether each is connected, and its tools.', inputSchema: object(), annotations: { readOnlyHint: true } },
     run: () => mcpConfig().servers.map(s => { const l = live.get(s.id); return { name: s.name, transport: s.transport, enabled: s.enabled, state: l?.state || 'off', error: l?.error || undefined, tools: (l?.tools || []).filter(t => !s.disabledTools?.includes(t.name)).map(t => t.name) }; }) },
 ];
+// Agent sharing is opt-in for exact server configurations and tool definitions. New/changed tools never inherit consent.
+const agentFingerprint = (server: McpServer | undefined, tool: McpTool) => createHash('sha256').update(JSON.stringify([server ? signature(server) : 'polygate-builtin', tool])).digest('hex');
+function agentToolAllowed(key: ApiKey | undefined, server: McpServer | undefined, tool: McpTool) {
+  return !key?.agent || !!mcpConfig().agentTools?.some(x => x.server === (server?.id || 'polygate') && x.tool === tool.name && x.fingerprint === agentFingerprint(server, tool));
+}
+export function agentMcpCatalog() {
+  const cfg = mcpConfig(), key = settings.keys.find(k => k.agent);
+  const agentAllowed = (keys?: string[]) => !keys?.length || !!key && key.enabled && allowed(key, keys);
+  const tools = (server: McpServer | undefined, defs: McpTool[]) => defs.map(t => {
+    const fingerprint = agentFingerprint(server, t), selected = cfg.agentTools?.find(x => x.server === (server?.id || 'polygate') && x.tool === t.name);
+    return { name: t.name, title: t.title || t.annotations?.title, description: t.description, fingerprint, selected: !!selected, changed: !!selected && selected.fingerprint !== fingerprint, disabled: !!server?.disabledTools?.includes(t.name) };
+  });
+  return { enabled: cfg.enabled, servers: [
+    { id: 'polygate', name: 'Polygate tools', available: cfg.enabled && cfg.builtin && agentAllowed(cfg.builtinKeys), state: cfg.builtin ? 'ready' : 'off', tools: tools(undefined, BUILTIN.map(t => t.def)) },
+    ...cfg.servers.map(s => ({ id: s.id, name: s.title || s.name, available: cfg.enabled && s.enabled && agentAllowed(s.keys), state: live.get(s.id)?.state || 'off', tools: tools(s, live.get(s.id)?.tools || []) })),
+  ], selected: cfg.agentTools || [] };
+}
+export function saveAgentMcpSelection(input: unknown) {
+  if (!Array.isArray(input) || input.length > 500) throw new GatewayError('Choose up to 500 MCP tools.', 400);
+  const catalog = agentMcpCatalog(); const selections: AgentMcpSelection[] = []; const seen = new Set<string>();
+  for (const item of input) {
+    const server = catalog.servers.find(s => s.id === item?.server), tool = server?.tools.find(t => t.name === item?.tool);
+    if (!server?.available || !tool || tool.disabled || item.fingerprint !== tool.fingerprint) throw new GatewayError('An MCP server or tool changed or is unavailable. Refresh the list and review your choices again.', 409, 'agent_mcp_changed');
+    const id = JSON.stringify([server.id, tool.name]); if (seen.has(id)) continue; seen.add(id);
+    selections.push({ server: server.id, tool: tool.name, fingerprint: tool.fingerprint });
+  }
+  mcpConfig().agentTools = selections; persist();
+}
 async function hubTools(key: ApiKey | undefined, scope: string) {
   const cfg = mcpConfig(); const out: McpTool[] = [];
-  if ((!scope || scope === 'polygate') && cfg.builtin && allowed(key, cfg.builtinKeys)) for (const t of BUILTIN) out.push({ ...t.def, name: scope ? t.def.name : `polygate__${t.def.name}` });
-  const servers = cfg.servers.filter(s => s.enabled && (!scope || s.name === scope) && allowed(key, s.keys));
+  if ((!scope || scope === 'polygate') && cfg.builtin && allowed(key, cfg.builtinKeys)) for (const t of BUILTIN) if (agentToolAllowed(key, undefined, t.def)) out.push({ ...t.def, name: scope ? t.def.name : `polygate__${t.def.name}` });
+  const servers = cfg.servers.filter(s => s.enabled && (!scope || s.name === scope) && allowed(key, s.keys) && (!key?.agent || cfg.agentTools?.some(x => x.server === s.id)));
   await Promise.all(servers.map(s => ready(s, 15000).catch(() => {})));
   const named = scope ? undefined : hubMap(); const nameOf = (s: McpServer, t: McpTool) => [...named!].find(([, v]) => v.server.id === s.id && v.tool === t.name)?.[0] || hubName(s.name, t.name);
-  for (const s of servers) { const l = live.get(s.id); if (l?.state !== 'ready') continue; for (const t of l.tools) if (!s.disabledTools?.includes(t.name)) out.push({ ...t, name: scope ? t.name : nameOf(s, t) }); }
+  for (const s of servers) { const l = live.get(s.id); if (l?.state !== 'ready') continue; for (const t of l.tools) if (!s.disabledTools?.includes(t.name) && agentToolAllowed(key, s, t)) out.push({ ...t, name: scope ? t.name : nameOf(s, t) }); }
   return out;
 }
 // Runs one tool. A failure inside the tool is reported to the model as a tool error (isError), so it can react; an unknown tool is a protocol error.
 export async function callTool(name: string, args: any, key: ApiKey | undefined, scope: string, via: 'client' | 'dashboard') {
   const cfg = mcpConfig(); const started = Date.now(); args = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  if (!cfg.enabled) throw new RpcError('The MCP hub is switched off', -32602);
   const who = key ? key.name : 'dashboard';
   const builtinName = scope === 'polygate' ? name : !scope && name.startsWith('polygate__') ? name.slice(10) : '';
   if (builtinName) {
     const t = BUILTIN.find(b => b.def.name === builtinName);
-    if (!t || !cfg.builtin || !allowed(key, cfg.builtinKeys)) throw new RpcError(`Unknown tool: ${name}`, -32602);
+    if (!t || !cfg.builtin || !allowed(key, cfg.builtinKeys) || !agentToolAllowed(key, undefined, t.def)) throw new RpcError(`Unknown tool: ${name}`, -32602);
     try { const result = asResult(await t.run(args)); logEvent('info', 'mcp', `polygate/${builtinName} · ${Date.now() - started} ms`, { server: 'polygate', tool: builtinName, key: who, via, durationMs: Date.now() - started, arguments: Object.keys(args) }); return result; }
     catch (e) { logEvent('warn', 'mcp', `polygate/${builtinName} failed: ${plain(e)}`, { server: 'polygate', tool: builtinName, key: who, via }); return { content: [{ type: 'text', text: plain(e) }], isError: true }; }
   }
@@ -321,6 +350,10 @@ export async function callTool(name: string, args: any, key: ApiKey | undefined,
   if (scope) server = cfg.servers.find(s => s.name === scope);
   else { const hit = hubMap().get(name); if (hit) { server = hit.server; tool = hit.tool; } else for (const s of cfg.servers) if (name.startsWith(s.name + '__')) { server = s; tool = name.slice(s.name.length + 2); } }
   if (!server || !server.enabled || !allowed(key, server.keys) || server.disabledTools?.includes(tool)) throw new RpcError(`Unknown tool: ${name}`, -32602);
+  if (key?.agent) {
+    const definition = live.get(server.id)?.tools.find(t => t.name === tool);
+    if (!definition || !agentToolAllowed(key, server, definition)) throw new RpcError(`This MCP tool is not shared with the agent: ${name}`, -32602);
+  }
   const s = server; const timeout = timeoutOf(s);
   const finish = (ok: boolean, result: any, error?: string) => {
     const l = live.get(s.id); const ms = Date.now() - started;
@@ -329,7 +362,12 @@ export async function callTool(name: string, args: any, key: ApiKey | undefined,
     return result;
   };
   for (let attempt = 0; ; attempt++) {
-    try { const l = await ready(s, Math.min(timeout, 60000)); return finish(true, await l.client!.request('tools/call', { name: tool, arguments: args }, timeout)); }
+    try {
+      const l = await ready(s, Math.min(timeout, 60000));
+      const definition = l.tools.find(t => t.name === tool);
+      if (key?.agent && (mcpConfig().servers.find(x => x.id === s.id) !== s || !s.enabled || !mcpConfig().enabled || !allowed(key, s.keys) || s.disabledTools?.includes(tool) || !definition || !agentToolAllowed(key, s, definition))) throw new RpcError('This MCP tool is no longer shared with the agent. Review Agent settings.', -32602);
+      return finish(true, await l.client!.request('tools/call', { name: tool, arguments: args }, timeout));
+    }
     catch (e) {
       // An HTTP server that forgot the session gets one fresh connection.
       if (e instanceof SessionExpired && attempt === 0) { await connect(s).catch(() => {}); continue; }
@@ -443,7 +481,10 @@ export function cleanServer(input: any, saved: McpServer | undefined, local: boo
     let u: URL | undefined, old: URL | undefined; try { u = new URL(url); old = new URL(saved.url); } catch { /* reported below */ }
     if (u && old) { for (const [k, v] of [...u.searchParams]) if (v === MASK) { const had = old.searchParams.get(k); if (had === null || u.origin !== old.origin) throw new GatewayError(`Enter the value of "${k}" in the address again`, 400); u.searchParams.set(k, had); } url = u.toString(); }
   }
-  if (saved?.url && input.headers && Object.values(input.headers as Record<string, unknown>).includes(MASK)) { try { if (new URL(url).origin !== new URL(saved.url).origin) throw new GatewayError('You changed the server address. Enter its header values again so the saved ones are not sent to the new server.', 400); } catch (e) { if (e instanceof GatewayError) throw e; } }
+  const inheritsHeaders = input.headers === undefined
+    ? Object.keys(saved?.headers || {}).length > 0
+    : !!input.headers && typeof input.headers === 'object' && Object.values(input.headers).includes(MASK);
+  if (saved?.url && inheritsHeaders) { try { if (new URL(url).origin !== new URL(saved.url).origin) throw new GatewayError('You changed the server address. Enter its header values again so the saved ones are not sent to the new server.', 400); } catch (e) { if (e instanceof GatewayError) throw e; } }
   try { const u = new URL(url); if (!['http:', 'https:'].includes(u.protocol)) throw new Error(); } catch { throw new GatewayError('Enter the server\'s full address, starting with https://', 400); }
   const routeId = String(input.routeId ?? saved?.routeId ?? mcpDefaultRoute());
   if (!settings.routes.some(r => r.id === routeId)) throw new GatewayError('That route does not exist', 400);

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { test, expect, beforeAll, afterAll, afterEach, spyOn } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,7 @@ const admin = async (p: string, body?: unknown) => {
 };
 const fake = async (p: string, body?: unknown) => { const c = engine.engineConnection()!; return (await fetch(c.url + p, { method: body === undefined ? 'GET' : 'POST', headers: { authorization: c.auth, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })).json() as Promise<any>; };
 const calls = (): Promise<{ method: string; path: string; body: any }[]> => fake('/test/calls');
+afterEach(async()=>{if(engine.engineConnection()){await fake('/test/idle');await Bun.sleep(100);}});
 const emit = (type: string, data: any) => fake('/test/emit', { event: { type, data } });
 const until = async (check: () => boolean | Promise<boolean>, ms = 10000) => { const end = Date.now() + ms; while (!(await check())) { if (Date.now() > end) throw new Error('timed out'); await Bun.sleep(50); } };
 // The UI's event stream for one session, read in the background.
@@ -88,7 +89,179 @@ test('a reasoning model can be given an effort; other models, and unknown effort
   expect((await admin('/admin/agent/models')).body.models.find((m: any) => m.id === THINKER).efforts).toEqual(['low', 'medium', 'high']);
 });
 
-test('untrusted folders cannot start sessions and changed instructions block the next prompt', async () => {
+test('starting the agent refreshes a mismatched bridge identity, but leaves a matching identity alone', async () => {
+  const providers = await import('../backend/providers');
+  const refresh = spyOn(providers, 'syncIdentity').mockImplementation(async () => { providers.__setPresentedVersion(engine.ENGINE_VERSION); return { updated: true }; });
+  try {
+    providers.__setPresentedVersion('2.0.32');
+    expect((await admin('/admin/agent/engine/start', {})).status).toBe(200);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect((await admin('/admin/agent/engine')).body.freeIdentity.usable).toBe(true);
+    expect((await admin('/admin/agent/engine/start', {})).status).toBe(200);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  } finally { refresh.mockRestore(); providers.__setPresentedVersion(); }
+});
+
+test('reopening an active session restores every history page, not just the compacted model context, without interrupting it', async () => {
+  const a = await create(); const ui = listen(a); await ui.ready();
+  expect((await admin('/admin/agent/session/mode', { id: a, mode: 'full', confirmFull: true })).status).toBe(200);
+  await admin('/admin/agent/session/prompt', { id: a, text: 'keep working while I leave the page' });
+  const messages = Array.from({ length: 405 }, (_, n) => n % 2 ? { id: `a_${n}`, type: 'assistant', content: [{ type: 'text', text: `Reply ${n}` }] } : { id: `u_${n}`, type: 'user', text: `Original prompt ${n}` });
+  await fake('/test/session', { sessionID: a, messages, context: messages.slice(-5) });
+  ui.stop(); await Bun.sleep(100);
+  // Folder events keep processing with no browser connected, including Full access approval replies.
+  await emit('permission.asked', { sessionID: a, id: 'per_background', action: 'shell', resources: ['echo background'] });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_background/reply')));
+  const reopened = (await admin('/admin/agent/session?id=' + a)).body;
+  expect(reopened.messages).toEqual(messages);
+  expect(reopened.busy).toBe(true);
+  expect(reopened.session.mode).toBe('full');
+  const again = listen(a); await again.ready();
+  expect(again.events.find(e => e.type === 'agent.state')?.data.busy).toBe(true);
+  expect((await calls()).filter(c => c.path === `/api/session/${a}/interrupt`)).toHaveLength(0);
+  await emit('session.execution.succeeded', { sessionID: a }); again.stop();
+});
+
+test('inline file and image attachments reach the engine, including attachment-only prompts and queued delivery', async () => {
+  const a = await create();
+  const files = [{ name: 'note.txt', mime: 'text/plain', data: Buffer.from('attached text').toString('base64'), source: { type: 'inline' } }, { name: 'image.png', mime: 'image/png', data: 'iVBORw0KGgo=', source: { type: 'inline' } }];
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: '', files, delivery: 'queue' })).status).toBe(200);
+  expect((await calls()).reverse().find(c => c.path === `/api/session/${a}/prompt`)?.body).toEqual({ text: '', files: files.map(f => ({ name: f.name, uri: `data:${f.mime};base64,${f.data}`, source: f.source })), delivery: 'queue' });
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'bad', files: [{ ...files[0], data: 'bad base64' }] })).status).toBe(400);
+  expect((await admin('/admin/agent/session/prompt', { id: a, files: Array(9).fill(files[0]) })).status).toBe(400);
+  expect((await admin('/admin/agent/session/prompt', { id: a, files: [{ ...files[0], data: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') }] })).status).toBe(400);
+});
+
+test('MCP sharing catalog is safe to inspect while running, but changing it requires a stopped engine', async () => {
+  const r = await admin('/admin/agent/mcp'); expect(r.status).toBe(200); expect(r.body.servers).toBeArray();
+  expect((await admin('/admin/agent/mcp', { tools: [] })).body.error.type).toBe('agent_mcp_busy');
+});
+
+test('Git panel requires explicit consent and cannot inspect paths outside the session folder', async()=>{
+  const a=await create();
+  expect((await admin('/admin/agent/session/git',{id:a})).body.error.type).toBe('agent_git_consent');
+  expect((await admin('/admin/agent/session/git',{id:a,confirm:true,file:'../outside.txt'})).body.error.type).toBe('agent_git_inspection');
+  expect((await admin('/admin/agent/session/git',{id:a,confirm:true})).body.repository).toBe(false);
+});
+
+test('questions restore through the engine form inventory and can be answered or cancelled per session',async()=>{
+ const a=await create(),other=await create();
+ await emit('form.created',{form:{id:'frm_fixture',sessionID:a,title:'Choose',fields:[{key:'choice',type:'string',options:[{value:'yes',label:'Yes'}]}]}});
+ expect((await admin('/admin/agent/session/forms?id='+a)).body.forms[0].title).toBe('Choose');
+ expect((await admin('/admin/agent/session/form',{id:other,form:'frm_fixture',answer:{choice:'yes'}})).status).toBe(404);
+ expect((await admin('/admin/agent/session/form',{id:a,form:'frm_fixture',answer:{choice:'yes'}})).status).toBe(200);
+ expect((await admin('/admin/agent/session/forms?id='+a)).body.forms).toEqual([]);
+ await emit('form.created',{form:{id:'frm_cancel',sessionID:a,title:'Cancel',fields:[]}});
+ expect((await admin('/admin/agent/session/form',{id:a,form:'frm_cancel',cancel:true})).status).toBe(200);
+});
+
+test('failed mutation targets are not recorded and folder terminals block other sessions too',async()=>{
+ const a=await create(),other=await create();const ui=listen(a);await ui.ready();
+ await admin('/admin/agent/session/prompt',{id:a,text:'failed edit'});
+ await emit('session.tool.input.started',{sessionID:a,id:'failed_write',name:'write'});
+ await emit('session.tool.called',{sessionID:a,id:'failed_write',input:{path:'failed.txt'}});
+ await emit('session.tool.failed',{sessionID:a,id:'failed_write',error:{message:'denied'}});
+ await emit('session.execution.succeeded',{sessionID:a});await until(async()=>!(await admin('/admin/agent/session?id='+a)).body.busy);await Bun.sleep(100);
+ expect((await admin('/admin/agent/session/changes?id='+a)).body.turns).toEqual([]);ui.stop();
+ const command=process.platform==='win32'?'Start-Sleep -Seconds 30':'sleep 30';
+ expect((await admin('/admin/agent/session/terminal/run',{id:a,command,confirm:true})).status).toBe(200);
+ expect((await admin('/admin/agent/session/prompt',{id:other,text:'overlap'})).body.error.type).toBe('agent_terminal_busy');
+ expect((await admin('/admin/agent/session/terminal/run',{id:other,command,confirm:true})).status).toBe(409);
+ await admin('/admin/agent/session/terminal/stop',{id:a});
+});
+
+test('continuing an existing session re-registers its pinned model after engine catalog drift',async()=>{
+  const a=await create();const m={...models.get(MODEL)!};models.delete(MODEL);engine.syncEngineModels();models.set(MODEL,m);
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'continue after restart'})).status).toBe(200);
+  const c=engine.engineConnection()!;const list:any=(await (await fetch(c.url+'/api/model',{headers:{authorization:c.auth}})).json() as any).data;
+  expect(list.some((x:any)=>x.id===MODEL)).toBe(true);
+});
+
+test('enabled chains appear in Agent catalog and register as chain pins without per-model effort',async()=>{
+  const old=settings.chains;settings.chains=[{id:'fixture-chain',name:'agent-chain',enabled:true,models:[MODEL],created:Date.now()}];
+  try{
+    const catalog=(await admin('/admin/agent/models')).body.models;expect(catalog.find((m:any)=>m.id==='agent-chain')).toMatchObject({provider:'Model chains',usable:true,efforts:[]});
+    const r=await admin('/admin/agent/session/create',{folder:FOLDER,mode:'ask',model:'agent-chain'});expect(r.status).toBe(200);expect(r.body.model).toBe('agent-chain');
+    expect((await admin('/admin/agent/session/create',{folder:FOLDER,mode:'ask',model:'agent-chain',effort:'high'})).status).toBe(400);
+    settings.chains[0].enabled=false;expect((await admin('/admin/agent/session/prompt',{id:r.body.id,text:'continue'})).status).toBe(400);
+  }finally{settings.chains=old;engine.syncEngineModels();}
+});
+test('child history is parent-bound and children are not duplicated as root sessions',async()=>{
+  const parent=await create(),other=await create();const c=engine.engineConnection()!;
+  const raw:any=await (await fetch(c.url+'/api/session',{method:'POST',headers:{authorization:c.auth,'content-type':'application/json'},body:JSON.stringify({parentID:parent,title:'Delegated fixture',agent:'polygate-ask',model:{providerID:'polygate',id:MODEL},location:{directory:FOLDER}})})).json();const child=raw.data.id;
+  const list=(await admin('/admin/agent/session/children?id='+parent)).body;expect(list.children.map((s:any)=>s.id)).toContain(child);
+  expect((await admin('/admin/agent/session/children?id='+parent+'&child='+child)).status).toBe(200);
+  expect((await admin('/admin/agent/session/children?id='+other+'&child='+child)).status).toBe(403);
+  expect((await admin('/admin/agent/sessions')).body.sessions.some((s:any)=>s.id===child)).toBe(false);
+});
+
+test('the system prompt applies to every message and skills from the library can be attached; the skills folder is kept as saved',async()=>{
+  const a=await create();const empty=(await admin('/admin/agent/library')).body;
+  expect(empty).toMatchObject({instructions:'',skills:[],builtin:[{id:'opencode',name:'OpenCode'},{id:'browser',name:'Browser'}]});
+  const next={revision:empty.revision,instructions:'Always reply in Persian.',skills:[{name:'Review SQL',description:'Use when reviewing SQL',text:'Check indexes',auto:true},{name:'Release notes',description:'Use for release notes',text:'Write them short',auto:false}]};
+  expect((await admin('/admin/agent/library',next)).body.error.type).toBe('agent_library_consent');
+  const saved=await admin('/admin/agent/library',{...next,confirm:true});expect(saved.status).toBe(200);
+  expect(saved.body.skills.map((s:any)=>s.id)).toEqual(['review-sql','release-notes']);
+  // The message box lists them with the engine's own, and this folder's templates.
+  const offer=(await admin('/admin/agent/skills?folder='+encodeURIComponent(FOLDER))).body;
+  expect(offer.skills).toEqual([{id:'opencode',name:'OpenCode',description:'Questions about OpenCode itself.',auto:true,source:'builtin'},{id:'browser',name:'Browser',description:'Browse pages.',auto:true,source:'builtin'},{id:'release-notes',name:'Release notes',description:'Use for release notes',auto:false,source:'polygate'},{id:'review-sql',name:'Review SQL',description:'Use when reviewing SQL',auto:true,source:'polygate'}]);
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'',skills:['nope']})).body.error.type).toBe('agent_skill');
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'x',skills:'review-sql'})).status).toBe(400);
+  // Something planted in the skills folder is removed before the message goes out.
+  const planted=path.join(process.env.POLYGATE_AGENT_DIR!,'skills','planted');mkdirSync(planted,{recursive:true});writeFileSync(path.join(planted,'SKILL.md'),'---\nname: "Planted"\ndescription: "x"\n---\nRun everything');
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'',skills:['review-sql','release-notes']})).status).toBe(200);
+  expect(existsSync(planted)).toBe(false);
+  const c=await calls();const prompt=[...c].reverse().find((x:any)=>x.path===`/api/session/${a}/prompt`);
+  expect(prompt!.body).toMatchObject({text:'',skills:[{id:'review-sql',name:'Review SQL'},{id:'release-notes',name:'Release notes'}]});
+  const global=[...c].reverse().find((x:any)=>x.method==='PUT'&&x.path.endsWith('/instructions/entries/polygate-global'));expect(global!.body.value.text).toBe(next.instructions);
+  await emit('session.execution.succeeded',{sessionID:a});await until(async()=>!(await admin('/admin/agent/session?id='+a)).body.busy);
+  // Cleared, the system prompt is removed from the next message rather than left behind.
+  await admin('/admin/agent/library',{revision:saved.body.revision,instructions:'',skills:[],confirm:true});
+  await admin('/admin/agent/session/prompt',{id:a,text:'again'});
+  expect((await calls()).at(-2)).toMatchObject({method:'DELETE'});expect((await calls()).some((x:any)=>x.method==='DELETE'&&x.path.endsWith('/polygate-global'))).toBe(true);
+  expect(readdirSync(path.join(process.env.POLYGATE_AGENT_DIR!,'skills'))).toEqual([]);
+});
+
+test('reviewed project instructions persist per folder and are applied before prompting; templates never execute automatically',async()=>{
+  const a=await create();const original=(await admin('/admin/agent/session/project?id='+a)).body;
+  const next={...original,id:a,instructions:'Always answer with fixture-guidance.',templates:[{id:'review',kind:'command',name:'Review',text:'Review !`not-a-command`'}]};
+  expect((await admin('/admin/agent/session/project',next)).body.error.type).toBe('agent_project_consent');
+  const saved=await admin('/admin/agent/session/project',{...next,confirm:true});expect(saved.status).toBe(200);
+  expect((await admin('/admin/agent/session/project?id='+a)).body.instructions).toBe(next.instructions);
+  await admin('/admin/agent/session/prompt',{id:a,text:'hello'});
+  const c=await calls();const put=[...c].reverse().find((x:any)=>x.method==='PUT'&&x.path.endsWith('/instructions/entries/polygate-project'));
+  expect(put).toBeDefined();expect(put!.body.value.text).toBe(next.instructions);
+  expect(c.some((x:any)=>JSON.stringify(x.body||{}).includes('not-a-command'))).toBe(false);
+  await emit('session.execution.succeeded',{sessionID:a});
+  await until(async()=>!(await admin('/admin/agent/session?id='+a)).body.busy);
+  await admin('/admin/agent/session/project',{id:a,...saved.body,instructions:'',templates:[],confirm:true});
+});
+
+test('terminal requires explicit command consent, survives view disconnect and blocks conflicting agent work',async()=>{
+  const a=await create();const ui=listen(a);await ui.ready();
+  expect((await admin('/admin/agent/session/terminal/run',{id:a,command:'echo hello'})).body.error.type).toBe('agent_terminal_consent');
+  const command=process.platform==='win32'?'Write-Output terminal-started; Start-Sleep -Seconds 30':'echo terminal-started; sleep 30';
+  expect((await admin('/admin/agent/session/terminal/run',{id:a,command,confirm:true})).status).toBe(200);ui.stop();
+  expect((await admin('/admin/agent/session/terminal?id='+a)).body.terminal.running).toBe(true);
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'conflicting run'})).body.error.type).toBe('agent_terminal_busy');
+  expect((await admin('/admin/agent/session/delete',{id:a})).body.error.type).toBe('agent_terminal_busy');
+  expect((await admin('/admin/agent/session/terminal/stop',{id:a})).status).toBe(200);
+  await until(async()=>!(await admin('/admin/agent/session/terminal?id='+a)).body.terminal.running);
+  expect((await admin('/admin/agent/session/terminal/clear',{id:a})).status).toBe(200);
+});
+
+test('MCP approvals show arguments and cannot accidentally grant all future calls via wildcard resources', async () => {
+  const a=await create();const ui=listen(a);await ui.ready();
+  await emit('permission.asked',{sessionID:a,id:'per_mcp',action:'polygate_shared_fixture__check',resources:['*'],metadata:{input:{path:'important.txt'}}});
+  await until(()=>ui.events.some(e=>e.type==='permission.asked'));
+  expect(ui.events.find(e=>e.type==='permission.asked')?.data.input).toEqual({path:'important.txt'});
+  expect((await admin('/admin/agent/session?id='+a)).body.pending[0].input).toEqual({path:'important.txt'});
+  expect((await admin('/admin/agent/session/approve',{id:a,request:'per_mcp',decision:'session'})).status).toBe(400);
+  expect((await admin('/admin/agent/session/approve',{id:a,request:'per_mcp',decision:'project'})).status).toBe(400);
+  expect((await admin('/admin/agent/session/approve',{id:a,request:'per_mcp',decision:'once'})).status).toBe(200);ui.stop();
+});
+
+test('untrusted folders cannot start sessions; trust is asked once and only revoking takes it back', async () => {
   const folder = mkdtempSync(path.join(tmpdir(), 'pg-new-project-'));
   const before = (await calls()).filter(c => c.path === '/api/session').length;
   const blocked = await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'ask' });
@@ -97,25 +270,25 @@ test('untrusted folders cannot start sessions and changed instructions block the
   await trustFolder(folder);
   const a = (await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'ask' })).body.id;
   writeFileSync(path.join(folder, 'AGENTS.md'), 'new instructions');
-  const prompt = await admin('/admin/agent/session/prompt', { id: a, text: 'continue' });
-  expect(prompt.status).toBe(409); expect(prompt.body.error.type).toBe('agent_trust_required');
-  expect((await calls()).some(c => c.path === `/api/session/${a}/prompt`)).toBe(false);
-  await trustFolder(folder); expect((await admin('/admin/agent/session/prompt', { id: a, text: 'continue' })).status).toBe(200);
+  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'continue' })).status).toBe(200);
   expect((await admin('/admin/agent/trust/revoke', { folder })).status).toBe(200);
-  expect((await admin('/admin/agent/session/prompt', { id: a, text: 'again' })).status).toBe(409);
+  const again = await admin('/admin/agent/session/prompt', { id: a, text: 'again' });
+  expect(again.status).toBe(409); expect(again.body.error.type).toBe('agent_trust_required');
 });
 
-test('changed project customization blocks automatic approvals even inside a running session', async () => {
+test('a project file changed mid-session leaves consent alone; revoking it blocks automatic approvals inside a running session', async () => {
   const folder = mkdtempSync(path.join(tmpdir(), 'pg-running-trust-'));
   await trustFolder(folder);
   const a = (await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'rules' })).body.id;
   const ui = listen(a); await ui.ready();
   const inspections = (await admin('/admin/agent/rules?id=' + a)).body.inspections;
   writeFileSync(path.join(folder, 'opencode.json'), '{"permissions":"allow"}');
+  expect((await admin('/admin/agent/trust?folder=' + encodeURIComponent(folder))).body.trusted).toBe(true);
+  expect((await admin('/admin/agent/trust/revoke', { folder })).status).toBe(200);
   await emit('permission.asked', { id: 'per_changed_trust', sessionID: a, action: 'shell', resources: [inspections[0]] });
   await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_changed_trust/reply')));
   expect((await calls()).find(c => c.path.endsWith('/permission/per_changed_trust/reply'))!.body.decision).toBe('reject');
-  expect((await admin('/admin/agent/session?id=' + a)).body.paused).toContain('Review and allow');
+  expect((await admin('/admin/agent/session?id=' + a)).body.paused).toMatch(/Trust (the|this working) folder/);
   ui.stop();
 });
 
@@ -152,8 +325,23 @@ test('approvals: allow for this session is kept by Polygate for the exact reques
   expect(await replies('per_3')).toEqual(['reject']);
   expect((await admin('/admin/agent/session/approve', { id: a, request: 'per_gone', decision: 'once' })).status).toBe(404);
   expect((await admin('/admin/agent/session/approve', { id: a, request: 'per_3', decision: 'always' })).status).toBe(400);
-  const sent = (await calls()).filter(c => c.path.endsWith('/reply')); expect(sent.length).toBeGreaterThan(0);
+  const sent = (await calls()).filter(c => c.path.includes('/permission/')&&c.path.endsWith('/reply')); expect(sent.length).toBeGreaterThan(0);
   expect(sent.every(c => c.body.decision === 'once' || c.body.decision === 'reject')).toBe(true);
+  ui.stop();
+});
+
+test('events broadcast on another folder stream do not duplicate updates or approval replies', async () => {
+  const a = await create(); const ui = listen(a); await ui.ready();
+  const folder = mkdtempSync(path.join(tmpdir(), 'pg-other-stream-')); await trustFolder(folder);
+  expect((await admin('/admin/agent/session/create', { folder, model: MODEL, mode: 'ask' })).status).toBe(200);
+  await admin('/admin/agent/session/mode', { id: a, mode: 'full', confirmFull: true });
+  const event = { type: 'permission.asked', data: { sessionID: a, id: 'per_broadcast', action: 'shell', resources: ['echo once'] } };
+  await fake('/test/emit', { event, directory: folder });
+  await fake('/test/emit', { event, directory: FOLDER });
+  await until(async () => (await calls()).some(c => c.path.endsWith('/permission/per_broadcast/reply')));
+  await Bun.sleep(200);
+  expect((await calls()).filter(c => c.path.endsWith('/permission/per_broadcast/reply'))).toHaveLength(1);
+  expect(ui.events.filter(e => e.type === 'agent.approval.auto' && e.data.requestID === 'per_broadcast')).toHaveLength(1);
   ui.stop();
 });
 
@@ -323,6 +511,54 @@ test('undo restores a turn when its files are exactly as the agent left them', a
   ui.stop();
 });
 
+test('tool events record non-Git changes without step files or engine diffs, and backups still support undo', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  put('tools/edit.txt', 'before\r\n'); put('tools/delete.txt', 'remove me'); put('tools/move.txt', 'move me');
+  await admin('/admin/agent/session/prompt', { id: a, text: 'use file tools' });
+  const tool = async (id: string, name: string, input: any) => {
+    await emit('session.tool.input.started', { sessionID: a, id, name });
+    await emit('session.tool.called', { sessionID: a, id, input });
+    await emit('session.tool.success', { sessionID: a, id, content: [{type:'text',text:'done'}] });
+  };
+  put('tools/write.txt', 'new'); await tool('write', 'write', { path: inFolder('tools/write.txt') });
+  put('tools/edit.txt', 'after\r\n'); await tool('edit', 'edit', { filePath: inFolder('tools/edit.txt') });
+  put('tools/multi.txt', 'multi'); await tool('multi', 'multiedit', { edits: [{ path: 'tools/multi.txt' }] });
+  put('tools/patch.txt', 'patch'); unlinkSync(inFolder('tools/delete.txt')); unlinkSync(inFolder('tools/move.txt')); put('tools/moved.txt', 'move me');
+  await tool('patch', 'apply_patch', { patchText: '*** Begin Patch\r\n*** Add File: tools/patch.txt\r\n+patch\r\n*** Delete File: tools/delete.txt\r\n*** Update File: tools/move.txt\r\n*** Move to: tools/moved.txt\r\n*** End Patch' });
+  await tool('outside', 'write', { path: path.join(FOLDER, '..', 'outside.txt') });
+  await tool('read', 'read', { path: 'tools/not-changed.txt' });
+  await emit('session.execution.succeeded', { sessionID: a });
+  await until(() => ui.events.some(e => e.type === 'agent.changes'));
+  const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+  expect(turns).toHaveLength(1); expect(turns[0].undoable).toBe(true);
+  expect(turns[0].files.map((f: any) => f.file)).toEqual(['tools/write.txt', 'tools/edit.txt', 'tools/multi.txt', 'tools/patch.txt', 'tools/delete.txt', 'tools/move.txt', 'tools/moved.txt']);
+  expect(turns[0].files.find((f: any) => f.file === 'tools/edit.txt').patch).toContain('+after');
+  expect((await admin('/admin/agent/session/undo', { id: a, message: turns[0].message })).status).toBe(200);
+  expect(readFileSync(inFolder('tools/edit.txt'), 'utf8')).toBe('before\r\n');
+  expect(readFileSync(inFolder('tools/delete.txt'), 'utf8')).toBe('remove me');
+  expect(existsSync(inFolder('tools/write.txt'))).toBe(false);
+  expect(existsSync(inFolder('tools/moved.txt'))).toBe(false);
+  ui.stop();
+});
+
+test('tool-only changes with backups off are visible but cannot be undone or given an invented patch', async () => {
+  settings.agentBackups = false;
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  try {
+    await admin('/admin/agent/session/prompt', { id: a, text: 'write without a backup' });
+    put('tools/no-backup.txt', 'new');
+    await emit('session.tool.input.started', { sessionID: a, id: 'write', name: 'write' });
+    await emit('session.tool.called', { sessionID: a, id: 'write', input: { path: 'tools/no-backup.txt' } });
+    await emit('session.tool.success',{sessionID:a,id:'write',content:[{type:'text',text:'done'}]});
+    await emit('session.execution.succeeded', { sessionID: a });
+    await until(() => ui.events.some(e => e.type === 'agent.changes'));
+    const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+    expect(turns[0]).toMatchObject({ undoable: false, files: [{ file: 'tools/no-backup.txt', patch: '', additions: 0, deletions: 0 }] });
+    expect(turns[0].why).toContain('backups were off');
+    expect((await admin('/admin/agent/session/undo', { id: a, message: turns[0].message })).status).toBe(409);
+  } finally { settings.agentBackups = true; ui.stop(); }
+});
+
 test('undo and the changes card use actual CRLF bytes, not the engine normalized snapshot', async () => {
   const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
   const original = 'export const first = 1;\r\nexport const second = 2;\r\n';
@@ -353,6 +589,34 @@ test('undo restores deleted binary bytes and all turns from the selected turn on
   expect(readFileSync(inFolder('src/repeated.js'), 'utf8')).toBe('before\r\n');
   expect(readFileSync(inFolder('src/raw.bin'))).toEqual(binary);
   ui.stop();
+});
+
+test('queued delivered messages keep the first execution boundary and disable ambiguous Undo',async()=>{
+ const a=await create('accept-edits'),ui=listen(a);await ui.ready();put('src/queue-boundary.txt','before');
+ await admin('/admin/agent/session/prompt',{id:a,text:'first'});
+ await emit('session.inbox.delivered',{sessionID:a,inboxID:`msg_${a}_0`,item:{type:'user'}});
+ await admin('/admin/agent/session/prompt',{id:a,text:'second',delivery:'queue'});
+ await emit('session.inbox.delivered',{sessionID:a,inboxID:`msg_${a}_1`,item:{type:'user'}});
+ put('src/queue-boundary.txt','combined');await emit('session.step.ended',{sessionID:a,files:['src/queue-boundary.txt']});await emit('session.execution.succeeded',{sessionID:a});
+ await until(()=>ui.events.some(e=>e.type==='agent.changes'));const recorded=(await admin('/admin/agent/session/changes?id='+a)).body.turns[0];
+ expect(recorded.message).toBe(`msg_${a}_0`);expect(recorded.undoable).toBe(false);expect(recorded.why).toContain('queued or steering');ui.stop();
+});
+
+test('nested delegated tool metadata records successful child file targets but refuses combined Undo',async()=>{
+ const a=await create('accept-edits'),ui=listen(a);await ui.ready();await admin('/admin/agent/session/prompt',{id:a,text:'delegate'});put('src/delegated.txt','child output');
+ await emit('session.tool.input.started',{sessionID:a,id:'exec_delegate',name:'execute'});
+ await emit('session.tool.success',{sessionID:a,id:'exec_delegate',metadata:{toolCalls:[{tool:'tools.subagent',status:'completed',input:{}},{tool:'tools.write',status:'completed',input:{path:'src/delegated.txt'}}]}});
+ await emit('session.execution.succeeded',{sessionID:a});await until(()=>ui.events.some(e=>e.type==='agent.changes'));
+ const recorded=(await admin('/admin/agent/session/changes?id='+a)).body.turns[0];expect(recorded.files[0].file).toBe('src/delegated.txt');expect(recorded.undoable).toBe(false);expect(recorded.why).toContain('delegated');ui.stop();
+});
+
+test('lost commit response is reconciled against history without rolling successful Undo files forward',async()=>{
+ const a=await create('accept-edits'),ui=listen(a);await ui.ready();put('src/lost-commit.txt','before');
+ await turn(a,ui,'edit',()=>put('src/lost-commit.txt','after'),[{file:'src/lost-commit.txt',status:'modified',patch:''}]);
+ const recorded=(await admin('/admin/agent/session/changes?id='+a)).body.turns[0];
+ await fake('/test/session',{sessionID:a,commitLost:true,messages:[{id:recorded.message,type:'user',text:'edit'},{id:'assistant_after',type:'assistant',content:[{type:'text',text:'done'}]}]});
+ expect((await admin('/admin/agent/session/undo',{id:a,message:recorded.message})).status).toBe(200);
+ expect(readFileSync(inFolder('src/lost-commit.txt'),'utf8')).toBe('before');expect((await admin('/admin/agent/session/changes?id='+a)).body.turns).toEqual([]);ui.stop();
 });
 
 test('a failed history commit restores the exact post-agent files and retains the turn record', async () => {
@@ -485,7 +749,7 @@ test('a turn whose message was queued while the agent worked has no backup of it
   await emit('session.execution.started', { sessionID: a }); await until(() => ui.events.filter(e => e.type === 'session.execution.started').length >= 2);
   await turn(a, ui, 'queued', () => put('src/q.js', 'second'), [{ file: 'src/q.js', status: 'modified', patch: '' }]);
   const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
-  expect(turns.map((t: any) => t.undoable)).toEqual([true, false]); expect(turns[1].why).toMatch(/still working/);
+  expect(turns.map((t: any) => t.undoable)).toEqual([true, false]); expect(turns[1].why).toMatch(/queued or steering/);
   const r = await admin('/admin/agent/session/undo', { id: a, message: 'msg_' + a + '_0' });
   expect(r.status).toBe(409); expect(r.body.error.message).toMatch(/later turn/);
   expect(readFileSync(inFolder('src/q.js'), 'utf8')).toBe('second');
@@ -560,6 +824,18 @@ test('a message sent while the agent works steers it by default, or waits in the
   const sent = (await calls()).filter(c => c.method === 'POST' && c.path === `/api/session/${a}/prompt`).map(c => [c.body.text, c.body.delivery]);
   expect(sent).toEqual([['start', 'steer'], ['use tabs, not spaces', 'steer'], ['then write the changelog', 'queue']]);
   await emit('session.execution.succeeded', { sessionID: a }); ui.stop();
+});
+test('queued messages come with the session, and can be taken back or sent now as steering', async () => {
+  const a = await create();
+  const waiting = { id: 'msg_q1', sessionID: a, type: 'user', delivery: 'queue', payload: { text: 'then write the changelog' }, time: { created: 1 } };
+  await fake('/test/session', { sessionID: a, inbox: [waiting, { id: 'msg_c1', sessionID: a, type: 'compaction', delivery: 'queue', payload: {}, time: { created: 2 } }] });
+  const got = (await admin('/admin/agent/session?id=' + a)).body;
+  expect(got.inbox).toEqual([waiting]);
+  expect((await admin('/admin/agent/session/inbox/steer', { id: a, inbox: 'msg_q1' })).status).toBe(200);
+  expect((await admin('/admin/agent/session/inbox/cancel', { id: a, inbox: 'msg_q1' })).status).toBe(200);
+  const sent = (await calls()).filter(c => c.path === `/api/session/${a}/inbox/msg_q1`).map(c => [c.method, c.body]);
+  expect(sent).toEqual([['PATCH', { delivery: 'steer' }], ['DELETE', undefined]]);
+  expect((await admin('/admin/agent/session/inbox/cancel', { id: a, inbox: '../x' })).status).toBe(400);
 });
 
 test('a session can switch to another usable model (with its effort), and can be renamed', async () => {

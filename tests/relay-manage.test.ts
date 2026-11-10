@@ -121,7 +121,7 @@ test('the used-up count moves once per used-up spell, not with every re-ask, and
   const until = Date.now() + 3600e3;
   routeExhausted(relay, { until, seconds: 3600 }); routeExhausted(relay, { until, seconds: 3600 }); routeExhausted(relay, { until, seconds: 3600 }); // the periodic re-asks while it stays used up
   const row = relayReport(7).relays.find(r => r.id === 'r-spell')!; expect(row.usedUp).toBe(1);
-  expect(row.tone).toBe('neutral'); expect(row.advice).toContain('used up');
+  expect(row.tone).toBe('neutral'); expect(row.advice).toContain('limit/access');expect(row.advice).not.toContain('00:00');
   relay.exhaustedUntil = 0; routeExhausted(relay, { until, seconds: 3600 }); // a new spell after it recovered
   expect(relayReport(7).relays.find(r => r.id === 'r-spell')!.usedUp).toBe(2);
 });

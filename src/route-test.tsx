@@ -1,18 +1,18 @@
 import {useEffect,useRef,useState} from 'react';
-import {Check,TriangleAlert,X,Zap} from 'lucide-react';
+import {Check,TriangleAlert,X,FlaskConical} from 'lucide-react';
 import {api} from './api';
 import {Button} from './ui';
 import type {Provider,Route} from '../backend/types';
 // Testing a route means sending something through it, and what is sent depends on the provider: OpenCode Free and Kilo answer different
 // questions and have different limits. The dialog lets the user pick which provider the test goes through.
-type Result={ok:boolean;status:number;latency?:number;chat:string;summary:string;provider?:string};
+type Result={ok:boolean;status:number;latency?:number;chat:string;summary:string;provider?:string;model?:string};
 const nameOf=(p:Provider)=>p.kind==='free'?'OpenCode Free':p.kind==='kilo'?'Kilo Free':p.name;
 const detail=(p:Provider)=>p.kind==='free'?'Checks its model list, then sends one chat request and reads the daily allowance.'
   :p.kind==='kilo'?'Reads its model list, then sends one small chat request. That request counts against Kilo’s free allowance.'
   :p.kind==='opencode'?'Sends one small chat request to that OpenCode server.':'Reads its model list, then sends one small chat request.';
 const carries=(route:Route,p:Provider)=>!route.only||route.only===p.kind;
 export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;providers:Provider[];onClose:()=>void;onDone:()=>void}){
-  const enabled=providers.filter(p=>p.enabled);
+  const enabled=providers.filter(p=>p.enabled&&p.kind!=='zai'); // Z.ai never goes through a route (backend/zai.ts).
   const usable=enabled.filter(p=>carries(route,p));
   const [chosen,setChosen]=useState((usable.find(p=>p.kind==='free')||usable[0])?.id||'');
   const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);
@@ -31,7 +31,7 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
   const good=result?.chat==='ok';
   return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose();}}>
     <div ref={box} className="dialog" role="dialog" aria-modal="true" aria-label={`Test ${route.name}`}>
-      <header className="dialog-head"><Zap size={16}/><h2>Test {route.name}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>
+      <header className="dialog-head"><FlaskConical size={16}/><h2>Test {route.name}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>
       <div className="dialog-body">
         <p className="subtle">Pick the provider to send through this route. Each provider has its own limits, so a route can pass for one and fail for another.</p>
         {route.only&&<div className="dialog-note info"><Check size={16}/><p>This relay carries {route.only==='kilo'?'Kilo':route.only} only, so other providers cannot be tested through it.</p></div>}
@@ -40,9 +40,9 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
             <input ref={p.id===chosen?first:undefined} type="radio" name="test-provider" disabled={!ok} checked={chosen===p.id} onChange={()=>setChosen(p.id)}/>
             <span><strong>{nameOf(p)}</strong><small>{ok?detail(p):`This relay carries ${route.only==='kilo'?'Kilo':route.only} only.`}</small></span></label>;}):<p className="subtle">No provider is enabled. Enable one on the Providers page.</p>}
         </fieldset>
-        {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}</p></div>}
+        {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}{good&&<> <span className="subtle">One model was asked. Another model can still be refused or run out on its own.</span></>}</p></div>}
         {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-        <div className="dialog-actions"><Button variant="primary" disabled={busy||!chosen} onClick={()=>void run()}><Zap size={14}/>{busy?'Testing…':result||error?'Test again':'Run test'}</Button><Button disabled={busy} onClick={onClose}>Close</Button></div>
+        <div className="dialog-actions"><Button variant="primary" disabled={busy||!chosen} onClick={()=>void run()}><FlaskConical size={14}/>{busy?'Testing…':result||error?'Test again':'Run test'}</Button><Button disabled={busy} onClick={onClose}>Close</Button></div>
       </div>
     </div>
   </div>;

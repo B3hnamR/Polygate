@@ -5,7 +5,8 @@ import path from 'node:path';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 const { startGateway } = await import('../backend/main');
 const { settings } = await import('../backend/state');
-const { cleanServer, parseImport, slug, mcpConfig } = await import('../backend/mcp');
+const { cleanServer, parseImport, slug, mcpConfig, agentMcpCatalog, saveAgentMcpSelection } = await import('../backend/mcp');
+const { ensureAgentKey } = await import('../backend/keys');
 const { queryEvents } = await import('../backend/logbook');
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = ''; let savedToken: string | undefined; let dir = '';
 const admin = { authorization: 'Bearer mcp-test-secret', 'content-type': 'application/json' };
@@ -136,4 +137,34 @@ test('the hub can be turned off', async () => {
   try { expect((await rpc('tools/list')).status).toBe(404); } finally { await call('/admin/mcp/settings', { enabled: true }); }
   await call('/admin/mcp/settings', { builtin: false });
   try { expect((await rpc('tools/list')).body.result.tools.map((t: any) => t.name)).not.toContain('polygate__gateway_status'); } finally { await call('/admin/mcp/settings', { builtin: true }); }
+});
+
+test('Agent MCP defaults to none; only exact selected tools list and execute, in hub and scoped endpoints', async () => {
+  const key = ensureAgentKey(); const cfg = mcpConfig(); const saved = cfg.agentTools; cfg.agentTools = [];
+  try {
+    expect((await rpc('tools/list', {}, key.value)).body.result.tools).toEqual([]);
+    expect((await rpc('tools/call', { name: 'polygate__gateway_status' }, key.value)).body.error.code).toBe(-32602);
+    const catalog = agentMcpCatalog(); const server = catalog.servers.find(s => s.name === 'Renamed') || catalog.servers.find(s => s.tools.some(t => t.name === 'echo'))!;
+    const tool = server.tools.find(t => t.name === 'echo')!;
+    saveAgentMcpSelection([{ server: server.id, tool: tool.name, fingerprint: tool.fingerprint }]);
+    const upstream = cfg.servers.find(s => s.id === server.id)!;
+    expect((await rpc('tools/list', {}, key.value)).body.result.tools.map((t:any)=>t.name)).toEqual([`${upstream.name}__echo`]);
+    expect((await rpc('tools/list', {}, key.value, '/mcp/'+upstream.name)).body.result.tools.map((t:any)=>t.name)).toEqual(['echo']);
+    expect((await rpc('tools/call', { name: `${upstream.name}__echo`, arguments: { text: 'selected' } }, key.value)).body.result.content[0].text).toBe('echo: selected');
+    expect((await rpc('tools/call', { name: 'add', arguments: { a: 1, b: 2 } }, key.value, '/mcp/'+upstream.name)).body.error.code).toBe(-32602);
+    // Ordinary clients retain the hub independently of the Agent selection.
+    expect((await rpc('tools/list')).body.result.tools.some((t:any)=>t.name==='polygate__gateway_status')).toBe(true);
+    expect(JSON.stringify(catalog)).not.toContain('upstream-secret-1');
+    expect(JSON.stringify(catalog)).not.toContain('abc123secret');
+    const oldHeaders = upstream.headers; upstream.headers = { Authorization: 'Bearer changed-credential' };
+    expect(agentMcpCatalog().servers.find(s=>s.id===server.id)?.tools.find(t=>t.name==='echo')?.changed).toBe(true);
+    expect((await rpc('tools/call', { name: `${upstream.name}__echo` }, key.value)).body.error.code).toBe(-32602);
+    expect(()=>saveAgentMcpSelection([{ server: server.id, tool:'echo', fingerprint:tool.fingerprint }])).toThrow(/changed/);
+    upstream.headers = oldHeaders;
+    const keys = upstream.keys; upstream.keys = ['someone-else'];
+    expect((await rpc('tools/list', {}, key.value)).body.result.tools).toEqual([]); upstream.keys = keys;
+    saveAgentMcpSelection([]);
+    expect((await rpc('tools/call', { name: `${upstream.name}__echo` }, key.value)).body.error.code).toBe(-32602);
+    expect(()=>saveAgentMcpSelection([{server:'missing',tool:'oops',fingerprint:'x'}])).toThrow(/unavailable/);
+  } finally { cfg.agentTools = saved; }
 });

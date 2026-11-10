@@ -213,13 +213,33 @@ async function applyHttps(b: any) {
   })();
   return httpsStatus();
 }
-async function applyListener() {
-  if (!rebind) return; const cfg = httpsConfig(); const tls = readTls(cfg);
-  await rebind({ port: cfg.mode === 'off' ? plain.port : cfg.port || 443, host: cfg.mode === 'off' ? plain.host : '0.0.0.0', tls: cfg.mode === 'off' || !tls ? undefined : { cert: tls.cert, key: tls.key } });
+async function applyListener(cfg = httpsConfig()) {
+  if (!rebind) return; const tls = readTls(cfg);
+  // Match startup recovery: configured HTTPS without usable files must never become public plaintext.
+  if (cfg.mode !== 'off' && !tls) { await rebind({ port: plain.port, host: '127.0.0.1' }); return; }
+  await rebind({ port: cfg.mode === 'off' ? plain.port : cfg.port || 443, host: cfg.mode === 'off' ? plain.host : '0.0.0.0', tls: tls ? { cert: tls.cert, key: tls.key } : undefined });
 }
 export async function httpsDisable() {
-  settings.https = { ...httpsConfig(), mode: 'off', lastError: '' }; persist(); stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined;
-  await applyListener(); return httpsStatus();
+  if (job.running || applying) throw new GatewayError('A certificate request or listener change is already running', 409);
+  applying = true;
+  const previous = settings.https;
+  const next: HttpsSettings = { ...httpsConfig(), mode: 'off', lastError: '' };
+  let changed = false;
+  try {
+    // Do not discard TLS settings or renewal until the replacement listener is available.
+    await applyListener(next); changed = true;
+    settings.https = next; persist();
+    stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined;
+    job.url = '';
+  } catch (error) {
+    settings.https = previous;
+    if (changed) {
+      await applyListener();
+      persist();
+    }
+    throw error;
+  } finally { applying = false; }
+  return httpsStatus();
 }
 // Re-issues the managed certificate. Called by the timer and by the "Renew now" button.
 export async function httpsRenew() {

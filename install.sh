@@ -650,6 +650,13 @@ https_wait() {
 }
 HTTPS_ERROR=
 
+https_disable() {
+  # A data-preserving uninstall retains settings.https as well as certificates. The environment alone cannot turn TLS off.
+  systemctl daemon-reload && systemctl stop polygate || die 'Could not stop Polygate before reconciling retained HTTPS settings. No settings were changed.'
+  if systemctl is-active --quiet polygate; then die 'Polygate must be stopped before reconciling retained HTTPS settings. No settings were changed.'; fi
+  RUN_SILENT=1 run 'Reconciling the selected HTTP access mode' runuser -u polygate --preserve-environment -- "$release/bin/bun" "$release/build/manage.js" https-disable-offline --service-stopped || die 'Could not disable the retained HTTPS configuration before startup. The vault and certificates were kept.'
+}
+
 https_setup() {
   printf '\n  %s%s%s %sSetting up HTTPS%s\n' "$CYN" "$S_GO" "$R" "$B" "$R"
   local started
@@ -817,8 +824,17 @@ main() {
   if [ "$INTERACTIVE" = 1 ]; then confirm 'Install now?' y || die 'Stopped. Nothing was changed.'; say ''; fi
 
   fetch_release
+  if [ "$UPDATE" = 0 ]; then
+    case "$MODE" in
+      local|proxy|http)
+        grep -Fq 'https-disable-offline' "$work/polygate/build/manage.js" || die 'This release does not support safe offline HTTPS reconciliation. Choose a newer release; the existing installation was not changed.' ;;
+    esac
+  fi
   install_release
   configure_service
+  if [ "$UPDATE" = 0 ]; then
+    case "$MODE" in local|proxy|http) https_disable ;; esac
+  fi
   start_service
   if [ "$UPDATE" = 0 ]; then
     [ "$MODE" != proxy ] || write_proxy_example

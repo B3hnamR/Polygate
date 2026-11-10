@@ -1,9 +1,12 @@
-import { expect, test } from 'bun:test';
+import { expect, test, afterAll } from 'bun:test';
+import { preserveTestState } from './setup';
 import net from 'node:net';
 // The state folder comes from tests/setup.ts (shared by every test file and removed after the run).
 const engine = await import('../backend/proxy-engine');
+const restore = preserveTestState();
 // A target that answers like the OpenCode model list, and three tiny proxies in front of it.
 const target = Bun.serve({ port: 0, hostname: '127.0.0.2', fetch: req => new URL(req.url).pathname === '/models' ? Response.json({ data: [{ id: 'x' }] }) : new Response('nope', { status: 404 }) });
+afterAll(() => { target.stop(true); engine.__resetEngine(); restore(); });
 const API = `http://127.0.0.2:${target.port}/models`;
 const listen = (handler: (c: net.Socket) => void) => new Promise<net.Server>(r => { const s = net.createServer(c => { c.on('error', () => {}); handler(c); }); s.listen(0, '127.0.0.1', () => r(s)); });
 const port = (s: net.Server) => (s.address() as net.AddressInfo).port;
@@ -46,12 +49,25 @@ test('Proxies that passed are saved fastest first, can be removed, and a check j
   engine.addVerified([a, b, c], new Map([[a.url, { latency: 900, status: 200 }], [b.url, { latency: 100, status: 200 }]]));
   expect(engine.storedProxies().map(s => s.port)).toEqual([2222, 1111]);
   engine.removeProxies([b.url]); expect(engine.storedProxies().map(s => s.port)).toEqual([1111]); engine.removeProxies(); expect(engine.storedProxies()).toEqual([]);
-  // Nothing at these public test addresses answers, so every check times out and nothing is saved.
+  // Keep the public-address parser under test, but redirect its socket seam to a
+  // loopback fixture that deterministically refuses every proxy protocol.
+  const refusing = await listen(c => c.end('HTTP/1.1 407 Fixture refusal\r\n\r\n'));
+  const connect = net.Socket.prototype.connect;
+  let attempts = 0;
+  net.Socket.prototype.connect = function (this: net.Socket, ...args: any[]) {
+    const actual = Array.isArray(args[0]) ? args[0] : args;
+    const options = actual[0];
+    if (options?.host === '203.0.113.7') { attempts++; actual[0] = { ...options, host: '127.0.0.1', port: port(refusing) }; }
+    return Reflect.apply(connect, this, args);
+  } as typeof connect;
+  try {
   let followed = 0; engine.startImport('203.0.113.7:8080', { api: API, timeoutSec: 1, gateMs: 2500, after: () => { followed++; } });
   expect(engine.engineJob().running).toBe(true);
   for (let i = 0; i < 60 && engine.engineJob().running; i++) await Bun.sleep(100);
   const job = engine.engineJob(); expect(job.running).toBe(false); expect(job.phase).toBe('done'); expect(job.total).toBe(3); expect(job.passed).toBe(0); expect(job.message).toContain('0 of 3'); expect(followed).toBe(1);
   expect(engine.storedProxies()).toEqual([]);
+  expect(attempts).toBe(3);
+  } finally { net.Socket.prototype.connect = connect; refusing.close(); }
 });
 test('SOCKS4 and SOCKS5 proxy URLs are both understood by the bridge', async () => {
   const { parseSocksUrl } = await import('../backend/socks-bridge');

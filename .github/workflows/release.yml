@@ -6,7 +6,14 @@ on:
 permissions:
   contents: read
 jobs:
+  validation:
+    # Re-run the same full tests, typecheck, exact native gates and browser smoke
+    # for this release SHA. A tag must not bypass pull-request validation.
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
   linux:
+    needs: validation
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -32,10 +39,15 @@ jobs:
         with:
           name: polygate-linux-${{ matrix.arch }}
           path: release/polygate-linux-*
+          if-no-files-found: error
   windows:
-    runs-on: windows-latest
+    needs: validation
+    runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
@@ -51,27 +63,23 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.4'
-      - run: npm ci
-      - run: bun test tests
+      - run: npm ci --ignore-scripts
+      - name: Prepare the Electron packaging runtime
+        run: node node_modules/electron/install.js
       - name: Fetch the Bun runtime and verify its release checksum
         run: python scripts/fetch-bun.py 1.4.4 windows-x64
-      - run: bun run dist
+      - name: Build and verify the portable executable
+        id: desktop
+        run: bun run dist
         env:
           POLYGATE_BUN_RUNTIME: ${{ github.workspace }}\build\runtime\1.4.4\windows-x64\bun.exe
-      - name: Write the SHA-256 of the executable
-        run: |
-          $exes = @(Get-ChildItem release/*.exe)
-          if ($exes.Count -eq 0) { throw 'No executable to checksum' }
-          foreach ($exe in $exes) {
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash.ToLower()
-            [IO.File]::WriteAllText("$($exe.FullName).sha256", "$hash *$($exe.Name)`n")
-          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: polygate-windows-x64
           path: |
-            release/*.exe
-            release/*.exe.sha256
+            ${{ steps.desktop.outputs.executable }}
+            ${{ steps.desktop.outputs.checksum }}
+          if-no-files-found: error
   draft-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, windows]
@@ -83,6 +91,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          pattern: polygate-*
       - name: Prepare a draft for manual review
         env:
           GH_TOKEN: ${{ github.token }}

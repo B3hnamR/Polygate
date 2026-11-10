@@ -1,4 +1,6 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { preserveTestState } from './setup';
+const restore = preserveTestState();
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +25,8 @@ const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
   return new Response(data.map(x=>'data: '+JSON.stringify(x)+'\n\n').join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
 }});
 beforeAll(async()=>{
+  models.clear(); settings.enabled=true; settings.rotate=false; settings.routeId='direct'; settings.chains=[];delete settings.admin;
+  settings.routes=[{id:'direct',name:'Direct connection',kind:'direct',url:'',enabled:true,models:[]}];
   // These tests cover the model pause, which is off by default: switch it on for this file.
   settings.cooldowns=true;
   // Do not discover or borrow a WARP listener belonging to another local app/test session.
@@ -31,7 +35,7 @@ beforeAll(async()=>{
   for(const id of ['working','limited'])saveModel({id:'mock/'+id,upstreamId:id,providerId:'mock',name:id,context:128000,output:4096,tools:true,reasoning:false,state:'unchecked',latency:0,score:50,priority:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});
   gateway=await startGateway(0);base=`http://127.0.0.1:${gateway.port}`;
 });
-afterAll(async()=>{await gateway?.close();upstream.stop(true);});
+afterAll(async()=>{try{await gateway?.close();}finally{upstream.stop(true);__setExitVerifier();__setCanarySender();__resetToolTrim();const auth=await import('../backend/auth');auth.loginGate.reset();auth.keyGate.reset();restore();}});
 const call=(p:string,body:any,key=settings.keys[0].value,signal?:AbortSignal)=>fetch(base+p,{method:'POST',signal,headers:{authorization:'Bearer '+key,'content-type':'application/json'},body:JSON.stringify(body)});
 test('API keys and admin sessions are separate',async()=>{
   expect((await fetch(base+'/v1/models')).status).toBe(401);
@@ -56,7 +60,10 @@ test('Explicit quota response is not retried or routed to another model',async()
 process.env.POLYGATE_DIAG_EGRESS='0';
 test('Disabling model cooldowns releases cooling models and keeps every request going upstream',async()=>{
   const setting=(body:any)=>fetch(base+'/admin/settings',{method:'POST',headers:{authorization:'Bearer test-admin-secret','content-type':'application/json'},body:JSON.stringify(body)});
-  const limited=models.get('mock/limited')!;expect(limited.state).toBe('cooldown');
+  const limited=models.get('mock/limited')!;
+  limited.cooldownUntil=0;limited.state='unchecked';settings.cooldowns=true;
+  expect((await call('/v1/chat/completions',{model:'mock/limited',messages:[{role:'user',content:'Hello'}]})).status).toBe(429);
+  expect(models.get('mock/limited')!.state).toBe('cooldown');
   expect((await setting({cooldowns:false})).status).toBe(200);expect(settings.cooldowns).toBe(false);expect(limited.cooldownUntil).toBe(0);expect(limited.state).not.toBe('cooldown');
   const before=seen.length;
   for(let i=0;i<2;i++){const r=await call('/v1/chat/completions',{model:'mock/limited',messages:[{role:'user',content:'Hello'}]});expect(r.status).toBe(429);expect(models.get('mock/limited')!.cooldownUntil).toBe(0);expect(models.get('mock/limited')!.state).not.toBe('cooldown');}
@@ -157,7 +164,7 @@ afterAll(()=>{remote.stop(true);opencode.stop(true);});
 const remoteProvider=()=>({id:'remote',name:'Remote',kind:'openai' as const,enabled:true,baseUrl:`http://127.0.0.2:${remote.port}/v1`,apiKey:'',models:[] as string[],routeId:'direct'});
 const freshModel=(provider:string,id:string)=>saveModel({id:provider+'/'+id,upstreamId:id,providerId:provider,name:id,context:0,output:0,tools:true,reasoning:false,state:'unchecked',latency:0,score:50,priority:100,failCount:0,cooldownUntil:0,checkedAt:0,error:''});
 // Runs a test body against a temporary provider list and restores the shared one afterwards.
-const scoped=async(providers:any[],body:()=>Promise<void>)=>{const saved=settings.providers;settings.providers=providers;try{await body();}finally{settings.providers=saved;}};
+const scoped=async(providers:any[],body:()=>Promise<void>)=>{const saved=structuredClone(settings);settings.providers=providers;try{await body();}finally{for(const key of Object.keys(settings))delete (settings as any)[key];Object.assign(settings,saved);}};
 const until=async<T>(find:()=>T|undefined,ms=3000):Promise<T>=>{const t=Date.now();while(Date.now()-t<ms){const v=find();if(v)return v;await Bun.sleep(25);}throw new Error('Timed out waiting for condition');};
 const faultOf=(id:string)=>(db.query('SELECT fault FROM requests WHERE id=?').get(id) as {fault:number}).fault;
 const chat=(model:string,extra:any={})=>call('/v1/chat/completions',{model,stream:true,messages:[{role:'user',content:'x'}],...extra});
@@ -177,6 +184,12 @@ test('Catalog refresh keeps models on an empty answer, refreshes facts and reviv
   catalog=[];await expect(discover()).rejects.toThrow(/empty catalog/);expect(models.get('remote/a')!.state).toBe('unchecked');expect(models.get('remote/b')!.state).toBe('unchecked');
   catalog=['a'];await discover();expect(models.get('remote/b')!.state).toBe('unavailable');expect(models.get('remote/b')!.error).toContain('Absent');expect(models.get('remote/a')!.priority).toBe(7);
   catalog=['a','b'];await discover();expect(models.get('remote/b')!.state).toBe('unchecked');expect(models.get('remote/b')!.error).toBe('');
+});});
+
+test('a partial OpenAI-compatible catalog cannot retire a recently working model',async()=>{await scoped([remoteProvider()],async()=>{
+  catalog=['a','b'];await discover();const m=models.get('remote/b')!;m.state='available';m.checkedAt=Date.now();m.error='';
+  catalog=['a'];await discover();expect(models.get(m.id)!.state).toBe('available');expect(models.get(m.id)!.error).toBe('');
+  models.get(m.id)!.checkedAt=Date.now()-8*86400000;await discover();expect(models.get(m.id)!.state).toBe('unavailable');
 });});
 test('Model ID overrides work when the provider has no /models endpoint',async()=>{
   const nocat={...remoteProvider(),id:'nocat',baseUrl:`http://127.0.0.2:${remote.port}/nocatalog/v1`,models:['custom-1']};
@@ -199,6 +212,16 @@ test('A provider failure is the model fault, counted once per request',async()=>
   const row=await until(()=>logs(5).find(l=>l.model==='remote/boom'));expect(faultOf(row.id)).toBe(1);
   const m=models.get('remote/boom')!;expect(m.state).toBe('cooldown');expect(m.failCount).toBe(1);expect(settings.routes.find(x=>x.id==='direct')!.cooldownUntil||0).toBe(0);
 });});
+test('a relay platform 503 does not erase route failure history as successful delivery', async () => {
+  const routes = settings.routes, previousFetch = globalThis.fetch;
+  const relay = { id: 'platform-failure-fixture', name: 'Fixture relay', kind: 'relay' as const, url: 'http://127.0.0.1:9', enabled: true, models: [], failures: 2, status: 'previous failure' };
+  settings.routes = [...routes, relay];
+  globalThis.fetch = Object.assign(async () => new Response('platform unavailable', { status: 503 }), { preconnect: previousFetch.preconnect }) as typeof fetch;
+  try {
+    const result = await networkFetch('https://provider.example.test/v1/chat/completions', { method: 'POST', body: '{}' }, relay.id);
+    expect(result.status).toBe(503); expect(relay.failures).toBe(2); expect(relay.status).toBe('previous failure');
+  } finally { globalThis.fetch = previousFetch; settings.routes = routes; }
+});
 // The remote mock sits on 127.0.0.2, where outbound calls are attributed to a route and so recorded as attempts.
 test('Request shape is recorded with each request and holds no prompt or credential text',async()=>{await scoped([{...remoteProvider(),apiKey:'remote-secret-key'}],async()=>{
   const admin=(p:string)=>fetch(base+p,{headers:{authorization:'Bearer test-admin-secret'}}).then(r=>r.json()) as Promise<any>;
@@ -222,12 +245,13 @@ const FREE_LIMIT_BODY=JSON.stringify({error:{message:'Free usage limit reached. 
 const proxyEntry=(n:number,port:number,ms:number)=>({url:`http://127.0.0.1:${port}`,proxy:`http://127.0.0.1:${port}`,proto:'http',host:'127.0.0.1',port,https:true,latencyMs:ms,exitIp:`exit-${n}`});
 const sseOk=()=>new Response(sse('\n\n'),{headers:{'content-type':'text/event-stream'}});
 async function withPool(proxies:Array<(req:Request)=>Response|Promise<Response>>,body:(info:{entries:any[];hits:number[];route:any})=>Promise<void>){
+  const {__capturePoolTestState}=await import('../backend/pool');const restorePool=__capturePoolTestState();
   const hits=proxies.map(()=>0);const servers=proxies.map((fn,i)=>Bun.serve({port:0,hostname:'127.0.0.1',fetch(req){hits[i]++;return fn(req);}}));
   const entries=servers.map((sv,i)=>proxyEntry(i+1,sv.port!,10*(i+1)));__setPoolEntries(entries);__poolHealth.clear();
   const route={id:'proxy-pool',name:'pool',kind:'proxy' as const,url:'proxyhive://saved-pool',enabled:true,models:[] as string[],poolUrls:[] as string[]};
   const saved={routes:[...settings.routes],pool:settings.pool,strategy:settings.strategy,routeId:settings.routeId};
   settings.routes.push(route);settings.pool={mode:'ready',deepTest:true,recheckMinutes:30,maxTested:60,concurrency:2,retries:3,standby:false};settings.strategy='fastest';
-  try{await body({entries,hits,route});}finally{servers.forEach(sv=>sv.stop(true));settings.routes=saved.routes;settings.pool=saved.pool;settings.strategy=saved.strategy;settings.routeId=saved.routeId;__poolHealth.clear();for(const r of settings.routes)r.exhaustedUntil=0;}
+  try{await body({entries,hits,route});}finally{servers.forEach(sv=>sv.stop(true));settings.routes=saved.routes;settings.pool=saved.pool;settings.strategy=saved.strategy;settings.routeId=saved.routeId;restorePool();for(const r of settings.routes)r.exhaustedUntil=0;}
 }
 const viaPoolProvider=()=>({...remoteProvider(),routeId:'proxy-pool'});
 test('A pool proxy whose exit is used up is retired and the same request moves to the next clean proxy',async()=>{
@@ -247,10 +271,10 @@ test('When every exit is used up the client gets one clear message with the rese
     freshModel('remote','allgone');poolReport(entries[0].url,'ok',10);poolReport(entries[1].url,'ok',50);
     const r=await chat('remote/allgone',{stream:false});const x:any=await r.json();
     expect(r.status).toBe(429);expect(Number(r.headers.get('retry-after'))).toBeGreaterThan(7000);expect(Number(r.headers.get('retry-after'))).toBeLessThanOrEqual(7200);
-    expect(x.error).toMatchObject({code:'egress_exhausted',type:'egress_exhausted'});expect(x.error.message).toContain('daily allowance');expect(x.error.message).toContain('UTC');expect(x.error.message).toMatch(/in 1 h|in 2 h/);expect(x.error.message).not.toContain('{"error"');
+    expect(x.error).toMatchObject({code:'egress_exhausted',type:'egress_exhausted'});expect(x.error.message).toContain('limit/access error');expect(x.error.message).toContain('UTC');expect(x.error.message).toMatch(/in 1 h|in 2 h/);expect(x.error.message).not.toContain('{"error"');
     expect(x.error.retry_after_seconds).toBeGreaterThan(7000);expect(new Date(x.error.resets_at).getTime()).toBeGreaterThan(Date.now());
     const m=models.get('remote/allgone')!;expect(m.state).not.toBe('cooldown');expect(m.cooldownUntil).toBe(0);
-    const row=await until(()=>logs(5).find(l=>l.model==='remote/allgone'));expect(faultOf(row.id)).toBe(0);expect(row.error).toContain('daily allowance');
+    const row=await until(()=>logs(5).find(l=>l.model==='remote/allgone'));expect(faultOf(row.id)).toBe(0);expect(row.error).toContain('limit/access error');
   });});
 });
 test('The default strategy sticks to the proxy that carried the last request, and the warm-up keeps good proxies warm and drops dead ones',async()=>{
@@ -292,7 +316,7 @@ test('A used-up direct exit sends requests to a clean pool proxy, and keeps doin
   await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct',routes:{ids:['direct'],backups:true}}],async()=>{
     freshModel('remote','drained');poolReport(entries[0].url,'ok',10);
     const r=await chat('remote/drained');expect(r.status).toBe(200);await r.text();expect(hits).toEqual([1]);
-    const direct=settings.routes.find(x=>x.id==='direct')!;expect(direct.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(direct.status).toContain('Daily Free allowance used');
+    const direct=settings.routes.find(x=>x.id==='direct')!;expect(direct.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(direct.status).toContain('OpenCode limit/access error');
     const before=seen.length;const again=await chat('remote/drained');expect(again.status).toBe(200);await again.text();
     expect(seen.length).toBe(before);expect(hits).toEqual([2]);
     expect(models.get('remote/drained')!.state).not.toBe('cooldown');
@@ -301,7 +325,7 @@ test('A used-up direct exit sends requests to a clean pool proxy, and keeps doin
 });
 test('A 429 without a reset time is explained as a refused request and still pauses the model',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','shape');const r=await chat('remote/shape',{stream:false});const x:any=await r.json();
-  expect(r.status).toBe(429);expect(x.error.code).toBe('request_refused');expect(x.error.message).toContain('did not give a reset time');expect(x.error.message).toContain('Request shape');
+  expect(r.status).toBe(429);expect(x.error.code).toBe('request_refused');expect(x.error.message).toContain('No confirmed retry time');expect(x.error.message).toContain('Request shape');
   expect(models.get('remote/shape')!.state).toBe('cooldown');
   const again=await chat('remote/shape',{stream:false});const y:any=await again.json();expect(again.status).toBe(429);expect(y.error.type).toBe('model_paused');expect(y.error.message).toContain('paused');expect(Number(again.headers.get('retry-after'))).toBeGreaterThan(0);
 });});
@@ -367,8 +391,8 @@ test('The agent\'s requests are recorded with the agent session they belong to, 
 });});
 test('A request that succeeds on its retry is not recorded as a model fault',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','recover');recoverCalls=0;settings.retries=1;
-  const r=await chat('remote/recover',{stream:false});await r.text();expect(r.status).toBe(200);
-  const row=await until(()=>logs(5).find(l=>l.model==='remote/recover'));expect(faultOf(row.id)).toBe(0);expect(row.error||'').toBe('');
+    const r=await chat('remote/recover',{stream:false});await r.text();expect(r.status).toBe(200);
+    const row=await until(()=>logs(5).find(l=>l.model==='remote/recover'));expect(faultOf(row.id)).toBe(0);expect(row.error||'').toBe('');
 });});
 test('A non-streaming answer cut short is an error, not a 200 with half an answer',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','cut');const r=await chat('remote/cut',{stream:false});const x:any=await r.json();
@@ -379,7 +403,7 @@ test('A 429 countdown is only a suspicion: when a known-good request through the
   freshModel('remote','drained');let asked=0;__setExitVerifier(async()=>{asked++;return 'refused';});
   try{
     const r=await chat('remote/drained',{stream:false});const x:any=await r.json();
-    expect(asked).toBe(1);expect(r.status).toBe(429);expect(x.error.code).toBe('request_refused');expect(x.error.message).toContain('still has allowance');
+    expect(asked).toBe(1);expect(r.status).toBe(429);expect(x.error.code).toBe('request_refused');expect(x.error.message).toContain('small check through the same network exit was accepted');
     expect(settings.routes.find(z=>z.id==='direct')!.exhaustedUntil||0).toBe(0);
     const m=models.get('remote/drained')!;expect(m.cooldownUntil).toBeLessThan(Date.now()+3600e3);
   }finally{__setExitVerifier();settings.routes.find(z=>z.id==='direct')!.exhaustedUntil=0;}
@@ -395,6 +419,10 @@ test('Asking a used-up route again clears a stale mark, renews a true one and sk
     const relay={...route,kind:'relay' as const};
     __setCanarySender(async()=>new Response(FREE_LIMIT_BODY,{status:429,headers:{'content-type':'application/json','retry-after':'7200'}}));
     expect((await checkChat(relay)).chat).toBe('refused');expect(relay.status).toContain('Refused');
+    __setCanarySender(async()=>new Response(FREE_LIMIT_BODY,{status:429,headers:{'retry-after':'7331','x-relay-runtime':'node-bun-ciphers 26.13.0','x-relay-egress':'203.0.113.1'}}));
+    expect((await checkChat(relay)).chat).toBe('used-up');expect(relay.status).toContain('limit/access error');expect(relay.exhaustedUntil!).toBeLessThanOrEqual(Date.now()+7331e3);
+    __setCanarySender(async()=>new Response(FREE_LIMIT_BODY,{status:429}));
+    const noTime=await checkChat(route);expect(noTime.chat).toBe('refused');expect(noTime.note).toContain('not assuming a daily reset');expect(route.exhaustedUntil!).toBeLessThan(Date.now()+16*60e3);
     __setCanarySender(async()=>undefined);expect((await checkChat(route)).chat).toBe('unknown');
   }finally{__setCanarySender();}
 });
@@ -415,7 +443,7 @@ test('A relay that does not say it runs Bun is skipped briefly, a Bun relay is j
     await (await call('relay-x','node v22')).text();const x=settings.routes.find(r=>r.id==='relay-x')!;
     expect(asked).toBe(0);expect(x.exhaustedUntil!).toBeGreaterThan(Date.now());expect(x.exhaustedUntil!).toBeLessThan(Date.now()+20*60e3);expect(x.status).toContain('Refused');
     await (await call('relay-bun','bun 1.3.14')).text();const b=settings.routes.find(r=>r.id==='relay-bun')!;
-    expect(asked).toBe(1);expect(b.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(b.status).toContain('Daily Free allowance used');
+    expect(asked).toBe(1);expect(b.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(b.status).toContain('OpenCode limit/access error');
   }finally{settings.routes=saved;settings.relayRotations=undefined;__setExitVerifier();for(const r of settings.routes)r.exhaustedUntil=0;}
 });
 test('A Bun relay whose address is used up is recycled and the same request is retried on the new instance',async()=>{
@@ -500,7 +528,7 @@ test('The pool is either the active route or standby, and standby gives the prev
     setPoolRole(true);expect(settings.previousRouteId).toBe('direct');           // selecting it twice keeps the real previous route
     setPoolRole(false);expect(settings.routeId).toBe('direct');
     settings.routes.find(r=>r.id==='direct')!.exhaustedUntil=Date.now()+3600e3;
-    expect(describeRoutes().direct).toMatchObject({label:'Used up today',tone:'cooldown'});expect(describeRoutes().direct.detail).toContain('UTC');
+    expect(describeRoutes().direct).toMatchObject({label:'OpenCode limit/access error',tone:'cooldown'});expect(describeRoutes().direct.detail).toContain('UTC');
     settings.exhaustedFailover=false;expect(backupChain()).toEqual([]);expect(describeRoutes()['proxy-pool'].role).toBe('off');
   }finally{Object.assign(settings,{routes:saved.routes,routeId:saved.routeId,previousRouteId:saved.prev,pool:saved.pool,allowDirect:saved.allow,exhaustedFailover:saved.ef});for(const r of settings.routes)r.exhaustedUntil=0;}
 });
@@ -690,11 +718,14 @@ test('Dashboard login issues a signed session, locks out guessing and can be rev
   loginGate.reset();
 });
 test('The dashboard password can be changed and old sessions stop working', async () => {
+  const adminBefore=structuredClone(settings.admin);delete settings.admin;loginGate.reset();
+  try {
   const login = (password: string) => fetch(base + '/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
   expect((await adminFetch('/admin/password', { current: 'wrong', next: 'a-new-long-password-1' })).status).toBe(403);
   expect((await adminFetch('/admin/password', { current: 'test-admin-secret', next: 'short' })).status).toBe(400);
   const changed = await adminFetch('/admin/password', { current: 'test-admin-secret', next: 'a-new-long-password-1' }); expect(changed.status).toBe(200);
   expect((await login('a-new-long-password-1')).status).toBe(200); expect((await login('test-admin-secret')).status).toBe(401); loginGate.reset();
+  } finally { settings.admin=adminBefore;loginGate.reset(); }
 });
 test('Invalid API keys are throttled per address', async () => {
   keyGate.reset(); let last = 0;
@@ -763,11 +794,13 @@ test('Health, readiness and CORS endpoints behave for a public deployment', asyn
 
 test('Scoped keys enforce rate, budget, expiry, model list and enabled state', async () => {
   const create = async (b: any) => ((await (await adminFetch('/admin/keys', b)).json()) as any).key;
-  const use = (key: string, model = 'mock/working') => fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }) });
+  const requestBody = (model: string) => ({ model, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] });
+  const use = (key: string, model = 'mock/working') => fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer ' + key, 'content-type': 'application/json' }, body: JSON.stringify(requestBody(model)) });
   const rpm = await create({ name: 'rpm', rpm: 2 }); expect((await use(rpm.value)).status).toBe(200); expect((await use(rpm.value)).status).toBe(200);
   const blocked = await use(rpm.value); expect(blocked.status).toBe(429); expect(Number(blocked.headers.get('retry-after'))).toBeGreaterThan(0);
-  const budget = await create({ name: 'budget', budget: 5 }); expect((await use(budget.value)).status).toBe(200);
-  const exhausted = await use(budget.value); expect(exhausted.status).toBe(429); expect(((await exhausted.json()) as any).error.type).toBe('insufficient_quota'); expect(settings.keys.find((k: any) => k.id === budget.id)!.used).toBeGreaterThanOrEqual(5);
+  const allowance = Math.ceil(JSON.stringify(requestBody('mock/working')).length / 4) + 10;
+  const budget = await create({ name: 'budget', budget: allowance }); expect((await use(budget.value)).status).toBe(200);
+  const exhausted = await use(budget.value); expect(exhausted.status).toBe(429); expect(((await exhausted.json()) as any).error.type).toBe('insufficient_quota'); expect(settings.keys.find((k: any) => k.id === budget.id)!.used).toBeGreaterThan(0);
   const only = await create({ name: 'only-working', models: ['mock/working'] }); expect((await use(only.value, 'mock/limited')).status).toBe(403); expect((await use(only.value)).status).toBe(200);
   expect(((await (await fetch(base + '/v1/models', { headers: { authorization: 'Bearer ' + only.value } })).json()) as any).data.map((m: any) => m.id).filter((id: string) => id !== 'auto')).toEqual(['mock/working']);
   const expiring = await create({ name: 'expiring' }); settings.keys.find((k: any) => k.id === expiring.id)!.expiresAt = Date.now() - 1000; const expired = await use(expiring.value); expect(expired.status).toBe(403); expect(((await expired.json()) as any).error.type).toBe('key_expired');

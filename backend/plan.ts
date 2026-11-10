@@ -121,7 +121,7 @@ export function previewRouting(requested: string, key: ApiKey | undefined, needs
   }
   let first = true;
   const steps: PlanStep[] = rows.map(r => {
-    const provider = r.m ? settings.providers.find(p => p.id === r.m!.providerId)?.name || r.m.providerId : '—';
+    const provider = r.m ? settings.providers.find(p => p.id === r.m!.providerId)?.name || r.m.providerId : '-';
     const from = r.from ? { from: r.from } : {};
     if (!r.v.ok && !r.chosen) return { model: r.id, provider, status: 'skip' as const, reason: r.v.reason, ...from };
     if (!r.chosen) return { model: r.id, provider, status: 'later' as const, reason: 'not reached: the models before it are tried first', ...from };

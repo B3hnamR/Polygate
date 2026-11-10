@@ -1,9 +1,12 @@
-import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { preserveTestState } from './setup';
+const restore = preserveTestState();
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 process.env.POLYGATE_ADMIN_TOKEN = 'deploy-token-secret';
 const { startGateway } = await import('../backend/main');
 const { settings, publicSettings, redactError } = await import('../backend/state');
 const { __timing } = await import('../backend/relay-deploy');
+const timing = { ...__timing };
 __timing.poll = 1; __timing.verify = 1;
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = '';
 const realFetch = globalThis.fetch; const saved = { routes: settings.routes.slice() };
@@ -12,7 +15,6 @@ const call = async (p: string, body: unknown) => { const r = await realFetch(bas
 const TOKEN = 'vercel-api-token-abcdef123456';
 const sent: { url: string; auth: string; body: any }[] = [];
 beforeAll(async () => {
-  gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
   // Only Vercel and the new relay are faked; the dashboard calls to the local gateway go through.
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url); const headers = new Headers(init.headers);
@@ -22,17 +24,20 @@ beforeAll(async () => {
       if (init.method === 'POST') { const region = JSON.parse(String(init.body)).regions[0]; return Response.json({ id: 'dpl_' + region, readyState: 'READY', alias: [`relay-${region}.vercel.app`], url: 'x.vercel.app' }); }
       return Response.json({ teams: [{ id: 't1', slug: 'me', billing: { plan: 'pro' } }], projects: [] });
     }
-    if (headers.has('x-relay-key')) return Response.json({ data: [] });
+    if (/^https:\/\/relay-[a-z0-9]+\.vercel\.app\/?$/.test(u) && headers.has('x-relay-key')) return Response.json({ data: [] });
     return realFetch(url, init);
   }) as any;
+  gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`;
 });
-afterAll(async () => { globalThis.fetch = realFetch; delete settings.deployTokens; settings.routes = saved.routes.slice(); await gateway?.close(); });
+afterAll(async () => { try { await gateway?.close(); } finally { globalThis.fetch = realFetch; Object.assign(__timing, timing); restore(); } });
+beforeEach(() => { settings.routes = structuredClone(saved.routes); settings.deployTokens = { vercel: TOKEN }; sent.length = 0; });
 
 test('a deploy does not keep the token unless asked, and keeps it encrypted-only when asked', async () => {
+  delete settings.deployTokens;
   const plain = await call('/admin/relays/deploy', { platform: 'vercel', token: TOKEN, region: 'fra1', name: 'one' });
   expect(plain.status).toBe(200); expect(settings.deployTokens).toBeUndefined();
   const kept = await call('/admin/relays/deploy', { platform: 'vercel', token: TOKEN, region: 'iad1', name: 'two', remember: true });
-  expect(kept.status).toBe(200); expect(settings.deployTokens?.vercel).toBe(TOKEN);
+  expect(kept.status).toBe(200); expect(publicSettings().deployTokens?.vercel).toBe('••••••••');
 });
 
 test('the saved token never reaches the dashboard or an error message', () => {
@@ -66,6 +71,7 @@ test('forgetting the token removes it, and a saved-token deploy then asks for on
 });
 
 test('a token Vercel rejects is not remembered', async () => {
+  delete settings.deployTokens;
   const bad = await call('/admin/relays/deploy', { platform: 'vercel', token: 'a-wrong-token-123456', region: 'fra1', remember: true });
   expect(bad.status).toBe(400); expect(bad.body.error.message).toContain('check the token'); expect(settings.deployTokens).toBeUndefined();
 });

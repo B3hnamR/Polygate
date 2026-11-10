@@ -66,6 +66,11 @@ export class FailureGate {
   }
   clear(ip: string) { this.hits.delete(gateKey(ip)); }
   reset() { this.hits.clear(); }
+  // Module-only test isolation: preserve both existing lockouts and nested timestamp arrays.
+  __captureTestState() {
+    const hits = structuredClone(this.hits);
+    return () => { this.hits = structuredClone(hits); };
+  }
 }
 export const loginGate = new FailureGate(5, 10 * 60000);
 export const keyGate = new FailureGate(30, 5 * 60000);

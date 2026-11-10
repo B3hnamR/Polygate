@@ -1,16 +1,18 @@
-import { test, expect, afterAll } from 'bun:test';
+import { test, expect, afterAll, beforeEach } from 'bun:test';
+import { preserveTestState } from './setup';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 // The agent's engine manager (docs/agent/PLAN.md, Phase 1): the pinned OpenCode download, how it is run, and the self-test that refuses
 // an engine that is not using Polygate's configuration. The state folder comes from tests/setup.ts; the engine gets a folder of its own.
-process.env.POLYGATE_AGENT_DIR = mkdtempSync(path.join(tmpdir(), 'pg-agent-'));
+const restore = preserveTestState();
+const agentDir = mkdtempSync(path.join(tmpdir(), 'pg-agent-'));
+process.env.POLYGATE_AGENT_DIR = agentDir;
 const engine = await import('../backend/agent-engine');
 const { settings } = await import('../backend/state');
 const { ensureAgentKey } = await import('../backend/keys');
 const FAKE = [process.execPath, path.join(import.meta.dir, 'fixtures', 'fake-opencode.ts')];
-const keysBefore = settings.keys.map(k => k.id);
 
 // A tar.gz the way npm packs one.
 function tgz(entries: [string, string | Buffer][]) {
@@ -40,10 +42,10 @@ const alive = (pid?: number) => { try { process.kill(pid!, 0); return true; } ca
 const until = async (check: () => boolean, ms = 15000) => { const end = Date.now() + ms; while (!check()) { if (Date.now() > end) throw new Error('timed out'); await Bun.sleep(100); } };
 
 afterAll(async () => {
-  await engine.stopEngine(); registry.stop(true);
-  settings.keys = settings.keys.filter(k => keysBefore.includes(k.id));
-  delete process.env.FAKE_OPENCODE_MODE; delete process.env.FAKE_OPENCODE_CRASH_FILE; delete process.env.POLYGATE_AGENT_DIR;
+  try { await engine.stopEngine(); } finally { registry.stop(true); restore(); rmSync(agentDir, { recursive: true, force: true }); }
 });
+
+beforeEach(async () => { await engine.stopEngine(); engine.setEngineGateway('http://127.0.0.1:9'); delete process.env.FAKE_OPENCODE_MODE; delete process.env.FAKE_OPENCODE_CRASH_FILE; });
 
 test('downloads come from the npm registry over HTTPS, and nowhere else', () => {
   expect(engine.tarballUrl('@opencode/cli-windows-x64')).toBe(`https://registry.npmjs.org/@opencode/cli-windows-x64/-/cli-windows-x64-${engine.ENGINE_VERSION}.tgz`);
@@ -53,6 +55,7 @@ test('downloads come from the npm registry over HTTPS, and nowhere else', () => 
 });
 
 test('an engine download that does not match the published checksum is refused, and nothing is left behind', async () => {
+  rmSync(paths().bin, { recursive: true, force: true });
   await expect(engine.installEngine({ source: source('/good.tgz', integrity(Buffer.from('something else'))), arch: 'x64' })).rejects.toThrow(/checksum/);
   expect(engine.engineStatus().installed).toBe(false);
   expect(existsSync(paths().bin)).toBe(false);
@@ -60,6 +63,7 @@ test('an engine download that does not match the published checksum is refused, 
 });
 
 test('an archive whose program is not a Windows executable is refused', async () => {
+  rmSync(paths().bin, { recursive: true, force: true });
   await expect(engine.installEngine({ source: source('/not-a-program.tgz'), arch: 'x64' })).rejects.toThrow(/Windows program/);
   expect(engine.engineStatus().installed).toBe(false);
 });
@@ -76,11 +80,12 @@ test('only the program and its package file are taken from the archive, whatever
 });
 
 test('a changed engine program is not started', async () => {
+  await engine.installEngine({ source: source('/good.tgz'), arch: 'x64' });
   const p = paths(); const saved = readFileSync(p.exe);
   writeFileSync(p.exe, Buffer.concat([saved, Buffer.from('tampered')]));
   engine.setEngineGateway('http://127.0.0.1:9');
-  await expect(engine.startEngine()).rejects.toThrow(/changed since it was installed/);
-  writeFileSync(p.exe, saved);
+  try { await expect(engine.startEngine()).rejects.toThrow(/changed since it was installed/); }
+  finally { writeFileSync(p.exe, saved); }
 });
 
 test('the engine configuration holds Polygate as the only provider, the ask-first rules and the scrub plugin, and no secret', () => {
@@ -94,7 +99,7 @@ test('the engine configuration holds Polygate as the only provider, the ask-firs
   expect(cfg.policies).toEqual([{ action: 'provider.use', resource: '*', effect: 'deny' }, { action: 'provider.use', resource: 'polygate', effect: 'allow' }]);
   expect(cfg.permissions[0]).toEqual({ action: '*', resource: '*', effect: 'ask' });
   const effect = (action: string, resource = '*') => cfg.permissions.filter((r: any) => r.action === action && r.resource === resource).at(-1)?.effect;
-  expect([effect('read'), effect('read', '*.env'), effect('edit'), effect('shell'), effect('external_directory'), effect('webfetch')]).toEqual(['allow', 'ask', 'ask', 'ask', 'ask', 'ask']);
+  expect([effect('read'), effect('read', '*.env'), effect('edit'), effect('shell'), effect('external_directory'), effect('webfetch')]).toEqual(['allow', 'ask', 'ask', 'ask', 'ask', 'allow']);
   expect(cfg).toMatchObject({ update: 'disable', share: 'disabled', snapshots: true, plugins: ['./polygate-scrub'] });
   expect(JSON.stringify(cfg)).not.toMatch(/pg_[0-9a-f]{10}/);
 });
@@ -117,10 +122,39 @@ test('each mode is an engine agent with its own rules, and Polygate\'s folders s
   expect(['edit', 'shell'].map(a => last(rulesOf('polygate-rules'), a))).toEqual(['allow', 'ask']);
 });
 
+test('reasoning efforts register real engine variants and Code Mode leaves remain permission-controlled',()=>{
+  const cfg=engine.engineConfig({gatewayUrl:'http://127.0.0.1:4317',models:[{id:'reasoner',name:'Reasoner',context:32000,output:4000,reasoning:true}]});
+  expect(cfg.providers.polygate.models.reasoner.variants).toEqual(['low','medium','high'].map(id=>({id,body:{reasoning_effort:id}})));
+  expect(cfg.agents['polygate-plan'].permissions.some((p:{action:string;effect:string})=>p.action==='execute'&&p.effect==='deny')).toBe(false);
+  expect(cfg.agents['polygate-plan'].permissions).toContainEqual({action:'shell',resource:'*',effect:'deny'});
+});
+
+test('MCP sharing config is opt-in, uses the Agent key on the local hub only, and Plan denies its tools', () => {
+  expect(engine.engineConfig({ gatewayUrl:'http://127.0.0.1:4317', models:[] }).mcp).toBeUndefined();
+  const cfg=engine.engineConfig({ gatewayUrl:'http://127.0.0.1:4317', models:[], mcp:true });
+  expect(cfg.mcp.servers).toEqual({polygate_shared:{type:'remote',url:'http://127.0.0.1:4317/mcp',headers:{Authorization:'Bearer {env:POLYGATE_AGENT_KEY}'},oauth:false,codemode:false}});
+  expect(cfg.agents['polygate-plan'].permissions).toContainEqual({action:'polygate_shared_*',resource:'*',effect:'deny'});
+});
+
 test('the agent\'s shell is chosen by Polygate: PowerShell 7 when it is installed, Windows PowerShell otherwise, and written to the configuration', () => {
   expect(engine.chooseShell(name => name === 'pwsh' ? 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' : null)).toBe('C:\\Program Files\\PowerShell\\7\\pwsh.exe');
   expect(engine.chooseShell(() => null)).toBe(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
   expect(engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [], shell: 'C:\\pwsh.exe' }).shell).toBe('C:\\pwsh.exe');
+});
+test('a model whose output limit is unknown gets the engine\'s own default, at most half its window, so long replies and compaction fit', () => {
+  const cfg = engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [{ id: 'big', name: 'Big', context: 272000, output: 0 }, { id: 'small', name: 'Small', context: 20000, output: 0 }, { id: 'unknown', name: 'Unknown', context: 0, output: 0 }, { id: 'known', name: 'Known', context: 128000, output: 8192 }] });
+  const limits = Object.fromEntries(Object.entries<any>(cfg.providers.polygate.models).map(([id, m]) => [id, m.limit]));
+  expect(limits).toEqual({ big: { context: 272000, output: 32000 }, small: { context: 20000, output: 10000 }, unknown: { context: 32000, output: 16000 }, known: { context: 128000, output: 8192 } });
+});
+test('web search uses Exa without the engine\'s first-search question; searching and reading pages never ask for approval', () => {
+  const cfg = engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [] });
+  expect(cfg.websearch).toEqual({ provider: 'exa' });
+  expect(cfg.permissions.filter((r: any) => r.action === 'websearch')).toEqual([{ action: 'websearch', resource: '*', effect: 'allow' }]);
+  expect(cfg.permissions.filter((r: any) => r.action === 'webfetch')).toEqual([{ action: 'webfetch', resource: '*', effect: 'allow' }]);
+});
+test('skills come only from Polygate\'s library folder, besides the engine\'s own', () => {
+  expect(engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [] }).skills).toBeUndefined();
+  expect(engine.engineConfig({ gatewayUrl: 'http://127.0.0.1:4317', models: [], skills: 'C:\\pg\\agent\\skills' }).skills).toEqual(['C:\\pg\\agent\\skills']);
 });
 
 test('the engine gets none of Polygate\'s secrets, a password of its own and every hardening switch', () => {
@@ -162,7 +196,7 @@ test('a started engine passes its self-test on a loopback port with a fresh pass
 });
 
 test('an engine that reads a project\'s configuration, offers another provider, loosens the rules or is another version is stopped, with the reason', async () => {
-  const reasons: Record<string, RegExp> = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/, 'missing-agent': /polygate-plan agent/ };
+  const reasons: Record<string, RegExp> = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/, 'missing-agent': /polygate-plan agent/, 'foreign-skill': /planted/ };
   try {
     for (const [mode, reason] of Object.entries(reasons)) {
       process.env.FAKE_OPENCODE_MODE = mode;
@@ -204,9 +238,11 @@ test('a change to the engine\'s configuration that Polygate did not make stops t
 
 test('the snapshot check says whether undo can work, and why not', () => {
   const p = { ...paths(), data: mkdtempSync(path.join(tmpdir(), 'pg-snap-')) };
+  try {
   expect(engine.snapshotCheck(p)).toEqual({ ok: true });
   expect(engine.snapshotCheck(p, 'git-that-is-not-installed').reason).toContain('Git is not installed');
   expect(readdirSync(path.join(p.data, 'opencode', 'snapshot'))).toEqual([]);
+  } finally { rmSync(p.data, { recursive: true, force: true }); }
 });
 
 test('the agent\'s own client key is created once and kept, and a turned-off key stops the engine from starting', async () => {
@@ -217,6 +253,7 @@ test('the agent\'s own client key is created once and kept, and a turned-off key
 });
 
 test('the engine routes answer in the desktop app only', async () => {
+  await engine.installEngine({ source: source('/good.tgz'), arch: 'x64' });
   const { startGateway } = await import('../backend/main');
   const saved = { token: process.env.POLYGATE_ADMIN_TOKEN, desktop: process.env.POLYGATE_DESKTOP };
   process.env.POLYGATE_ADMIN_TOKEN = 'agent-engine-secret'; delete process.env.POLYGATE_DESKTOP;

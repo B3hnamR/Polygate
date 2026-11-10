@@ -1,9 +1,12 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { preserveTestState } from './setup';
+const restore = preserveTestState();
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 process.env.POLYGATE_ADMIN_TOKEN='test-admin-secret';
 const {startGateway}=await import('../backend/main');
 const {settings,models,removeModels,initialSettings,withBuiltIns}=await import('../backend/state');
 const {freeCatalog}=await import('../backend/kilo');
+const {discover}=await import('../backend/providers');
 let gateway:Awaited<ReturnType<typeof startGateway>>,base='';
 let addressLimited=false;const sent:{model:string;auth:string|null;max:any}[]=[];
 // A stand-in for api.kilo.ai that answers the way the live service was observed to.
@@ -32,18 +35,32 @@ const chat=(model:string,extra:any={})=>fetch(base+'/v1/chat/completions',{metho
 beforeAll(async()=>{
   settings.warp={engine:'disabled',autoStart:false,pool:1,rotateMinutes:0,helperPath:'',endpoint:''};
   settings.providers=[];removeModels('kilo');settings.cooldowns=true;settings.fallback=true;
+  models.clear(); settings.enabled=true; settings.rotate=false; settings.routeId='direct'; settings.chains=[];
+  settings.routes=[{id:'direct',name:'Fixture direct',kind:'direct',url:'',enabled:true,models:[]}];
   gateway=await startGateway(0);base=`http://127.0.0.1:${gateway.port}`;
 });
-afterAll(async()=>{removeModels('kilo');settings.providers=[];await gateway?.close();kilo.stop(true);});
+afterAll(async()=>{
+  try{await gateway?.close();}
+  finally{kilo.stop(true);addressLimited=false;restore();} // Restore shared pool/key/activity state only after shutting down the file's gateway.
+});
+const seedKilo = async () => {
+  addressLimited=false;removeModels('kilo');
+  settings.providers=[{id:'kilo',name:'Kilo Free',kind:'kilo',enabled:true,baseUrl:`http://127.0.0.1:${kilo.port}`,apiKey:'',models:[],routeId:'direct'}];
+  await discover();
+};
 
 test('Kilo is a built-in provider: in fresh settings, added to older ones, and never deleted',async()=>{
-  expect(initialSettings().providers.map(p=>[p.id,p.kind,p.enabled])).toEqual([['opencode','free',true],['kilo','kilo',true]]);
+  expect(initialSettings().providers.map(p=>[p.id,p.kind,p.enabled])).toEqual([['opencode','free',true],['kilo','kilo',true],['zai','zai',false]]);
   const older={...initialSettings(),providers:[initialSettings().providers[0]]};
-  expect(withBuiltIns(older).providers.map(p=>p.id)).toEqual(['opencode','kilo']);
+  expect(withBuiltIns(older).providers.map(p=>p.id)).toEqual(['opencode','kilo','zai']);
   const custom={...older,providers:[...older.providers,{id:'mine',name:'Mine',kind:'openai' as const,enabled:true,baseUrl:'http://x/v1',apiKey:'k',models:[],routeId:''}]};
-  expect(withBuiltIns(custom).providers.map(p=>p.id)).toEqual(['opencode','mine','kilo']);
+  expect(withBuiltIns(custom).providers.map(p=>p.id)).toEqual(['opencode','kilo','zai','mine']);
+  // Built-ins first (OpenCode, Kilo, Z.ai) whatever order they were saved in; the user's own keep theirs.
+  const mixed={...older,providers:[custom.providers[1],{...custom.providers[1],id:'other',name:'Other'},initialSettings().providers[2],initialSettings().providers[1],older.providers[0]]};
+  expect(withBuiltIns(mixed).providers.map(p=>p.id)).toEqual(['opencode','kilo','zai','mine','other']);
+  const ordered=withBuiltIns(custom);expect(withBuiltIns(ordered)).toBe(ordered);
   const kept=withBuiltIns({...initialSettings(),providers:[{...initialSettings().providers[1],enabled:false,apiKey:'saved'}]});
-  expect(kept.providers).toHaveLength(1);expect(kept.providers[0]).toMatchObject({enabled:false,apiKey:'saved'});
+  expect(kept.providers.map(p=>p.id)).toEqual(['kilo','zai']);expect(kept.providers[0]).toMatchObject({enabled:false,apiKey:'saved'});
 });
 test('the catalog keeps free chat models only',()=>{
   expect(freeCatalog(catalog).map(x=>x.id)).toEqual(['kilo-auto/free','vendor/busy:free','vendor/gone:free','vendor/big:free']);
@@ -60,31 +77,37 @@ test('adding Kilo through the dashboard API lists its free models behind OpenCod
   expect(settings.providers[0]).toMatchObject({name:'Kilo Free',kind:'kilo'});
 });
 test('the built-in providers cannot be deleted',async()=>{
+  await seedKilo();
   expect((await admin('/admin/providers/delete',{id:'kilo'})).status).toBe(400);
   expect((await admin('/admin/providers/delete',{id:'opencode'})).status).toBe(400);
   expect(settings.providers.some(p=>p.id==='kilo')).toBe(true);
 });
 test('requests carry no Authorization header unless a key was saved',async()=>{
+  await seedKilo();
   sent.length=0;const r=await chat('kilo/kilo-auto/free');expect(r.status).toBe(200);
   expect((await r.json() as any).choices[0].message.content).toBe('hello from kilo-auto/free');
   expect(sent.at(-1)!.auth).toBeNull();
   settings.providers[0].apiKey='kilo-key';await chat('kilo/kilo-auto/free');expect(sent.at(-1)!.auth).toBe('Bearer kilo-key');settings.providers[0].apiKey='';
 });
 test('a model Kilo no longer serves (401 paid-model) is retired as unavailable, not read as a blocked exit',async()=>{
+  await seedKilo();
   const r=await chat('kilo/vendor/gone:free');expect(r.status).toBe(404);
   expect(models.get('kilo/vendor/gone:free')!.state).toBe('unavailable');
 });
 test('one busy model pauses briefly while the others keep working',async()=>{
+  await seedKilo();
   const r=await chat('kilo/vendor/busy:free');expect(r.status).toBe(429);
   const m=models.get('kilo/vendor/busy:free')!;expect(m.state).toBe('cooldown');expect(m.cooldownUntil-Date.now()).toBeLessThanOrEqual(2*60000+1000);expect(m.cooldownUntil-Date.now()).toBeGreaterThan(60000);
   expect(models.get('kilo/kilo-auto/free')!.state).not.toBe('cooldown');expect((await chat('kilo/kilo-auto/free')).status).toBe(200);
 });
 test('a too-large output ceiling is retried once with a smaller one',async()=>{
+  await seedKilo();
   sent.length=0;const r=await chat('kilo/vendor/big:free',{max_tokens:32000});expect(r.status).toBe(200);
   expect(sent.map(s=>s.max)).toEqual([32000,4096]);
   sent.length=0;expect((await chat('kilo/vendor/big:free',{max_tokens:100})).status).toBe(200);expect(sent).toHaveLength(1);
 });
 test('the address-wide limit pauses every Kilo model together and the next request is not sent',async()=>{
+  await seedKilo();
   addressLimited=true;sent.length=0;
   const r=await chat('kilo/kilo-auto/free');expect(r.status).toBe(429);expect(Number(r.headers.get('retry-after'))).toBe(1800);
   expect(((await r.json()) as any).error.message).toContain('limits anonymous use per network address');
@@ -94,10 +117,14 @@ test('the address-wide limit pauses every Kilo model together and the next reque
   const again=await chat('kilo/vendor/big:free');expect(again.status).toBe(429);expect(sent).toHaveLength(1);
   const auto=await chat('auto');expect(auto.status).toBe(503);expect(sent).toHaveLength(1);
 });
-test('Kilo models are never picked for background probing',()=>{
-  expect(settings.providers[0].kind).toBe('kilo');
-  const src=require('node:fs').readFileSync(require('node:path').join(import.meta.dir,'../backend/main.ts'),'utf8') as string;
-  expect(src).toMatch(/providerId!==KILO_ID/);
+test('Kilo models are checked in the background only when the user chooses it for Kilo',async()=>{
+   await seedKilo();
+  const {autoCheckMinutes}=await import('../backend/model-checks');
+  const kilo=settings.providers[0];expect(kilo.kind).toBe('kilo');const had=settings.autoProbe;
+  try{
+    settings.autoProbe=true;expect(autoCheckMinutes(kilo)).toBe(0); // the old all-providers switch never covered it
+    expect(autoCheckMinutes({...kilo,autoCheckMinutes:360})).toBe(360);
+  }finally{settings.autoProbe=had;}
 });
 
 test('A relay that carries one provider only is never chosen for another provider\'s request', async () => {

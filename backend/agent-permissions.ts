@@ -38,7 +38,9 @@ export function removeProjectRule(folder: string, id: string, root?: string) {
   mkdirSync(path.dirname(file), { recursive: true }); writeFileAtomic(file, JSON.stringify(rules));
 }
 export function permissionDecision(mode: PermissionMode, action: string, resources: string[], rules: ProjectRule[], inspections: string[] = inspectionCommands()): 'allow' | 'ask' | 'deny' {
-  if (mode === 'plan' && ['shell', 'edit', 'execute', 'subagent'].includes(action)) return 'deny';
+  if (mode === 'plan' && (['shell', 'edit', 'subagent'].includes(action) || action.startsWith('polygate_shared_'))) return 'deny';
+  // Code Mode is an isolated orchestration wrapper, not a shell. Each invoked leaf checks its own permissions.
+  if (action === 'execute') return 'allow';
   if (mode === 'full') return 'allow';
   if (!resources.length) return 'ask';
   if (mode === 'rules' && action === 'shell' && resources.some(command =>

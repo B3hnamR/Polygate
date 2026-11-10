@@ -3,7 +3,7 @@ import { test, expect, beforeAll, afterAll } from 'bun:test';
 const {settings,models,saveModel,removeModels}=await import('../backend/state');
 const {testRoute}=await import('../backend/transport');
 // One stand-in server answers both ways a request can arrive: straight (the provider's own URL) and through a relay (x-relay-path says where it was going).
-let mode:'ok'|'limit'|'busy'|'refused'|'catalog500'='ok';const seen:{path:string;auth:string|null;relayKey:string|null;model?:string}[]=[];
+let mode:'ok'|'limit'|'busy'|'refused'|'catalog500'|'cut'|'streamerror'='ok';const seen:{path:string;auth:string|null;relayKey:string|null;model?:string}[]=[];
 const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
   const path=req.headers.get('x-relay-path')||new URL(req.url).pathname;const call:any={path,auth:req.headers.get('authorization'),relayKey:req.headers.get('x-relay-key')};
   if(path.endsWith('/models')){seen.push(call);return mode==='catalog500'?new Response('down',{status:500}):Response.json({data:[{id:'a:free'}]});}
@@ -11,6 +11,9 @@ const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
   if(mode==='limit')return Response.json({error:{code:'PROMOTION_MODEL_LIMIT_REACHED',message:'Sign up for free to continue'}},{status:429});
   if(mode==='busy')return Response.json({error:{message:'a:free is temporarily rate-limited upstream'}},{status:429});
   if(mode==='refused')return Response.json({error:{message:'blocked'}},{status:403});
+  // Accepted (HTTP 200), then the answer never reaches a finish: cut off, or an error event in the stream.
+  if(mode==='cut')return new Response('data: '+JSON.stringify({choices:[{index:0,delta:{content:'O'},finish_reason:null}]})+'\n\n',{headers:{'content-type':'text/event-stream'}});
+  if(mode==='streamerror')return new Response('data: '+JSON.stringify({error:{message:'upstream overloaded'}})+'\n\n',{headers:{'content-type':'text/event-stream'}});
   return new Response('data: '+JSON.stringify({choices:[{index:0,delta:{content:'OK'},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
 }});
 const saved={providers:settings.providers,routes:settings.routes};
@@ -25,7 +28,7 @@ const reset=(m:typeof mode='ok')=>{mode=m;seen.length=0;settings.providers[0].ap
 
 test('a route is tested with the chosen provider: model list first, then one small chat, in plain words',async()=>{
   reset();const r=await testRoute('direct','kilo');
-  expect(r).toMatchObject({ok:true,status:200,chat:'ok',provider:'Kilo Free'});expect(r.summary).toBe('Direct connection: connected, and a real Kilo Free chat request passed.');
+  expect(r).toMatchObject({ok:true,status:200,chat:'ok',provider:'Kilo Free',model:'A (free)'});expect(r.summary).toBe('Direct connection: connected, and A (free) answered a small Kilo Free chat request.');
   expect(seen.map(s=>s.path)).toEqual(['/api/gateway/models','/api/gateway/chat/completions']);expect(seen[1].model).toBe('a:free');expect(seen.every(s=>s.auth===null)).toBe(true);
   expect(settings.routes[0].status).toBe('healthy');expect(settings.routes[0].latency).toBeGreaterThanOrEqual(0);
   reset();settings.providers[0].apiKey='kilo-key';await testRoute('direct','kilo');expect(seen.every(s=>s.auth==='Bearer kilo-key')).toBe(true);
@@ -33,8 +36,13 @@ test('a route is tested with the chosen provider: model list first, then one sma
 test('Kilo\'s address limit, a busy model and a refusal each get their own sentence, and the model keeps its state',async()=>{
   reset('limit');let r=await testRoute('direct','kilo');expect(r.chat).toBe('limited');expect(r.summary).toContain('limits anonymous use per address');expect(r.ok).toBe(true);
   reset('busy');r=await testRoute('direct','kilo');expect(r.chat).toBe('busy');expect(r.summary).toContain('was busy (HTTP 429)');
-  reset('refused');r=await testRoute('direct','kilo');expect(r.chat).toBe('refused');expect(r.summary).toContain('refused the request (HTTP 403)');
+  reset('refused');r=await testRoute('direct','kilo');expect(r.chat).toBe('refused');expect(r.summary).toContain('refused the request to A (free) (HTTP 403)');
   expect(models.get('kilo/a:free')!.state).toBe('available');expect(models.get('kilo/a:free')!.cooldownUntil).toBe(0);
+});
+test('a request that is accepted but never finishes is not a pass, and the model asked is named',async()=>{
+  reset('cut');let r=await testRoute('direct','kilo');expect(r).toMatchObject({ok:true,chat:'incomplete',model:'A (free)'});expect(r.summary).toBe('Direct connection: connected, and Kilo Free accepted a small chat request to A (free), but the answer ended before it was complete.');
+  reset('streamerror');r=await testRoute('direct','kilo');expect(r.chat).toBe('incomplete');expect(r.summary).toContain('but the provider reported: upstream overloaded');
+  expect(models.get('kilo/a:free')!.state).toBe('available');
 });
 test('a model list that does not answer, or no ready model, is reported without sending a chat',async()=>{
   reset('catalog500');let r=await testRoute('direct','kilo');expect(r.ok).toBe(false);expect(r.status).toBe(500);expect(r.summary).toContain('model list answered HTTP 500');expect(seen.some(s=>s.path.endsWith('/chat/completions'))).toBe(false);expect(settings.routes[0].status).toBe('HTTP 500');
@@ -43,7 +51,7 @@ test('a model list that does not answer, or no ready model, is reported without 
 test('a Kilo-only relay defaults to Kilo, works through the relay, and cannot be tested with another provider',async()=>{
   reset();settings.providers[0].baseUrl='https://api.kilo.ai/api/gateway';
   try{
-    const r=await testRoute('r-kilo');expect(r.chat).toBe('ok');expect(r.summary).toContain('Kilo relay: connected, and a real Kilo Free chat request passed.');
+    const r=await testRoute('r-kilo');expect(r.chat).toBe('ok');expect(r.summary).toContain('Kilo relay: connected, and A (free) answered a small Kilo Free chat request.');
     expect(seen.map(s=>s.path)).toEqual(['/api/gateway/models','/api/gateway/chat/completions']);expect(seen.every(s=>s.relayKey==='relay-secret')).toBe(true);
     seen.length=0;await expect(testRoute('r-kilo','opencode')).rejects.toThrow('carries Kilo only');expect(seen.length).toBe(0);
     settings.providers=[opencode];await expect(testRoute('r-kilo')).rejects.toThrow('enable that provider');

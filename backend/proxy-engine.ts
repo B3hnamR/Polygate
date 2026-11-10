@@ -27,6 +27,7 @@ function ipv6Bytes(host: string): number[] | undefined {
 export function isPublicHost(raw: string) {
   const host = raw.toLowerCase().replace(/^\[|\]$/g, '');
   if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) return false;
+  if (/^[\d.]+$/.test(host) && !net.isIPv4(host)) return false;
   if (net.isIPv4(host)) { const [a, b] = host.split('.').map(Number); return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)); }
   if (net.isIPv6(host)) {
     const v = ipv6Bytes(host); if (!v) return false;
@@ -49,9 +50,9 @@ const NOT_A_LOGIN = new Set(['http', 'https', 'socks4', 'socks5', 'elite', 'anon
 const HOST_KEYS = ['ip', 'host', 'address', 'ip_address', 'ipAddress', 'proxy_ip', 'server'], PORT_KEYS = ['port', 'proxy_port', 'portNumber'], PROTO_KEYS = ['protocols', 'protocol', 'type', 'types', 'scheme'];
 // A list reached from the internet may hold a small address range (/24 or narrower), never a whole network.
 const MIN_RANGE = 24;
-const validIp = (host: string, port: number) => port > 0 && port < 65536 && host.split('.').every(o => Number(o) <= 255) && isPublicHost(host);
+const validIp = (host: string, port: number) => port > 0 && port < 65536 && net.isIPv4(host) && isPublicHost(host);
 function rangeHosts(host: string, prefix: number) {
-  if (prefix < MIN_RANGE || prefix > 32 || host.split('.').some(o => Number(o) > 255)) return [];
+  if (prefix < MIN_RANGE || prefix > 32 || !net.isIPv4(host)) return [];
   const n = host.split('.').reduce((a, o) => a * 256 + Number(o), 0); const size = 2 ** (32 - prefix); const start = n - (n % size);
   const first = prefix >= 31 ? start : start + 1, last = prefix >= 31 ? start + size - 1 : start + size - 2;
   return Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => [24, 16, 8, 0].map(s => ((first + i) >>> s) & 255).join('.'));
@@ -62,12 +63,22 @@ function rangeHosts(host: string, prefix: number) {
 export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false): Candidate[] {
   const seen = new Map<string, Candidate>();
   const fallback = (): Proto[] => hint === 'all' ? ['http', 'socks5', 'socks4'] : [hint === 'https' ? 'http' : hint];
-  const add = (protos: Proto[], host: string, port: number, login?: [string, string]) => {
+  const add = (protos: Proto[], host: string, port: number, login?: [string, string], rawLogin = false) => {
+    // Text logins use URL escapes; JSON fields are literal credentials. Decode text once, then serialize both safely.
+    let auth = '';
+    try { if (login) auth = login.map(value => encodeURIComponent(rawLogin ? value : decodeURIComponent(value))).join(':') + '@'; }
+    catch { return; } // malformed URI escapes (or invalid Unicode) are not usable credentials
     for (const proto of protos) {
       if (seen.size >= MAX_CANDIDATES) return;
       const url = `${proto}://${host}:${port}`;
+      const proxy = `${proto}://${auth}${host}:${port}`;
+      let approved: URL, serialized: URL;
+      try { approved = new URL(url); serialized = new URL(proxy); } catch { continue; }
+      const canonicalHost = approved.hostname;
+      if ((!net.isIPv6(host.replace(/^\[|\]$/g, '')) && canonicalHost !== host.toLowerCase()) || !isPublicHost(canonicalHost)) continue;
+      if (serialized.hostname !== canonicalHost || serialized.host !== approved.host || serialized.protocol !== approved.protocol || serialized.pathname !== approved.pathname || serialized.search || serialized.hash) continue;
       // The first login listed for a proxy wins; a later bare mention does not drop it.
-      if (!seen.has(url) || (login && !seen.get(url)!.proxy.includes('@'))) seen.set(url, { url, proxy: login ? `${proto}://${login[0]}:${login[1]}@${host}:${port}` : url, proto, host, port });
+      if (!seen.has(url) || (login && !seen.get(url)!.proxy.includes('@'))) seen.set(url, { url, proxy, proto, host: canonicalHost, port });
     }
   };
   const scan = (body: string) => {
@@ -93,7 +104,7 @@ export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false)
         if (host && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host.trim()) && validIp(host.trim(), port)) {
           const named = PROTO_KEYS.flatMap(k => Array.isArray(o[k]) ? o[k] : [o[k]]).map(v => typeof v === 'string' ? SCHEME[v.toLowerCase()] : undefined).filter(Boolean) as Proto[];
           const user = ['username', 'user', 'login'].map(k => o[k]).find(v => typeof v === 'string' && v); const pw = ['password', 'pass', 'pwd'].map(k => o[k]).find(v => typeof v === 'string') || '';
-          add(named.length ? [...new Set(named)] : fallback(), host.trim(), port, user ? [user, pw] : undefined);
+          add(named.length ? [...new Set(named)] : fallback(), host.trim(), port, user ? [user, pw] : undefined, true);
         }
         for (const v of Object.values(o)) if (v && typeof v === 'object') walk(v, depth + 1);
       };
@@ -121,11 +132,11 @@ export function splitLinks(text: string) {
 // --- one request through one proxy ---
 function httpConnect(c: Candidate, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
   const u = new URL(c.proxy);
+  const auth = u.username ? `Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')}\r\n` : '';
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 80 }); let buffer = Buffer.alloc(0); let done = false;
     const fail = (error: Error) => { if (done) return; done = true; clearTimeout(timer); socket.destroy(); reject(error); };
     const timer = setTimeout(() => fail(new Error('CONNECT timed out')), timeoutMs);
-    const auth = u.username ? `Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')}\r\n` : '';
     socket.once('connect', () => socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n${auth}\r\n`));
     socket.on('data', (chunk: Buffer) => {
       if (done) return; buffer = Buffer.concat([buffer, chunk]); const end = buffer.indexOf('\r\n\r\n');

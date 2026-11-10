@@ -25,13 +25,22 @@ const publicPool=(r:Route,kind?:string)=>r.id==='proxy-pool'&&!!kind&&kind!=='fr
 const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
 // Counted once, when the mark is first set: the periodic re-asks of an exit that is still used up renew the mark without being new events.
-export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by the Free tier (retry after ${resetTime(ex.until)})`:`Daily Free allowance used (resets ${resetTime(ex.until)})`;persist();}
+export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by OpenCode; cause unconfirmed (recheck ${resetTime(ex.until)})`:`OpenCode limit/access error (retry after ${resetTime(ex.until)})`;persist();}
 // A relay is judged like a direct connection only when it says its TLS handshake is Bun's: it runs on Bun, or on Node with Bun's cipher list (relays/netlify-relay.js).
 const trustedRuntime=(v:string|null)=>/^(bun|node-bun-ciphers)/i.test(v||'');
 // A 429 with a countdown is only a suspicion of a used-up exit: a wrong request shape or a TLS client other than Bun's gets the same answer.
 // One small known-good request through the same exit settles it. Replaceable so tests need no network.
 // undefined when there is nothing to send with or the connection failed; canaryNote says which.
-let canaryNote='';
+let canaryNote='',canaryModel='';
+// Whether a chat that was accepted (HTTP 2xx) also ran to its end. Empty when it did; otherwise why not, in a few words.
+async function unfinished(r:Response):Promise<string>{
+  let text:string;try{text=await r.text();}catch{return 'the answer stopped arriving';}
+  let done=false,problem='';
+  const read=(d:any)=>{if(d?.error)problem=redactError(String(d.error?.message||d.error)).replace(/\s+/g,' ').slice(0,140);if(Array.isArray(d?.choices)&&d.choices.some((c:any)=>c?.finish_reason))done=true;};
+  for(const line of text.split(/\r?\n/)){if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(raw==='[DONE]'){done=true;continue;}try{read(JSON.parse(raw));}catch{/* a partial line is not a verdict */}}
+  if(!done&&!problem)try{read(JSON.parse(text));}catch{/* not a JSON answer */}
+  return problem?`the provider reported: ${problem}`:done?'':'the answer ended before it was complete';
+}
 async function canaryResponse(routeId:string):Promise<Response|undefined>{
   const {rankedModels,providerChat,sessionFor}=await import('./providers');
   const provider=settings.providers.find(p=>p.enabled&&p.kind==='free');
@@ -40,6 +49,7 @@ async function canaryResponse(routeId:string):Promise<Response|undefined>{
   if(!provider||!usable.length){canaryNote='no enabled OpenCode Free provider has an available model';return;}
   let last:Response|undefined;
   for(const model of usable.slice(0,3)){
+    canaryModel=model.name;
     try{
       const r=await providerChat(provider,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},AbortSignal.timeout(20000),routeId,sessionFor('canary',[{role:'user',content:'canary'}],{}),newCanaryId());
       // A refusal or success says something about the exit; a model-level error (unavailable, deprecated) says nothing, so the next model is tried.
@@ -54,17 +64,19 @@ async function defaultVerifier(routeId:string):Promise<'exhausted'|'refused'>{
   r.body?.cancel().catch(()=>{});return r.ok?'refused':'exhausted';
 }
 let canarySender=canaryResponse;export const __setCanarySender=(fn?:typeof canaryResponse)=>{canarySender=fn||canaryResponse;};
-export type ChatCheck={chat:'ok'|'used-up'|'refused'|'unknown';until?:number;note?:string};
+// `model` is the one the request went to; `unfinished` (only asked for by a route test) says why an accepted request did not complete.
+export type ChatCheck={chat:'ok'|'used-up'|'refused'|'unknown';until?:number;note?:string;model?:string;unfinished?:string};
 // A "used up" mark is only the countdown the provider announced. Asking again settles it: a passing request clears the mark, a refusal renews it.
-export async function checkChat(route:Route):Promise<ChatCheck>{
-  const r=await canarySender(route.id);if(!r)return {chat:'unknown',note:canaryNote};
-  if(r.ok){r.body?.cancel().catch(()=>{});route.exhaustedUntil=0;route.recheckedAt=0;route.cooldownUntil=0;route.status='healthy';persist();return {chat:'ok'};}
-  // The bridge answers a refusal without the provider's Retry-After header, so the limit text alone also counts (the reset is the next 00:00 UTC).
+export async function checkChat(route:Route,complete=false):Promise<ChatCheck>{
+  canaryModel='';const r=await canarySender(route.id);const model=canaryModel||undefined;if(!r)return {chat:'unknown',note:canaryNote};
+  // Being accepted is what settles the used-up mark. Whether the answer also finishes is a separate fact, read only when the caller asks.
+  if(r.ok){route.exhaustedUntil=0;route.recheckedAt=0;route.cooldownUntil=0;route.status='healthy';persist();if(!complete){r.body?.cancel().catch(()=>{});return {chat:'ok',model};}const why=await unfinished(r);return {chat:'ok',model,...(why?{unfinished:why}:{})};}
+  // Never invent a midnight reset when upstream did not advertise a retry time.
   let seen=await detectExhaustion(r);const text=seen?'':await r.text().catch(()=>'');r.body?.cancel().catch(()=>{});
-  if(!seen&&r.status===429&&FREE_LIMIT_TEXT.test(text)){const until=nextResetAt();seen={until,seconds:Math.round((until-Date.now())/1000)};}
+  if(!seen&&r.status===429&&FREE_LIMIT_TEXT.test(text)){const ex=refusedExhaustion();routeExhausted(route,ex);return {chat:'refused',until:ex.until,note:'OpenCode returned a limit/access error without a retry time. Cause unconfirmed; rechecking in 15 minutes, not assuming a daily reset.'};}
   if(!seen)return {chat:'unknown',note:`HTTP ${r.status} ${redactError(text.replace(/\s+/g,' ')).slice(0,140)}`.trim()};
   const ex=route.kind==='relay'&&!trustedRuntime(r.headers.get('x-relay-runtime'))?refusedExhaustion():seen;
-  routeExhausted(route,ex);return {chat:ex.refused?'refused':'used-up',until:ex.until};
+  routeExhausted(route,ex);return {chat:ex.refused?'refused':'used-up',until:ex.until,note:ex.refused?'OpenCode returned a limit/access error, but the relay runtime could not be verified. This does not prove a relay or TLS failure.':'OpenCode returned a limit/access error with Retry-After. The advertised time is not a guaranteed quota reset.'};
 }
 // Routes marked used up are asked again every few minutes, so a stale mark (an address that recovered, a wrong countdown) does not keep a working exit out of play.
 export function startExitRecheck(){
@@ -107,11 +119,11 @@ async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response
 // Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
 // A relay forwards to any public HTTPS host. The one limit is a relay marked `only`: a Cloudflare Worker is refused by OpenCode Free, so it carries Kilo and the providers the user added, not OpenCode.
 const carries=(r:Route,kind?:string)=>!r.only||r.only===kind||(r.only==='kilo'&&kind==='openai');
-export function exhaustedAlternative(current:Route):Route|undefined{
+export function exhaustedAlternative(current:Route,excluded:readonly string[]=[]):Route|undefined{
   if(settings.exhaustedFailover===false)return;
-  const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!coolingDown(r));
+  const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!excluded.includes(r.id)&&!coolingDown(r));
   if(pool&&hasCleanStandby())return pool;
-  return failoverRoutes(current).find(r=>r.id!=='proxy-pool');
+  return failoverRoutes(current).find(r=>r.id!=='proxy-pool'&&!excluded.includes(r.id));
 }
 // Virtual routes ("pool:<proxy>") let the pool tester send real traffic through one specific proxy without saving a route for it.
 export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id&&r.enabled);
@@ -120,9 +132,10 @@ export function routeFor(model='', explicit='', kind?: string, peek=false): Rout
   const selected=explicit||settings.routeId;
   let current=findRoute(selected);
   const rotating=settings.rotate&&!explicit;
+  if(!rotating&&current&&!carries(current,kind))throw new GatewayError('Selected network route cannot carry this provider',503,'route_unavailable');
   // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
-  if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt)return alt;}
+  if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt&&carries(alt,kind))return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
   // Direct is left out of the spread unless the user includes it.
   const pool=settings.routes.filter(r=>r.enabled&&(r.kind!=='direct'||settings.spreadDirect===true)&&carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
@@ -145,7 +158,7 @@ export function routeFor(model='', explicit='', kind?: string, peek=false): Rout
 // No list: the provider follows the route in use, with the global rotation, failover and backup switches. A list: only those routes, never any other.
 // The old single route of a provider reads as a list of one.
 export function providerRoutes(p: Provider): ProviderRoutes | undefined {
-  if (p.routes?.ids?.length) return p.routes;
+  if (p.routes?.ids?.length) { const paused = p.routes.paused; return paused?.length ? { ...p.routes, ids: p.routes.ids.filter(id => !paused.includes(id)) } : p.routes; }
   // A provider pinned the old way keeps what a pinned OpenCode Free provider always had: the backup exits when its route is used up.
   return p.routeId ? { ids: [p.routeId], backups: p.kind === 'free' } : undefined;
 }
@@ -160,30 +173,46 @@ function whyNot(id: string, kind?: string): string {
   if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
   return `${r.name} is resting after errors${r.cooldownUntil && r.cooldownUntil > now() ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. Resume it on the Routes page if the connection is back` : ''}`;
 }
+// Z.ai's coding plan keeps one steady address: Direct, or one proxy the user added. A relay, the proxy pool and WARP change address between requests, which is
+// what an account's unusual-activity check looks at, so they are not offered, and nothing moves Z.ai to another exit on its own (zai.ts).
+export const steadyExit = (r: Route) => r.kind === 'direct' || (r.kind === 'proxy' && r.id !== 'proxy-pool' && !r.poolUrls?.length);
+const ZAI_DIRECT: Route = { id: 'direct', name: 'Direct connection', kind: 'direct', url: '', enabled: true, models: [] };
 export function routeForProvider(p: Provider, model: string, peek=false): Route {
+  if (p.kind === 'zai') {
+    const id = p.routes?.ids?.[0]; if (!id) return settings.routes.find(r => r.id === 'direct') || ZAI_DIRECT;
+    const r = settings.routes.find(x => x.id === id);
+    if (p.routes!.paused?.includes(id)) throw new GatewayError(`The route of ${p.name} is paused. Resume it on the Routing page.`, 503, 'route_unavailable');
+    if (!r || !r.enabled) throw new GatewayError(`The route chosen for ${p.name} (${r?.name || 'a deleted route'}) is switched off. Choose another on the Routing page.`, 503, 'route_unavailable');
+    return r;
+  }
   const set = providerRoutes(p);
   if (!set) return routeFor(model, '', p.kind, peek);
+  // Every connection is paused: that is the user's choice, so nothing else is tried, not even the backup exits.
+  if (!set.ids.length) throw new GatewayError(`Every route of ${p.name} is paused. Resume one on the Routing page.`, 503, 'route_unavailable');
   const usable = set.ids.map(id => findRoute(id)).filter((r): r is Route => routeUsable(r, p.kind));
   if (usable.length) {
     if (set.spread && usable.length > 1) { const at = spreadAt.get(p.id) || 0; if (!peek) spreadAt.set(p.id, at + 1); return usable[at % usable.length]; }
     return usable[0];
   }
   // Nothing in the list can take it. OpenCode Free may be allowed the backup exits; every other provider stays inside its list.
-  if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from); if (alt) return alt; }
+  if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from, set.paused); if (alt) return alt; }
   throw new GatewayError(`None of the routes chosen for ${p.name} can take this request right now: ${set.ids.map(id => whyNot(id, p.kind)).join('; ')}. Change them on the Providers page.`, 503, 'route_unavailable');
 }
 // The route to move to after a connection failure: the next one in the provider's list, never one outside it. A provider that follows the route
 // in use uses the global fallback order.
 export function routeAfter(p: Provider, current: Route): Route | undefined {
+  if (p.kind === 'zai') return;
   const set = providerRoutes(p);
   if (!set) return failoverRoutes(current, p.kind)[0];
   return set.ids.map(id => findRoute(id)).find((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id);
 }
 // The route to move to when the one in use has used up its allowance (OpenCode Free).
 export function exhaustedRouteAfter(p: Provider, current: Route): Route | undefined {
+  if (p.kind === 'zai') return;
   const set = providerRoutes(p);
   if (!set) return exhaustedAlternative(current);
-  return routeAfter(p, current) || (set.backups ? exhaustedAlternative(current) : undefined);
+  if (!set.ids.length) return;
+  return routeAfter(p, current) || (set.backups ? exhaustedAlternative(current, set.paused) : undefined);
 }
 // Spread: every attempt picks again. Otherwise a failed connection moves on to the next route.
 export const providerPicksAgain = (p: Provider) => { const set = providerRoutes(p); return set ? !!set.spread : settings.rotate; };
@@ -202,7 +231,7 @@ export function describeRoutes(): Record<string, RouteInfo> {
     const role: RouteInfo['role'] = !r.enabled ? 'off' : r.id === settings.routeId ? 'active' : backupOn && (r.id === 'proxy-pool' || r.kind !== 'direct' || settings.allowDirect === true) ? 'backup' : 'off';
     let label = r.status || 'Not tested'; let tone: RouteInfo['tone'] = 'neutral'; let detail = '';
     if (!r.enabled) { label = 'Disabled'; }
-    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'Refused by Free tier' : 'Used up today'; tone = 'cooldown'; detail = refused ? `Not the daily allowance: the Free tier refused chat from this exit. Skipped until ${resetTime(r.exhaustedUntil!)}, then tried again` : rerolling.has(r.id) ? 'Asking again for a fresh address…' : `Resets ${resetTime(r.exhaustedUntil!)}` + (r.recheckedAt ? ` · asked again ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
+    else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'OpenCode refused; cause unconfirmed' : 'OpenCode limit/access error'; tone = 'cooldown'; detail = refused ? `Recheck after ${resetTime(r.exhaustedUntil!)}. This is not evidence of relay transport failure.` : rerolling.has(r.id) ? 'Rechecking the relay…' : `Provider retry time ${resetTime(r.exhaustedUntil!)}; reset not guaranteed` + (r.recheckedAt ? ` · checked ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
     else if (r.id === 'proxy-pool') { const s = poolSummary(); label = s.clean ? `${s.clean} clean exit${s.clean > 1 ? 's' : ''} ready` : s.ready ? `${s.ready} model-ready` : 'No clean proxy yet'; tone = s.clean || s.ready ? 'healthy' : 'cooldown'; detail = `${s.exhausted} used up today · keeps ${s.target} ready`; }
     else if (r.kind === 'warp') { const up = !!warpTarget(); label = up ? 'Connected' : 'Not connected'; tone = up ? 'healthy' : 'neutral'; detail = up ? '' : 'Connect it in the WARP panel below'; }
     else if (coolingDown(r)) { label = 'Cooling down'; tone = 'cooldown'; detail = `Until ${new Date(r.cooldownUntil!).toISOString().slice(11, 16)} UTC`; }
@@ -376,8 +405,8 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}
     // The relay's own refusal of a wrong access token is not delivery: the relay answered, but nothing it is sent will ever get through.
     else if(route.kind==='relay'&&response.status===401&&await relayRejectedKey(response))routeFailed(route,'The relay rejected its access token (HTTP 401). Check the token on the Relays page.',true);
-    else if(response.status<500&&!exhausted){if(route.kind==='relay'&&response.status<400)tallyRoute(route.id,'ok');routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
     else if(route.kind==='relay'&&(response.status===502||response.status===504))routeFailed(route,`HTTP ${response.status}`);
+    else if(!exhausted&&(response.status<500||route.kind==='direct')){if(route.kind==='relay'&&response.status<400)tallyRoute(route.id,'ok');routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
     return response;
   }catch(e){
     finishAttempt(attempt,undefined,e);
@@ -388,28 +417,30 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
 }
 // What a route test sends, and how its answer is read, depends on the provider chosen in the dialog. OpenCode Free keeps its own check (the model list
 // plus a chat that also settles the daily-allowance mark, checkChat); any other provider gets its model list and one small chat, read in plain words.
-export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string};
+// chat 'ok' means the test model answered to the end; 'incomplete' means the request was accepted and the answer did not finish.
+// One model is asked (`model`), so a pass says the exit works for that provider, not that every model of it will answer.
+export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string;model?:string};
 function testProvider(route:Route,providerId?:string):Provider|undefined{
-  const enabled=settings.providers.filter(p=>p.enabled);
+  const enabled=settings.providers.filter(p=>p.enabled&&p.kind!=='zai');
   const chosen=providerId?enabled.find(p=>p.id===providerId):route.only?enabled.find(p=>p.kind===route.only):undefined;
   if(providerId&&!chosen)throw new GatewayError('That provider is not enabled',400);
   if(chosen&&route.only&&chosen.kind!==route.only)throw new GatewayError(`This relay carries ${route.only==='kilo'?'Kilo':route.only} only, so it cannot be tested with ${chosen.name}`,400);
   if(!chosen&&route.only)throw new GatewayError(`This relay carries ${route.only==='kilo'?'Kilo':route.only} only; enable that provider to test it`,400);
   return chosen&&chosen.kind!=='free'?chosen:undefined;
 }
-async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:string}>{
+async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:string;model?:string}>{
   const {rankedModels,providerChat,sessionFor}=await import('./providers');const {isAddressLimit}=await import('./kilo');
   const usable=rankedModels().filter(m=>m.providerId===p.id&&m.state!=='unavailable'&&m.cooldownUntil<=Date.now()).sort((a,b)=>(a.state==='available'?0:1)-(b.state==='available'?0:1)||(a.latency||1e9)-(b.latency||1e9));
   const model=usable[0];if(!model)return {chat:'unknown',line:`a chat request could not be sent: no ${p.name} model is ready`};
   let r:Response;
   try{r=await providerChat(p,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},AbortSignal.timeout(30000),route.id,sessionFor('route-test',[{role:'user',content:'route-test'}],{}),newCanaryId());}
   catch(e:any){return {chat:'unknown',line:`a chat request could not be sent (${redactError(String(e?.message||e)).slice(0,140)})`};}
-  if(r.ok){r.body?.cancel().catch(()=>{});return {chat:'ok',line:`and a real ${p.name} chat request passed`};}
+  if(r.ok){const why=await unfinished(r);return why?{chat:'incomplete',model:model.name,line:`and ${p.name} accepted a small chat request to ${model.name}, but ${why}`}:{chat:'ok',model:model.name,line:`and ${model.name} answered a small ${p.name} chat request`};}
   const text=await r.text().catch(()=>'');const brief=redactError(text.replace(/\s+/g,' ')).slice(0,140);
   if(p.kind==='kilo'&&isAddressLimit(r.status,text))return {chat:'limited',line:`but Kilo's free tier has stopped answering from this network address (it limits anonymous use per address). Try again later, from another exit, or with a saved Kilo key`};
-  if(r.status===429)return {chat:'busy',line:`but ${model.name} was busy (HTTP 429). Try again in a minute`};
-  if(r.status===401||r.status===403)return {chat:'refused',line:`but ${p.name} refused the request (HTTP ${r.status}) from this exit${brief?': '+brief:''}`};
-  return {chat:'unknown',line:`but a chat request through it failed (HTTP ${r.status}${brief?' '+brief:''})`};
+  if(r.status===429)return {chat:'busy',model:model.name,line:`but ${model.name} was busy (HTTP 429). Try again in a minute`};
+  if(r.status===401||r.status===403)return {chat:'refused',model:model.name,line:`but ${p.name} refused the request to ${model.name} (HTTP ${r.status}) from this exit${brief?': '+brief:''}`};
+  return {chat:'unknown',model:model.name,line:`but a chat request to ${model.name} through it failed (HTTP ${r.status}${brief?' '+brief:''})`};
 }
 // Every route test leaves its outcome in the Logs page: a test that passed and a chat that is then refused are easier to understand side by side.
 function tested<T extends {chat:string;summary:string;status?:number;latency?:number}>(route:Route,res:T):T{logEvent(res.chat==='ok'?'info':'warn','routes',res.summary,{route:route.id,chat:res.chat,status:res.status,ms:res.latency});return res;}
@@ -426,14 +457,15 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
     route.status=reached?'healthy':`HTTP ${code}`;route.latency=now()-start;if(code<500){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
     if(other){
       const check=reached?await chatCheck(route,other):{chat:'unknown',line:`but ${other.name}'s model list answered HTTP ${code}`};
-      return tested(route,{ok:reached,status:code,latency:route.latency,buffered:!!route.buffered,chat:check.chat,provider:other.name,summary:`${route.name}: ${reached?'connected, ':'reached, '}${check.line}.`});
+      return tested(route,{ok:reached,status:code,latency:route.latency,buffered:!!route.buffered,chat:check.chat,provider:other.name,model:check.model,summary:`${route.name}: ${reached?'connected, ':'reached, '}${check.line}.`});
     }
     // The model list is not counted against the allowance, so reaching it proves only the connection. A chat request shows whether the Free tier accepts this exit.
-    const check:ChatCheck=r!.ok&&!id.startsWith('pool:')&&id!=='proxy-pool'?await checkChat(route):{chat:'unknown'};
-    const summary=check.chat==='ok'?`${route.name}: connected, and a real chat request passed.`
-      :check.chat==='used-up'?`${route.name}: connected, but OpenCode Free says this exit's daily allowance is used up (resets ${resetTime(check.until!)}).`
-      :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request through it.`
+    const check:ChatCheck=r!.ok&&!id.startsWith('pool:')&&id!=='proxy-pool'?await checkChat(route,true):{chat:'unknown'};const asked=check.model?` to ${check.model}`:'';
+    const summary=check.chat==='ok'&&check.unfinished?`${route.name}: connected, and OpenCode Free accepted a small chat request${asked}, but ${check.unfinished}.`
+      :check.chat==='ok'?`${route.name}: connected, and ${check.model||'a model'} answered a small OpenCode Free chat request.`
+      :check.chat==='used-up'?`${route.name}: connected, but OpenCode returned a limit/access error (provider retry time ${resetTime(check.until!)}; reset not guaranteed).`
+      :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request${asked} through it.`
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
-    return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat,summary,provider:'OpenCode Free'});
+    return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat==='ok'&&check.unfinished?'incomplete':check.chat,summary,provider:'OpenCode Free',model:check.model});
   }catch(e){const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }

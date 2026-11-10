@@ -67,7 +67,8 @@ export default {
     inflight++; let handedOver = false;
     try {
       const r = await send(url, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body, duplex: 'half', redirect: 'manual' });
-      const out = new Headers(r.headers); for (const h of ['content-encoding', 'content-length', 'transfer-encoding', 'connection']) out.delete(h);
+      const out = new Headers(r.headers); for (const h of ['content-length', 'transfer-encoding', 'connection']) out.delete(h);
+      if (isBun) out.delete('content-encoding'); // fetch decodes; node:https preserves the compressed wire bytes.
       out.set('x-relay-runtime', runtime()); out.set('x-relay-instance', instance); out.set('x-relay-egress', await egressIp());
       if (!r.body) return new Response(null, { status: r.status, headers: out });
       handedOver = true; const reader = r.body.getReader(); let ended = false; const end = () => { if (!ended) { ended = true; finish(); } };

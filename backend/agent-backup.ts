@@ -16,6 +16,12 @@ const MAX_FILE = 8 * 1024 * 1024;
 // For tests: smaller limits, so a folder cut short can be built from a few files.
 export function __setBackupLimits(files = 20000, bytes = 256 * 1024 * 1024) { MAX_FILES = files; MAX_BYTES = bytes; }
 const SKIP = new Set(['.git', 'node_modules', '.venv', 'venv']);
+// Keep stored/display paths intact; only identity comparisons fold case on Windows.
+export const fileKey = (file: string) => {
+  const rel = path.posix.normalize(file.replace(/\\/g, '/'));
+  return process.platform === 'win32' ? rel.toLowerCase() : rel;
+};
+const backupIndexes = new WeakMap<Backup, Map<string, SavedFile>>();
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const store = () => path.join(enginePaths().root, 'backups');
 const blob = (hash: string) => {
@@ -60,11 +66,11 @@ export function filePath(folder: string, file: string) {
 // The last backup of each folder stays on disk: the next one reads only the files that changed since, and pruning keeps its copies.
 const KEEP_BASELINES = 5;
 const baselineDir = () => path.join(enginePaths().root, 'baselines');
-const baselineFile = (folder: string) => path.join(baselineDir(), digest(path.resolve(folder).replace(/\\/g, '/').toLowerCase()) + '.json');
+const baselineFile = (folder: string) => path.join(baselineDir(), digest(fileKey(path.resolve(folder))) + '.json');
 function baseline(folder: string): Record<string, Seen> {
   try {
     const saved = JSON.parse(readFileSync(baselineFile(folder), 'utf8'));
-    if (saved?.folder === path.resolve(folder) && saved.files && typeof saved.files === 'object') return saved.files;
+    if (typeof saved?.folder === 'string' && fileKey(saved.folder) === fileKey(path.resolve(folder)) && saved.files && typeof saved.files === 'object') return Object.fromEntries(Object.entries<Seen>(saved.files).map(([file, value]) => [fileKey(file), value]));
   } catch { /* none yet, or unreadable: every file is read again */ }
   return Object.create(null);
 }
@@ -87,7 +93,7 @@ export async function captureBackup(folder: string): Promise<Backup> {
       if (++count > MAX_FILES) { excluded.push(rel); limited = true; return; }
       if (st.size > MAX_FILE || bytes + st.size > MAX_BYTES) { excluded.push(rel); limited = true; return; }
       bytes += st.size;
-      const mode = st.mode & 0o777, old = last[rel];
+      const mode = st.mode & 0o777, old = last[fileKey(rel)];
       let hash: string;
       if (old && old.size === st.size && old.mtimeMs === st.mtimeMs && old.ctimeMs === st.ctimeMs && /^[a-f0-9]{64}$/.test(old.hash) && existsSync(blob(old.hash))) hash = old.hash;
       else {
@@ -106,7 +112,7 @@ export async function captureBackup(folder: string): Promise<Backup> {
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { excluded.push(relOf(dir)); return; }
     const found: string[] = [], dirs: string[] = [];
     for (const entry of entries) {
-      if (entry.isSymbolicLink() || (entry.isDirectory() && SKIP.has(entry.name)) || !entry.isDirectory() && !entry.isFile()) excluded.push(relOf(path.join(dir, entry.name)));
+      if (entry.isSymbolicLink() || (entry.isDirectory() && SKIP.has(fileKey(entry.name))) || !entry.isDirectory() && !entry.isFile()) excluded.push(relOf(path.join(dir, entry.name)));
       else (entry.isDirectory() ? dirs : found).push(path.join(dir, entry.name));
     }
     for (let i = 0; i < found.length; i += 16) {
@@ -155,11 +161,13 @@ export async function pruneBackups(refs: Set<string> | null, now = Date.now(), k
   } finally { pruning = false; }
 }
 export function beforeFile(backup: Backup | undefined, file: string): FileBackup | undefined {
-  const rel = file.replace(/\\/g, '/');
+  const rel = fileKey(file);
   if (!backup || rel.split('/').some(x => SKIP.has(x))) return undefined;
   // A saved file first: a folder the limits cut short is excluded, though the files saved before the cut are exact.
-  if (Object.hasOwn(backup.files, rel)) return backup.files[rel];
-  return backup.excluded.some(x => !x || rel === x || rel.startsWith(x + '/')) ? undefined : null;
+  let index = backupIndexes.get(backup);
+  if (!index) { index = new Map(Object.entries(backup.files).map(([file, saved]) => [fileKey(file), saved])); backupIndexes.set(backup, index); }
+  if (index.has(rel)) return index.get(rel);
+  return backup.excluded.some(x => { const excluded = x ? fileKey(x) : ''; return !excluded || excluded === '.' || rel === excluded || rel.startsWith(excluded + '/'); }) ? undefined : null;
 }
 export function restoreFile(folder: string, file: string, saved: FileBackup, bytes?: Buffer) {
   const full = filePath(folder, file);

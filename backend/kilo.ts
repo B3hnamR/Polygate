@@ -1,6 +1,7 @@
 import { models, saveModel, redactError, KILO_ID, KILO_BASE } from './state';
 import { networkFetch } from './transport';
 import type { Provider, Model } from './types';
+import type { GenerationAccounting } from './providers';
 // Kilo Gateway's free tier: OpenAI-compatible, no account. Behaviour below was measured against the live service and cross-checked with other
 // open clients: the catalog marks free models with a boolean `isFree`; any Authorization header is validated (even a placeholder is a 401), so none
 // is sent unless the user saved a real key; an unknown or paid model answers 401 PAID_MODEL_AUTH_REQUIRED, not 404; and anonymous use has a limit per
@@ -27,6 +28,7 @@ export async function kiloCatalog(p: Provider, routeId: string) {
   if (!r.ok) throw new Error(`Catalog HTTP ${r.status}`);
   const data: any = await r.json(); const list = data.data || data.models;
   if (!Array.isArray(list)) throw new Error('Catalog response has no model list');
+  if(list.some(x=>!x||typeof x!=='object'||typeof x.id!=='string'||!x.id.trim()||typeof x.isFree!=='boolean'))throw new Error('Catalog response contains invalid model entries');
   return freeCatalog(list);
 }
 // Kilo answers a model it does not serve with 401, which the gateway would read as a blocked network exit. It means "this model is not available
@@ -37,13 +39,17 @@ async function asUnavailable(r: Response): Promise<Response> {
   if (!/paid_model_auth_required/i.test(text)) return new Response(text, { status: r.status, headers: r.headers });
   return new Response(text, { status: 404, headers: { 'content-type': r.headers.get('content-type') || 'application/json' } });
 }
-export async function kiloChat(p: Provider, m: Model, body: any, signal: AbortSignal, routeId: string): Promise<Response> {
-  const send = (b: any) => networkFetch(base(p) + '/chat/completions', { method: 'POST', headers: headers(p), body: JSON.stringify({ ...b, model: m.upstreamId, stream: true }), signal }, routeId);
+export async function kiloChat(p: Provider, m: Model, body: any, signal: AbortSignal, routeId: string, accounting?: GenerationAccounting): Promise<Response> {
+  const send = (b: any) => { accounting?.before(b); return networkFetch(base(p) + '/chat/completions', { method: 'POST', headers: headers(p), body: JSON.stringify({ ...b, model: m.upstreamId, stream: true }), signal }, routeId); };
   let r = await send(body);
   if (r.status === 400) {
     // A request asking for more output than the model allows is refused with 400; the same request with a smaller ceiling usually passes.
     const key = ['max_tokens', 'max_completion_tokens', 'max_output_tokens'].find(k => typeof body[k] === 'number' && body[k] > CLAMPED_TOKENS);
-    if (key) { const retry = await send({ ...body, [key]: CLAMPED_TOKENS }); if (retry.ok) { r.body?.cancel().catch(() => {}); r = retry; } else retry.body?.cancel().catch(() => {}); }
+    if (key) {
+      if (accounting) { const text = await r.text().catch(() => ''); let usage; try { usage = JSON.parse(text)?.usage; } catch {} accounting.failed(usage); }
+      const retry = await send({ ...body, [key]: CLAMPED_TOKENS });
+      if (retry.ok || accounting) { r.body?.cancel().catch(() => {}); r = retry; } else retry.body?.cancel().catch(() => {});
+    }
   }
   return asUnavailable(r);
 }

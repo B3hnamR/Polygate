@@ -38,3 +38,11 @@ test('a very large request is named as such in the used-up message, a small one 
   expect(explainError(base)!.message).not.toContain('large');
   expect(largeRequestNote(399_999)).toBe(''); expect(largeRequestNote(400_000)).toContain('0.4 MB');
 });
+
+test('OpenCode limit diagnostics do not claim a proven daily quota, TLS rejection or broken relay',()=>{
+  const base={status:429,message:'{"error":{"type":"FreeUsageLimitError"}}',model:'opencode/x',route:'Vercel fra1',switches:0,cooldownsEnabled:true};
+  const limited=explainError({...base,exhausted:{until:Date.now()+3600e3,seconds:3600}})!;
+  expect(limited.message).toContain('not a guaranteed daily reset');expect(limited.message).toContain('access restriction');expect(limited.message).not.toContain('use a different IP');
+  const unknown=explainError({...base,exhausted:{until:Date.now()+900e3,seconds:900,refused:true}})!;
+  expect(unknown.message).toContain('does not prove');expect(unknown.message).not.toContain('probably its TLS identity');
+});

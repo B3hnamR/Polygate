@@ -2,8 +2,9 @@ export class GatewayError extends Error { constructor(message: string, public st
 type Waiter = { key: string; limit: number; resolve: (release: () => void) => void; reject: (e: Error) => void; signal: AbortSignal; cancel: () => void };
 export class AdmissionQueue {
   active = 0; perKey = new Map<string,number>(); waiting: Waiter[] = [];
-  constructor(public max = 4, public capacity = 32) {}
-  private available(key: string, limit: number) { return this.active < this.max && (this.perKey.get(key)||0) < limit; }
+  constructor(public max = 0, public capacity = 32) {}
+  // 0 (or less) for the gateway's max or a key's limit means no limit: the request starts at once.
+  private available(key: string, limit: number) { return (this.max <= 0 || this.active < this.max) && (limit <= 0 || (this.perKey.get(key)||0) < limit); }
   private take(key: string) { this.active++; this.perKey.set(key,(this.perKey.get(key)||0)+1); let done=false; return () => { if(done)return; done=true; this.active--; this.perKey.set(key,Math.max(0,(this.perKey.get(key)||0)-1)); this.drain(); }; }
   drain() { for(let i=0;i<this.waiting.length;) { const w=this.waiting[i]; if(this.available(w.key,w.limit)){ this.waiting.splice(i,1); w.signal.removeEventListener('abort',w.cancel);w.resolve(this.take(w.key)); }else i++; } }
   acquire(key: string, limit: number, signal: AbortSignal, maxWaitMs = 0): Promise<() => void> {

@@ -1,6 +1,5 @@
-// OpenCode Free answers several different problems with the same 429 FreeUsageLimitError, and every one of them carries a Retry-After
-// that counts down to 00:00:00 UTC: a used-up daily allowance (which follows the egress IP), a request whose shape is wrong, and a
-// client whose TLS handshake is not Bun's. The response alone cannot tell them apart, so a 429 with a
+// OpenCode Free can answer quota and access restrictions with the same 429 FreeUsageLimitError. Retry-After is an advertised delay,
+// not proof of an exhausted daily allowance or midnight reset. The response alone cannot tell them apart, so a 429 with a
 // countdown is only a suspicion; transport.ts confirms it with a small known-good request through the same exit before retiring it.
 // `refused` marks a short-lived exhaustion recorded for a relay whose outbound TLS client cannot be confirmed to be Bun's.
 export type Exhaustion = { until: number; seconds: number; refused?: boolean };

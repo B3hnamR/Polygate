@@ -12,7 +12,12 @@ const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 // With `request` (the Playground's), the preview is about that very request: its key, its conversation, its tools and images. Without it the person says what to ask about.
 export function RoutePreview({ data, model: first = 'auto', tools: firstTools = false, request, keyId: firstKey = '', onClose }: { data: Snapshot; model?: string; tools?: boolean; request?: { protocol: string; body: unknown }; keyId?: string; onClose: () => void }) {
-  const [model, setModel] = useState(first); const [keyId, setKeyId] = useState(firstKey); const [tools, setTools] = useState(firstTools); const [images, setImages] = useState(false); const [tokens, setTokens] = useState('');
+  const storageKey=`polygate-route-preview:${first}`;
+  const [saved]=useState(()=>{if(request)return {};try{const value=JSON.parse(localStorage.getItem(storageKey)||'{}');return value&&typeof value==='object'?value:{};}catch{return {};}});
+  const [model, setModel] = useState(()=>typeof saved.model==='string'&&(['auto','auto:smart','auto:fast',...(data.settings.chains||[]).map(c=>c.name),...data.models.map(m=>m.id)].includes(saved.model))?saved.model:first);
+  const [keyId, setKeyId] = useState(()=>typeof saved.keyId==='string'&&(saved.keyId===''||data.settings.keys.some(k=>k.id===saved.keyId))?saved.keyId:firstKey);
+  const [tools, setTools] = useState(typeof saved.tools==='boolean'?saved.tools:firstTools); const [images, setImages] = useState(saved.images===true); const [tokens, setTokens] = useState(typeof saved.tokens==='string'&&/^\d{0,7}$/.test(saved.tokens)?saved.tokens:'');
+  useEffect(()=>{if(request)return;try{localStorage.setItem(storageKey,JSON.stringify({model,keyId,tools,images,tokens}));}catch{/* storage may be unavailable */}},[storageKey,request,model,keyId,tools,images,tokens]);
   const [plan, setPlan] = useState<Plan | null>(null); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
   async function run() {
     setBusy(true); setError('');
@@ -23,7 +28,7 @@ export function RoutePreview({ data, model: first = 'auto', tools: firstTools = 
   useEffect(() => { void run(); /* a first look when it opens */ }, []);
   const chains = data.settings.chains || []; const known = data.models.filter(m => m.state !== 'unavailable').map(m => m.id);
   return <Dialog title="Preview routing" icon={<Eye size={18} />} onClose={onClose} busy={busy} wide>
-    <p className="subtle">See which models a request would try and why, before anything is sent. Nothing is sent to a model, so no allowance is used.</p>
+    <p className="subtle">See which models a request would try and why, before anything is sent. Nothing is sent to a model, so no allowance is used.{!request&&' These preview choices are remembered on this device; they do not change your chain or client settings.'}</p>
     <div className="form-grid">
       <Field label="Request for"><Select value={model} onChange={setModel}><option value="auto">auto</option><option value="auto:smart">auto:smart</option><option value="auto:fast">auto:fast</option>{chains.map(c => <option key={c.id} value={c.name}>{c.name} (chain)</option>)}{known.map(id => <option key={id} value={id}>{id}</option>)}</Select></Field>
       <Field label="Client key" hint="A key can be limited to some models."><Select value={keyId} onChange={setKeyId}><option value="">No key: skip the permission check</option>{data.settings.keys.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}</Select></Field>

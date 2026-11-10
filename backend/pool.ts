@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { settings, stateDir, redactError, persist, writeFileAtomic } from './state';
 import { GatewayError } from './queue';
@@ -33,8 +33,24 @@ export async function poolEntries(_force = false): Promise<PoolEntry[]> {
 }
 // Test seam: lets tests supply pool rows without the proxy engine.
 let seamed = false;
-export function __setPoolEntries(list: PoolEntry[]) { seamed = true; entries = list; byUrl = new Map(list.map(e => [e.url, e])); }
+export function __setPoolEntries(list?: PoolEntry[]) { seamed = !!list; source = undefined; entries = list || []; byUrl = new Map(entries.map(e => [e.url, e])); }
 export const __poolHealth = health;
+// Module-only test scope, never wired to administration. Stop maintenance and await callers before restoring.
+export function __capturePoolTestState() {
+  const idle = () => { if (activeTests || activeScans || backgroundTests || job.running || standbyBusy || warming) throw new Error('Pool test state requires an idle pool'); };
+  idle();
+  const snapshot = { rows: structuredClone({ entries, byUrl }), source, seamed, health: structuredClone(health), apiRunner, cursor, lastPick, job: { ...job }, apiScan: { ...apiScan }, stopRequested, pendingSave: !!saveTimer, file: existsSync(healthFile) ? readFileSync(healthFile) : undefined };
+  return Object.assign(() => {
+    idle();
+    if (saveTimer) clearTimeout(saveTimer); saveTimer = undefined;
+    ({ entries, byUrl } = structuredClone(snapshot.rows)); source = snapshot.source; seamed = snapshot.seamed;
+    health.clear(); for (const [url, h] of snapshot.health) health.set(url, structuredClone(h));
+    apiRunner = snapshot.apiRunner; cursor = snapshot.cursor; lastPick = snapshot.lastPick;
+    job = { ...snapshot.job }; apiScan = { ...snapshot.apiScan }; stopRequested = snapshot.stopRequested;
+    if (snapshot.file) writeFileAtomic(healthFile, snapshot.file); else rmSync(healthFile, { force: true });
+    if (snapshot.pendingSave) save();
+  }, { assertIdle: idle });
+}
 export function virtualPoolRoute(url: string): Route | undefined {
   const e = byUrl.get(url); return e ? { id: 'pool:' + url, name: `${e.host}:${e.port}`, kind: 'proxy', url: e.proxy, enabled: true, models: [] } : undefined;
 }
@@ -133,12 +149,14 @@ let apiRunner: ApiRunner = engineApiRunner;
 export const __setApiRunner = (fn: ApiRunner) => { apiRunner = fn; };
 export type ApiScan = { running: boolean; at: number; checked: number; passed: number; message: string };
 let apiScan: ApiScan = { running: false, at: 0, checked: 0, passed: 0, message: '' };
+let activeScans = 0, activeTests = 0, backgroundTests = 0;
 export const apiScanState = () => ({ ...apiScan });
 const apiGate = () => poolConfig().apiMaxLatencyMs!;
 export const apiPassed = (h?: PoolHealth) => !!h?.api?.ok && h.api.latency <= apiGate();
 const apiFresh = (h?: PoolHealth) => apiPassed(h) && Date.now() - h!.api!.at < poolConfig().apiRecheckMinutes! * 60000;
 // Checks every proxy in the pool against the OpenCode API. Returns the proxies that answered within the speed gate, fastest first.
 export async function scanApi(list: PoolEntry[], onProgress?: (done: number, total: number) => void): Promise<PoolEntry[] | null> {
+  activeScans++;
   const cfg = poolConfig(); apiScan = { running: true, at: Date.now(), checked: 0, passed: 0, message: `Checking ${list.length} proxies against the OpenCode API…` };
   try {
     const found = await apiRunner(list, { timeoutSec: cfg.apiTimeoutSec!, cancelled: () => stopRequested, progress: (done, total) => { apiScan.checked = done; onProgress?.(done, total); } });
@@ -156,10 +174,13 @@ export async function scanApi(list: PoolEntry[], onProgress?: (done: number, tot
     apiScan = { running: false, at, checked: list.length, passed: passed.length, message: `${passed.length} of ${list.length} proxies reach the OpenCode API within ${cfg.apiMaxLatencyMs} ms.` }; save();
     return passed;
   } catch (e) { apiScan = { ...apiScan, running: false, message: redactError(String((e as Error).message || e)) }; throw e; }
+  finally { activeScans--; }
 }
 // Tests the whole pool (not one proxy): the OpenCode API for every proxy first, then a real model request for the fast survivors.
 // attach: when the run finishes with model-ready proxies, put them in the pool route (select: also make it the active route).
 export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: boolean; attach?: { select: boolean } } = {}) {
+  activeTests++;
+  try {
   if (job.running) return poolJob();
   // A background scan shares the API scan and the stop flag with a test: wait for it to finish instead of running both at once.
   for (let i = 0; i < 40 && standbyBusy; i++) await Bun.sleep(500);
@@ -169,6 +190,7 @@ export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: bo
   if (!list.length) { job = { ...job, running: false, phase: 'done', finishedAt: Date.now(), total: 0, done: 0, message: 'The pool is empty. Scan or import proxies first.' }; return poolJob(); }
   const staged = (opts.api ?? cfg.apiCheck !== false) && !picked;
   job = { running: true, phase: staged ? 'api' : 'quick', total: staged ? list.length : Math.min(list.length, cfg.maxTested), done: 0, ready: 0, failed: 0, startedAt: Date.now(), finishedAt: 0, deep, message: staged ? `Checking ${list.length} proxies against the OpenCode API…` : `Checking ${Math.min(list.length, cfg.maxTested)} proxies against the upstream…` };
+  backgroundTests++;
   void (async () => {
     try {
       let candidates = list; let usedApi = false;
@@ -196,8 +218,10 @@ export async function testPool(opts: { deep?: boolean; urls?: string[]; api?: bo
       if (!stopRequested && opts.attach && ready) { try { await attachPool({ select: opts.attach.select }); job.message += opts.attach.select ? ' Added to the pool and in use.' : ' Added to the pool as standby.'; } catch (e) { job.message += ' ' + redactError(String((e as Error).message || e)); } }
       if (!stopRequested) notify('Proxy pool tested', job.message, ready ? 'success' : 'warning', 'pool-tested', 0);
     } catch (error) { job = { ...job, running: false, phase: 'stopped', finishedAt: Date.now(), message: redactError(String(error)) }; }
+    finally { backgroundTests--; }
   })();
   return poolJob();
+  } finally { activeTests--; }
 }
 // Active route or standby. Becoming standby gives the route back that requests used before the pool took over.
 export function setPoolRole(active: boolean) {
@@ -295,7 +319,7 @@ export function startPoolMaintenance() {
   const standby = setInterval(() => { void standbyTick(); }, 45000); standby.unref?.();
   const warm = setInterval(() => { void warmTick(); }, 20000); warm.unref?.();
   const timer = setInterval(() => {
-    const route = settings.routes.find(r => r.id === 'proxy-pool'); if (!route?.enabled || job.running) return;
+    const route = settings.routes.find(r => r.id === 'proxy-pool'); if (!settings.enabled || !route?.enabled || job.running) return;
     if (Date.now() - Math.max(job.finishedAt, 0) < poolConfig().recheckMinutes * 60000) return;
     void testPool({ deep: poolConfig().deepTest }).catch(() => {});
   }, 60000); timer.unref?.(); return () => { clearInterval(timer); clearInterval(standby); clearInterval(warm); };

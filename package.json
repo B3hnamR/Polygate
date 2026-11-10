@@ -1,6 +1,6 @@
 {
   "name": "polygate",
-  "version": "0.5.6",
+  "version": "0.6.0",
   "private": true,
   "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
@@ -10,12 +10,13 @@
     "dev": "bun scripts/dev.ts",
     "start": "bun backend/main.ts",
     "test": "bun test tests",
+    "test:windows-native": "bun test tests/updates.test.ts tests/agent-integrity-regressions.test.ts --test-name-pattern \"atomically replaces an executable with spaces and apostrophes in its path|rejects tampered bytes while preserving the original|a portable executable named after its version is renamed to the new version, and any other name is left alone|one click downloads, verifies, closes the old process, replaces the file, and launches the replacement|the helper waits for the old app without failing when it has already gone|alternate-case backup paths and exclusions never turn an existing Windows file into an addition|Undo coalesces alternate-case identities across persisted Windows turns\" --reporter=junit --reporter-outfile=build/verification/windows-native.xml",
     "check": "tsc --noEmit",
     "build:ui": "vite build",
     "build:gateway": "bun build backend/main.ts --target bun --outfile build/gateway.js",
     "build:runtime": "python scripts/bundle-bun.py",
     "build": "bun run check && bun run build:ui && bun run build:gateway && bun run build:runtime",
-    "dist": "bun run build && electron-builder --win portable --x64",
+    "dist": "bun scripts/build-desktop.ts",
     "desktop": "electron .",
     "build:linux": "bash scripts/build-linux.sh amd64",
     "verify:pool": "bun scripts/verify-pool.ts",
@@ -26,6 +27,12 @@
     "verify:installer": "bash scripts/verify-installer.sh"
   },
   "devDependencies": {
+    "@fontsource-variable/dm-sans": "5.3.0",
+    "@fontsource-variable/figtree": "5.3.0",
+    "@fontsource-variable/geist": "5.3.0",
+    "@fontsource-variable/instrument-sans": "5.3.0",
+    "@fontsource-variable/inter": "5.3.0",
+    "@fontsource-variable/vazirmatn": "5.3.0",
     "@fontsource/barlow": "5.3.0",
     "@fontsource/barlow-condensed": "5.3.0",
     "@fontsource/doto": "5.3.0",
@@ -85,6 +92,10 @@
         "to": "warp/usque.patch"
       },
       {
+        "from": "resources/warp/sha256.txt",
+        "to": "warp/sha256.txt"
+      },
+      {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
       },
@@ -106,7 +117,8 @@
       },
       {
         "from": "vendor/licenses",
-        "to": "licenses"
+        "to": "licenses",
+        "filter": ["**/*"]
       },
       {
         "from": "vendor/bridge/LICENSE",

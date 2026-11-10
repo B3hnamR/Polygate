@@ -4,6 +4,7 @@ import { RoutePreview } from './route-preview';
 import { api } from './api';
 import { Badge, Button, Empty, Field, Select, Toggle, time, type Snapshot } from './ui';
 import { Dialog } from './mcp';
+import { useConfirm } from './confirm';
 import type { Chain } from '../backend/types';
 
 type Draft = { id?: string; name: string; description: string; models: string[]; enabled: boolean };
@@ -73,10 +74,11 @@ function ChainCard({ c, data, copy, onEdit, onToggle, onDelete, onTry, onPreview
 }
 export function ChainsPage({ data, copy, notice, refresh, tryChain }: { data: Snapshot; copy: (s: string) => void; notice: (m: string, kind?: 'ok' | 'error') => void; refresh: () => void; tryChain: (name: string) => void }) {
   const chains = data.settings.chains || []; const [editing, setEditing] = useState<Draft | null>(null); const [preview, setPreview] = useState<string | null>(null);
-  const blank = (): Draft => ({ name: '', description: '', models: [''], enabled: true });
+  const blank = (): Draft => ({ name: '', description: '', models: [''], enabled: true }); const { confirm, dialog } = useConfirm();
   async function toggle(c: Chain, enabled: boolean) { try { await api('/admin/chains/save', { ...c, enabled }); notice(enabled ? `${c.name} is on` : `${c.name} is off`); refresh(); } catch (e: any) { notice(e?.message || 'Not saved', 'error'); } }
-  async function remove(c: Chain) { if (!confirm(`Delete the chain "${c.name}"? Clients that ask for it will get a 404.`)) return; try { await api('/admin/chains/delete', { id: c.id }); notice(`${c.name} deleted`); refresh(); } catch (e: any) { notice(e?.message || 'Not deleted', 'error'); } }
+  async function remove(c: Chain) { if (!await confirm(<>Delete the chain <strong>{c.name}</strong>? Clients that ask for it will get a 404.</>, { title: 'Delete chain', confirm: 'Delete chain' })) return; try { await api('/admin/chains/delete', { id: c.id }); notice(`${c.name} deleted`); refresh(); } catch (e: any) { notice(e?.message || 'Not deleted', 'error'); } }
   return <>
+    {dialog}
     {preview && <RoutePreview data={data} model={preview} onClose={() => setPreview(null)} />}
     <section className="section-block form-section" aria-labelledby="chains-heading">
       <div className="section-toolbar"><div><h2 id="chains-heading">Model chains</h2><p className="subtle">A chain is a model name you define. Ask for it and Polygate tries its models in your order, moving on when one is resting, refuses the request or is full.</p></div><span className="toolbar-spacer" /><Button onClick={() => setPreview('auto')}><Eye size={14} />Preview routing</Button><Button variant="primary" onClick={() => setEditing(blank())}><Plus size={14} />New chain</Button></div>
