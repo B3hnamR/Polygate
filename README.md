@@ -1,41 +1,82 @@
 <p align="center">
-  <img src="assets/social-preview.png" alt="Polygate — a free AI model gateway" width="900">
+  <img src="assets/readme/hero.png" alt="Polygate: your models, one endpoint. The dashboard's Overview and Routing pages." width="100%">
 </p>
 
 <p align="center">
   <a href="https://github.com/B3hnamR/Polygate/releases/latest"><img src="https://img.shields.io/github/v/release/B3hnamR/Polygate?color=5c8374&label=release" alt="Latest release"></a>
-  <a href="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml"><img src="https://github.com/B3hnamR/Polygate/actions/workflows/ci.yml/badge.svg" alt="Build and tests"></a>
+  <a href="https://github.com/B3hnamR/Polygate/releases"><img src="https://img.shields.io/github/downloads/B3hnamR/Polygate/total?color=183d3d&label=downloads" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-183d3d" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20Docker-94a3b8" alt="Windows, Linux, and Docker">
 </p>
 
-<h1 align="center">Your models. One endpoint.</h1>
-
 <p align="center">
   Connect your AI tools to free models through a gateway you control.<br>
-  Switch providers, manage network routes, and see every request from one dashboard.
+  Switch providers, choose how requests leave your network, and see every request from one dashboard.
 </p>
 
 <p align="center">
-  <a href="#quick-start"><b>Install Polygate</b></a> ·
+  <a href="#quick-start"><b>Install</b></a> ·
   <a href="#connect-your-client">Connect a client</a> ·
+  <a href="#a-look-around">Screenshots</a> ·
   <a href="https://github.com/B3hnamR/Polygate/releases/latest">Downloads</a>
 </p>
+
+## How it works
+
+<p align="center">
+  <img src="assets/readme/flow.png" alt="Your tools connect to Polygate with one address and one key. Polygate picks a model, then sends the request through an exit (direct, a relay, WARP or a proxy) to a provider (OpenCode Free, Kilo Free, a Z.ai account or your own API)." width="100%">
+</p>
+
+Your tools keep one base URL and one key. Polygate picks the model, moves to another when one is busy, and sends each request out through the exit you chose.
 
 ## Why Polygate?
 
 | | What you get |
 |---|---|
-| **Free providers, built in** | OpenCode Free and Kilo Free. Discover their current catalogs, or add your own compatible API. |
+| **Free providers, built in** | OpenCode Free and Kilo Free, with their current catalogs. Add a Z.ai (ZCode) account or any OpenAI-compatible API beside them. |
 | **One address for your tools** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. |
 | **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. Or name your own **chain** (`my-coding`: try model A, then B, then C). |
 | **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool (from public lists or your own list links), WARP, and deployable relays. |
 | **One MCP address for your tools** | Add MCP servers once; every AI client gets all their tools from `/mcp` with its Polygate key, reached through your own routes. |
-| **See what is happening** | Model availability, request timing, a searchable log of everything the gateway does, client keys, and a Playground for real requests: conversations, side-by-side model comparison, tool and reasoning output, speed and token figures. |
+| **A coding agent in the app** | The Windows app has an **Agent** workspace: sessions per folder, permission modes, each turn's changed files with Undo. It runs on the models your gateway already serves. |
+| **Limits that hold** | Client keys can carry a token budget, a per-minute limit, an expiry and a model list. A request that cannot fit is refused, not cut short. |
+| **See what is happening** | Model availability, request timing, a searchable log of everything the gateway does, usage by day, and a Playground for real requests: conversations, side-by-side model comparison, tool and reasoning output, speed and token figures. |
 | **Run it your way** | Portable Windows app, Linux service with a manager, or Docker. Built-in HTTPS is available on servers. |
 
 > [!NOTE]
 > Free models have provider limits and changing availability. Polygate helps you manage access; it cannot guarantee capacity or remove provider limits. Follow each provider’s terms.
+
+## A look around
+
+The pictures follow your GitHub theme: the dashboard has a light and a dark side too. They show a demo setup with invented traffic and example model names; your own catalog comes from your providers.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/overview-dark.png"><img src="assets/screenshots/overview-light.png" alt="Overview page: connection details, the last 24 hours, providers and what failed"></picture>
+<p><b>Overview.</b> The address and key to paste into your tool, the last 24 hours, each provider's health, and what failed and why.</p>
+</td>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/routing-dark.png"><img src="assets/screenshots/routing-light.png" alt="Routing map: providers on the left joined by lines to exits on the right"></picture>
+<p><b>Routing map.</b> Drag a line from a provider to an exit. Thicker lines carry more traffic; a paused line keeps its place.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/models-dark.png"><img src="assets/screenshots/models-light.png" alt="Models page: a check row per provider and the model list with availability"></picture>
+<p><b>Models.</b> Check one model or a whole provider. A model that did not answer shows the reason and when it last worked.</p>
+</td>
+<td width="50%" valign="top">
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/playground-dark.png"><img src="assets/screenshots/playground-light.png" alt="Playground: a request on the left and the model's answer with timing on the right"></picture>
+<p><b>Playground.</b> Send a real request through your gateway and see which model answered, how fast, and through which exit.</p>
+</td>
+</tr>
+</table>
+
+<p align="center">
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/usage-dark.png"><img src="assets/screenshots/usage-light.png" alt="Usage page: requests per day and the busiest models" width="78%"></picture>
+</p>
+<p align="center"><b>Usage.</b> Requests, tokens and failures per day for up to a year, by model, route or key.</p>
 
 ## Quick start
 
@@ -58,7 +99,7 @@ Run **`polygate`** any time to open the server manager.
 > The `curl` command is silent when it succeeds: it saves `install.sh`. The second command starts the installer.
 > To check the machine first, run `sudo bash install.sh --check`.
 
-**Requirements:** Linux with systemd and glibc, on x86-64 or ARM64. Ubuntu, Debian, Fedora/RHEL, Arch, and openSUSE families are supported. Alpine and environments without systemd should use Docker. ARM64 packages are built in CI; running them on ARM64 hardware has not yet been verified.
+**Requirements:** Linux with systemd and glibc, on x86-64 or ARM64. Ubuntu, Debian, Fedora/RHEL, Arch, and openSUSE families are supported. Alpine and environments without systemd should use Docker. ARM64 packages are built with each release; running them on ARM64 hardware has not yet been verified.
 
 <details>
 <summary><b>Advanced install options, HTTPS choices, and server changes</b></summary>
@@ -140,7 +181,7 @@ This also publishes ports 80 and 443. Enable HTTPS in **Settings**; both ports m
 
 ## Explore
 
-[Client setup](#connect-your-client) · [Providers](#providers) · [MCP hub](#mcp-hub) · [Network routes and relays](#network-routes-and-relays) · [HTTPS](#https-and-domains) · [Server manager](#managing-a-server) · [Privacy](#privacy-and-access-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
+[Client setup](#connect-your-client) · [Providers](#providers) · [Agent](#agent) · [MCP hub](#mcp-hub) · [Network routes and relays](#network-routes-and-relays) · [HTTPS](#https-and-domains) · [Server manager](#managing-a-server) · [Privacy](#privacy-and-access-control) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
 ---
 
@@ -190,7 +231,7 @@ print(client.chat.completions.create(model="auto", messages=[{"role": "user", "c
 
 **Ready, and the recovery checklist.** The header says **Ready** only when a request could succeed right now: a usable model, a client key that can be used, and a route that would really be chosen. Otherwise it says **Needs attention** and the Overview page lists what is wrong, what it means and a button for the fixes that are safe (refresh the catalog, try a resting route again, reconnect WARP). A problem stays on the list until its cause is gone; one that is fixed while the page is open shows as resolved until you dismiss it. The list never switches anything on for you, so a route you turned off, such as Direct, stays off.
 
-Your client’s key is never sent to a provider. Streaming and tool support depend on the selected provider and model. Manage client key limits, expiry, and model allowlists in **Settings**.
+Your client’s key is never sent to a provider. Streaming and tool support depend on the selected provider and model. Manage client key limits, expiry, and model allowlists in **Settings**. A key with a token budget or a per-minute limit is held to it strictly, which rules out a few request types for that key; [docs/API.md](docs/API.md) lists them.
 
 Responses continuation through `previous_response_id` is not implemented; send conversation input explicitly. The real OpenCode server adapter supports text conversations rather than native tool execution.
 
@@ -203,10 +244,20 @@ Responses continuation through `previous_response_id` is not implemented; send c
 | **OpenCode Free** | built in | OpenCode has a daily allowance per network address. When an address is used up, Polygate moves to another exit if you have one, and says when the limit resets. |
 | **Kilo Free** | built in; every model Kilo marks free, no account needed | Kilo limits anonymous use per network address. When that happens all Kilo models rest for 30 minutes (the answer says so and carries `Retry-After`). A single busy model rests for 2 minutes while the others keep working. You can save a Kilo API key on its row. Kilo models rank behind OpenCode's in `auto` and take over when OpenCode's are resting. |
 | **OpenAI-compatible** | add any endpoint that has `/v1/chat/completions` | needs a base URL and, usually, a key |
+| **Z.ai (ZCode)** | built in, off until you add an account | Import an account under **Providers → Z.ai (ZCode)** and choose the active one. Each model has its own quota and reset time, shown on the page. When a model's quota runs out it rests until the reset and the other models keep working. Polygate never switches accounts by itself. |
 | **OpenCode server** | an OpenCode you run yourself (`opencode serve`), reached over its own REST API | uses the providers and logins configured in that OpenCode; model ids are `provider/model` as that server lists them; text conversation only (no tool calls) |
 
-Built-in providers can be switched off but not deleted. A model's priority and score can be changed on the Models page, which can also show one provider's models at a time. Models are not probed in the
-background by default (a probe is a real request that uses up allowance); press *Check* on a model to test it, or *Check all* for every model of one provider. A run stops as soon as the provider asks to slow down. Each provider can also be checked automatically every hour, 6 hours or day: one model at a time, waiting 15 minutes after a slow-down, and including unavailable models so one that comes back is found.
+Built-in providers can be switched off but not deleted. **Refresh catalog** on the Models page loads each provider's current list and removes models it retired or made paid; if the list cannot be read, the previous one is kept. A model's priority and score can be changed on the Models page, which can also show one provider's models at a time. Models are not probed in the
+background by default (a probe is a real request that uses up allowance); press *Check* on a model to test it, or *Check all* for every model of one provider. A run stops as soon as the provider asks to slow down; a model that is only out of its own allowance is passed over and the rest are still checked. A model whose check got a temporary refusal stays in use, and its row shows the reason and when it last answered. Each provider can also be checked automatically every hour, 6 hours or day: one model at a time, waiting 15 minutes after a slow-down, and including unavailable models so one that comes back is found.
+
+## Agent
+
+The Windows app has an **Agent** workspace at the top of the side menu: a coding agent (the OpenCode engine, which Polygate downloads, verifies and runs for you) working in folders you allow, on the models your gateway serves.
+
+- **Sessions by folder.** Each session keeps its own folder, model and mode. A message sent while the agent works steers it; Ctrl+Enter queues it for the end of the turn.
+- **Permission modes.** The agent asks before it writes or runs commands, or works without asking in **Full access**, which you switch on with a confirmation. Polygate's own folders stay closed to it in every mode.
+- **Undo.** Each turn lists the files it changed. Undo puts them back and keeps edits you made yourself in the meantime. Folder backups for Undo are off until you turn them on in the Agent settings.
+- **OpenCode Free models** can be used only while the engine and the gateway present the same OpenCode version; a model that cannot be used says why in the list.
 
 ## MCP hub
 
@@ -233,6 +284,8 @@ The Routing page has two views of the same settings. *List* shows the exits and 
 - **Cloudflare WARP**: a built-in MASQUE tunnel over HTTP/2, using a bundled helper built from usque (MIT). It changes nothing on the machine: no network interface, route, DNS or firewall rule, only a local SOCKS port on `127.0.0.1` that Polygate's own requests use. If another program already uses that port (Cloudflare's own `warp-cli` and some xray setups use 40000), Polygate picks the next free one and never touches the other program. It needs outbound TCP 443 and normal DNS access, and splits the first part of the TLS handshake on networks that reset it (names inside the tunnel are looked up through `8.8.8.8` and `9.9.9.9`, not Cloudflare's own resolver; the helper program can be changed only in the Windows app, or on a server with the admin token), so it works where WireGuard/UDP is blocked. Cloudflare's WARP exit addresses are shared, so a service can still rate-limit an exit while the tunnel itself is healthy.
 - **Relays**: one click on the Relays page deploys a small forwarding function to your own Vercel, Netlify or Cloudflare account. The platform token is used for the deploy and is kept only if you tick **Remember this token** (encrypted with your other settings, never shown again; the dialog can forget it). On Vercel you can tick several regions and deploy them one after another. A relay Polygate deployed can be **updated** to the current relay code from its row, and deleting it can remove its project, site or Worker from the platform as well. A table on the Relays page shows how each relay has done (worked, refused, redirected, failed), so a region that never works can be replaced.
 
+Press **Test** on a route to send one small request through it with the provider you pick. The result names the model that was asked and passes only when the answer finished; another model can still be refused.
+
 | Relay | OpenCode Free | Kilo |
 |---|---|---|
 | Vercel (Bun runtime) | yes, streams | yes |
@@ -240,7 +293,6 @@ The Routing page has two views of the same settings. *List* shows the exits and 
 | Cloudflare Worker | no (OpenCode refuses its TLS handshake) | yes, streams |
 
 Every relay has its own access token and forwards to any public HTTPS host, so it carries OpenCode, Kilo and the providers you add yourself (the Cloudflare one carries Kilo and your providers, not OpenCode, which refuses it). Set `POLYGATE_ALLOWED_HOSTS` on a relay to narrow the hosts. An older relay only knows the OpenCode and Kilo hosts: press **Update** on the Relays page.
-Press **Test** on any route to send a real request through it with the provider of your choice.
 When a route's exit is used up, Polygate moves to another healthy exit if you allow it. Rotation is off by default. A relay that is used up is not written off for the day: relays can come back on a fresh address, so Polygate asks it again once or twice a few seconds apart (recycling it first when it runs the Polygate template), and then leaves it until the next check, which runs every 10 minutes. Requests keep using other exits meanwhile. Switch this off with **Ask a used-up relay again for a fresh address** under Routing policy.
 
 **Which relay?** For OpenCode, **Vercel is the best choice**: it streams answers, runs on Bun (the handshake OpenCode checks), and Polygate can switch it to a fresh outbound address when one is used up. Deploy one in a region near you and a second elsewhere as a backup. **Netlify** is for light, short requests only: its answers are buffered (nothing arrives until the whole answer is ready), a function is stopped after 30 seconds, and some networks block `netlify.app`. **Cloudflare** carries Kilo only.
@@ -378,7 +430,7 @@ bun run dev          # dashboard + gateway with live reload
 
 `backend/` is the gateway (Bun, no framework), `src/` the dashboard (React), `desktop/` the Windows app (Electron), `relays/` the relay templates,
 `install.sh` and `install/` the Linux installer and the `polygate` command, `vendor/` code reused from other open projects (see below).
-Releases are built by GitHub Actions: pushing a `v*` tag builds the Windows app and the Linux packages and prepares a draft release.
+Releases are built on the maintainer's machine with the commands below and published with their `.sha256` files; the workflows in `.github/` describe the same steps but are not run for releases.
 
 To build the portable Windows app in PowerShell, with Python available:
 
