@@ -25,7 +25,7 @@ test('no switched-on provider and no models are named, with the page that fixes 
 test('spreading with nothing but Direct left is not ready, and the reason says why', () => {
   healthy(); settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false;
   settings.routes = settings.routes.filter(r => r.id === 'direct');
-  const r = readiness(); expect(r.state).toBe('attention'); expect(r.issues[0]).toMatchObject({ code: 'no_route', page: 'Routing' }); expect(r.issues[0].message).toContain('Include Direct in the spread');
+  const r = readiness(); expect(r.state).toBe('attention'); expect(r.issues[0]).toMatchObject({ code: 'no_route', page: 'Routing' }); expect(r.issues[0].message).toContain('"In the spread"');
   settings.spreadDirect = true; expect(readiness().state).toBe('ready');
 });
 test('a route that is resting makes the provider that only uses it not ready', () => {

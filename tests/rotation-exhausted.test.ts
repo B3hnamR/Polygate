@@ -19,6 +19,15 @@ test('with rotation off, a used-up selected route is still replaced by a clean b
   expect(routeFor('opencode/x').id).toBe('rx-b');
 });
 
+test('when every exit in the spread is resting after failed connections, Direct as the last resort answers', () => {
+  settings.routes.length = 0; settings.routes.push(...saved.routes.filter(r => r.id === 'direct'));
+  const a = proxy('rx-a'), b = proxy('rx-b'); a.cooldownUntil = b.cooldownUntil = Date.now() + 60_000;
+  settings.routeId = 'rx-a'; settings.rotate = true; settings.strategy = 'round_robin'; settings.allowDirect = true;
+  expect(routeFor('opencode/x').id).toBe('direct');
+  settings.allowDirect = false;
+  expect(() => routeFor('opencode/x')).toThrow(/Direct fallback is disabled/);
+});
+
 test('when every rotating route is used up, the backup exits still answer', () => {
   settings.routes.length = 0; settings.routes.push(...saved.routes.filter(r => r.id === 'direct'));
   proxy('rx-a', true); proxy('rx-b', true);

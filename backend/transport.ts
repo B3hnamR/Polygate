@@ -7,7 +7,7 @@ import type { Route, Provider, ProviderRoutes } from './types';
 import { socksBridge, parseSocksUrl } from './socks-bridge';
 import { warpTarget, warpFailure, warpSuccess } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
-import { detectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
+import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
 const exec = promisify(execFile);
@@ -22,7 +22,20 @@ const coolingDown=(r:Route)=>(!!r.cooldownUntil&&r.cooldownUntil>now())||(!!r.ex
 const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
 // The verified proxy pool is public proxies: a provider on its own server (its key and prompts) never falls back to it unless it is chosen for that provider.
 const publicPool=(r:Route,kind?:string)=>r.id==='proxy-pool'&&!!kind&&kind!=='free'&&kind!=='kilo';
-const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):!!r.cooldownUntil&&r.cooldownUntil>now();
+// Kilo's free tier limits anonymous use per network address. Like OpenCode's allowance it belongs to the exit, not to a model: the exit is set aside
+// for Kilo only (every other provider can still use it) until the pause is over, and Kilo's requests move to another exit meanwhile.
+const kiloLimits=new Map<string,number>();
+export const kiloLimitUntil=(r:Route)=>kiloLimits.get(r.id)||0;
+export const kiloLimited=(r:Route)=>kiloLimitUntil(r)>now();
+export function kiloLimitRoute(r:Route,until:number){const fresh=!kiloLimited(r);kiloLimits.set(r.id,until);if(fresh)logEvent('warn','routes',`${r.name} reached Kilo's free limit for its address; Kilo uses other exits until ${resetTime(until)}`,{route:r.id,until});}
+export const __resetKiloLimits=()=>kiloLimits.clear();
+const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):(!!r.cooldownUntil&&r.cooldownUntil>now())||(kind==='kilo'&&kiloLimited(r));
+// Out of play for this provider because of an allowance that belongs to the exit's address: OpenCode Free's, or Kilo's.
+const spentFor=(r:Route,kind?:string)=>(exhaustionApplies(kind)&&isExhausted(r))||(kind==='kilo'&&kiloLimited(r));
+// The exits a spread takes turns over, before each request's own filters (provider, model list, health). Shared with the dashboard's list and map.
+export const spreadRoutes=()=>settings.routes.filter(r=>r.enabled&&(r.kind!=='direct'||settings.spreadDirect===true));
+// Direct is the route that sends from this computer's own address; switched off, nothing may leave from it.
+const directOn=()=>settings.routes.some(r=>r.kind==='direct'&&r.enabled);
 export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
 // Counted once, when the mark is first set: the periodic re-asks of an exit that is still used up renew the mark without being new events.
 export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by OpenCode; cause unconfirmed (recheck ${resetTime(ex.until)})`:`OpenCode limit/access error (retry after ${resetTime(ex.until)})`;persist();}
@@ -59,8 +72,9 @@ async function canaryResponse(routeId:string):Promise<Response|undefined>{
   }
   canaryNote='';return last;
 }
-async function defaultVerifier(routeId:string):Promise<'exhausted'|'refused'>{
-  const r=await canaryResponse(routeId);if(!r)return 'exhausted';
+// 'unknown': no check could be sent (no OpenCode Free model to ask, for one). A countdown is still trusted then; a limit without one is not.
+async function defaultVerifier(routeId:string):Promise<'exhausted'|'refused'|'unknown'>{
+  const r=await canaryResponse(routeId);if(!r)return 'unknown';
   r.body?.cancel().catch(()=>{});return r.ok?'refused':'exhausted';
 }
 let canarySender=canaryResponse;export const __setCanarySender=(fn?:typeof canaryResponse)=>{canarySender=fn||canaryResponse;};
@@ -109,21 +123,26 @@ export async function rerollRelay(route:Route,pauseMs=REROLL_PAUSE_MS):Promise<b
 const scheduleReroll=(route:Route)=>{if(route.kind!=='relay'||settings.relayRecheck===false)return;const t=setTimeout(()=>void rerollRelay(route).catch(()=>{}),15000);t.unref?.();};
 let exitVerifier=defaultVerifier;export const __setExitVerifier=(fn?:typeof defaultVerifier)=>{exitVerifier=fn||defaultVerifier;};
 // Returns the exhaustion to record, or undefined when the exit is fine and only this request was refused.
-async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response,ex:Exhaustion,rid?:string):Promise<Exhaustion|undefined>{
+// null: nothing could be confirmed either way, so the answer is left as it is (neither the exit's limit nor a refusal of this request).
+async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response,ex:Exhaustion,rid?:string):Promise<Exhaustion|undefined|null>{
   if(rid?.startsWith('pool-test-'))return ex; // pool tests already are the known-good request
   // A relay is the TLS client the provider sees. Only one that says it runs Bun can be judged like a direct connection (relays/vercel-bun).
   if(viaRelay&&!trustedRuntime(response.headers.get('x-relay-runtime')))return refusedExhaustion();
-  return (await exitVerifier(routeId))==='refused'?undefined:ex;
+  const verdict=await exitVerifier(routeId);
+  // A limit without a retry time moves the request to another exit only when the check through the same exit was refused too.
+  return verdict==='refused'?undefined:verdict==='unknown'&&ex.refused?null:ex;
 }
 // Where a request goes when its route's exit is used up: a pool proxy that just proved itself clean, else the next healthy route.
 // Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
 // A relay forwards to any public HTTPS host. The one limit is a relay marked `only`: a Cloudflare Worker is refused by OpenCode Free, so it carries Kilo and the providers the user added, not OpenCode.
 const carries=(r:Route,kind?:string)=>!r.only||r.only===kind||(r.only==='kilo'&&kind==='openai');
-export function exhaustedAlternative(current:Route,excluded:readonly string[]=[]):Route|undefined{
+export function exhaustedAlternative(current:Route,excluded:readonly string[]=[],kind?:string):Route|undefined{
   if(settings.exhaustedFailover===false)return;
+  // Kilo's limit is not OpenCode's allowance, so the pool's clean-for-OpenCode standby means nothing for it: the next usable exit in the failover order.
+  if(kind==='kilo')return failoverRoutes(current,kind).find(r=>!excluded.includes(r.id));
   const pool=settings.routes.find(r=>r.id==='proxy-pool'&&r.enabled&&r.id!==current.id&&!excluded.includes(r.id)&&!coolingDown(r));
   if(pool&&hasCleanStandby())return pool;
-  return failoverRoutes(current).find(r=>r.id!=='proxy-pool'&&!excluded.includes(r.id));
+  return failoverRoutes(current,kind).find(r=>r.id!=='proxy-pool'&&!excluded.includes(r.id));
 }
 // Virtual routes ("pool:<proxy>") let the pool tester send real traffic through one specific proxy without saving a route for it.
 export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):settings.routes.find(r=>r.id===id&&r.enabled);
@@ -135,17 +154,19 @@ export function routeFor(model='', explicit='', kind?: string, peek=false): Rout
   if(!rotating&&current&&!carries(current,kind))throw new GatewayError('Selected network route cannot carry this provider',503,'route_unavailable');
   // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
   // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
-  if(!rotating&&current&&isExhausted(current)&&exhaustionApplies(kind)){const alt=exhaustedAlternative(current);if(alt&&carries(alt,kind))return alt;}
+  if(!rotating&&current&&spentFor(current,kind)){const alt=exhaustedAlternative(current,[],kind);if(alt&&carries(alt,kind))return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
   // Direct is left out of the spread unless the user includes it.
-  const pool=settings.routes.filter(r=>r.enabled&&(r.kind!=='direct'||settings.spreadDirect===true)&&carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
+  const pool=spreadRoutes().filter(r=>carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind));
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
-    const last=current&&isExhausted(current)&&exhaustionApplies(kind)?exhaustedAlternative(current):undefined;if(last)return last;
+    const last=current&&spentFor(current,kind)?exhaustedAlternative(current,[],kind):undefined;if(last)return last;
+    // Direct allowed as the last resort still answers when every exit in the spread is out of play.
+    const direct=settings.routes.find(r=>r.kind==='direct'&&r.enabled);
+    if(direct&&settings.allowDirect===true&&carries(direct,kind)&&!coolingDownFor(direct,kind))return direct;
     // Say why, so a spread that has nothing to spread over does not read as a broken connection.
-    const direct=settings.routes.find(r=>r.id==='direct'&&r.enabled);
-    const why=direct&&settings.spreadDirect!==true?' Direct is on but left out of the spread: turn on "Include Direct in the spread" on the Routing page, or turn spreading off.':'';
-    throw new GatewayError(`All configured routes are unavailable or cooling down. Direct fallback is disabled.${why}`,503,'route_unavailable');
+    const why=!direct?' Direct is switched off.':settings.allowDirect===true?' Direct, the last resort, is resting too.':' Direct fallback is disabled: choose "As the last resort" or "In the spread" under "Your own address" on the Routing page, or turn spreading off.';
+    throw new GatewayError(`All configured routes are unavailable or cooling down.${why}`,503,'route_unavailable');
   }
   if(settings.strategy==='random')return pool[Math.floor(Math.random()*pool.length)];
   // "Selected route" used to be an order here, but with the selected route outside the spread it just stuck to the first exit; it now takes turns.
@@ -170,6 +191,7 @@ function whyNot(id: string, kind?: string): string {
   if (!r.enabled) return `${r.name} is switched off`;
   if (!carries(r, kind)) return `${r.name} cannot carry this provider`;
   if (exhaustionApplies(kind) && isExhausted(r)) return `${r.name} is used up until ${resetTime(r.exhaustedUntil!)}`;
+  if (kind === 'kilo' && kiloLimited(r)) return `${r.name} has reached Kilo's free limit for its address until ${resetTime(kiloLimitUntil(r))}`;
   if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
   return `${r.name} is resting after errors${r.cooldownUntil && r.cooldownUntil > now() ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. Resume it on the Routes page if the connection is back` : ''}`;
 }
@@ -195,7 +217,7 @@ export function routeForProvider(p: Provider, model: string, peek=false): Route 
     return usable[0];
   }
   // Nothing in the list can take it. OpenCode Free may be allowed the backup exits; every other provider stays inside its list.
-  if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from, set.paused); if (alt) return alt; }
+  if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from, set.paused, p.kind); if (alt) return alt; }
   throw new GatewayError(`None of the routes chosen for ${p.name} can take this request right now: ${set.ids.map(id => whyNot(id, p.kind)).join('; ')}. Change them on the Providers page.`, 503, 'route_unavailable');
 }
 // The route to move to after a connection failure: the next one in the provider's list, never one outside it. A provider that follows the route
@@ -206,13 +228,15 @@ export function routeAfter(p: Provider, current: Route): Route | undefined {
   if (!set) return failoverRoutes(current, p.kind)[0];
   return set.ids.map(id => findRoute(id)).find((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id);
 }
-// The route to move to when the one in use has used up its allowance (OpenCode Free).
-export function exhaustedRouteAfter(p: Provider, current: Route): Route | undefined {
+// The route to move to when the one in use has used up the allowance of its address (OpenCode Free's, or Kilo's). `tried` are the exits this
+// request already went through, so an exit whose mark did not stick is not tried twice.
+export function exhaustedRouteAfter(p: Provider, current: Route, tried: readonly string[] = []): Route | undefined {
   if (p.kind === 'zai') return;
   const set = providerRoutes(p);
-  if (!set) return exhaustedAlternative(current);
+  if (!set) return exhaustedAlternative(current, tried, p.kind);
   if (!set.ids.length) return;
-  return routeAfter(p, current) || (set.backups ? exhaustedAlternative(current, set.paused) : undefined);
+  const next = set.ids.map(id => findRoute(id)).find((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id && !tried.includes(r.id));
+  return next || (set.backups ? exhaustedAlternative(current, [...(set.paused || []), ...tried], p.kind) : undefined);
 }
 // Spread: every attempt picks again. Otherwise a failed connection moves on to the next route.
 export const providerPicksAgain = (p: Provider) => { const set = providerRoutes(p); return set ? !!set.spread : settings.rotate; };
@@ -237,6 +261,7 @@ export function describeRoutes(): Record<string, RouteInfo> {
     else if (coolingDown(r)) { label = 'Cooling down'; tone = 'cooldown'; detail = `Until ${new Date(r.cooldownUntil!).toISOString().slice(11, 16)} UTC`; }
     else if (r.status === 'healthy') { label = 'Healthy'; tone = 'healthy'; if (r.kind === 'relay') { const i = relayInfo(r.id); if (i.egress) detail = `Address ${i.egress}` + (i.spent ? ` · ${i.spent} used up today` : ''); } }
     else if (r.status?.startsWith('HTTP')) tone = 'cooldown'; else if (r.status) tone = 'error';
+    if (r.enabled && kiloLimited(r)) detail = (detail ? detail + ' · ' : '') + `Kilo's free limit until ${resetTime(kiloLimitUntil(r))}; Kilo uses other exits`;
     out[r.id] = { role, label, tone, detail };
   }
   return out;
@@ -250,7 +275,7 @@ export function backupChain(): { id: string; name: string; usable: boolean; why:
   if (pool) { const s = poolSummary(); const ok = pool.enabled && !coolingDown(pool) && s.ready > 0; add(pool, ok, !pool.enabled ? 'disabled' : s.ready ? `${s.ready} model-ready` : 'no clean proxy yet'); }
   const others = settings.routes.filter(r => r.id !== 'proxy-pool' && r.id !== current?.id && r.kind !== 'direct');
   for (const r of [...others.filter(r => r.kind === 'warp'), ...others.filter(r => r.kind !== 'warp')]) add(r, r.enabled && !coolingDown(r) && (r.kind !== 'warp' || !!warpTarget()), !r.enabled ? 'disabled' : isExhausted(r) ? 'used up today' : coolingDown(r) ? 'cooling down' : r.kind === 'warp' && !warpTarget() ? 'not connected' : 'ready');
-  const direct = settings.routes.find(r => r.kind === 'direct' && r.id !== current?.id); if (direct) add(direct, direct.enabled && settings.allowDirect === true && !coolingDown(direct), !direct.enabled ? 'switched off' : settings.allowDirect === true ? (isExhausted(direct) ? 'used up today' : 'allowed as last resort') : 'blocked (allow it under the policy below)');
+  const direct = settings.routes.find(r => r.kind === 'direct' && r.id !== current?.id); if (direct) add(direct, direct.enabled && settings.allowDirect === true && !coolingDown(direct), !direct.enabled ? 'switched off' : settings.allowDirect === true ? (isExhausted(direct) ? 'used up today' : 'allowed as last resort') : 'not a backup (see Your own address)');
   return chain;
 }
 // --- Relay instances ---
@@ -309,9 +334,13 @@ export function plainRouteError(raw:string,kind?:string):string{
   if(/certificate|CERT_|self.signed|SSL|TLS handshake|unable to verify/i.test(t))return 'Secure connection failed: the certificate or handshake was rejected';
   return t.replace(/^(Type|Syntax)?Error:\s*/i,'').slice(0,160);
 }
+const canStandIn=(route:Route)=>settings.failover!==false&&settings.routes.some(r=>r.id!==route.id&&r.enabled&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true||settings.spreadDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
 export function routeFailed(route:Route,reason:string,immediate=false){
   const raw=redactError(reason);route.status=plainRouteError(raw,route.kind);route.failures=(route.failures||0)+1;
   if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');
+  // Resting only helps when another exit can take the requests meanwhile. With none (Direct alone, or failover off), a rest would only keep
+  // refusing requests after the connection is back, until someone pressed Resume; the failure is still shown, and the next request tries again.
+  if(!canStandIn(route)){if(route.failures>=BREAKER_THRESHOLD)route.failures=0;return;}
   if(immediate||route.failures>=BREAKER_THRESHOLD){route.opened=(route.opened||0)+1;route.cooldownUntil=now()+Math.min(300000,30000*2**(route.opened-1));route.failures=0;
     logEvent('warn','routes',`${route.name} is paused for ${Math.round((route.cooldownUntil-now())/1000)} s after failing: ${route.status}`,{route:route.id,kind:route.kind,reason:route.status,raw:raw===route.status?undefined:raw,pausedUntil:route.cooldownUntil});}
 }
@@ -355,7 +384,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   const route=findRoute(id);
   if(!route)throw new GatewayError('Network route is disabled or missing',503,'route_unavailable');
   if(route.kind==='relay'&&!relayReaches(local))return fetch(url,init);
-  const started=now();let warpPort=0;let judged:{seen?:Exhaustion;ex?:Exhaustion}|undefined;
+  const started=now();let warpPort=0;let judged:{seen?:Exhaustion;ex?:Exhaustion|null}|undefined;
   // Diagnostic lookups (egress identity) must not move a route's health or open its breaker.
   const quiet=!!init?.polygateQuiet;if(quiet){init={...init};delete init.polygateQuiet;}
   const attempt=quiet?undefined:beginAttempt(routeContext.getStore()?.requestId||'',url,init);
@@ -377,7 +406,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
         // The instance knew its address was used up and refused before calling OpenCode: take another instance.
         if(response.headers.get('x-relay-rotate')==='1'){await response.body?.cancel().catch(()=>{});if(spin<max&&await rotateRelay(route))continue;response=usedUpAnswer();judged={seen:{until:nextResetAt(),seconds:0},ex:{until:nextResetAt(),seconds:0}};break;}
         if(response.status!==429)break;
-        const seen=await detectExhaustion(response);if(!seen)break;
+        const seen=await suspectExhaustion(response);if(!seen)break;
         const ex=await judgeExhaustion(route.id,true,response,seen,rid0);judged={seen,ex};
         // Confirmed used up on this instance's address: recycle the instance and retry on the new one.
         if(ex&&!ex.refused&&spin<max){markSpent(route.id,egress,ex.until);if(await rotateRelay(route)){await response.body?.cancel().catch(()=>{});judged=undefined;continue;}}
@@ -390,7 +419,8 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     }
     else if(route.kind==='proxy'){
       // Only a chat request spends Free allowance; catalog, version and other reads are not limited, so they skip the slow shared proxies.
-      if(route.id==='proxy-pool'&&settings.catalogDirect!==false&&isReadOnly(init))response=await fetch(url,init);
+      // Only while Direct is on: switched off, nothing leaves from this computer's own address, not even a model list.
+      if(route.id==='proxy-pool'&&settings.catalogDirect!==false&&directOn()&&isReadOnly(init))response=await fetch(url,init);
       else if(route.id==='proxy-pool')response=await viaPool(route,url,init);
       else response=await fetch(url,{...init,proxy:await usableProxy(route.url||'')});
     }
@@ -399,7 +429,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     finishAttempt(attempt,response);
     // A 429 with a Retry-After that counts down to the daily reset is probably this exit's allowance, but is confirmed first (judgeExhaustion); the gateway learns of it by request id.
     let exhausted=false;const rid=routeContext.getStore()?.requestId;
-    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'){const seen=judged?judged.seen:await detectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&!ex)noteRefused(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(route.id!=='proxy-pool'){routeExhausted(route,ex);if(!ex.refused)scheduleReroll(route);}}}
+    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'){const seen=judged?judged.seen:await suspectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&ex===undefined)noteRefused(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(route.id!=='proxy-pool'){routeExhausted(route,ex);if(!ex.refused)scheduleReroll(route);}}}
     // Route health follows delivery, not the model's verdict: a 429 or 500 from the provider means the route worked.
     if(quiet){/* diagnostic lookup: leave route health alone */}
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}
@@ -410,7 +440,9 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     return response;
   }catch(e){
     finishAttempt(attempt,undefined,e);
-    if(quiet||callerCancelled(init)||route.id.startsWith('pool:'))throw e;
+    // Background reads (model lists, version and identity checks) carry no one's request, and a slow one times out now and then: they never
+    // put an exit to rest. Only requests that send something (chat) count toward the breaker.
+    if(quiet||callerCancelled(init)||route.id.startsWith('pool:')||isReadOnly(init))throw e;
     if(warpPort)warpFailure(warpPort);
     routeFailed(route,String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');throw e;
   }

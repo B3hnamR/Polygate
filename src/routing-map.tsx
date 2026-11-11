@@ -6,7 +6,7 @@ import {Stamp,usedUp} from './daypass';
 import {shortName,stateCounts} from './overview-parts';
 import {platformOf} from './relay-manage';
 import {ZAI_EXITS,providerRouteText,routeRefusal,routesOf,usedByText} from './provider-routes';
-import {ExitPolicy,ModelPolicy} from './routing-policy';
+import {ExitPolicy} from './routing-policy';
 import type {Provider,ProviderRoutes,Route} from '../backend/types';
 
 // A second view of the Routing page: providers and exits as tickets joined by lines. Nothing here has settings of its own. A line is a provider's
@@ -65,7 +65,8 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
   const routeCount=(r:Route)=>metrics?.byRoute.find(x=>x.route===r.name)?.requests||0;
   const linkCount=(p:Provider,r:Route)=>metrics?.byLink?.find(x=>x.provider===p.id&&x.route===r.name)?.requests||0;
   const followers=s.providers.filter(p=>p.kind!=='zai'&&!routesOf(p));
-  const spread=s.rotate?s.routes.filter(r=>r.enabled&&(r.kind!=='direct'||s.spreadDirect===true)):[];
+  // The gateway's own list of the exits a spread takes turns over, so the map and the requests cannot disagree.
+  const spread=s.rotate?(data.spread?s.routes.filter(r=>data.spread!.includes(r.id)):s.routes.filter(r=>r.enabled&&(r.kind!=='direct'||s.spreadDirect===true))):[];
 
   const lines=useMemo<Line[]>(()=>{
     const out:Line[]=[];
@@ -231,7 +232,7 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
     </div>
     {(picked||setup)&&<aside className="map-panel" aria-label="Details">
       {picked?.type==='line'&&pickedLine?<LinePanel line={pickedLine} s={s} act={act} toggleProvider={toggleProvider} togglePause={togglePause} disconnect={disconnect} follow={follow} moveLine={moveLine} useExit={useExit} connect={connect} pickNode={id=>setPicked({type:'node',id})} onClose={()=>setPicked(null)}/>
-      :pickedNode==='requests'?<Section title="Requests" kind="Incoming" onClose={()=>setPicked(null)}><Toggle checked={s.enabled} onChange={toggleGateway} label={s.enabled?'Gateway running':'Gateway paused'} detail="When paused, every client gets a clear error and nothing is sent anywhere."/><p className="map-fact">Each provider's line from here is its on and off switch. Pausing a line pauses that provider.</p><h3 className="subhead">Models</h3><ModelPolicy data={data} act={act}/></Section>
+      :pickedNode==='requests'?<Section title="Requests" kind="Incoming" onClose={()=>setPicked(null)}><Toggle checked={s.enabled} onChange={toggleGateway} label={s.enabled?'Gateway running':'Gateway paused'} detail="When paused, every client gets a clear error and nothing is sent anywhere."/><p className="map-fact">Each provider's line from here is its on and off switch. Pausing a line pauses that provider.</p><p className="map-fact">What happens when a model fails is set on the Models page. <button type="button" className="text-button" onClick={()=>go('Models')}>Open it</button></p></Section>
       :pickedNode==='gate'?<GatePanel data={data} act={act} followers={followers} useExit={useExit} pickNode={id=>setPicked({type:'node',id})} onClose={()=>setPicked(null)}/>
       :pickedNode.startsWith('p:')&&s.providers.find(p=>providerNode(p.id)===pickedNode)?<ProviderPanel p={s.providers.find(p=>providerNode(p.id)===pickedNode)!} data={data} go={go} count={countFor} toggleProvider={toggleProvider} saveRoutes={saveRoutes} connect={connect} disconnect={disconnect} togglePause={togglePause} move={move} follow={follow} pickNode={id=>setPicked({type:'node',id})} onClose={()=>setPicked(null)}/>
       :pickedNode.startsWith('r:')&&s.routes.find(r=>routeNode(r.id)===pickedNode)?<RoutePanel r={s.routes.find(r=>routeNode(r.id)===pickedNode)!} data={data} pending={pending} go={go} count={routeCount} act={act} toggleRoute={toggleRoute} useExit={useExit} connect={connect} onTest={onTest} onManage={onManage} onDelete={onDelete} onShowList={onShowList} pickNode={id=>setPicked({type:'node',id})} onClose={()=>setPicked(null)}/>
@@ -324,12 +325,10 @@ function RoutePanel({r,data,pending,go,count,toggleRoute,useExit,connect,act,onT
 }
 
 function GatePanel({data,act,followers,useExit,pickNode,onClose}:{data:Snapshot;act:Function;followers:Provider[];useExit:(r:Route)=>void;pickNode:(id:string)=>void;onClose:()=>void}){
-  const s=data.settings;let n=0;
+  const s=data.settings;
   return <Section title="Route in use" kind="Shared by the providers that follow it" onClose={onClose}>
     {!s.rotate&&<Field label="Exit in use"><Select aria-label="Exit in use" value={s.routeId} onChange={v=>{const r=s.routes.find(x=>x.id===v);if(r)useExit(r);}}>{s.routes.filter(r=>r.enabled||r.id===s.routeId).map(r=><option key={r.id} value={r.id}>{shortName(r.name)}</option>)}</Select></Field>}
     <p className="map-fact">{followers.length?<>Followed by {followers.map((p,i)=><span key={p.id}>{i>0&&', '}<button type="button" className="text-button" onClick={()=>pickNode(providerNode(p.id))}>{p.name}</button></span>)}.</>:'No provider follows it right now.'}</p>
-    <h3 className="subhead">Next in line</h3>
-    {s.exhaustedFailover===false?<p className="map-fact">Exit switching is off, so a used-up exit returns its error with the reset time.</p>:data.backup?.length?<ol className="map-backups">{data.backup.map(b=><li key={b.id} className={b.usable?'':'skipped'}><span>{b.usable?++n:'-'}</span><button type="button" className="text-button" title={b.name} onClick={()=>pickNode(routeNode(b.id))}>{shortName(b.name)}</button><small>{b.why}</small></li>)}</ol>:<p className="map-fact">No backup exit is available.</p>}
-    <ExitPolicy data={data} act={act}/>
+    <ExitPolicy data={data} act={act} compact/>
   </Section>;
 }

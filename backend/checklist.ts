@@ -1,5 +1,5 @@
 import { settings } from './state';
-import { routeForProvider, providerRoutes } from './transport';
+import { routeForProvider, providerRoutes, spreadRoutes } from './transport';
 import { catalogProblems } from './providers';
 import { engineMode, warpTarget } from './warp';
 import { keyProblem } from './plan';
@@ -26,7 +26,7 @@ export function checklist(ctx: { providers: Provider[]; known: Model[]; usable: 
   else if (known.length && !usable.length) {
     // Listed, but every one is paused after errors: requests are refused until the first comes back.
     const back = Math.min(...known.map(m => m.cooldownUntil));
-    items.push({ id: 'models_resting', severity: 'blocking', title: 'Every model is resting', detail: `All ${known.length} known model${known.length === 1 ? ' is' : 's are'} resting after errors; the first is back at ${clock(back)}. The pause can be turned off under Routing.`, page: 'Models' });
+    items.push({ id: 'models_resting', severity: 'blocking', title: 'Every model is resting', detail: `All ${known.length} known model${known.length === 1 ? ' is' : 's are'} resting after errors; the first is back at ${clock(back)}. The pause can be turned off on the Models page.`, page: 'Models' });
   }
   const keys = settings.keys; const usableKeys = keys.filter(k => !keyProblem(k, now));
   if (!usableKeys.length) {
@@ -56,8 +56,9 @@ export function checklist(ctx: { providers: Provider[]; known: Model[]; usable: 
   for (const c of catalogProblems()) { const p = providers.find(x => x.id === c.providerId); if (p) items.push({ id: `catalog:${p.id}`, severity: 'warning', title: `${p.name}: the model list could not be read`, detail: c.error, page: 'Models', fix: REFRESH }); }
   const inUse = (id: string) => settings.routeId === id || providers.some(p => providerRoutes(p)?.ids.includes(id));
   let warpSaid = false;
+  const spread = new Set(spreadRoutes().map(r => r.id));
   for (const r of settings.routes.filter(x => x.enabled)) {
-    const used = inUse(r.id) || (settings.rotate && (r.kind !== 'direct' || settings.spreadDirect === true));
+    const used = inUse(r.id) || (settings.rotate && spread.has(r.id));
     if (!used) continue;
     if (r.kind === 'warp' && engineMode() !== 'disabled' && !warpTarget() && !warpSaid) { warpSaid = true; items.push({ id: 'warp_down', severity: 'warning', title: 'Cloudflare WARP is not connected', detail: 'Requests assigned to WARP cannot leave.', page: 'Routing', fix: { label: 'Reconnect WARP', endpoint: '/admin/warp/connect' } }); }
     if (r.cooldownUntil && r.cooldownUntil > now) items.push({ id: `rest:${r.id}`, severity: 'warning', title: `${r.name} is resting after errors`, detail: `Requests wait for it until ${clock(r.cooldownUntil)}. If the connection is back, try it again now.`, page: 'Routing', fix: { label: 'Try it again now', endpoint: '/admin/routes/resume', body: { id: r.id } } });

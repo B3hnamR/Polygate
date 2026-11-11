@@ -6,7 +6,7 @@ import { AUTO_CHECK_CHOICES, checkRuns, startCheck, stopCheck } from './model-ch
 import { discover, identityState, syncIdentity, rankedModels, presentedOpenCodeVersion } from './providers';
 import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchList } from './proxy-engine';
 import { PROXY_SOURCES } from './proxy-sources';
-import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit } from './transport';
+import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit, spreadRoutes } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
@@ -117,7 +117,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   const method=req.method;
   if(pathname==='/admin/updates'&&method==='GET')return json(res,200,await checkForUpdates());
   if(pathname==='/admin/updates/check'&&method==='POST'){await readJson(req);return json(res,200,await checkForUpdates(true));}
-  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain(),checks:checkRuns()});
+  if(pathname==='/admin/state'&&method==='GET')return json(res,200,{settings:publicSettings(),models:rankedModels(),logs:logs(),stats:stats(),queue:{active:queue.active,waiting:queue.waiting.length},identity:identityState(),ready:readiness(),notices:notices().unread,server:{platform:process.platform,mode:serverConfig().desktop?'desktop':'server'},version,runtime:Bun.version,routeInfo:describeRoutes(),backup:backupChain(),spread:settings.rotate?spreadRoutes().map(r=>r.id):[],checks:checkRuns()});
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
   if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}

@@ -4,7 +4,7 @@ import { authenticate, checkTokenRate, modelAllowed, reserveTokens } from './key
 import { AdmissionQueue, GatewayError } from './queue';
 import { toChat, fromChat, collect, stream, observeSse, lfBody, type Protocol } from './protocols';
 import { rankedModels, providerChat, sessionFor } from './providers';
-import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch } from './transport';
+import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch, kiloLimitRoute } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
 import { logEvent } from './logbook';
@@ -22,6 +22,8 @@ export const queue=new AdmissionQueue(settings.maxConcurrent,settings.maxQueue);
 export async function readJson(req:IncomingMessage,limit=8*1024*1024){let size=0;const chunks:Buffer[]=[];for await(const c of req){size+=c.length;if(size>limit)throw new GatewayError(limit>=1024*1024?`Request exceeds ${limit/1024/1024} MiB`:`Request exceeds ${Math.round(limit/1024)} KiB`,413,'request_too_large');chunks.push(Buffer.from(c));}try{const b=JSON.parse(Buffer.concat(chunks).toString()||'{}');if(!b||typeof b!=='object'||Array.isArray(b))throw new Error();return b;}catch{throw new GatewayError('Request body must be a JSON object',400,'invalid_json');}}
 export function json(res:ServerResponse,status:number,data:any){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));}
 export const clientKey=(req:IncomingMessage)=>authenticate(req,false);
+// How many times one request may move to another exit after one was used up: every exit gets its turn, within reason (each move can cost a check).
+const maxSwitches=()=>Math.min(10,Math.max(3,settings.routes.filter(r=>r.enabled).length));
 const providerEnabled=(m:Model)=>settings.providers.some(p=>p.id===m.providerId&&p.enabled);
 // A chain is the user's own order: its steps that are ready right now, each tried when the one before it fails. The "fallback" setting
 // does not shorten it, because the user listed these on purpose.
@@ -123,7 +125,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const b=complete&&finalUsage?finalUsage.output:Math.max(reportedOutput,Math.ceil(outputChars/4));
     reservation.settle(Math.min(Number.MAX_SAFE_INTEGER,a+b));reservation=undefined;settledInput+=a;settledOutput+=b;accountingStarted=false;
   };
-  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
+  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;const exitsTried=new Set<string>();let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
   // The first provider whose exit was used up: kept while later providers (not on that allowance) are tried, and reported if none of them answers.
   let spent:{ex:Exhaustion;message:string;status:number;used:typeof used;route:string}|undefined;
   try{
@@ -145,7 +147,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
         if(attempt>0&&providerPicksAgain(p)){r=routeForProvider(p,m.id);route=r.name;}
-        tried=true;t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
+        tried=true;exitsTried.add(r.id);t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
         // A tool list OpenCode refused earlier goes out already trimmed; never for the agent, whose model must see every tool it may call.
         if(!trimmed.length&&settings.trimTools!==false&&!k.agent&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
         let retained=false;
@@ -175,8 +177,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
           try{const usage=JSON.parse(message)?.usage;if(Number.isSafeInteger(usage?.prompt_tokens)&&usage.prompt_tokens>=0)reportedInput=Math.max(reportedInput,usage.prompt_tokens);if(Number.isSafeInteger(usage?.completion_tokens)&&usage.completion_tokens>=0)reportedOutput=Math.max(reportedOutput,usage.completion_tokens);}catch{}
           // Kilo's anonymous limit covers every Kilo model at once: they all rest together and the rest of this request skips them.
-          if(p.kind==='kilo'&&isAddressLimit(status,message)){const until=pauseKilo(p.id,message);limited.add(p.id);fault=false;retryAfter=String(Math.ceil(KILO_LIMIT_PAUSE_MS/1000));
-            const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from this one. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
+          // The limit belongs to the exit's address, not to the model: that exit is set aside for Kilo and the request moves on to another one.
+          // Only when no exit is left do the Kilo models rest, so requests are not sent into the same limit again and again.
+          if(p.kind==='kilo'&&isAddressLimit(status,message)){fault=false;kiloLimitRoute(r,Date.now()+KILO_LIMIT_PAUSE_MS);
+            const alt=switches<maxSwitches()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
+            if(alt){switches++;notify('Switched network exit',`Kilo's free limit was reached through ${r.name}; Kilo requests moved to ${alt.name}.`,'info','kilo-switched|'+alt.id,600000);r=alt;route=r.name;attempts++;continue;}
+            const until=pauseKilo(p.id,message);limited.add(p.id);retryAfter=String(Math.ceil(KILO_LIMIT_PAUSE_MS/1000));
+            const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from ${switches?'every exit Polygate could try':'this one'}. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
             notify('Kilo free limit reached',plain,'warning','kilo-limit',3600000);message=plain;break;}
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
           const refused=takeRefused(requestId);if(refused)confirmedClean=true;
@@ -186,7 +193,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
           if(ex){
             exhausted=ex;notify(ex.refused?'Network exit refused':'Network exit used up',ex.refused?`${r.name} was refused by the Free tier; it is skipped until ${resetTime(ex.until)}.`:`${r.name} has used its daily Free allowance (resets ${resetTime(ex.until)}).`,'warning','exhausted|'+r.id,3600000);
-            const alt=switches<3?exhaustedRouteAfter(p,r):undefined;
+            const alt=switches<maxSwitches()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
             if(alt){switches++;notify('Switched network exit',`Requests moved from ${r.name} to ${alt.name}.`,'info','switched|'+alt.id,600000);r=alt;route=r.name;attempts++;exhausted=undefined;continue;}
             break;
           }
@@ -225,7 +232,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(trimmed.length&&!upstream?.ok)forgetTrim(trimmedFor,askedChat);
     if(!upstream?.ok&&exhausted){fault=false;throw new GatewayError(message,429,'egress_exhausted');}
     if(!upstream?.ok)throw new GatewayError(message||'No provider responded successfully',status||502,'upstream_error');
-    if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" under Routing.`,{model:used.id,route});}
+    if(trimmed.length){res.setHeader('x-polygate-tools-trimmed',String(trimmed.length));if(trimRetried)logEvent('info','requests',`OpenCode Free refused this request while the exit was fine; it was accepted without ${trimmed.length} of the client's tools (${trimmed.slice(0,6).join(', ')}${trimmed.length>6?', …':''}). Polygate leaves them out of this tool list from now on. Turn this off with "Retry with fewer tools" on the Models page.`,{model:used.id,route});}
     res.setHeader('x-polygate-model',used.id);if(chain)res.setHeader('x-polygate-chain',chain.name);if(hops.length)res.setHeader('x-polygate-skipped',encodeURIComponent(hops.join(', ')));res.setHeader('x-polygate-route',encodeURIComponent(route));
     // The answer is complete at [DONE], or when every choice that started has finished: with n > 1 one choice finishing is not the end.
     // `asked` is the number of answers requested (n): with fewer finished, a stream that ends without [DONE] is cut short.

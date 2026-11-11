@@ -52,6 +52,6 @@ test('with spreading on and nothing but Direct left, the refusal says Direct is 
   settings.routes.length = 0; settings.routes.push(...saved.routes.filter(r => r.id === 'direct'));
   settings.routeId = 'direct'; settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false;
   let err: any; try { routeFor('opencode/x', '', 'free'); } catch (e) { err = e; }
-  expect(err.status).toBe(503); expect(String(err.message)).toContain('Include Direct in the spread');
+  expect(err.status).toBe(503); expect(String(err.message)).toContain('"In the spread"');
   settings.spreadDirect = true; expect(routeFor('opencode/x', '', 'free').id).toBe('direct'); // included: it carries the request
 });

@@ -375,6 +375,8 @@ tr.clickable{cursor:pointer}tr.clickable:focus-visible{outline:2px solid var(--a
 .region-grid label.taken{opacity:.55;cursor:default}.region-grid label small{color:var(--text-muted,var(--text-secondary))}
 .dialog-body .region-grid input,.dialog-body .check-row input{width:15px;height:15px;flex:none;accent-color:var(--accent)}
 .check-row{align-items:flex-start}.check-row label{display:flex;flex-direction:column;gap:2px;cursor:pointer}.check-row small{color:var(--text-secondary);font-size:12px}
+/* A dialog form spaces its parts like the dialog body does; a checkbox label is one sentence over its note. */
+.dialog-form{display:flex;flex-direction:column;gap:14px;margin:0}.dialog-form .dialog-actions{margin-top:4px}.dialog-form .check-row{gap:10px}.dialog-form .check-row input{margin-top:3px}.check-row label>span{font-size:14px;color:var(--text);line-height:1.45}.check-row label>span strong{font-weight:650;overflow-wrap:anywhere}.dialog-form .check-row small{font-size:12.5px;line-height:1.5;margin-top:2px}
 .batch-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
 .batch-row{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px}
 .batch-row .batch-head{display:flex;gap:8px;align-items:center}.batch-row.done{border-color:var(--green)}.batch-row.failed{border-color:var(--red)}.batch-row.skipped{opacity:.6}
@@ -947,3 +949,75 @@ nav.ag-q-tabs{flex-direction:row;align-items:center}.agent-folder-trust>p.subtle
 /* No room for both side by side: the panel lies over the map's right side, so what was clicked stays in view. */
 @media(max-width:1180px){.map-shell.with-panel{grid-template-columns:minmax(0,1fr)}.map-panel{position:absolute;top:0;right:0;bottom:0;width:min(344px,100%);box-shadow:var(--lift)}}
 @media(max-width:700px){.map-legend{display:none}}
+
+/* Switches: the off state is an outlined track with a visible knob, so on and off differ by more than the knob's place. */
+.toggle-row input:not(:checked){background:transparent;box-shadow:inset 0 0 0 1.5px var(--muted)}
+.toggle-row input:not(:checked):before{background:var(--muted);box-shadow:none}
+.toggle-row input:not(:checked):hover{box-shadow:inset 0 0 0 1.5px var(--text-secondary)}
+.toggle-row input:disabled{opacity:.5;cursor:not-allowed}
+
+/* Routing policy: a short summary, then three groups. The column is narrow enough that each switch sits next to its own words. */
+.policy-section>.subtle{margin:-2px 0 18px;max-width:70ch}
+/* The groups sit side by side on a wide page and stack on a narrow one; each column is narrow enough that a switch stays next to its words. */
+.policy{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:26px 40px;align-items:start}
+.policy-summary{grid-column:1/-1}
+.policy-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;margin:0;border:1px solid var(--line-strong);border-radius:10px;overflow:hidden;background:var(--line-strong)}
+.policy-summary>div{background:var(--surface-raised);padding:12px 14px;min-width:0}
+.policy-summary dt{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 3px}
+.policy-summary dd{margin:0;font-size:15px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere}
+.policy-summary b{color:var(--text);font-weight:600}
+.policy-group{display:grid;gap:2px;padding-top:20px;border-top:1.5px solid var(--line-strong)}
+.policy-head{margin:0 0 10px;font:650 17px/1.3 var(--font);letter-spacing:0;text-transform:none;color:var(--text)}
+.policy .toggle-row{margin:0;padding:12px 0;border-bottom:1px solid var(--line);gap:24px}
+.policy .toggle-row:last-child{border-bottom:0}
+.policy .toggle-row strong{font-size:16px}
+.policy .toggle-row small{display:block;font-size:14.5px;line-height:1.5}
+.policy .field{margin:12px 0 4px;max-width:360px}
+.policy .proof{margin:2px 0 8px}
+.policy-chain{display:grid;gap:8px;margin:4px 0 10px;padding:12px 14px;border-radius:10px;background:var(--surface-raised);border:1px solid var(--line)}
+.policy-chain>.button{justify-self:start}
+.policy-chain-label{font-size:13px;font-weight:600;color:var(--muted)}
+.policy-chain .backup-list{border-top:0}
+.policy-chain .backup-list li{padding:7px 0}
+.policy-chain .backup-list li:last-child{border-bottom:0}
+.policy-chain .backup-list li strong{font:600 15px/1.3 var(--font)}
+.policy-chain .backup-list .step-n{font:600 14px/1 var(--font)}
+.policy-chain .backup-list small{font-size:13.5px}
+.policy-choices{display:grid;gap:8px;margin:2px 0 8px}
+.policy-choices label{display:flex;gap:12px;align-items:flex-start;padding:11px 14px;border:1px solid var(--line);border-radius:10px;cursor:pointer;transition:border-color 150ms,background 150ms}
+.policy-choices label:hover{border-color:var(--line-strong)}
+.policy-choices label.on{border-color:var(--accent-line);background:var(--accent-soft)}
+.policy-choices input{width:18px;height:18px;margin:2px 0 0;padding:0;flex:none;accent-color:var(--accent)}
+.policy-choices strong{display:block;font-size:15px;font-weight:600;color:var(--text)}
+.policy-choices small{display:block;font-size:14px;line-height:1.45;color:var(--text-secondary);margin-top:2px}
+.policy-more{margin:8px 0 0;font-size:14px;color:var(--text-secondary)}
+.policy-more summary{width:max-content;color:var(--muted);font-weight:600}
+.policy-more summary:hover{color:var(--text)}
+.policy-more>div{margin-top:8px;max-width:68ch;line-height:1.55}
+.policy-more p{margin:0 0 8px}
+.policy-more b{color:var(--text)}
+/* The same settings in the map's side panel: one column, smaller type. */
+.policy.compact{grid-template-columns:minmax(0,1fr);gap:18px}
+.policy.compact .policy-group{padding-top:14px}
+.policy.compact .policy-head{font-size:15px;margin-bottom:6px}
+.policy.compact .toggle-row{padding:9px 0;gap:14px}
+.policy.compact .toggle-row strong{font-size:14.5px}
+.policy.compact .toggle-row small{font-size:13px;line-height:1.4}
+.policy.compact .policy-choices label{padding:9px 11px}
+.policy.compact .policy-choices strong{font-size:14px}
+.policy.compact .policy-choices small{font-size:12.5px}
+.policy.compact .policy-chain{padding:10px 11px}
+@media(max-width:640px){.policy .toggle-row{gap:14px}.policy-summary{grid-template-columns:1fr}}
+/* The model switches on the Models page: one switch per column, side by side when there is room. */
+.model-policy .toggle-row{border-bottom:0;border-top:1.5px solid var(--line-strong);padding-top:16px}
+/* Narrower than that, the routing groups stack in one column. */
+.exit-policy{grid-template-columns:minmax(0,1fr)}
+/* The routing groups on a wide page: what an exit is and your own address on the left, what happens when an exit fails (the tallest) on the right. */
+@media(min-width:1100px){
+  .exit-policy:not(.compact){grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"sum sum" "which fail" "own fail"}
+  .exit-policy:not(.compact) .policy-summary{grid-area:sum}
+  .exit-policy:not(.compact) .g-which{grid-area:which}
+  .exit-policy:not(.compact) .g-fail{grid-area:fail}
+  .exit-policy:not(.compact) .g-own{grid-area:own}
+}
+.model-policy{grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:18px 32px}

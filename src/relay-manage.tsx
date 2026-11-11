@@ -30,7 +30,7 @@ function useToken(platform:Platform,settings:Settings){
   const fields=<>
     {usingSaved?<div className="dialog-note good saved-token"><Check size={16}/><div><p><strong>Using your saved {LABEL[platform]} token.</strong> It is kept encrypted on this computer and is not shown again.</p><div className="token-row"><Button onClick={()=>setAnother(true)}>Use another token</Button></div></div></div>
     :<><Field label={`${LABEL[platform]} API token`} hint="The token of the account the relay was deployed to."><input data-autofocus type="password" autoComplete="new-password" value={token} onChange={e=>setToken(e.target.value)} spellCheck={false}/></Field>
-      <div className="check-row"><input id={`remember-${platform}`} type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)}/><label htmlFor={`remember-${platform}`}>Remember this token on this computer<small>Saved encrypted with your other settings.</small></label></div>
+      <div className="check-row"><input id={`remember-${platform}`} type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)}/><label htmlFor={`remember-${platform}`}><span>Remember this token on this computer</span><small>Saved encrypted with your other settings.</small></label></div>
       {saved&&<div className="token-row"><Button onClick={()=>setAnother(false)}>Use the saved token instead</Button></div>}</>}
     {needsAccount&&<Field label="Account ID" hint="32 letters and digits. Shown in the Cloudflare dashboard under Workers & Pages."><input value={account} onChange={e=>setAccount(e.target.value)} placeholder="0123456789abcdef0123456789abcdef" spellCheck={false} autoComplete="off"/></Field>}
   </>;
@@ -39,7 +39,7 @@ function useToken(platform:Platform,settings:Settings){
 export function RelayUpdateDialog({route,settings,onClose,onDone,notice}:{route:Route;settings:Settings;onClose:()=>void;onDone:()=>void;notice:(s:string)=>void}){
   const platform=platformOf(route)!;const t=useToken(platform,settings);const [busy,setBusy]=useState(false);const [error,setError]=useState('');
   async function run(){setBusy(true);setError('');try{const r=await api('/admin/relays/update',{id:route.id,...t.credentials()});notice(r.reachable?`${route.name} updated`:`${route.name} updated, not answering yet`);onDone();onClose();}catch(e:any){setError(e.message||'The update failed');}finally{setBusy(false);}}
-  return <Shell title="Update relay" onClose={onClose} busy={busy}><form autoComplete="off" onSubmit={e=>{e.preventDefault();if(t.ready&&!busy)void run();}}>
+  return <Shell title="Update relay" onClose={onClose} busy={busy}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if(t.ready&&!busy)void run();}}>
     <p className="subtle">Deploys the current relay code to the {KIND[platform]} <strong>{platformName(route)}</strong> on {LABEL[platform]} again. Its address and access token stay the same, so nothing else needs changing. Use this after a Polygate update that changes the relay.</p>
     {t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
@@ -53,9 +53,9 @@ export function RelayRemoveDialog({route,settings,onClose,onDone,notice}:{route:
     try{if(both)await api('/admin/relays/remove',{id:route.id,...t.credentials()});else await api('/admin/routes/delete',{id:route.id});notice(both?`${route.name} removed from ${LABEL[platform]} and from Polygate`:'Route removed');onDone();onClose();}
     catch(e:any){setError(e.message||'Could not remove the relay');}finally{setBusy(false);}
   }
-  return <Shell title="Delete relay" onClose={onClose} busy={busy}><form autoComplete="off" onSubmit={e=>{e.preventDefault();if((!both||t.ready)&&!busy)void run();}}>
+  return <Shell title="Delete relay" onClose={onClose} busy={busy}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if((!both||t.ready)&&!busy)void run();}}>
     <p className="subtle">Delete <strong>{route.name}</strong>? Requests can no longer use it.</p>
-    <div className="check-row"><input id="remove-both" type="checkbox" checked={both} onChange={e=>setBoth(e.target.checked)}/><label htmlFor="remove-both">Also delete the {KIND[platform]} <strong>{platformName(route)}</strong> from {LABEL[platform]}<small>This deletes that whole {KIND[platform]}, so check the name is the relay's own. Otherwise it keeps running on your {LABEL[platform]} account and counts toward its limits.</small></label></div>
+    <div className="check-row"><input id="remove-both" type="checkbox" checked={both} onChange={e=>setBoth(e.target.checked)}/><label htmlFor="remove-both"><span>Also delete the {KIND[platform]} <strong>{platformName(route)}</strong> from {LABEL[platform]}</span><small>This deletes that whole {KIND[platform]}, so check the name is the relay's own. Otherwise it keeps running on your {LABEL[platform]} account and counts toward its limits.</small></label></div>
     {both&&t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
     <div className="dialog-actions"><Button variant="primary" type="submit" disabled={(both&&!t.ready)||busy}><Trash2 size={14}/>{busy?'Deleting…':'Delete relay'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>

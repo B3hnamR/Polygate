@@ -202,10 +202,16 @@ test('Route health follows delivery, not provider verdicts or caller aborts',asy
   await expect(pending).rejects.toThrow();expect(direct.cooldownUntil||0).toBe(0);
   const bad=await networkFetch(`http://127.0.0.2:${remote.port}/v1/chat/completions`,{method:'POST',body:JSON.stringify({model:'boom'})});expect(bad.status).toBe(503);expect(direct.cooldownUntil||0).toBe(0);expect(direct.status).toBe('healthy');
   // Circuit breaker: a real refused connection counts as one failure; two more (simulated, because refused loopback connections are slow on Windows) open the route for 30s.
-  await expect(networkFetch('http://127.0.0.2:1/v1/x',{})).rejects.toThrow();expect(direct.failures).toBe(1);expect(direct.cooldownUntil||0).toBe(0);
+  // A failed background read (a model list, a version check) never counts: it carries no one's request.
+  await expect(networkFetch('http://127.0.0.2:1/v1/x',{})).rejects.toThrow();expect(direct.failures||0).toBe(0);
+  // Resting needs another exit to take over; with Direct alone it would only keep refusing requests once the connection is back.
+  const spare={id:'breaker-spare',name:'Spare',kind:'proxy' as const,url:'http://127.0.0.1:9',enabled:true,models:[] as string[]};const others=settings.routes.filter(r=>r.id!=='direct'&&r.enabled);for(const r of others)r.enabled=false;
+  routeFailed(direct,'refused');routeFailed(direct,'refused');routeFailed(direct,'refused');expect(direct.cooldownUntil||0).toBe(0);expect(direct.status).toBe('refused');direct.failures=0;
+  settings.routes.push(spare);
+  await expect(networkFetch('http://127.0.0.2:1/v1/x',{method:'POST',body:'{}'})).rejects.toThrow();expect(direct.failures).toBe(1);expect(direct.cooldownUntil||0).toBe(0);
   routeFailed(direct,'refused');expect(direct.cooldownUntil||0).toBe(0);routeFailed(direct,'refused');expect(direct.cooldownUntil).toBeGreaterThan(Date.now()+25000);expect(direct.opened).toBe(1);
   routeFailed(direct,'refused');routeFailed(direct,'refused');routeFailed(direct,'refused');expect(direct.opened).toBe(2);expect(direct.cooldownUntil).toBeGreaterThan(Date.now()+55000);// each re-open doubles the wait
-  direct.cooldownUntil=0;direct.failures=0;direct.opened=0;
+  direct.cooldownUntil=0;direct.failures=0;direct.opened=0;direct.status='healthy';settings.routes=settings.routes.filter(r=>r.id!=='breaker-spare');for(const r of others)r.enabled=true;
 });
 test('A provider failure is the model fault, counted once per request',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','boom');const r=await chat('remote/boom');expect(r.status).toBe(503);expect(r.headers.get('retry-after')).toBeNull();
@@ -312,6 +318,14 @@ test('With the pool as the route, chat requests use a proxy while catalog reads 
     settings.catalogDirect=false;await (await networkFetch(base+'/models',{})).text();expect(hits).toEqual([2]);settings.catalogDirect=undefined;
   });
 });
+test('With Direct switched off, catalog reads go through the pool too: nothing leaves from your own address',async()=>{
+  const forward=async(req:Request)=>fetch(req.url,{method:req.method,headers:req.headers,body:req.method==='GET'||req.method==='HEAD'?undefined:await req.arrayBuffer()});
+  await withPool([forward],async({entries,hits})=>{
+    poolReport(entries[0].url,'ok',10);settings.routeId='proxy-pool';const direct=settings.routes.find(x=>x.id==='direct')!;direct.enabled=false;
+    try{const base=`http://127.0.0.2:${remote.port}/v1`;await (await networkFetch(base+'/models',{})).text();expect(hits).toEqual([1]);}
+    finally{direct.enabled=true;}
+  });
+});
 test('A used-up direct exit sends requests to a clean pool proxy, and keeps doing so until the reset',async()=>{
   await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct',routes:{ids:['direct'],backups:true}}],async()=>{
     freshModel('remote','drained');poolReport(entries[0].url,'ok',10);
@@ -329,6 +343,18 @@ test('A 429 without a reset time is explained as a refused request and still pau
   expect(models.get('remote/shape')!.state).toBe('cooldown');
   const again=await chat('remote/shape',{stream:false});const y:any=await again.json();expect(again.status).toBe(429);expect(y.error.type).toBe('model_paused');expect(y.error.message).toContain('paused');expect(Number(again.headers.get('retry-after'))).toBeGreaterThan(0);
 });});
+test('A limit without a retry time moves the request to another exit once a check through the same exit is refused too',async()=>{
+  await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct',routes:{ids:['direct'],backups:true}}],async()=>{
+    freshModel('remote','shape');poolReport(entries[0].url,'ok',10);__setExitVerifier(async()=>'exhausted');
+    try{
+      const r=await chat('remote/shape');expect(r.status).toBe(200);await r.text();expect(hits).toEqual([1]);
+      const direct=settings.routes.find(x=>x.id==='direct')!;expect(direct.status).toContain('Refused by OpenCode');
+      // Set aside for the short recheck only: no retry time was given, so no daily reset is assumed.
+      expect(direct.exhaustedUntil!-Date.now()).toBeLessThanOrEqual(15*60000+1000);expect(direct.exhaustedUntil!).toBeGreaterThan(Date.now()+14*60000);
+      expect(models.get('remote/shape')!.state).not.toBe('cooldown');
+    }finally{__setExitVerifier();settings.routes.find(x=>x.id==='direct')!.exhaustedUntil=0;}
+  });});
+});
 const tool=(name:string)=>({type:'function',function:{name,description:'x',parameters:{type:'object',properties:{}}}});
 test('A request OpenCode refuses only because of its tool list is retried with the standard tools, remembered, and can be switched off',async()=>{await scoped([remoteProvider()],async()=>{
   freshModel('remote','toolgate');__resetToolTrim();toolgateSeen.length=0;__setExitVerifier(async()=>'refused');

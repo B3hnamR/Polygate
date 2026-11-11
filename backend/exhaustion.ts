@@ -21,6 +21,14 @@ export async function detectExhaustion(response: Response): Promise<Exhaustion |
   let text = ''; try { text = (await response.clone().text()).slice(0, 2000); } catch { return; }
   return exhaustionOf(429, response.headers.get('retry-after'), text);
 }
+// A live request's 429: the countdown case above, or OpenCode's limit text with no Retry-After at all. The second is only a suspicion that the
+// exit cannot be used (marked `refused`, rechecked in 15 minutes, never read as a daily reset); the caller confirms it with a known-good request
+// through the same exit before the exit is set aside, so a refusal of this one request still reads as a refusal of the request.
+export async function suspectExhaustion(response: Response): Promise<Exhaustion | undefined> {
+  const counted = await detectExhaustion(response); if (counted || response.status !== 429) return counted;
+  let text = ''; try { text = (await response.clone().text()).slice(0, 2000); } catch { return; }
+  return FREE_LIMIT_TEXT.test(text) ? refusedExhaustion() : undefined;
+}
 // The gateway learns about an exhausted egress from the network layer, keyed by the request that hit it.
 const seen = new Map<string, Exhaustion>();
 export function noteExhaustion(requestId: string | undefined, ex: Exhaustion) { if (!requestId) return; seen.set(requestId, ex); if (seen.size > 300) seen.delete(seen.keys().next().value!); }

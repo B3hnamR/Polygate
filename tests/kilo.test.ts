@@ -6,6 +6,7 @@ process.env.POLYGATE_ADMIN_TOKEN='test-admin-secret';
 const {startGateway}=await import('../backend/main');
 const {settings,models,removeModels,initialSettings,withBuiltIns}=await import('../backend/state');
 const {freeCatalog}=await import('../backend/kilo');
+const {__resetKiloLimits}=await import('../backend/transport');
 const {discover}=await import('../backend/providers');
 let gateway:Awaited<ReturnType<typeof startGateway>>,base='';
 let addressLimited=false;const sent:{model:string;auth:string|null;max:any}[]=[];
@@ -20,7 +21,8 @@ const catalog=[
   {id:'google/lyria-audio',name:'Audio',isFree:false,pricing:{prompt:'0',completion:'0'}},
 ];
 const sse=(text:string)=>new Response('data: '+JSON.stringify({id:'c1',choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:3,completion_tokens:2}})+'\n\ndata: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
-const kilo=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
+// On 127.0.0.2, not 127.0.0.1: a loopback address skips the network routes, so switching exits could not be seen.
+const kilo=Bun.serve({port:0,hostname:'127.0.0.2',async fetch(req){
   const path=new URL(req.url).pathname;
   if(path.endsWith('/models'))return Response.json({data:catalog});
   const body=await req.json() as any;sent.push({model:body.model,auth:req.headers.get('authorization'),max:body.max_tokens});
@@ -41,11 +43,11 @@ beforeAll(async()=>{
 });
 afterAll(async()=>{
   try{await gateway?.close();}
-  finally{kilo.stop(true);addressLimited=false;restore();} // Restore shared pool/key/activity state only after shutting down the file's gateway.
+  finally{kilo.stop(true);addressLimited=false;__resetKiloLimits();restore();} // Restore shared pool/key/activity state only after shutting down the file's gateway.
 });
 const seedKilo = async () => {
-  addressLimited=false;removeModels('kilo');
-  settings.providers=[{id:'kilo',name:'Kilo Free',kind:'kilo',enabled:true,baseUrl:`http://127.0.0.1:${kilo.port}`,apiKey:'',models:[],routeId:'direct'}];
+  addressLimited=false;removeModels('kilo');__resetKiloLimits();
+  settings.providers=[{id:'kilo',name:'Kilo Free',kind:'kilo',enabled:true,baseUrl:`http://127.0.0.2:${kilo.port}`,apiKey:'',models:[],routeId:'direct'}];
   await discover();
 };
 
@@ -67,7 +69,7 @@ test('the catalog keeps free chat models only',()=>{
   const auto=freeCatalog(catalog)[0];expect(auto).toMatchObject({context_length:256000,maxOutput:65536,reasoning:true,tool_call:true});
 });
 test('adding Kilo through the dashboard API lists its free models behind OpenCode in auto',async()=>{
-  const added=await admin('/admin/providers',{kind:'kilo',name:'',baseUrl:`http://127.0.0.1:${kilo.port}`,routeId:'direct'});
+  const added=await admin('/admin/providers',{kind:'kilo',name:'',baseUrl:`http://127.0.0.2:${kilo.port}`,routeId:'direct'});
   expect(added.status).toBe(200);expect((await added.json() as any).id).toBe('kilo');
   expect((await admin('/admin/providers',{kind:'kilo',baseUrl:'http://127.0.0.1:1'})).status).toBe(400);
   expect((await admin('/admin/discover',{})).status).toBe(200);
@@ -116,6 +118,33 @@ test('the address-wide limit pauses every Kilo model together and the next reque
   expect(rest.length).toBeGreaterThan(1);for(const m of rest){expect(m.state).toBe('cooldown');expect(m.cooldownUntil-Date.now()).toBeGreaterThan(29*60000);}
   const again=await chat('kilo/vendor/big:free');expect(again.status).toBe(429);expect(sent).toHaveLength(1);
   const auto=await chat('auto');expect(auto.status).toBe(503);expect(sent).toHaveLength(1);
+});
+// An HTTP proxy stand-in for another exit: whatever it is asked to fetch, it answers from its own (clean) address.
+const exitProxy=(text:string)=>Bun.serve({port:0,hostname:'127.0.0.1',fetch:()=>sse(text)});
+test('the address-wide limit moves Kilo to another exit; no model is paused while an exit is left',async()=>{
+  await seedKilo();settings.providers[0].routeId='';settings.exhaustedFailover=true;
+  const proxy=exitProxy('via the other exit');
+  settings.routes.push({id:'kx-proxy',name:'Fixture proxy',kind:'proxy',url:`http://127.0.0.1:${proxy.port}`,enabled:true,models:[]} as any);
+  try{
+    addressLimited=true;sent.length=0;
+    const r=await chat('kilo/kilo-auto/free');expect(r.status).toBe(200);
+    expect(((await r.json()) as any).choices[0].message.content).toBe('via the other exit');expect(sent).toHaveLength(1);
+    expect([...models.values()].filter(m=>m.providerId==='kilo').some(m=>m.state==='cooldown')).toBe(false);
+    // The limited exit is set aside for Kilo, so the next Kilo request goes straight to the other exit.
+    const again=await chat('kilo/vendor/big:free');expect(again.status).toBe(200);expect(sent).toHaveLength(1);
+    expect(((await again.json()) as any).choices[0].message.content).toBe('via the other exit');
+  }finally{proxy.stop(true);settings.routes=settings.routes.filter(x=>x.id!=='kx-proxy');settings.providers[0].routeId='direct';addressLimited=false;__resetKiloLimits();}
+});
+test('a Kilo provider with its own list moves to the next exit in that list',async()=>{
+  await seedKilo();settings.exhaustedFailover=true;
+  const proxy=exitProxy('via the listed exit');
+  settings.routes.push({id:'kx-proxy2',name:'Fixture proxy 2',kind:'proxy',url:`http://127.0.0.1:${proxy.port}`,enabled:true,models:[]} as any);
+  settings.providers[0].routes={ids:['direct','kx-proxy2']};
+  try{
+    addressLimited=true;sent.length=0;
+    const r=await chat('kilo/kilo-auto/free');expect(r.status).toBe(200);expect(((await r.json()) as any).choices[0].message.content).toBe('via the listed exit');
+    expect(sent).toHaveLength(1);
+  }finally{proxy.stop(true);settings.routes=settings.routes.filter(x=>x.id!=='kx-proxy2');delete settings.providers[0].routes;addressLimited=false;__resetKiloLimits();}
 });
 test('Kilo models are checked in the background only when the user chooses it for Kilo',async()=>{
    await seedKilo();

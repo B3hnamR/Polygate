@@ -16,7 +16,7 @@ export const largeRequestNote = (bytes?: number, messages?: number) => bytes && 
 export function pausedModel(model: string, until: number, cooldownsEnabled = true): Explained {
   const seconds = Math.max(0, Math.ceil((until - Date.now()) / 1000));
   return { code: 'model_paused', retryAfter: seconds, extra: { resets_at: new Date(until).toISOString(), retry_after_seconds: seconds, model },
-    message: `Polygate has paused ${model} until ${resetTime(until)} (in ${human(seconds)}) after the provider returned errors. ${cooldownsEnabled ? 'Turn off "Pause models after errors" under Routing to keep trying, or choose another model.' : 'Choose another model.'}` };
+    message: `Polygate has paused ${model} until ${resetTime(until)} (in ${human(seconds)}) after the provider returned errors. ${cooldownsEnabled ? 'Turn off "Pause a model after errors" on the Models page to keep trying, or choose another model.' : 'Choose another model.'}` };
 }
 export function explainError(c: ErrorContext): Explained | undefined {
   const up = upstreamFields(c.message);

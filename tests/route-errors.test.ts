@@ -23,7 +23,7 @@ test('network failures are named in plain words, with the raw text left to the l
 
 test('a failed route shows the plain reason and the log keeps the raw one', () => {
   const route: any = { id: 'rf-1', name: 'Test relay', kind: 'relay', url: 'https://x.example/', enabled: true, models: [] };
-  settings.routes.push(route);
+  settings.routes.push(route, { id: 'rf-spare', name: 'Spare exit', kind: 'proxy', url: 'http://127.0.0.1:9', enabled: true, models: [] } as any); // another exit can take over, so the failed one rests
   routeFailed(route, 'TypeError: ECONNRESET: The socket connection was closed unexpectedly.', true);
   expect(route.status).toContain('Connection reset'); expect(route.status).not.toContain('TypeError');
   const entry = queryEvents({ q: 'Test relay is paused' }).entries[0]; expect(entry).toBeTruthy();
