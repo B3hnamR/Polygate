@@ -123,7 +123,8 @@ function onNotice(inst: Instance, n: any) {
   const t = n?.noticeType, d = n?.data || {};
   if (t === 'AvailableEgressRegions') saveRegions(d.regions);
   else if (t === 'Tunnels') {
-    if (d.count > 0) { const first = !inst.readyAt; inst.state = 'ready'; inst.readyAt = Date.now(); inst.error = ''; inst.failures = 0; void learnExit(inst, first); }
+    // Connected again: the restart count starts over, so crashes days apart never add up to "left stopped".
+    if (d.count > 0) { const first = !inst.readyAt; inst.state = 'ready'; inst.readyAt = Date.now(); inst.error = ''; inst.failures = 0; inst.restarts = 0; void learnExit(inst, first); }
     else if (inst.state === 'ready') inst.state = 'reconnecting';
   }
   else if (t === 'Error' || t === 'Alert') inst.output = String(d.message || '').slice(0, 300);
@@ -246,8 +247,8 @@ export const psiphonReady = (scope: PsiphonScope = 'other') => { const c = psiph
 // Why nothing could be picked, in words, for the request's error.
 export function psiphonUnavailable(scope: PsiphonScope = 'other'): string {
   const c = psiphonConfig();
-  if (!c.enabled) return 'Psiphon is turned off. Turn it on on the Routing page.';
-  if (!instances.size) return 'Psiphon is not connected. Connect it on the Routing page.';
+  if (!c.enabled) return 'Psiphon is turned off. Turn it on under Routing → Psiphon.';
+  if (!instances.size) return 'Psiphon is not connected. Connect it under Routing → Psiphon.';
   const all = candidates(c); const ready = all.filter(i => i.state === 'ready');
   const limit = scope === 'kilo' ? "Kilo's free limit" : 'its OpenCode Free allowance';
   if (c.mode === 'single') { const i = all[0]; return `Psiphon ${c.pinned || c.regions[0]} can't take this request: ${!i || i.state !== 'ready' ? 'it is not connected' : `its exit has reached ${limit}`}. Choose another region, or let Psiphon take turns.`; }

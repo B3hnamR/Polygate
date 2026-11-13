@@ -115,7 +115,19 @@ export function toolArgRepair(tools: unknown, onRepair?: (tool: string, renamed:
       }
       if (ch?.finish_reason) finishing.push(i);
     }
-    for (const i of finishing) release(c, i);
+    // A call can start and finish in one event (some providers send the whole call at once). Its start (id, name) must reach the client
+    // before its arguments, and the arguments before the finish, so such an event goes out in three parts: the event without its finish,
+    // the held arguments, then the finish (with usage, if the event carried it).
+    const ending = finishing.filter(i => calls.has(i));
+    if (ending.length) {
+      const reasons = new Map<number, unknown>();
+      for (const ch of d.choices) { const i = Number.isInteger(ch?.index) ? ch.index : 0; if (ending.includes(i)) { reasons.set(i, ch.finish_reason); ch.finish_reason = null; } }
+      const usage = d.usage; delete d.usage;
+      emit(c, `data: ${JSON.stringify(d)}\n\n`);
+      for (const i of ending) release(c, i);
+      emit(c, `data: ${JSON.stringify({ ...meta, choices: ending.map(i => ({ index: i, delta: {}, finish_reason: reasons.get(i) })), ...(usage ? { usage } : {}) })}\n\n`);
+      return;
+    }
     emit(c, changed ? `data: ${JSON.stringify(d)}\n\n` : block + '\n\n');
   };
   return new TransformStream<Uint8Array, Uint8Array>({

@@ -7,7 +7,7 @@ import type { Level, LogEntry } from '../backend/logbook';
 
 type Result = { entries: LogEntry[]; more: boolean; levels: Partial<Record<Level, number>>; sources: { source: string; count: number }[]; total: number };
 const LEVEL_INFO: Record<Level, { label: string; icon: typeof Info }> = { error: { label: 'Errors', icon: AlertCircle }, warn: { label: 'Warnings', icon: AlertTriangle }, info: { label: 'Info', icon: Info } };
-const SOURCE_LABELS: Record<string, string> = { requests: 'Requests', models: 'Models', routes: 'Routes', proxies: 'Proxies', warp: 'WARP', https: 'HTTPS', auth: 'Sign-in', settings: 'Settings', keys: 'API keys', providers: 'Providers', relays: 'Relays', notify: 'Notifications', updates: 'Updates', gateway: 'Gateway', logs: 'Logs', catalog: 'Catalog', state: 'Storage' };
+const SOURCE_LABELS: Record<string, string> = { requests: 'Requests', models: 'Models', routes: 'Routes', proxies: 'Proxies', warp: 'WARP', https: 'HTTPS', auth: 'Sign-in', settings: 'Settings', keys: 'API keys', providers: 'Providers', relays: 'Relays', notify: 'Notifications', updates: 'Updates', gateway: 'Gateway', logs: 'Logs', catalog: 'Catalog', state: 'Storage', mcp: 'MCP', psiphon: 'Psiphon', agent: 'Agent', backup: 'Backup' };
 const sourceLabel = (s: string) => SOURCE_LABELS[s] || s.charAt(0).toUpperCase() + s.slice(1);
 const RANGES = [['900000', 'Last 15 minutes'], ['3600000', 'Last hour'], ['86400000', 'Last 24 hours'], ['604800000', 'Last 7 days']] as const;
 const PAGE = 200, LIVE_MS = 2500, MAX_ROWS = 2000;

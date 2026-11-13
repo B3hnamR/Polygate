@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { ENGINE_PACKAGES, ENGINE_VERSION, freeIdentityProblem, isBuiltinEngineSkill } from '../backend/agent-engine';
 import { skillProblems } from '../backend/agent-library';
 
-test('real 2.2.6 built-in skill URIs are recognized without accepting arbitrary skill paths', () => {
+test('real 2.3.0 built-in skill URIs are recognized without accepting arbitrary skill paths', () => {
   for (const id of ['opencode', 'report', 'browser']) {
     expect(isBuiltinEngineSkill({ id, path: `skill://${id}/SKILL.md` })).toBe(true);
     expect(isBuiltinEngineSkill({ id, path: `/builtin/${id}.md` })).toBe(true);
@@ -20,11 +20,11 @@ test('real 2.2.6 built-in skill URIs are recognized without accepting arbitrary 
 });
 
 test('the pinned Agent engine matches the verified current bridge release and registry packages', () => {
-  expect(ENGINE_VERSION).toBe('2.2.6');
-  expect(freeIdentityProblem('2.2.6')).toBe('');
-  expect(freeIdentityProblem('2.2.5')).toContain('compatibility check');
-  expect(ENGINE_PACKAGES.x64.integrity).toBe('sha512-Wcmduf9DaGQgJG3GMliHilaI+YvdckW7O6aLzRwz1r3iIkP82MSoUlSU+ovlOEDj8O+Gy5Ywy5LL6Iv77YuzFw==');
-  expect(ENGINE_PACKAGES.arm64.integrity).toBe('sha512-efXFT4J8p9KLVQ3+e4s9EQRZkskvcRZABd3W9sIsZ+zcMuLrZ77CU0YyeeSLrYcHpdpgcRFRVnD2AiF4yLlRPA==');
+  expect(ENGINE_VERSION).toBe('2.3.0');
+  expect(freeIdentityProblem('2.3.0')).toBe('');
+  expect(freeIdentityProblem('2.2.6')).toContain('compatibility check');
+  expect(ENGINE_PACKAGES.x64.integrity).toBe('sha512-0wnPu8aCczjN82X6qK+XmMFiheyvOnBXRsb+hkyTWaeG6WlIeN9cM6J7vKnj741juyIE7q57SmRSRVPWUmun/g==');
+  expect(ENGINE_PACKAGES.arm64.integrity).toBe('sha512-dqOtQicdmaKxyA8fSBYysegVl0QrlHYWXy/D/ocgZvGa0bNGi+9KR6N1Za9BCkOu/q7gemroXliMS+aBREhShA==');
 });
 
 test('Agent compatibility explains the local version block without claiming an upstream minimum', () => {

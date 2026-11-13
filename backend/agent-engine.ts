@@ -18,13 +18,13 @@ import { logEvent } from './logbook';
 
 // The version Polygate's OpenCode Free identity presents (vendor/bridge/identity.js), so the agent's own tools pass the bridge untouched.
 // The integrity values are the ones npm published for these exact packages.
-export const ENGINE_VERSION = '2.2.6';
+export const ENGINE_VERSION = '2.3.0';
 export const BUILTIN_ENGINE_SKILLS = ['opencode', 'report', 'browser'] as const;
 export const isBuiltinEngineSkill = (skill: any) => BUILTIN_ENGINE_SKILLS.some(id => skill?.id === id &&
   (skill.path === `skill://${id}/SKILL.md` || skill.path === `/builtin/${id}.md`));
 export const ENGINE_PACKAGES: Record<string, { name: string; integrity: string }> = {
-  x64: { name: '@opencode/cli-windows-x64', integrity: 'sha512-Wcmduf9DaGQgJG3GMliHilaI+YvdckW7O6aLzRwz1r3iIkP82MSoUlSU+ovlOEDj8O+Gy5Ywy5LL6Iv77YuzFw==' },
-  arm64: { name: '@opencode/cli-windows-arm64', integrity: 'sha512-efXFT4J8p9KLVQ3+e4s9EQRZkskvcRZABd3W9sIsZ+zcMuLrZ77CU0YyeeSLrYcHpdpgcRFRVnD2AiF4yLlRPA==' },
+  x64: { name: '@opencode/cli-windows-x64', integrity: 'sha512-0wnPu8aCczjN82X6qK+XmMFiheyvOnBXRsb+hkyTWaeG6WlIeN9cM6J7vKnj741juyIE7q57SmRSRVPWUmun/g==' },
+  arm64: { name: '@opencode/cli-windows-arm64', integrity: 'sha512-dqOtQicdmaKxyA8fSBYysegVl0QrlHYWXy/D/ocgZvGa0bNGi+9KR6N1Za9BCkOu/q7gemroXliMS+aBREhShA==' },
 };
 const REGISTRY = 'registry.npmjs.org';
 const MAX_DOWNLOAD = 300 * 1024 * 1024;

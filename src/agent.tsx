@@ -1,5 +1,5 @@
 import {useCallback,useEffect,useMemo,useRef,useState,type CSSProperties,type ReactNode} from 'react';
-import {ArrowDown,ArrowLeft,ArrowUp,BookOpen,Bot,Brain,CornerDownRight,ListEnd,FileText,Globe,SquareTerminal,Wrench,ClipboardList,ScrollText,Workflow,Check,CheckCircle2,ChevronDown,ChevronRight,Circle,Copy,Cpu,Download,Files,Folder,FolderOpen,ListChecks,Loader2,Pencil,Play,Plus,RefreshCw,Search,Settings2,ShieldAlert,ShieldCheck,Square,Trash2,TriangleAlert,Undo2,X} from 'lucide-react';
+import {ArrowDown,ArrowLeft,ArrowUp,BookOpen,Hammer,Brain,CornerDownRight,ListEnd,FileText,Globe,SquareTerminal,Wrench,ClipboardList,ScrollText,Workflow,Check,CheckCircle2,ChevronDown,ChevronRight,Circle,Copy,Cpu,Download,Files,Folder,FolderOpen,ListChecks,Loader2,Pencil,Play,Plus,RefreshCw,Search,Settings2,ShieldAlert,ShieldCheck,Square,Trash2,TriangleAlert,Undo2,X} from 'lucide-react';
 import {api,at} from './api';
 import {MAX_AGENT_FILES,MAX_AGENT_FILE_BYTES,type AgentFile} from '../backend/agent-attachments';
 import {Button,Progress,Toggle,compact,usePoll,tickWhileVisible,when} from './ui';
@@ -85,7 +85,7 @@ export function AgentApp({onBack}:{onBack:()=>void}){
     :<NewSession key={start.seq} startFolder={start.folder} models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
   return <div className="ag-app" style={agentFontVars(font) as CSSProperties}>
     <aside className="ag-side" aria-label="Agent sessions">
-      <div className="ag-side-head"><button className="ag-back" onClick={onBack} title="Back to Polygate"><ArrowLeft size={16}/>Polygate</button><span className="ag-side-title"><Bot size={17}/>Agent</span></div>
+      <div className="ag-side-head"><button className="ag-back" onClick={onBack} title="Back to Polygate"><ArrowLeft size={16}/>Polygate</button><span className="ag-side-title"><Hammer size={17}/>Agent</span></div>
       <button className={`ag-new${running&&!info?' active':''}`} onClick={()=>newSession()} disabled={!running}><Plus size={16}/>New session</button>
       <nav className="ag-sessions">
         {groups.map(([folder,items])=>{const shut=folded.includes(folder);return <section key={folder} className="ag-group">
@@ -413,7 +413,7 @@ function NewSession({startFolder,models,folders,reloadFolders,onResync,onCreated
   const placeholder=!current?'No model can run the agent yet…':!trusted?'Trust this folder first…':'Describe a task or ask a question';
   return <div className="ag-center">
     <div className="ag-column ag-new-session">
-      <div className="ag-hero"><Bot size={30}/><h1>What should the agent do?</h1><p>It reads, edits and runs commands in the folder you choose, through Polygate's own models, and asks first where its mode says so.</p></div>
+      <div className="ag-hero"><Hammer size={30}/><h1>What should the agent do?</h1><p>It reads, edits and runs commands in the folder you choose, through Polygate's own models, and asks first where its mode says so.</p></div>
       {folder&&report&&!report.trusted&&<FolderTrust folder={report.folder} report={report} error={trustError} reload={()=>{reloadTrust();reloadFolders();}}/>}
       {folder&&!report&&trustError&&<div className="pg-error">{trustError}</div>}
       {models&&!usable.length&&<p className="agent-warn"><TriangleAlert size={15}/>No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
@@ -601,7 +601,7 @@ function MessageCopy({text,who}:{text:string;who:string}){
   </div>;
 }
 // Each kind of work has its own icon and colour (styles.css .ag-kind-*), so a long turn reads at a glance.
-const KIND_ICONS:Record<StepKind,typeof Brain>={run:SquareTerminal,read:FileText,edit:Pencil,search:Search,web:Globe,agent:Bot,todo:ListChecks,other:Wrench};
+const KIND_ICONS:Record<StepKind,typeof Brain>={run:SquareTerminal,read:FileText,edit:Pencil,search:Search,web:Globe,agent:Hammer,todo:ListChecks,other:Wrench};
 function Steps({tools,folder}:{tools:Tool[];folder:string}){
   const working=tools.some(t=>t.status==='running'||t.status==='preparing');
   const parts=stepsParts(tools);

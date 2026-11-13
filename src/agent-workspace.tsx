@@ -1,5 +1,5 @@
 import {useEffect,useRef,useState} from 'react';
-import {Bot,CheckCircle2,Circle,Copy,FileText,GitBranch,ListChecks,Loader2,Play,RefreshCw,Square,Terminal,Undo2,X} from 'lucide-react';
+import {Hammer,CheckCircle2,Circle,Copy,FileText,GitBranch,ListChecks,Loader2,Play,RefreshCw,Square,Terminal,Undo2,X} from 'lucide-react';
 import {api} from './api';
 import {AgentDiff} from './agent-diff';
 import {useConfirm} from './confirm';
@@ -27,7 +27,7 @@ export function AgentWorkspace({id,turns,todos=[],initialTab='changes',busy,bloc
   return <aside className="ag-workspace" id="agent-workspace" aria-label="Task changes and Git">
     <header><strong>Task workspace</strong><button type="button" className="icon-button" aria-label="Close task workspace" onClick={onClose}><X size={16}/></button></header>
     <div className="ag-workspace-tabs" role="group" aria-label="Workspace view"><button type="button" aria-pressed={tab==='changes'} onClick={()=>setTab('changes')}>Agent changes{count?` (${count})`:''}</button><button type="button" aria-pressed={tab==='plan'} onClick={()=>setTab('plan')}><ListChecks size={13}/>Plan</button><button type="button" aria-pressed={tab==='git'} onClick={()=>setTab('git')}><GitBranch size={13}/>Git</button><button type="button" aria-pressed={tab==='terminal'} onClick={()=>setTab('terminal')}><Terminal size={13}/>Terminal</button><button type="button" aria-label="Project instructions, commands & skills" aria-pressed={tab==='project'} onClick={()=>setTab('project')}><FileText size={13}/>Project</button></div>
-    <div className="ag-workspace-tabs ag-workspace-subtabs"><button type="button" aria-pressed={tab==='children'} onClick={()=>setTab('children')}><Bot size={13}/>Subagents</button></div>
+    <div className="ag-workspace-tabs ag-workspace-subtabs"><button type="button" aria-pressed={tab==='children'} onClick={()=>setTab('children')}><Hammer size={13}/>Subagents</button></div>
     <div className="ag-workspace-content">
       {tab==='changes'?<>
         <p className="subtle">Recorded changes for this session, newest turn first. Patches show what was recorded at the end of a turn, not the current file contents.</p>

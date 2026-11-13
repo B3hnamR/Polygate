@@ -334,8 +334,8 @@ function RoutePanel({r,data,pending,go,count,toggleRoute,useExit,connect,act,onT
     </div>
     {out&&<p className="map-fact">Used up until {time(r.exhaustedUntil!)}. This applies to OpenCode Free only; other providers can still use it.</p>}
     {open.length>0&&<Field label="Join a provider"><Select aria-label={`Join a provider to ${r.name}`} value="" onChange={v=>{const p=s.providers.find(x=>x.id===v);if(p)connect(p,r);}}><option value="">Choose a provider…</option>{open.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field>}
-    {r.kind==='warp'&&<p className="map-fact">WARP connects and disconnects from the list view. <button type="button" className="text-button" onClick={onShowList}>Open it</button></p>}
-    {r.id==='psiphon'&&<p className="map-fact">Psiphon's regions are chosen, connected and disconnected in the list view. <button type="button" className="text-button" onClick={onShowList}>Open it</button></p>}
+    {r.kind==='warp'&&<p className="map-fact">WARP is connected, disconnected and set up on its own page under Routing. <button type="button" className="text-button" onClick={()=>go('WARP')}>Open it</button></p>}
+    {r.id==='psiphon'&&<p className="map-fact">Psiphon's regions are chosen, connected and disconnected on its own page under Routing. <button type="button" className="text-button" onClick={()=>go('Psiphon')}>Open it</button></p>}
     {r.id==='proxy-pool'&&<p className="map-fact">Its proxies are managed on the Proxies page. <button type="button" className="text-button" onClick={()=>go('Proxies')}>Open it</button></p>}
     <div className="map-actions quiet"><button type="button" className="text-button" onClick={()=>pickNode('gate')}>Route in use <ChevronRight size={14}/></button></div>
   </Section>;

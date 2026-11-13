@@ -108,6 +108,49 @@ test('a refusal that the check through the same exit does not confirm leaves the
   const r = await post(); expect(r.status).toBe(429); await r.text();
   expect(P.spentUntil(exits.DE)).toBe(0);
 });
+test('a refused request goes on to another region and answers there; the refusing exit is not marked', async () => {
+  __setExitVerifier(async () => 'refused');
+  const seen: number[] = [];
+  for (let i = 0; i < 3; i++) { const r = await post(); seen.push(r.status); await r.text(); }
+  expect(seen).toEqual([200, 200, 200]);
+  expect(hits.DE).toBeGreaterThanOrEqual(1);
+  expect(P.spentUntil(exits.DE)).toBe(0);
+});
+test('the region a request answered through is kept for its log line, and a move between regions is logged', async () => {
+  const { routeContext, takePsiphonRegion } = await import('../backend/transport');
+  const { queryEvents } = await import('../backend/logbook');
+  // Regions take turns; DE's exit is used up, so the request that lands on DE moves on and answers through another region.
+  const from = Date.now();
+  let answered = '';
+  for (let i = 0; i < 3 && !answered; i++) {
+    const id = 'psi-region-' + (i + 2); const x = await routeContext.run({ routeId: 'psiphon', requestId: id }, post); await x.text();
+    const reg = takePsiphonRegion(id)!; expect(['DE', 'NL', 'FR']).toContain(reg); expect(x.status).toBe(200);
+    if (hits.DE && reg !== 'DE') answered = reg;
+  }
+  expect(answered).not.toBe('');
+  const moves = queryEvents({ sources: ['psiphon'], from, limit: 50 }).entries.filter((e: any) => e.message.startsWith('A request moved from Psiphon DE'));
+  expect(moves.length).toBe(1);
+  expect(moves[0].message).toContain('used up for OpenCode Free');
+  expect(takePsiphonRegion('psi-region-2')).toBeUndefined(); // read once
+});
+test('a used-up region followed by refusing ones hands back a refusal with no stale used-up note', async () => {
+  const { routeContext } = await import('../backend/transport');
+  const { takeExhaustion, takeRefused } = await import('../backend/exhaustion');
+  __setExitVerifier(async (id: string) => id.endsWith(':DE') ? 'exhausted' : 'refused');
+  for (const r of ['NL', 'FR']) answers[r] = 'opencode-used-up';
+  const r = await routeContext.run({ routeId: 'psiphon', requestId: 'psi-mixed-1' }, post); await r.text();
+  expect(r.status).toBe(429);
+  expect(takeRefused('psi-mixed-1')).toBe(true);
+  expect(takeExhaustion('psi-mixed-1')).toBeUndefined();
+  expect(P.spentUntil(exits.DE)).toBeGreaterThan(Date.now()); // DE itself is still marked used up
+});
+test('when every region refuses, the refusal goes back after at most three regions', async () => {
+  __setExitVerifier(async () => 'refused');
+  for (const r of ['NL', 'FR']) answers[r] = 'opencode-used-up';
+  const r = await post(); expect(r.status).toBe(429); await r.text();
+  expect((hits.DE || 0) + (hits.NL || 0) + (hits.FR || 0)).toBe(3);
+  for (const x of ['DE', 'NL', 'FR'] as const) expect(P.spentUntil(exits[x])).toBe(0);
+});
 test('nothing connected: the request fails with a reason, not a hang', async () => {
   P.__instances.clear();
   await expect(post()).rejects.toThrow(/Psiphon is not connected/);

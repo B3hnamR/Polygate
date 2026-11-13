@@ -1,5 +1,5 @@
 import {useState} from 'react';
-import {Bot,ChevronRight,Loader2,RefreshCw} from 'lucide-react';
+import {Hammer,ChevronRight,Loader2,RefreshCw} from 'lucide-react';
 import {usePoll,Button} from './ui';
 import {fromHistory,blocks,stepsSummary,type Item} from './agent-logic';
 import {Markdown} from './markdown';
@@ -18,7 +18,7 @@ export function AgentChildren({id,depth=0}:{id:string;depth?:number}){
 }
 function ChildRow({child,parent,depth}:{child:Child;parent:string;depth:number}){
   const [open,setOpen]=useState(false);
-  return <section className="ag-child"><button type="button" className="ag-child-toggle" aria-expanded={open} onClick={()=>setOpen(o=>!o)}><ChevronRight size={14} className={open?'open':''}/>{child.busy?<Loader2 size={14} className="spin"/>:<Bot size={14}/>}<span>{child.title||'Subagent'}<small>{child.pending?'Approval needed':child.busy?'Working':child.outcome==='succeeded'?'Completed':child.outcome==='failed'?'Failed':child.outcome==='interrupted'?'Stopped':'Idle'}</small></span></button>
+  return <section className="ag-child"><button type="button" className="ag-child-toggle" aria-expanded={open} onClick={()=>setOpen(o=>!o)}><ChevronRight size={14} className={open?'open':''}/>{child.busy?<Loader2 size={14} className="spin"/>:<Hammer size={14}/>}<span>{child.title||'Subagent'}<small>{child.pending?'Approval needed':child.busy?'Working':child.outcome==='succeeded'?'Completed':child.outcome==='failed'?'Failed':child.outcome==='interrupted'?'Stopped':'Idle'}</small></span></button>
     {open&&<ChildDetail child={child} parent={parent} depth={depth}/>}
   </section>;
 }

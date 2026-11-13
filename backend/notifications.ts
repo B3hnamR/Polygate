@@ -33,7 +33,18 @@ async function deliver(item: Notice, force = false): Promise<{ ok: boolean; erro
     await r.body?.cancel();
     if (!r.ok) return { ok: false, error: `the webhook answered HTTP ${r.status}` };
     return { ok: true };
-  } catch (error) { console.warn('[notify] webhook failed:', redactError(String(error))); return { ok: false, error: redactError(String((error as Error)?.message || error)).slice(0, 120) }; }
+  } catch (error) {
+    console.warn('[notify] webhook failed:', redactError(String(error)));
+    const raw = String((error as Error)?.message || error);
+    // The runtime's own wording ("FailedToOpenSocket: Was there a typo…") says little; name what happened instead.
+    const plain = /timed? ?out|TimeoutError|aborted/i.test(raw) ? 'it did not answer within 8 seconds'
+      : /FailedToOpenSocket|ECONNREFUSED|ConnectionRefused/i.test(raw) ? 'nothing answered at that address'
+      : /ENOTFOUND|getaddrinfo|DNS/i.test(raw) ? 'that host name could not be found'
+      : /ECONNRESET|socket connection was closed/i.test(raw) ? 'the network closed the connection (the service may be blocked on this network)'
+      : /certificate|TLS|SSL/i.test(raw) ? 'its HTTPS certificate was not accepted'
+      : redactError(raw).slice(0, 120);
+    return { ok: false, error: plain };
+  }
 }
 // Sends one test message and waits for the webhook's answer, so the button reports what really happened.
 export async function testWebhook() {

@@ -21,7 +21,7 @@ export function BackupPanel({notice,refresh,needsPassword=false}:{notice:(s:stri
   }
   const canSave=pass.length>=8&&pass===again&&(!needsPassword||!!dashPass);
   return <section className="section-block form-section backup-panel"><h2>Backup and restore</h2>
-    <p className="muted">Saves your providers and their keys, routes and relay tokens, client keys, chains, MCP servers and preferences in one file. The file is protected by a passphrase you choose, so it can be restored on another computer or after a reinstall. The dashboard password, HTTPS certificates, WARP registration and request history are not included. Keep the file and the passphrase somewhere safe: anyone who has both can use your keys.</p>
+    <p className="muted">Saves your providers and their keys, routes and relay tokens, client keys, chains, MCP servers, Psiphon settings and preferences in one file. The file is protected by a passphrase you choose, so it can be restored on another computer or after a reinstall. The dashboard password, HTTPS certificates, WARP registration and request history are not included. Keep the file and the passphrase somewhere safe: anyone who has both can use your keys.</p>
     {needsPassword&&<Field label="Dashboard password" hint="Asked again because a backup holds every key and token Polygate stores."><input type="password" autoComplete="current-password" value={dashPass} onChange={e=>setDashPass(e.target.value)}/></Field>}
     <div className="backup-grid">
       <form onSubmit={e=>{e.preventDefault();if(canSave&&!busy)void save();}} autoComplete="off"><h3>Make a backup</h3>

@@ -4,7 +4,7 @@ import { authenticate, checkTokenRate, modelAllowed, reserveTokens } from './key
 import { AdmissionQueue, GatewayError } from './queue';
 import { toChat, fromChat, collect, stream, observeSse, lfBody, type Protocol } from './protocols';
 import { rankedModels, providerChat, sessionFor } from './providers';
-import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch, kiloLimitRoute } from './transport';
+import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch, kiloLimitRoute, takePsiphonRegion } from './transport';
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
 import { logEvent } from './logbook';
@@ -126,6 +126,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const b=complete&&finalUsage?finalUsage.output:Math.max(reportedOutput,Math.ceil(outputChars/4));
     reservation.settle(Math.min(Number.MAX_SAFE_INTEGER,a+b));reservation=undefined;settledInput+=a;settledOutput+=b;accountingStarted=false;
   };
+  // keepRoute: the next attempt goes through the exit just switched to, not a fresh pick (which could be the refusing one again).
+  // region: the Psiphon region the last answer came through, shown in the log line.
+  let keepRoute=false;let region='';
   let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;const exitsTried=new Set<string>();let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
   // The first provider whose exit was used up: kept while later providers (not on that allowance) are tried, and reported if none of them answers.
   let spent:{ex:Exhaustion;message:string;status:number;used:typeof used;route:string}|undefined;
@@ -147,7 +150,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
       for(let attempt=0;attempt<=attempts;attempt++){
-        if(attempt>0&&providerPicksAgain(p)){r=routeForProvider(p,m.id);route=r.name;}
+        if(attempt>0&&providerPicksAgain(p)&&!keepRoute){r=routeForProvider(p,m.id);route=r.name;}keepRoute=false;
         tried=true;exitsTried.add(r.id);t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
         // A tool list OpenCode refused earlier goes out already trimmed; never for the agent, whose model must see every tool it may call.
         if(!trimmed.length&&settings.trimTools!==false&&!k.agent&&knownTrim(p.id,chat)){const t=coreOnly(chat);if(t){trimmedFor=p.id;trimmed=t.dropped;chat=t.chat;}}
@@ -173,7 +176,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
               accountingStarted=true;outputChars=0;reportedInput=0;reportedOutput=0;finalUsage=undefined;complete=false;
             },
             failed(usage:any){for(const [field,target] of [['prompt_tokens','input'],['input_tokens','input'],['completion_tokens','output'],['output_tokens','output']] as const){const value=usage?.[field];if(Number.isSafeInteger(value)&&value>=0){if(target==='input')reportedInput=Math.max(reportedInput,value);else reportedOutput=Math.max(reportedOutput,value);}}}
-          }:undefined);status=upstream.status;
+          }:undefined);status=upstream.status;region=r.id==='psiphon'?takePsiphonRegion(requestId)||'':'';
           if(upstream.ok){retained=true;break;}
           fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
           try{const usage=JSON.parse(message)?.usage;if(Number.isSafeInteger(usage?.prompt_tokens)&&usage.prompt_tokens>=0)reportedInput=Math.max(reportedInput,usage.prompt_tokens);if(Number.isSafeInteger(usage?.completion_tokens)&&usage.completion_tokens>=0)reportedOutput=Math.max(reportedOutput,usage.completion_tokens);}catch{}
@@ -189,7 +192,11 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
           const refused=takeRefused(requestId);if(refused)confirmedClean=true;
           // The exit is fine, so the refusal belongs to this request. When it carries tools OpenCode may object to, ask again with the standard ones only.
-          if(refused&&settings.trimTools!==false&&!k.agent&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
+          if(refused&&settings.trimTools!==false&&!k.agent&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}
+          // Still refused: OpenCode can limit one model on an exit where a small check with another still answers, so the request tries
+          // another exit before the refusal goes back. Nothing is marked: the exit stays in turn for every other request.
+          if(refused&&switches<maxSwitches()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;logEvent('info','routes',`${r.name} refused this request though a small check passed; trying it through ${alt.name}`,{route:r.id,to:alt.id,model:m.id});r=alt;route=r.name;keepRoute=true;attempts++;continue;}}
+          const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
           const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
           if(ex){
@@ -289,15 +296,15 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     let detail:string|undefined;
     if(tried){try{
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
-      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||''},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
+      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||'',...(region?{region}:{})},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
     const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail,
       // The agent engine names its session in each request; kept for the agent's key only (per-session usage on the Agent page).
       session:k.agent?String(req.headers['x-opencode-session-id']||req.headers['x-session-id']||'').slice(0,80)||undefined:undefined});
-    logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
+    logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}${region?' '+region:''}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
 }
 // What could stop a client request right now, and where to fix it. `page` is the dashboard page that has the remedy.
-export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' | 'Agent' };
+export type ReadyIssue = { code: string; message: string; page: 'Providers' | 'Models' | 'Settings' | 'Routing' | 'WARP' | 'Agent' };
 // Ready means a client request could succeed right now: not paused, a usable model, a usable client key and a route that would really be chosen
 // (the same selection real requests use, asked without moving the rotation). Paused, Starting, Ready and Needs attention are the four states.
 // `checklist` is everything worth fixing, less the warnings the user acknowledged (while their text is unchanged: a different reset time or

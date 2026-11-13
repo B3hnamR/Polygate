@@ -261,7 +261,7 @@ export function RequestDetail({id,onClose}:{id:string;onClose:()=>void}){
     {d&&<>
       <div className="detail-grid">
         <Facts title="Outcome" items={[['status',row.status],['model',row.model],['protocol',row.protocol],['duration',ms(row.ms)],['upstream answer',attempt?.response?.status??attempt?.error??'none'],['model cooldowns',d.cooldownsEnabled?'on':'off'],['error',row.error?row.error.slice(0,300):'']].filter(([,v])=>v!=='') as [string,any][]}/>
-        <Facts title="Network path" items={[['route',`${d.route?.name||'-'} (${d.route?.kind||'?'})`],...(d.egress?[['egress ip',d.egress.ip],['datacenter',d.egress.colo],['country',d.egress.loc],['WARP as the CDN sees it',d.egress.warp],['http',d.egress.http]] as [string,any][]:[['egress','not looked up (only done after a failure)']] as [string,any][])]}/>
+        <Facts title="Network path" items={[['route',`${d.route?.name||'-'}${d.route?.region?' '+d.route.region:''} (${d.route?.kind||'?'})`],...(d.egress?[['egress ip',d.egress.ip],['datacenter',d.egress.colo],['country',d.egress.loc],['WARP as the CDN sees it',d.egress.warp],['http',d.egress.http]] as [string,any][]:[['egress','not looked up (only done after a failure)']] as [string,any][])]}/>
       </div>
       <div className="detail-grid">
         <Facts title="What your client sent" items={[...bodyFacts(d.client?.body),...headerFacts(d.client?.headers)]}/>

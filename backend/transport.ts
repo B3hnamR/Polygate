@@ -8,7 +8,7 @@ import { socksBridge, parseSocksUrl } from './socks-bridge';
 import { warpTarget, warpFailure, warpSuccess } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
 import { pickPsiphon, psiphonSpent, psiphonKiloLimited, psiphonClean, setPsiphonChecker, psiphonFailed, psiphonOk, psiphonUnavailable, psiphonVirtualRoute, psiphonSkips, psiphonLive, psiphonReady, psiphonRegionsReady, scopeOfUrl, scopeOfKind, ROUTE_ID as PSIPHON } from './psiphon';
-import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
+import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
 const exec = promisify(execFile);
@@ -55,11 +55,15 @@ async function unfinished(r:Response):Promise<string>{
   if(!done&&!problem)try{read(JSON.parse(text));}catch{/* not a JSON answer */}
   return problem?`the provider reported: ${problem}`:done?'':'the answer ended before it was complete';
 }
+// The order OpenCode Free models are asked in by the small check through an exit: DeepSeek 4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, then any other.
+const CHECK_MODELS=[/deepseek-v4\.1-flash/i,/glm-5\.3-flash/i,/minimax-m3\.1-flash/i];
+export const checkRank=(id:string)=>{const i=CHECK_MODELS.findIndex(x=>x.test(id));return i<0?CHECK_MODELS.length:i;};
 async function canaryResponse(routeId:string):Promise<Response|undefined>{
   const {rankedModels,providerChat,sessionFor}=await import('./providers');
   const provider=settings.providers.find(p=>p.enabled&&p.kind==='free');
   // Models that last answered come first; one the provider calls unavailable would fail for a reason that has nothing to do with the exit.
-  const usable=provider?rankedModels().filter(m=>m.providerId===provider.id&&(m.state==='available'||m.state==='unchecked')&&m.cooldownUntil<=Date.now()).sort((a,b)=>(a.state==='available'?0:1)-(b.state==='available'?0:1)||(a.latency||1e9)-(b.latency||1e9)):[];
+  // The models people work with come first (CHECK_MODELS), so a check that passes says the exit takes them; the rest follow.
+  const usable=provider?rankedModels().filter(m=>m.providerId===provider.id&&(m.state==='available'||m.state==='unchecked')&&m.cooldownUntil<=Date.now()).sort((a,b)=>checkRank(a.id)-checkRank(b.id)||(a.state==='available'?0:1)-(b.state==='available'?0:1)||(a.latency||1e9)-(b.latency||1e9)):[];
   if(!provider||!usable.length){canaryNote='no enabled OpenCode Free provider has an available model';return;}
   let last:Response|undefined;
   for(const model of usable.slice(0,3)){
@@ -386,24 +390,38 @@ async function viaPool(route:Route,url:string,init:any):Promise<Response>{
 // request goes on through the next region; with skipping off, the refusal is returned as it is.
 // OpenCode's daily allowance and Kilo's per-address limit are each judged for the service the request goes to: an exit used up for one
 // stays in turn for the other and for every other provider.
+// The region each request's answer came through, read once by the gateway for the request log (the route name stays "Psiphon").
+const psiphonRegions=new Map<string,string>();
+export const takePsiphonRegion=(rid:string|undefined)=>{if(!rid)return;const r=psiphonRegions.get(rid);psiphonRegions.delete(rid);return r;};
 async function viaPsiphon(url:string,init:any):Promise<Response>{
-  const rid=routeContext.getStore()?.requestId;const scope=scopeOfUrl(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;
+  const rid=routeContext.getStore()?.requestId;const scope=scopeOfUrl(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
+  // A request refused through a region whose small check passed: OpenCode's limits are not all per address and per day (one model can be
+  // limited on an exit where another still answers), so it goes on to another region, at most twice, before the refusal is returned.
+  let refused:Response|undefined;let refusedAt='';let refusals=0;
+  const via=(r:Response,region:string)=>{if(rid&&!isCanary(rid)){psiphonRegions.set(rid,region);if(psiphonRegions.size>300)psiphonRegions.delete(psiphonRegions.keys().next().value!);}return r;};
+  // A refusal goes back as a refusal: a used-up note from an earlier region is dropped, or the gateway would read the next exit's failure as used up.
+  const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt);}return exhausted&&via(exhausted,exhaustedAt);};
+  // Why the request left the region it was on, said in the log line when it reaches the next one.
+  let moved:{from:string;why:string}|undefined;
   const attempts=Math.max(1,Math.min(6,psiphonLive()));
   for(let i=0;i<attempts;i++){
     const pick=pickPsiphon(tried,scope);
-    if(!pick){if(exhausted)return exhausted;if(last)throw last;throw new GatewayError(psiphonUnavailable(scope),503,'route_unavailable');}
+    if(!pick){const r=giveUp();if(r)return r;if(last)throw last;throw new GatewayError(psiphonUnavailable(scope),503,'route_unavailable');}
     tried.add(pick.region);
+    if(moved&&!isCanary(rid))logEvent('info','psiphon',`A request moved from Psiphon ${moved.from} (${moved.why}) to ${pick.region}`,{from:moved.from,to:pick.region,request:rid});
+    moved=undefined;
     try{
       const response=await fetch(url,{...init,proxy:await socksBridge({host:'127.0.0.1',port:pick.port})});
       if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(PSIPHON+':'+pick.region,false,response,seen,rid);
-        if(ex){if(!ex.refused)psiphonSpent(pick.region,ex.until);noteExhaustion(rid,ex);if(!psiphonSkips())return response;exhausted?.body?.cancel().catch(()=>{});exhausted=response;continue;}noteRefused(rid);}}
+        if(ex){if(!ex.refused)psiphonSpent(pick.region,ex.until);noteExhaustion(rid,ex);if(!psiphonSkips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
+        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&psiphonSkips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}}}
       // Kilo's anonymous limit belongs to the exit's address (backend/kilo.ts): set this region aside for Kilo and try the next one. When every
       // region is limited the last answer goes back, and the gateway rests the whole route for Kilo as it does for any exit.
-      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){psiphonKiloLimited(pick.region,now()+30*60000);if(!psiphonSkips())return response;exhausted?.body?.cancel().catch(()=>{});exhausted=response;continue;}}
-      psiphonOk(pick.region);return response;
-    }catch(e){if(callerCancelled(init))throw e;psiphonFailed(pick.region);last=e;}
+      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){psiphonKiloLimited(pick.region,now()+30*60000);if(!psiphonSkips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:"Kilo's free limit for its address"};continue;}}
+      psiphonOk(pick.region);return via(response,pick.region);
+    }catch(e){if(callerCancelled(init))throw e;psiphonFailed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
   }
-  if(exhausted)return exhausted;
+  const r=giveUp();if(r)return r;
   throw last;
 }
 const isReadOnly=(init:any)=>['GET','HEAD'].includes(String(init?.method||'GET').toUpperCase());
@@ -444,7 +462,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
       }
     }
     else if(route.kind==='warp'){
-      const target=warpTarget();if(!target)throw new GatewayError('Cloudflare WARP is not connected. Connect it on the Routing page.',503,'route_unavailable');
+      const target=warpTarget();if(!target)throw new GatewayError('Cloudflare WARP is not connected. Connect it under Routing → WARP.',503,'route_unavailable');
       warpPort=target.port;response=await fetch(url,{...init,proxy:await socksBridge(target)});
     }
     else if(route.kind==='proxy'){

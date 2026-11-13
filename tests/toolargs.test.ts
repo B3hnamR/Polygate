@@ -83,6 +83,19 @@ describe('tool argument repair', () => {
     expect(argsOf(out, 0)).toBe('{"filePath":"a.ts"}');
     expect(argsOf(out, 1)).toBe('{"command":"ls","description":"List"}');
   });
+  test('a call sent whole in its finishing event: the start, then the arguments, then the finish', async () => {
+    const once = [
+      { ...head, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_9', type: 'function', function: { name: 'read', arguments: '{"path":"a.ts"}' } }] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 3, completion_tokens: 2 } },
+      '[DONE]',
+    ];
+    const out = await pipe(once);
+    expect(out[0].choices[0].delta.tool_calls[0]).toEqual({ index: 0, id: 'call_9', type: 'function', function: { name: 'read' } });
+    expect(out[0].choices[0].finish_reason).toBeNull();
+    expect(out[1].choices[0].delta.tool_calls[0]).toEqual({ index: 0, function: { arguments: '{"filePath":"a.ts"}' } });
+    expect(out[2].choices[0]).toEqual({ index: 0, delta: {}, finish_reason: 'tool_calls' });
+    expect(out[2].usage).toEqual({ prompt_tokens: 3, completion_tokens: 2 });
+    expect(out[3]).toBe('[DONE]');
+  });
   test('a stream cut off before its finish still hands over what it held', async () => {
     const out = await pipe(stream.slice(0, 4));
     expect(argsOf(out)).toBe('{"filePath":"src/a.ts"}');
