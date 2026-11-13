@@ -13,6 +13,7 @@ import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
 import { chainFor, modelFor, AUTO_STEPS } from './chains';
 import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
+import { toolArgRepair } from './toolargs';
 import { autoOrder, needsOf, pickFrom, type Needs } from './plan';
 import { checklist } from './checklist';
 import { LIMIT_SCOPE, type Model, type ApiKey, type Chain, type Provider } from './types';
@@ -257,7 +258,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const source=lfBody(upstream).body!.pipeThrough(new TransformStream<Uint8Array,Uint8Array>({transform(chunk,c){c.enqueue(chunk);},flush(){pipeFinished=true;}}));
     const piping=source.pipeTo(observer.writable,{signal:pipeController.signal}).catch(()=>{streamFailed=true;});
     const observed=observer.readable.pipeThrough(new TransformStream<Uint8Array,Uint8Array>({transform(chunk,c){if(controller.signal.aborted)throw controller.signal.reason;c.enqueue(chunk);}}));
-    const wrapped=new Response(observed,{headers:upstream.headers,status:upstream.status});
+    // A tool argument the model misnamed (read {"path"} for read {"filePath"}) is renamed before the client sees it; see toolargs.ts.
+    let repaired=0;const repair=/text\/event-stream/i.test(upstream.headers.get('content-type')||'')?toolArgRepair(askedChat.tools,(tool,renamed)=>{if(repaired++<3)logEvent('info','requests',`${used.id} misnamed an argument of the "${tool}" tool (${renamed.join(', ')}); Polygate renamed it so the call works.`,{model:used.id,route});}):undefined;
+    const wrapped=new Response(repair?observed.pipeThrough(repair):observed,{headers:upstream.headers,status:upstream.status});
     if(body.stream){
       status=200;await stream(req,res,wrapped,protocol,used.id,asked);
       if(!controller.signal.aborted&&!ended){status=502;fault=true;message='Upstream stream ended before a terminal event';}

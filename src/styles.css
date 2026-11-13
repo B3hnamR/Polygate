@@ -1021,3 +1021,5 @@ nav.ag-q-tabs{flex-direction:row;align-items:center}.agent-folder-trust>p.subtle
   .exit-policy:not(.compact) .g-own{grid-area:own}
 }
 .model-policy{grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:18px 32px}
+.policy-warn{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin:-6px 0 16px;padding:12px 14px;border-radius:10px;border:1px solid var(--amber);background:var(--amber-soft)}.policy-warn p{font-size:14.5px;line-height:1.6;color:var(--text)}
+.map-line.standby .map-stroke{stroke:var(--accent);stroke-opacity:.6;stroke-dasharray:12 7;stroke-width:1.5px!important}.map-line.on.standby .map-stroke{stroke-opacity:1}.map-legend line.standby{stroke-opacity:.6;stroke-dasharray:8 4;stroke-width:1.5px}

@@ -2,6 +2,8 @@ import {Clock3,Globe} from 'lucide-react';
 import type {ReactNode} from 'react';
 import {Button,Field,Select,Toggle,type Snapshot} from './ui';
 import {usedUp} from './daypass';
+import {routesOf} from './provider-routes';
+import type {Provider} from '../backend/types';
 
 // The routing switches, shown in the list view and in the map's panel: the same component, so both views always show the same settings.
 // `act` is the page's action helper: it shows the success text or the error, refreshes, and resolves to whether it worked.
@@ -28,6 +30,10 @@ export function ExitPolicy({data,act:run,go,compact=false}:Props){const act=run 
   const hasPool=s.routes.some(r=>r.id==='proxy-pool');const relays=s.routes.filter(r=>r.kind==='relay');
   const current=s.routes.find(r=>r.id===s.routeId);const spread=data.spread||[];
   const ready=(data.backup||[]).filter(b=>b.usable);
+  // OpenCode Free and Kilo providers with a strict route list of their own: that list wins over this policy, so without the backup exits a used-up
+  // exit in it fails the request instead of moving on. Said here, next to the switch it overrides, with the one-click way out.
+  const pinned=s.providers.filter(p=>p.enabled&&(p.kind==='free'||p.kind==='kilo')).flatMap(p=>{const set=routesOf(p);return set&&!set.backups?[{p,set}]:[];});
+  const letMoveOn=(p:Provider,set:NonNullable<ReturnType<typeof routesOf>>)=>act('provider','/admin/providers',{...p,routes:{...set,backups:true}},`${p.name} now moves on to the backup exits when its own routes are used up`);
   const recheck=relays.filter(r=>r.recheckedAt&&usedUp(r)).sort((a,b)=>b.recheckedAt!-a.recheckedAt!)[0];
   const setOwn=async(v:Own)=>{
     if(v===own)return;
@@ -44,7 +50,7 @@ export function ExitPolicy({data,act:run,go,compact=false}:Props){const act=run 
   return <div className={`policy exit-policy${compact?' compact':''}`}>
     {!compact&&<dl className="policy-summary" aria-label="Routing in short">
       <div><dt>Exit</dt><dd>{s.rotate?<>Taking turns over <b>{spread.length} exit{spread.length===1?'':'s'}</b>, {STRATEGY[s.strategy]||STRATEGY.round_robin}</>:current?<b>{current.name}</b>:'None selected'}</dd></div>
-      <div><dt>Used up</dt><dd>{s.exhaustedFailover===false?'The request fails with the reset time':ready.length?<>Moves on to {ready.slice(0,3).map((b,i)=><span key={b.id}>{i>0&&' → '}<b>{b.name}</b></span>)}{ready.length>3&&` and ${ready.length-3} more`}</>:<span className="amber">No backup exit is ready</span>}</dd></div>
+      <div><dt>Used up</dt><dd>{s.exhaustedFailover===false?'The request fails with the reset time':ready.length?<>Moves on to {ready.slice(0,3).map((b,i)=><span key={b.id}>{i>0&&' → '}<b>{b.name}</b></span>)}{ready.length>3&&` and ${ready.length-3} more`}</>:<span className="amber">No backup exit is ready</span>}{s.exhaustedFailover!==false&&pinned.length>0&&<span className="amber"> · not for {pinned.map(x=>x.p.name).join(', ')} (own route list)</span>}</dd></div>
       <div><dt>Can't connect</dt><dd>{s.failover===false?'The request fails':s.rotate?'Tries the next exit in the turn':'Tries the next healthy exit'}</dd></div>
       <div><dt>Your address</dt><dd>{choices.find(c=>c.v===own)?.label||'Only when it is the exit in use'}</dd></div>
     </dl>}
@@ -56,6 +62,7 @@ export function ExitPolicy({data,act:run,go,compact=false}:Props){const act=run 
 
     <Group title="When an exit can't take a request" area="g-fail" more={<><p><b>Used up</b> means the provider's limit for the exit's address is reached: OpenCode Free's daily allowance, or Kilo's free limit. The limit belongs to the address, not to the model, so the model is never paused for it; the exit is set aside (for that provider only) and the request goes on through the next one. A limit without a retry time is confirmed with a small check through the same exit first.</p><p><b>Can't connect</b> means the connection itself failed. That exit rests for 30 seconds, then longer, up to 5 minutes.</p></>}>
       <Toggle checked={s.exhaustedFailover!==false} onChange={exhaustedFailover=>act('exhausted','/admin/settings',{exhaustedFailover},exhaustedFailover?'Used-up exits now hand over to the next one':'A used-up exit now returns its error')} label="Move on when an exit is used up" detail="For OpenCode and Kilo. The model keeps working; only the exit is set aside until its limit resets."/>
+      {s.exhaustedFailover!==false&&pinned.map(({p,set})=><div key={p.id} className="policy-warn" role="note"><p><b>{p.name}</b> has its own route list ({set.ids.map(id=>s.routes.find(r=>r.id===id)?.name||'a deleted route').join(', ')}), which this switch does not override. When {set.ids.length>1?'those are':'that is'} used up, its requests fail instead of moving on.</p><Button onClick={()=>letMoveOn(p,set)}>Let it move on to the backup exits</Button></div>)}
       {s.exhaustedFailover!==false&&<div className="policy-chain"><span className="policy-chain-label">Next in line</span>{data.backup?.length?<ol className="backup-list">{data.backup.map((b,i)=><li key={b.id} className={b.usable?'':'skipped'}><span className="step-n">{i+1}</span><strong>{b.name}</strong><small>{b.usable?b.why:`skipped · ${b.why}`}</small></li>)}</ol>:<p className="subtle">No other exit is on. Add a relay, a proxy or WARP.</p>}{hasPool&&go&&<Button onClick={()=>go('Proxies')}><Globe size={14}/>Manage proxy pool</Button>}</div>}
       <Toggle checked={s.failover!==false} onChange={failover=>act('failover','/admin/settings',{failover},failover?'Unreachable exits now hand over to the next one':'An unreachable exit now returns its error')} label="Move on when an exit can't connect" detail="Tries WARP first, then your other exits."/>
       {relays.length>0&&<><Toggle checked={s.relayRecheck!==false} onChange={relayRecheck=>act('recheck','/admin/settings',{relayRecheck},relayRecheck?'Used-up relays are asked again':'Used-up relays wait for the 10-minute check')} label="Ask a used-up relay again soon" detail="A relay can come back on a new address. Checked twice a few seconds apart instead of waiting 10 minutes."/>

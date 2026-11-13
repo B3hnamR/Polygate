@@ -96,7 +96,7 @@ function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
     if (route.only && route.only !== b.kind && !(route.only === 'kilo' && b.kind === 'openai')) throw new GatewayError('This relay cannot carry that provider: OpenCode refuses a Cloudflare Worker. Choose a Vercel or Netlify relay, Direct, a proxy or WARP.', 400);
   }
   const paused = Array.isArray(raw.paused) ? [...new Set<string>(raw.paused.map(String))].filter(id => ids.includes(id)) : [];
-  return { ids, spread: raw.spread === true, backups: b.kind === 'free' && raw.backups === true, ...(paused.length ? { paused } : {}) };
+  return { ids, spread: raw.spread === true, backups: (b.kind === 'free' || b.kind === 'kilo') && raw.backups === true, ...(paused.length ? { paused } : {}) };
 }
 // Providers for which this route is the last enabled one in their list: switching it off or deleting it would leave them nowhere to go.
 const soleRouteOf = (routeId: string) => settings.providers.filter(p => { const set = providerRoutes(p); return !!set && set.ids.includes(routeId) && !set.ids.some(id => id !== routeId && settings.routes.some(r => r.id === id && r.enabled)); });

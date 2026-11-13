@@ -43,7 +43,8 @@ export function ProviderRoutesDialog({provider:p,data,onClose,onSave}:{provider:
   const start=routesOf(p);const all=data.settings.routes;
   const [mode,setMode]=useState<'follow'|'only'>(start?'only':'follow');
   const [ids,setIds]=useState<string[]>(start?.ids.filter(id=>all.some(r=>r.id===id))||[]);
-  const [spread,setSpread]=useState(!!start?.spread);const [backups,setBackups]=useState(!!start?.backups);
+  // A new list for OpenCode Free or Kilo starts with the backup exits allowed, so a used-up exit hands over, as it does without a list.
+  const [spread,setSpread]=useState(!!start?.spread);const [backups,setBackups]=useState(start?!!start.backups:takesRelay(p));
   const [busy,setBusy]=useState(false);
   // A relay reaches any public HTTPS host; the Cloudflare Worker (marked only) is refused by OpenCode, so it does not carry OpenCode providers.
   const refuse=(r:Route)=>routeRefusal(p,r);
@@ -63,10 +64,10 @@ export function ProviderRoutesDialog({provider:p,data,onClose,onSave}:{provider:
   const rest=all.filter(r=>!ids.includes(r.id));
   const summary=mode==='follow'?`${p.name} uses whichever route is in use, and the failover and rotation switches on the Routing page apply to it.`
     :!ids.length?'Choose at least one route.'
-    :ids.length===1?`${p.name} only ever leaves through ${chosenRows[0].name}. If that cannot take a request, the request fails with the reason instead of going anywhere else.`
+    :ids.length===1?`${p.name} only ever leaves through ${chosenRows[0].name}${takesRelay(p)&&backups?', and the backup exits once it is used up':''}. If ${takesRelay(p)&&backups?'none of them':'that'} can take a request, the request fails with the reason instead of going anywhere else.`
     :spread?`${p.name} takes turns over ${chosenRows.map(r=>r.name).join(', ')}, and never leaves through any other route.`
     :`${p.name} uses ${chosenRows[0].name}; if that fails it moves to ${chosenRows.slice(1).map(r=>r.name).join(', then ')}. It never leaves through any other route.`;
-  const save=async()=>{setBusy(true);try{if(await onSave(mode==='follow'?null:{ids,spread:ids.length>1&&spread,backups:p.kind==='free'&&backups,paused:paused.filter(id=>ids.includes(id))}))onClose();}finally{setBusy(false);}};
+  const save=async()=>{setBusy(true);try{if(await onSave(mode==='follow'?null:{ids,spread:ids.length>1&&spread,backups:takesRelay(p)&&backups,paused:paused.filter(id=>ids.includes(id))}))onClose();}finally{setBusy(false);}};
   return <Dialog title={`Routes for ${p.name}`} icon={<Network size={18}/>} onClose={onClose} busy={busy} wide>
     <div className="route-mode" role="radiogroup" aria-label="Which routes">
       <label><input type="radio" name="route-mode" checked={mode==='follow'} onChange={()=>setMode('follow')}/><span><strong>Follow the route in use</strong><small>Whatever you select on the Routing page, with its failover and rotation.</small></span></label>
@@ -78,7 +79,7 @@ export function ProviderRoutesDialog({provider:p,data,onClose,onSave}:{provider:
         <label><input type="radio" name="route-spread" checked={!spread} onChange={()=>setSpread(false)}/><span><strong>In order</strong><small>The first one, and the next only when a connection fails.</small></span></label>
         <label><input type="radio" name="route-spread" checked={spread} onChange={()=>setSpread(true)}/><span><strong>Spread requests</strong><small>Take turns over all of them.</small></span></label>
       </div>}
-      {p.kind==='free'&&<label className="route-check"><input type="checkbox" checked={backups} onChange={e=>setBackups(e.target.checked)}/><span><strong>Also use the backup exits when all of these are used up</strong><small>OpenCode Free only. The backup exits are the ones listed under Next in line on the Routing page.</small></span></label>}
+      {takesRelay(p)&&<label className="route-check"><input type="checkbox" checked={backups} onChange={e=>setBackups(e.target.checked)}/><span><strong>Also use the backup exits when all of these are used up</strong><small>OpenCode Free and Kilo. Without it, a used-up exit here fails the request. The backup exits are the ones listed under Next in line on the Routing page.</small></span></label>}
     </>}
     <p className="route-summary">{summary}</p>
     <div className="dialog-actions"><Button onClick={onClose} disabled={busy}>Cancel</Button><Button variant="primary" disabled={busy||(mode==='only'&&!ids.length)} onClick={save}>Save routes</Button></div>

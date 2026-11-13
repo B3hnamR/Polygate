@@ -216,9 +216,9 @@ export function routeForProvider(p: Provider, model: string, peek=false): Route 
     if (set.spread && usable.length > 1) { const at = spreadAt.get(p.id) || 0; if (!peek) spreadAt.set(p.id, at + 1); return usable[at % usable.length]; }
     return usable[0];
   }
-  // Nothing in the list can take it. OpenCode Free may be allowed the backup exits; every other provider stays inside its list.
+  // Nothing in the list can take it. OpenCode Free and Kilo may be allowed the backup exits; every other provider stays inside its list.
   if (set.backups) { const from = settings.routes.find(r => r.id === set.ids[0]) || settings.routes.find(r => r.id === 'direct'); const alt = from && exhaustedAlternative(from, set.paused, p.kind); if (alt) return alt; }
-  throw new GatewayError(`None of the routes chosen for ${p.name} can take this request right now: ${set.ids.map(id => whyNot(id, p.kind)).join('; ')}. Change them on the Providers page.`, 503, 'route_unavailable');
+  throw new GatewayError(`None of the routes chosen for ${p.name} can take this request right now: ${set.ids.map(id => whyNot(id, p.kind)).join('; ')}. ${(p.kind === 'free' || p.kind === 'kilo') && !set.backups && settings.exhaustedFailover !== false ? 'Its own route list does not allow the backup exits: on the Routing page, choose "Let it move on to the backup exits", or change its routes on the Providers page.' : 'Change them on the Providers page.'}`, 503, 'route_unavailable');
 }
 // The route to move to after a connection failure: the next one in the provider's list, never one outside it. A provider that follows the route
 // in use uses the global fallback order.

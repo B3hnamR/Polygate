@@ -16,8 +16,8 @@ import type {Provider,ProviderRoutes,Route} from '../backend/types';
 type Props={data:Snapshot;act:Function;pending:string;notice:(message:string,kind?:'ok'|'error')=>void;go:(page:any)=>void;onTest:(r:Route)=>void;onManage:(r:Route,mode:'update'|'remove')=>void;onDelete:(r:Route)=>void;onAddRoute:()=>void;onShowList:()=>void};
 type MapMetrics={byProvider:{provider:string;requests:number}[];byRoute:{route:string;requests:number}[];byLink:{provider:string;route:string;requests:number}[];requests:number};
 type Point={x:number;y:number};
-type LineState='live'|'paused'|'blocked'|'off';
-type Line={id:string;from:string;to:string;state:LineState;why:string;order?:number;requests:number;kind:'in'|'follow'|'link'|'out'|'locked';provider?:Provider;route?:Route};
+type LineState='live'|'standby'|'paused'|'blocked'|'off';
+type Line={id:string;from:string;to:string;state:LineState;why:string;order?:number;requests:number;kind:'in'|'follow'|'link'|'out'|'locked'|'backup';provider?:Provider;route?:Route};
 type Picked={type:'node'|'line';id:string}|null;
 // A line being dragged. from: where it starts. replace: the node an existing line ended on, when its end was picked up. reverse: dragged from an exit back to a provider.
 type Wire={from:string;at:Point;replace?:string;reverse?:boolean};
@@ -65,6 +65,10 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
   const routeCount=(r:Route)=>metrics?.byRoute.find(x=>x.route===r.name)?.requests||0;
   const linkCount=(p:Provider,r:Route)=>metrics?.byLink?.find(x=>x.provider===p.id&&x.route===r.name)?.requests||0;
   const followers=s.providers.filter(p=>p.kind!=='zai'&&!routesOf(p));
+  // The route in use, and why it cannot take requests right now (empty when it can).
+  const inUse=s.routes.find(r=>r.id===s.routeId);
+  const inUseOut=!inUse?'':!inUse.enabled?'is switched off':usedUp(inUse)?'is used up':resting(inUse)?'is resting after errors':'';
+  const standInName=!s.rotate&&inUseOut&&s.exhaustedFailover!==false?(data.backup||[]).find(b=>b.usable)?.name:undefined;
   // The gateway's own list of the exits a spread takes turns over, so the map and the requests cannot disagree.
   const spread=s.rotate?(data.spread?s.routes.filter(r=>data.spread!.includes(r.id)):s.routes.filter(r=>r.enabled&&(r.kind!=='direct'||s.spreadDirect===true))):[];
 
@@ -81,8 +85,19 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
     }
     const exits=s.rotate?spread:s.routes.filter(r=>r.id===s.routeId);
     for(const r of exits)out.push({id:'out:'+r.id,kind:'out',from:'gate',to:routeNode(r.id),route:r,requests:followers.reduce((t,p)=>t+linkCount(p,r),0),...(!r.enabled?{state:'off' as const,why:`${r.name} is switched off`}:usedUp(r)?{state:'blocked' as const,why:`Used up until ${time(r.exhaustedUntil!)}. Requests move to the next exit in line.`}:resting(r)?{state:'blocked' as const,why:`Resting until ${time(r.cooldownUntil!)}`}:{state:'live' as const,why:s.rotate?'Part of the spread':'The route in use'})});
+    // The exits next in line behind the route in use (the gateway's own list, as on the Routing policy), so a request that moved on to a backup
+    // is drawn going there. While the route in use cannot take requests, the first usable backup is the one carrying them: it is drawn open.
+    if(!s.rotate&&inUse){
+      const chain=(data.backup||[]).filter(b=>{const r=s.routes.find(x=>x.id===b.id);return r&&r.enabled&&(r.kind!=='direct'||s.allowDirect===true);});
+      const standIn=inUseOut?chain.find(b=>b.usable)?.id:undefined;
+      chain.forEach((b,i)=>{const r=s.routes.find(x=>x.id===b.id)!;
+        out.push({id:'backup:'+r.id,kind:'backup',from:'gate',to:routeNode(r.id),route:r,order:i+1,requests:followers.reduce((t,p)=>t+linkCount(p,r),0),
+          ...(r.id===standIn?{state:'live' as const,why:`Taking the requests now: ${shortName(inUse.name)} ${inUseOut}`}
+            :b.usable?{state:'standby' as const,why:`Backup ${i+1}: used when the exits before it cannot take a request`}
+            :{state:'blocked' as const,why:`Backup ${i+1}, ${b.why}`})});});
+    }
     return out;
-  },[s,metrics]);
+  },[s,metrics,data.backup]);
 
   // ---- changing the settings; every change goes through the same endpoints as the list view
   const saveRoutes=(p:Provider,routes:ProviderRoutes|null,success:string)=>act('map:'+p.id,'/admin/providers',{...p,routes},success);
@@ -221,14 +236,14 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
         </svg>
         <span className="map-col-label" style={{left:COLS.requests}}>Incoming</span><span className="map-col-label" style={{left:COLS.providers}}>Providers</span><span className="map-col-label" style={{left:COLS.gate}}>Shared route</span><span className="map-col-label" style={{left:COLS.routes}}>Exits</span>
         {shell('requests','Incoming requests',s.enabled?'':'is-paused',<><span className="map-kind">Incoming{metrics?` · ${compact(metrics.requests)} in 24 h`:''}</span><strong className="map-name">Requests</strong><span className="map-meta"><b>{data.queue.active}</b> running · <b>{data.queue.waiting}</b> waiting</span></>,{out:false,pause:{paused:!s.enabled,name:'the gateway',run:toggleGateway}})}
-        {shell('gate','Route in use','gate',<><span className="map-kind">Route in use</span><strong className="map-name" title={gateName}>{gateName}</strong><span className="map-meta">{followers.length?`${followers.length} provider${followers.length===1?'':'s'} follow${followers.length===1?'s':''} it`:'No provider follows it'}</span></>,{hasIn:true,inDrag:'Drag to a provider to make it follow the route in use',out:s.rotate?false:'Drag to an exit to make it the route in use',outWhy:s.rotate?'Spreading is on, so requests use every exit. Turn spreading off to pick one.':undefined})}
+        {shell('gate','Route in use','gate',<><span className="map-kind">Route in use</span><strong className="map-name" title={gateName}>{gateName}</strong><span className="map-meta">{standInName?<span className="amber">Requests go to {shortName(standInName)}</span>:followers.length?`${followers.length} provider${followers.length===1?'':'s'} follow${followers.length===1?'s':''} it`:'No provider follows it'}</span></>,{hasIn:true,inDrag:'Drag to a provider to make it follow the route in use',out:s.rotate?false:'Drag to an exit to make it the route in use',outWhy:s.rotate?'Spreading is on, so requests use every exit. Turn spreading off to pick one.':undefined})}
         {s.providers.map(p=>{const c=stateCounts(data.models.filter(m=>m.providerId===p.id));const id=providerNode(p.id);return shell(id,`Provider ${p.name}`,p.enabled?'':'is-paused',<><span className="map-kind">{providerKind(p)}</span><strong className="map-name" title={p.name}>{p.name}</strong><span className="map-meta">{c.available} of {c.total} models · {compact(countFor(p))} in 24 h</span></>,{hasIn:true,out:p.kind==='zai'?'Drag to Direct or a proxy of your own':'Drag to an exit to join them, or to Route in use to follow it',pause:{paused:!p.enabled,name:p.name,run:()=>toggleProvider(p)}});})}
         {s.routes.map(r=>{const info=data.routeInfo?.[r.id];const out=usedUp(r);const id=routeNode(r.id);const chosen=!s.rotate&&s.routeId===r.id;return shell(id,`Exit ${r.name}`,`${r.enabled?'':'is-paused'} ${out?'used':''} ${chosen?'chosen':''}`,<><span className="map-kind">{kindName(r)}{chosen?' · in use':''}</span><strong className="map-name" title={r.name}>{shortName(r.name)}</strong><span className="map-meta">{out?`${compact(routeCount(r))} in 24 h`:<><i className={`map-tone ${info?.tone||'neutral'}`}/>{r.enabled?(info?.label||r.status||'Not tested').slice(0,26):'Paused'} · {compact(routeCount(r))}</>}</span>{out&&<Stamp until={r.exhaustedUntil!} refused={r.status?.startsWith('Refused')}/>}</>,{hasIn:true,inDrag:'Drag to a provider to join them',pause:{paused:!r.enabled,name:r.name,run:()=>toggleRoute(r),title:r.enabled?`Pause ${r.name}`:`Resume ${r.name}`}});})}
         {pickedLine&&place[pickedLine.from]&&place[pickedLine.to]&&pickedLine.kind==='link'&&(()=>{const m=along(outOf(pickedLine.from),inOf(pickedLine.to),.5);const paused=pickedLine.state==='paused';return <div className="map-line-tools" style={{left:m.x,top:m.y,transform:`translate(-50%,-50%) scale(${1/view.k})`}}><button type="button" className="icon-button" aria-label={paused?'Resume this line':'Pause this line'} title={paused?'Resume':'Pause'} onClick={()=>togglePause(pickedLine.provider!,pickedLine.route!.id)}>{paused?<Play size={15}/>:<Pause size={15}/>}</button><button type="button" className="icon-button danger" aria-label="Remove this line" title="Remove" onClick={()=>{disconnect(pickedLine.provider!,pickedLine.route!.id);setPicked(null);}}><X size={15}/></button></div>;})()}
       </div>
       <div className="map-bar"><div className="map-tools"><button type="button" className="icon-button" aria-label="Zoom out" title="Zoom out (Ctrl and scroll)" onClick={()=>zoomBy(.85)}><Minus size={16}/></button><span className="map-zoom">{Math.round(view.k*100)}%</span><button type="button" className="icon-button" aria-label="Zoom in" title="Zoom in (Ctrl and scroll)" onClick={()=>zoomBy(1.18)}><Plus size={16}/></button><button type="button" className="icon-button" aria-label="Fit the map to the window" title="Fit to window" onClick={()=>fit()}><Maximize size={15}/></button><button type="button" className="icon-button" aria-label="Tidy up: put every node back in its column" title="Tidy up: put every node back in its column" onClick={tidy}><Rows3 size={15}/></button></div>
         <div className="map-tools"><Button onClick={()=>{setPicked(null);setSetup(v=>!v||!!picked);}}><ScrollText size={15}/>Your setup</Button><Button onClick={()=>go('Providers')}><Plus size={15}/>Provider</Button><Button variant="primary" onClick={onAddRoute}><Plus size={15}/>Exit</Button></div></div>
-      <ul className="map-legend" aria-label="What the lines mean"><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="live"/></svg>Open, thicker with more traffic</li><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="paused"/></svg>Paused or off</li><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="blocked"/></svg>Used up or resting</li></ul>
+      <ul className="map-legend" aria-label="What the lines mean"><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="live"/></svg>Open, thicker with more traffic</li><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="standby"/></svg>Backup, waits its turn</li><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="paused"/></svg>Paused or off</li><li><svg width="26" height="6" aria-hidden="true"><line x1="0" y1="3" x2="26" y2="3" className="blocked"/></svg>Used up or resting</li></ul>
     </div>
     {(picked||setup)&&<aside className="map-panel" aria-label="Details">
       {picked?.type==='line'&&pickedLine?<LinePanel line={pickedLine} s={s} act={act} toggleProvider={toggleProvider} togglePause={togglePause} disconnect={disconnect} follow={follow} moveLine={moveLine} useExit={useExit} connect={connect} pickNode={id=>setPicked({type:'node',id})} onClose={()=>setPicked(null)}/>
@@ -242,7 +257,7 @@ export function RoutingMap({data,act,pending,notice,go,onTest,onManage,onDelete,
 }
 
 const lineLabel=(l:Line)=>{const end=l.route?shortName(l.route.name):'';const start=l.provider?.name||'';
-  return (l.kind==='in'?`Requests to ${start}`:l.kind==='follow'?`${start} follows the route in use`:l.kind==='out'?`Route in use to ${end}`:`${start} to ${end}`)+`. ${l.why}.${l.requests?` ${l.requests.toLocaleString()} requests in 24 hours.`:''}`.replace('..','.');};
+  return (l.kind==='in'?`Requests to ${start}`:l.kind==='follow'?`${start} follows the route in use`:l.kind==='out'?`Route in use to ${end}`:l.kind==='backup'?`Backup ${l.order}: ${end}`:`${start} to ${end}`)+`. ${l.why}.${l.requests?` ${l.requests.toLocaleString()} requests in 24 hours.`:''}`.replace('..','.');};
 
 function Section({title,kind,onClose,children}:{title:string;kind:string;onClose?:()=>void;children:ReactNode}){
   return <div className="map-section"><header><div><small>{kind}</small><h2 title={title}>{title}</h2></div>{onClose&&<button type="button" className="icon-button" aria-label="Close details" onClick={onClose}><X size={16}/></button>}</header>{children}</div>;
@@ -264,19 +279,20 @@ const shortRouteText=(p:Provider,data:Snapshot)=>{const set=routesOf(p);if(!set)
 function LinePanel({line:l,s,toggleProvider,togglePause,disconnect,follow,moveLine,useExit,connect,pickNode,onClose}:{line:Line;s:Snapshot['settings'];act:Function;toggleProvider:(p:Provider)=>void;togglePause:(p:Provider,id:string)=>void;disconnect:(p:Provider,id:string)=>void;follow:(p:Provider)=>void;moveLine:(p:Provider,from:string,r:Route)=>void;useExit:(r:Route)=>void;connect:(p:Provider,r:Route)=>void;pickNode:(id:string)=>void;onClose:()=>void}){
   const p=l.provider,r=l.route;const set=p&&routesOf(p);
   const targets=l.kind==='locked'?s.routes.filter(x=>x.id!==r!.id&&!routeRefusal(p!,x)):l.kind==='link'?s.routes.filter(x=>!set?.ids.includes(x.id)&&!routeRefusal(p!,x)):l.kind==='out'&&!s.rotate?s.routes.filter(x=>x.enabled&&x.id!==r!.id):[];
-  return <Section title={l.kind==='in'?`Requests to ${p!.name}`:l.kind==='follow'?`${p!.name} to Route in use`:l.kind==='out'?`Route in use to ${shortName(r!.name)}`:`${p!.name} to ${shortName(r!.name)}`} kind="Line" onClose={onClose}>
-    <dl className="map-facts"><Fact label="Now"><LineBadge state={l.state}/></Fact><Fact label="Why">{l.why}</Fact><Fact label="In 24 h">{l.requests.toLocaleString()} requests</Fact>{l.order&&<Fact label="Order">{l.order} of {set?.ids.filter(id=>!set.paused?.includes(id)).length}</Fact>}</dl>
+  return <Section title={l.kind==='in'?`Requests to ${p!.name}`:l.kind==='follow'?`${p!.name} to Route in use`:l.kind==='out'?`Route in use to ${shortName(r!.name)}`:l.kind==='backup'?`Backup ${l.order}: ${shortName(r!.name)}`:`${p!.name} to ${shortName(r!.name)}`} kind="Line" onClose={onClose}>
+    <dl className="map-facts"><Fact label="Now"><LineBadge state={l.state}/></Fact><Fact label="Why">{l.why}</Fact><Fact label="In 24 h">{l.requests.toLocaleString()} requests</Fact>{l.order&&l.kind!=='backup'&&<Fact label="Order">{l.order} of {set?.ids.filter(id=>!set.paused?.includes(id)).length}</Fact>}</dl>
     {targets.length>0&&<Field label="Move the end to"><Select aria-label="Move the end of this line to another exit" value="" onChange={v=>{const to=s.routes.find(x=>x.id===v);if(!to)return;if(l.kind==='locked')connect(p!,to);else if(l.kind==='link')moveLine(p!,r!.id,to);else useExit(to);onClose();}}><option value="">Choose an exit…</option>{targets.map(x=>{return <option key={x.id} value={x.id}>{shortName(x.name)}{x.enabled?'':' (off)'}</option>;})}</Select></Field>}
     {l.kind==='link'&&<div className="map-actions"><Button onClick={()=>togglePause(p!,r!.id)}>{l.state==='paused'?<Play size={15}/>:<Pause size={15}/>}{l.state==='paused'?'Resume line':'Pause line'}</Button><Button onClick={()=>{disconnect(p!,r!.id);onClose();}}><Unlink size={15}/>Remove line</Button></div>}
     {l.kind==='in'&&<div className="map-actions"><Button onClick={()=>toggleProvider(p!)}>{p!.enabled?<Pause size={15}/>:<Play size={15}/>}{p!.enabled?`Pause ${p!.name}`:`Resume ${p!.name}`}</Button></div>}
     {l.kind==='follow'&&<p className="map-fact">To pin {p!.name} to certain exits, drag from its right dot to an exit. This line then goes away.</p>}
     {l.kind==='out'&&<p className="map-fact">{s.rotate?'Spreading is on, so every exit that is on takes part.':'To change it, drag from the right dot of Route in use to another exit.'}</p>}
     {l.kind==='locked'&&<p className="map-fact">{ZAI_EXITS}</p>}
+    {l.kind==='backup'&&<><p className="map-fact">Backups follow "Move on when an exit is used up" and "Move on when an exit can't connect" on the route in use. Providers with their own lines do not use them unless allowed.</p><div className="map-actions"><Button onClick={()=>{useExit(r!);onClose();}}>Make it the route in use</Button><Button onClick={()=>pickNode('gate')}>Routing policy</Button></div></>}
     {l.kind==='link'&&set&&set.ids.length===1&&<div className="map-actions"><Button onClick={()=>{follow(p!);onClose();}}>Follow the route in use instead</Button></div>}
     <div className="map-actions quiet">{p&&<button type="button" className="text-button" onClick={()=>pickNode(providerNode(p.id))}>{p.name} <ChevronRight size={14}/></button>}{r&&<button type="button" className="text-button" onClick={()=>pickNode(routeNode(r.id))}>{shortName(r.name)} <ChevronRight size={14}/></button>}</div>
   </Section>;
 }
-const LineBadge=({state}:{state:LineState})=><Badge state={state==='live'?'healthy':state==='blocked'?'cooldown':'neutral'}>{state==='live'?'Open':state==='blocked'?'Waiting':state==='paused'?'Paused':'Off'}</Badge>;
+const LineBadge=({state}:{state:LineState})=><Badge state={state==='live'?'healthy':state==='blocked'?'cooldown':'neutral'}>{state==='live'?'Open':state==='standby'?'Standing by':state==='blocked'?'Waiting':state==='paused'?'Paused':'Off'}</Badge>;
 
 function ProviderPanel({p,data,go,count,toggleProvider,saveRoutes,connect,disconnect,togglePause,move,follow,pickNode,onClose}:{p:Provider;data:Snapshot;go:(page:any)=>void;count:(p:Provider)=>number;toggleProvider:(p:Provider)=>void;saveRoutes:(p:Provider,routes:ProviderRoutes|null,success:string)=>unknown;connect:(p:Provider,r:Route)=>void;disconnect:(p:Provider,id:string)=>void;togglePause:(p:Provider,id:string)=>void;move:(p:Provider,id:string,by:number)=>void;follow:(p:Provider)=>void;pickNode:(id:string)=>void;onClose:()=>void}){
   const routes=data.settings.routes;const set=routesOf(p);const c=stateCounts(data.models.filter(m=>m.providerId===p.id));
@@ -296,7 +312,7 @@ function ProviderPanel({p,data,go,count,toggleProvider,saveRoutes,connect,discon
       </li>;})}</ol>:<p className="map-fact">Follows the route in use, with its spreading and failover. <button type="button" className="text-button" onClick={()=>pickNode('gate')}>See it</button></p>}
       {open.length>0&&<Field label="Join an exit"><Select aria-label={`Join ${p.name} to an exit`} value="" onChange={v=>{const r=routes.find(x=>x.id===v);if(r)connect(p,r);}}><option value="">Choose an exit…</option>{open.map(r=><option key={r.id} value={r.id}>{shortName(r.name)}{r.enabled?'':' (off)'}</option>)}</Select></Field>}
       {set&&set.ids.length>1&&<Toggle checked={!!set.spread} onChange={spread=>saveRoutes(p,{...set,spread},spread?'Requests take turns over its exits':'Exits are used in order')} label="Take turns over its exits" detail="Off: the first one, and the next only when a connection fails."/>}
-      {set&&p.kind==='free'&&<Toggle checked={!!set.backups} onChange={backups=>saveRoutes(p,{...set,backups},backups?'Backup exits allowed':'Backup exits not used')} label="Use backup exits when these are used up" detail="OpenCode Free only. The backup exits are the ones under Route in use."/>}
+      {set&&(p.kind==='free'||p.kind==='kilo')&&<Toggle checked={!!set.backups} onChange={backups=>saveRoutes(p,{...set,backups},backups?'Backup exits allowed':'Backup exits not used')} label="Use backup exits when these are used up" detail="OpenCode Free and Kilo. Off: a used-up exit here fails the request. The backup exits are the ones under Route in use."/>}
       {set&&<div className="map-actions"><Button onClick={()=>follow(p)}><Unlink size={15}/>Follow the route in use</Button></div>}
     </>}
     <p className="map-sentence">Route: {providerRouteText(p,data)}</p>

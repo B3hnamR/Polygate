@@ -36,3 +36,15 @@ test('when every rotating route is used up, the backup exits still answer', () =
   settings.allowDirect = false;
   expect(() => routeFor('opencode/x')).toThrow(/unavailable or cooling down/);
 });
+
+test('OpenCode Free with its own list of one used-up exit moves on only when its list allows the backup exits, and the error says how', async () => {
+  const { routeForProvider, exhaustedRouteAfter } = await import('../backend/transport');
+  const a = proxy('rx-own', true); const b = proxy('rx-spare');
+  settings.exhaustedFailover = true;
+  const p: any = { id: 'free-own', name: 'OpenCode Free', kind: 'free', enabled: true, baseUrl: '', apiKey: '', models: [], routeId: '', routes: { ids: ['rx-own'] } };
+  expect(() => routeForProvider(p, 'opencode/x')).toThrow(/Let it move on to the backup exits/);
+  expect(exhaustedRouteAfter(p, a)).toBeUndefined();
+  p.routes.backups = true;
+  expect(routeForProvider(p, 'opencode/x').id).toBe(b.id);
+  expect(exhaustedRouteAfter(p, a)?.id).toBe(b.id);
+});
