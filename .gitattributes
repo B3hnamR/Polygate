@@ -5,3 +5,5 @@
 *.yaml text eol=lf
 Dockerfile text eol=lf
 install/polygate text eol=lf
+# Bundled third-party files are kept byte for byte: their SHA-256 values are listed beside them, and Psiphon reads its server list line by line.
+resources/psiphon/** -text
