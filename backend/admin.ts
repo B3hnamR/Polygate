@@ -8,6 +8,7 @@ import { startScan, startImport, stopEngine, removeProxies, proxyLists, fetchLis
 import { PROXY_SOURCES } from './proxy-sources';
 import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit, spreadRoutes } from './transport';
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
+import { psiphonStatus, psiphonConnect, psiphonDisconnect, psiphonUpdateNodes, renewRegion, setPsiphonSettings, reconcilePsiphon, ROUTE_ID as PSIPHON } from './psiphon';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
@@ -121,7 +122,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
   if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
-  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();return json(res,200,{ok:true,...out});}
+  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();await setPsiphonSettings({}).catch(()=>{});reconcilePsiphon();return json(res,200,{ok:true,...out});}
   if(pathname==='/admin/usage'&&method==='GET')return json(res,200,usage(Number(new URL(req.url||'/','http://x').searchParams.get('days'))));
   if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
   if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));
@@ -142,7 +143,9 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(b.strategy){if(!['single','round_robin','random','fastest'].includes(b.strategy))throw new GatewayError('Unknown selection strategy',400);next.strategy=b.strategy;}
     if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
       // Remember where requests went, so making the pool "standby only" can give the route back.
-      if(b.routeId==='proxy-pool'&&settings.routeId!=='proxy-pool')next.previousRouteId=settings.routeId;}
+      if(b.routeId==='proxy-pool'&&settings.routeId!=='proxy-pool')next.previousRouteId=settings.routeId;
+      // The same for Psiphon: when it stops, requests go back to where they went before it.
+      if(b.routeId===PSIPHON&&settings.routeId!==PSIPHON)next.previousRouteId=settings.routeId;}
     // Everything is validated before anything is applied, so a rejected request never half-applies.
     // Turning cooldowns off also releases models that are cooling down now, so the change takes effect immediately.
     if(next.cooldowns===false)for(const m of models.values())if(m.cooldownUntil||m.state==='cooldown'){m.cooldownUntil=0;m.failCount=0;if(m.state==='cooldown')m.state='unchecked';saveModel(m);}
@@ -229,6 +232,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(!b.enabled){const only=soleRouteOf(route.id);if(only.length)throw new GatewayError(`Select another route before disabling this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}. Add another route to that provider first.`,409);}
     // Direct can be switched off so requests never leave from this network's own address, but only while another route is on to carry them.
     if(!b.enabled&&route.id==='direct'&&!settings.routes.some(r=>r.id!=='direct'&&r.enabled))throw new GatewayError('Turn on another route first (a proxy, a relay or WARP): with Direct off, requests need somewhere else to go',409);
+    // The Psiphon route is on exactly while Psiphon runs: switching it is connecting or disconnecting Psiphon.
+    if(route.id===PSIPHON){await (b.enabled?psiphonConnect():psiphonDisconnect());return json(res,200,{ok:true});}
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
   // A route the breaker paused after failures (a dropped connection) is tried again at once instead of waiting out the pause.
@@ -237,7 +242,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     route.cooldownUntil=0;route.failures=0;route.opened=0;persist();logEvent('info','routes',`${route.name} was resumed by hand`,{route:route.id});return json(res,200,{ok:true});
   }
   // Deleting a route is refused while a provider or the main selection depends on it; the checks are shared with removing a relay from its platform.
-  const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
+  const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id===PSIPHON)throw new GatewayError('The Psiphon route belongs to Psiphon. Disconnect it, or turn Psiphon off, in the Psiphon panel on the Routing page.',409);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
   const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id)};p.routeId=p.routes.ids[0]||'';}persist();};
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);assertRouteDeletable(String(b.id));deleteRoute(String(b.id));return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
@@ -302,6 +307,13 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/warp/install'&&method==='POST')return json(res,200,await warpOut(warpInstall()));
   if(pathname==='/admin/warp/rotate'&&method==='POST')return json(res,200,await warpOut(warpRotate()));
   if(pathname==='/admin/warp/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['engine','autoStart','pool','rotateMinutes','helperPath','endpoint','split'])if(k in b)patch[k]=b[k];const port='port' in b?bounded(b.port,1024,65535):undefined;checkHelperPath(b.helperPath,local);await setWarpSettings(patch,port);return json(res,200,await warpOut(warpStatus()));}
+  // --- Psiphon (backend/psiphon.ts): the bundled client is the only program it runs, so a dashboard session may control it ---
+  if(pathname==='/admin/psiphon/status'&&method==='GET')return json(res,200,psiphonStatus());
+  if(pathname==='/admin/psiphon/connect'&&method==='POST')return json(res,200,await psiphonConnect());
+  if(pathname==='/admin/psiphon/disconnect'&&method==='POST')return json(res,200,await psiphonDisconnect());
+  if(pathname==='/admin/psiphon/update'&&method==='POST')return json(res,200,await psiphonUpdateNodes());
+  if(pathname==='/admin/psiphon/renew'&&method==='POST'){const b=await readJson(req);return json(res,200,await renewRegion(String(b.region||'').toUpperCase()));}
+  if(pathname==='/admin/psiphon/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['enabled','autoStart','regions','mode','pinned','skip','renew'])if(k in b)patch[k]=b[k];return json(res,200,await setPsiphonSettings(patch));}
   // --- scoped client keys ---
   if(pathname==='/admin/keys'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:createKey(b)});}
   if(pathname==='/admin/keys/update'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:updateKey(String(b.id),b)});}

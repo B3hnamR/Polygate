@@ -51,6 +51,14 @@ cp "resources/warp/usque-linux-$ARCH" "$pkg/warp/"
 cp resources/warp/LICENSE resources/warp/README.md resources/warp/usque.patch resources/warp/sha256.txt "$pkg/warp/"
 if [ -f resources/warp/build-provenance.txt ]; then cp resources/warp/build-provenance.txt "$pkg/warp/"; fi
 chmod 0755 "$pkg/warp/usque-linux-$ARCH"
+# Psiphon has an official client for Linux x86-64 only (resources/psiphon/README.md).
+if [ "$ARCH" = amd64 ]; then
+  mkdir -p "$pkg/psiphon"
+  cp resources/psiphon/psiphon-tunnel-core-linux-amd64 resources/psiphon/psiphon.json resources/psiphon/server-list.dat resources/psiphon/LICENSE resources/psiphon/README.md "$pkg/psiphon/"
+  # Only the files this package carries, so `sha256sum -c sha256.txt` passes on a server (the Windows client is not here).
+  grep -v 'windows' resources/psiphon/sha256.txt > "$pkg/psiphon/sha256.txt"
+  chmod 0755 "$pkg/psiphon/psiphon-tunnel-core-linux-amd64"
+fi
 cp install.sh package.json README.md LICENSE THIRD_PARTY_NOTICES.md "$pkg/"
 mkdir -p "$pkg/vendor/bridge" "$pkg/vendor/protocols"
 cp -R vendor/licenses "$pkg/vendor/licenses"

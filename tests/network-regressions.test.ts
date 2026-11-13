@@ -26,6 +26,10 @@ const base = (settings: any = {}) => ({
   settings, path, net, stateDir: '/isolated', existsSync: () => false, readFileSync: () => '',
   mkdirSync() {}, writeFileSync() {}, writeFileAtomic() {}, persist() {}, notify() {},
   redactError: String, GatewayError, setTimeout: timer, clearTimeout() {}, setInterval: timer, clearInterval() {},
+  // transport.ts's Psiphon route (backend/psiphon.ts): not connected in these fixtures.
+  PSIPHON: 'psiphon', psiphonLive: () => 0, psiphonVirtualRoute: () => undefined, pickPsiphon: () => null, psiphonSkips: () => true,
+  psiphonSpent() {}, psiphonFailed() {}, psiphonOk() {}, psiphonUnavailable: () => 'Psiphon is not connected.',
+  psiphonReady: () => 0, setPsiphonChecker() {}, psiphonKiloLimited() {}, psiphonClean() {}, psiphonRegionsReady: () => [], scopeOfUrl: () => 'other', scopeOfKind: () => 'other',
 });
 
 test('malformed percent credentials are rejected before any proxy socket is opened', async () => {

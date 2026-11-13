@@ -5,7 +5,8 @@ import {Button} from './ui';
 import type {Provider,Route} from '../backend/types';
 // Testing a route means sending something through it, and what is sent depends on the provider: OpenCode Free and Kilo answer different
 // questions and have different limits. The dialog lets the user pick which provider the test goes through.
-type Result={ok:boolean;status:number;latency?:number;chat:string;summary:string;provider?:string;model?:string};
+type Result={ok:boolean;status:number;latency?:number;chat:string;summary:string;provider?:string;model?:string;regions?:{region:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string}[]};
+const regionWord:Record<string,string>={ok:'Answered','used-up':'Used up today',limited:'Kilo limit reached',refused:'Refused',busy:'Busy',incomplete:'Answer cut short',unknown:'No answer'};
 const nameOf=(p:Provider)=>p.kind==='free'?'OpenCode Free':p.kind==='kilo'?'Kilo Free':p.name;
 const detail=(p:Provider)=>p.kind==='free'?'Checks its model list, then sends one chat request and reads the daily allowance.'
   :p.kind==='kilo'?'Reads its model list, then sends one small chat request. That request counts against Kilo’s free allowance.'
@@ -34,13 +35,15 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
       <header className="dialog-head"><FlaskConical size={16}/><h2>Test {route.name}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>
       <div className="dialog-body">
         <p className="subtle">Pick the provider to send through this route. Each provider has its own limits, so a route can pass for one and fail for another.</p>
+        {route.id==='psiphon'&&<div className="dialog-note info"><Check size={16}/><p>Every connected Psiphon region is tested at the same time, each through its own exit. A region found used up is skipped from then on; one that answers is cleared.</p></div>}
         {route.only&&<div className="dialog-note info"><Check size={16}/><p>This relay carries {route.only==='kilo'?'Kilo':route.only} only, so other providers cannot be tested through it.</p></div>}
         <fieldset className="choices" disabled={busy}>
           {enabled.length?enabled.map(p=>{const ok=carries(route,p);return <label key={p.id} className={'choice'+(chosen===p.id?' selected':'')+(ok?'':' disabled')}>
             <input ref={p.id===chosen?first:undefined} type="radio" name="test-provider" disabled={!ok} checked={chosen===p.id} onChange={()=>setChosen(p.id)}/>
             <span><strong>{nameOf(p)}</strong><small>{ok?detail(p):`This relay carries ${route.only==='kilo'?'Kilo':route.only} only.`}</small></span></label>;}):<p className="subtle">No provider is enabled. Enable one on the Providers page.</p>}
         </fieldset>
-        {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}{good&&<> <span className="subtle">One model was asked. Another model can still be refused or run out on its own.</span></>}</p></div>}
+        {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&!result.regions&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}{good&&<> <span className="subtle">One model was asked. Another model can still be refused or run out on its own.</span></>}</p></div>}
+        {result?.regions&&<ul className="test-regions" aria-label="Each Psiphon region">{result.regions.map(r=><li key={r.region} className={r.ok?'ok':'bad'} title={r.summary}><strong className="mono">{r.region}</strong><span className="mono">{r.exitIp||'-'}</span><span>{regionWord[r.chat]||r.chat}</span><span className="subtle">{r.latency!==undefined?`${r.latency} ms`:''}</span></li>)}</ul>}
         {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
         <div className="dialog-actions"><Button variant="primary" disabled={busy||!chosen} onClick={()=>void run()}><FlaskConical size={14}/>{busy?'Testing…':result||error?'Test again':'Run test'}</Button><Button disabled={busy} onClick={onClose}>Close</Button></div>
       </div>

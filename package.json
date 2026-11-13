@@ -1,6 +1,6 @@
 {
   "name": "polygate",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
@@ -94,6 +94,30 @@
       {
         "from": "resources/warp/sha256.txt",
         "to": "warp/sha256.txt"
+      },
+      {
+        "from": "resources/psiphon/psiphon-tunnel-core-windows-i686.exe",
+        "to": "psiphon/psiphon-tunnel-core-windows-i686.exe"
+      },
+      {
+        "from": "resources/psiphon/psiphon.json",
+        "to": "psiphon/psiphon.json"
+      },
+      {
+        "from": "resources/psiphon/server-list.dat",
+        "to": "psiphon/server-list.dat"
+      },
+      {
+        "from": "resources/psiphon/LICENSE",
+        "to": "psiphon/LICENSE"
+      },
+      {
+        "from": "resources/psiphon/README.md",
+        "to": "psiphon/README.md"
+      },
+      {
+        "from": "resources/psiphon/sha256.txt",
+        "to": "psiphon/sha256.txt"
       },
       {
         "from": "THIRD_PARTY_NOTICES.md",

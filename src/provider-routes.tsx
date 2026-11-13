@@ -12,7 +12,7 @@ const names=(ids:string[],routes:Route[])=>ids.map(id=>routes.find(r=>r.id===id)
 
 // A relay marked `only` (the Cloudflare Worker) is refused by OpenCode, so it does not carry OpenCode providers.
 export const ZAI_EXITS='Z.ai keeps one steady address, so it can use Direct or a proxy of your own, not a relay, the proxy pool or WARP.';
-export const steadyExit=(r:Route)=>r.kind==='direct'||(r.kind==='proxy'&&r.id!=='proxy-pool'&&!r.poolUrls?.length);
+export const steadyExit=(r:Route)=>r.kind==='direct'||(r.kind==='proxy'&&r.id!=='proxy-pool'&&r.id!=='psiphon'&&!r.poolUrls?.length);
 export const routeRefusal=(p:Provider,r:Route)=>p.kind==='zai'?(steadyExit(r)?'':ZAI_EXITS):r.only&&r.only!==p.kind&&!(r.only==='kilo'&&p.kind==='openai')?'This relay cannot carry OpenCode':'';
 
 // The line under a provider on the Providers page.

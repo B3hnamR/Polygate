@@ -28,7 +28,7 @@ const LAYOUT_KEY='polygate-map-layout';
 const providerNode=(id:string)=>'p:'+id,routeNode=(id:string)=>'r:'+id;
 const readLayout=():Record<string,Point>=>{try{return JSON.parse(localStorage.getItem(LAYOUT_KEY)||'{}')||{};}catch{return {};}};
 const writeLayout=(l:Record<string,Point>)=>{try{localStorage.setItem(LAYOUT_KEY,JSON.stringify(l));}catch{/* storage can be disabled; the layout then lasts until the page closes */}};
-const kindName=(r:Route)=>r.id==='proxy-pool'?'Proxy pool':r.kind==='direct'?'Direct':r.kind==='warp'?'WARP':r.kind==='relay'?(r.deployed?.platform?`Relay · ${r.deployed.platform[0].toUpperCase()+r.deployed.platform.slice(1)}`:'Relay'):'Proxy';
+const kindName=(r:Route)=>r.id==='proxy-pool'?'Proxy pool':r.id==='psiphon'?'Psiphon':r.kind==='direct'?'Direct':r.kind==='warp'?'WARP':r.kind==='relay'?(r.deployed?.platform?`Relay · ${r.deployed.platform[0].toUpperCase()+r.deployed.platform.slice(1)}`:'Relay'):'Proxy';
 const providerKind=(p:Provider)=>p.kind==='free'?'Built in · OpenCode Free':p.kind==='kilo'?'Built in · Kilo':p.kind==='zai'?'Built in · Z.ai':p.kind==='opencode'?'OpenCode server':'OpenAI compatible';
 const resting=(r:Route)=>(r.cooldownUntil||0)>Date.now();
 
@@ -330,11 +330,12 @@ function RoutePanel({r,data,pending,go,count,toggleRoute,useExit,connect,act,onT
       <Button disabled={!!pending} onClick={()=>onTest(r)}><FlaskConical size={14}/>Test</Button>
       {resting(r)&&<Button disabled={!!pending} onClick={()=>act('resume:'+r.id,'/admin/routes/resume',{id:r.id},'Route resumed')}><Play size={14}/>Resume now</Button>}
       {platformOf(r)&&<Button disabled={!!pending} title="Deploy the current relay code to this relay again; its address and access token stay the same" onClick={()=>onManage(r,'update')}><CloudUpload size={14}/>Update</Button>}
-      {r.id!=='direct'&&r.id!=='warp'&&<Button onClick={()=>onDelete(r)}><Trash2 size={14}/>Delete</Button>}
+      {r.id!=='direct'&&r.id!=='warp'&&r.id!=='psiphon'&&<Button onClick={()=>onDelete(r)}><Trash2 size={14}/>Delete</Button>}
     </div>
     {out&&<p className="map-fact">Used up until {time(r.exhaustedUntil!)}. This applies to OpenCode Free only; other providers can still use it.</p>}
     {open.length>0&&<Field label="Join a provider"><Select aria-label={`Join a provider to ${r.name}`} value="" onChange={v=>{const p=s.providers.find(x=>x.id===v);if(p)connect(p,r);}}><option value="">Choose a provider…</option>{open.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field>}
     {r.kind==='warp'&&<p className="map-fact">WARP connects and disconnects from the list view. <button type="button" className="text-button" onClick={onShowList}>Open it</button></p>}
+    {r.id==='psiphon'&&<p className="map-fact">Psiphon's regions are chosen, connected and disconnected in the list view. <button type="button" className="text-button" onClick={onShowList}>Open it</button></p>}
     {r.id==='proxy-pool'&&<p className="map-fact">Its proxies are managed on the Proxies page. <button type="button" className="text-button" onClick={()=>go('Proxies')}>Open it</button></p>}
     <div className="map-actions quiet"><button type="button" className="text-button" onClick={()=>pickNode('gate')}>Route in use <ChevronRight size={14}/></button></div>
   </Section>;
