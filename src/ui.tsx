@@ -58,6 +58,13 @@ export function usePoll<T>(path:string,every:number,enabled=true){
   // The previous path's data stays visible while the new one loads (no flash when paging), but not once loading it has failed.
   return {data:box&&(box.path===path||!error)?box.value:null,error,reload};
 }
+// One cancellable action at a time: start() gives the signal to hand to api(), cancel() stops it. A dialog cancels its action when it
+// closes, so nothing keeps running unseen; a page (onLeave false) lets it finish when the person switches to another page.
+export function useCancel(onLeave=true){
+  const ref=useRef<AbortController|null>(null);
+  useEffect(()=>()=>{if(onLeave)ref.current?.abort();},[onLeave]);
+  return {start:()=>{ref.current?.abort();const c=new AbortController();ref.current=c;return c.signal;},cancel:()=>{ref.current?.abort();ref.current=null;}};
+}
 export function Progress({value,label}:{value:number;label?:string}){return <div className="progress" role="progressbar" aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100} aria-label={label}><i style={{width:Math.max(2,Math.min(100,value))+'%'}}/></div>;}
 // Left and right arrows move between the tabs of a tablist whose selected tab is its only tab stop.
 export const tabKeys=(e:KeyboardEvent<HTMLElement>)=>{const d=e.key==='ArrowRight'?1:e.key==='ArrowLeft'?-1:0;const tabs=[...e.currentTarget.querySelectorAll<HTMLElement>('[role=tab]')];const i=tabs.indexOf(e.target as HTMLElement);if(!d||i<0)return;e.preventDefault();const t=tabs[(i+d+tabs.length)%tabs.length];t.focus();t.click();};

@@ -12,6 +12,7 @@ import { authenticate } from './keys';
 import { serverConfig, clientIp } from './auth';
 import { version } from './version';
 import type { AgentMcpSelection, ApiKey, McpServer, McpSettings } from './types';
+import { cancellable } from './cancel';
 // The MCP hub. Clients connect once to /mcp with a Polygate client API key and get the tools of every MCP server added on the MCP page,
 // named "<server>__<tool>", plus Polygate's own tools (polygate__…). /mcp/<server> offers one server with its tools' own names.
 // Remote servers are reached through a Polygate route (direct, a proxy, the proxy pool or WARP); local servers are programs started here.
@@ -176,7 +177,7 @@ class McpClient {
         this.channel.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'Timed out in Polygate' } }).catch(() => {});
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.channel.send({ jsonrpc: '2.0', id, method, params }, AbortSignal.timeout(timeoutMs)).catch(e => { const p = this.pending.get(id); if (!p) return; this.pending.delete(id); clearTimeout(timer); reject(e); });
+      this.channel.send({ jsonrpc: '2.0', id, method, params }, cancellable(timeoutMs)).catch(e => { const p = this.pending.get(id); if (!p) return; this.pending.delete(id); clearTimeout(timer); reject(e); });
     });
   }
   async connect(timeoutMs: number) {

@@ -123,7 +123,8 @@ function EngineCard({engine,busy,act}:{engine:Engine;busy:string;act:(path:strin
       {s==='not_installed'&&<Button variant="primary" disabled={working} onClick={()=>act('/admin/agent/engine/install','install')}><Download size={15}/>Install</Button>}
       {(s==='installed'||s==='failed')&&<Button variant="primary" disabled={working} onClick={()=>act('/admin/agent/engine/start','start')}>{busy==='start'?<Loader2 className="spin" size={15}/>:<Play size={15}/>}Start</Button>}
       {(running||s==='restarting')&&<Button disabled={working} onClick={()=>act('/admin/agent/engine/stop','stop')}><Square size={14}/>Stop</Button>}
-      {working&&!busy&&<Loader2 className="spin" size={16}/>}
+      {s==='installing'&&<Button onClick={()=>act('/admin/agent/engine/install/cancel','cancel')} title="Stop the download; nothing is installed"><Square size={14}/>Cancel</Button>}
+      {working&&!busy&&s!=='installing'&&<Loader2 className="spin" size={16}/>}
     </div>
     {s==='not_installed'&&<p className="subtle">The agent runs on OpenCode, an open-source coding agent. Polygate downloads its pinned version once from npm (about 100 MB), checks it against the published checksum, and runs it on this computer only. Its model requests go through Polygate under its own key.</p>}
     {s==='installing'&&<Progress value={engine.progress||0} label="Downloading the agent engine"/>}

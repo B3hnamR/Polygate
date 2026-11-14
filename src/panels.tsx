@@ -1,9 +1,9 @@
 import {useState,useEffect,useRef,type FormEvent} from 'react';
 import {AlertCircle,Bell,Check,CheckCircle2,ChevronLeft,ChevronRight,Cloud,Copy,ExternalLink,Gauge,Globe,Info,KeyRound,Loader2,Lock,LogOut,Play,Plus,Power,RefreshCw,Search,Shield,ShieldCheck,Square,Trash2,X,Radar} from 'lucide-react';
-import {api,at} from './api';
+import {api,at,isCancelled} from './api';
 import {ProxyLists} from './proxy-lists';
 import {useConfirm} from './confirm';
-import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,ApplyTag,type Snapshot} from './ui';
+import {Logo,Badge,Button,Empty,Field,Toggle,Select,Progress,usePoll,tabKeys,ms,time,when,compact,ApplyTag,useCancel,type Snapshot} from './ui';
 export type Notice=(message:string,kind?:'ok'|'error')=>void;
 const errorOf=(e:unknown)=>String((e as Error)?.message||e);
 // ---------- sign in ----------
@@ -38,7 +38,10 @@ export function WarpPanel({notice,onChanged}:{notice:Notice;onChanged:()=>void})
   const [form,setForm]=useState({engine:'embedded',port:40000,pool:2,rotateMinutes:0,autoStart:false,helperPath:'',endpoint:'',split:'auto'});const [dirty,setDirty]=useState(false);const [busy,setBusy]=useState('');
   useEffect(()=>{if(s&&!dirty)setForm({engine:s.engine,port:s.port,pool:s.pool,rotateMinutes:s.rotateMinutes,autoStart:s.autoStart,helperPath:s.config.helperPath,endpoint:s.config.endpoint,split:s.config.split||'auto'});},[s,dirty]);
   const edit=(patch:Partial<typeof form>)=>{setDirty(true);setForm(f=>({...f,...patch}));};
-  async function run(name:string,path:string,body:unknown={},done=''){setBusy(name);try{await api(path,body);if(done)notice(done);await reload();onChanged();return true;}catch(e){notice(errorOf(e),'error');await reload();return false;}finally{setBusy('');}}
+  // Setting WARP up can take a while (registering, trying endpoints): Cancel stops it like Disconnect, and no tunnel is left running.
+  const {start,cancel}=useCancel(false);
+  async function run(name:string,path:string,body:unknown={},done=''){setBusy(name);try{await api(path,body,name==='connect'?start():undefined); // only setup holds the cancel; another action must not stop it
+if(done)notice(done);await reload();onChanged();return true;}catch(e){if(isCancelled(e))notice('WARP setup cancelled');else notice(errorOf(e),'error');await reload();return false;}finally{setBusy('');}}
   const [tone,label]=warpLabel[s?.state||'disconnected']||['neutral',s?.state||''];const working=!!busy||!!s?.busy;const connected=s?.state==='connected';
   const needsInstall=!!s&&s.engine==='embedded'&&!s.helper.installed;
   return <section className="section-block form-section warp-panel">
@@ -50,7 +53,7 @@ export function WarpPanel({notice,onChanged}:{notice:Notice;onChanged:()=>void})
       {working&&<div className="progress-block"><Progress value={s.progress.percent||8} label="WARP setup progress"/><small>{s.progress.message}</small></div>}
       {s.lastError&&!connected&&!working&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.lastError}</span></div>}
       <div className="button-row">
-        <Button variant="primary" disabled={working||s.engine==='disabled'||needsInstall} onClick={()=>run('connect','/admin/warp/connect',{},'WARP is connected')}>{busy==='connect'?<Loader2 size={15} className="spin"/>:<Power size={15}/>}{connected?'Reconnect':'Set up & connect'}</Button>
+        <Button variant="primary" disabled={working||s.engine==='disabled'||needsInstall} onClick={()=>run('connect','/admin/warp/connect',{},'WARP is connected')}>{busy==='connect'?<Loader2 size={15} className="spin"/>:<Power size={15}/>}{connected?'Reconnect':'Set up & connect'}</Button>{busy==='connect'&&<Button onClick={cancel}><X size={15}/>Cancel</Button>}
         <Button disabled={working||!connected} onClick={()=>run('disconnect','/admin/warp/disconnect',{},'WARP disconnected')}>Disconnect</Button>
         {needsInstall&&<Button variant="primary" disabled={working} onClick={()=>run('install','/admin/warp/install',{},'Helper found')}>{busy==='install'?<Loader2 size={15} className="spin"/>:<Search size={15}/>}Locate helper</Button>}
         {s.canRotate&&<Button disabled={working||!connected} title="Request a fresh WARP identity and exit IP" onClick={()=>run('rotate','/admin/warp/rotate',{},'WARP identity rotated')}><RefreshCw size={15}/>New identity</Button>}

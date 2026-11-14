@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, Check, ChevronRight, Copy, Download, Globe, Loader2, Play, Plug, Plus, RefreshCw, Server, Terminal, Trash2, Upload, X, Pencil, Wrench } from 'lucide-react';
-import { api, BASE } from './api';
-import { Button, Empty, Field, Select, Toggle, type Snapshot } from './ui';
+import { api, BASE, isCancelled } from './api';
+import { Button, Empty, Field, Select, Toggle, useCancel, type Snapshot } from './ui';
 import type { McpServer } from '../backend/types';
 import { useConfirm } from './confirm';
 
@@ -99,14 +99,16 @@ function ServerDialog({ initial, hub, data, onClose, onSaved }: { initial: Draft
   const editing = !!initial.id; const local = d.transport === 'stdio'; const lockedLocal = local && !hub.canAddLocal;
   const set = (patch: Partial<Draft>) => { setD({ ...d, ...patch }); setTest(null); };
   const routes = data.settings.routes.filter(r => r.kind !== 'relay' && r.enabled);
+  // A connection test can wait as long as the server takes: it can be cancelled, and closing the dialog cancels it.
+  const tester = useCancel(); const close = () => { tester.cancel(); onClose(); };
   const run = async (what: 'test' | 'save') => {
     setBusy(what); setError('');
     try {
-      if (what === 'test') setTest(await api('/admin/mcp/test', fromDraft(d)));
+      if (what === 'test') setTest(await api('/admin/mcp/test', fromDraft(d), tester.start()));
       else onSaved(await api('/admin/mcp/servers', fromDraft(d)));
-    } catch (e: any) { setError(e?.message || 'That did not work'); } finally { setBusy(''); }
+    } catch (e: any) { if (!isCancelled(e)) setError(e?.message || 'That did not work'); } finally { setBusy(''); }
   };
-  return <Dialog title={editing ? `Edit ${initial.name}` : 'Add an MCP server'} icon={<Plug size={16} />} onClose={onClose} busy={!!busy} wide>
+  return <Dialog title={editing ? `Edit ${initial.name}` : 'Add an MCP server'} icon={<Plug size={16} />} onClose={close} busy={busy === 'save'} wide>
     {!editing && <div className="seg mcp-kind" role="tablist" aria-label="Kind of server">
       <button role="tab" aria-selected={!local} className={!local ? 'on' : ''} onClick={() => set({ transport: 'http' })}><Globe size={14} />Remote server</button>
       <button role="tab" aria-selected={local} className={local ? 'on' : ''} onClick={() => set({ transport: 'stdio' })}><Terminal size={14} />Local program</button>
@@ -141,7 +143,7 @@ function ServerDialog({ initial, hub, data, onClose, onSaved }: { initial: Draft
     {error && <div className="dialog-note error" role="alert"><AlertTriangle size={16} /><p>{error}</p></div>}
     <div className="dialog-actions">
       <Button variant="primary" disabled={!!busy} onClick={() => void run('save')}>{busy === 'save' ? <Loader2 size={14} className="spin" /> : <Check size={14} />}{busy === 'save' ? 'Saving and connecting…' : editing ? 'Save' : 'Add server'}</Button>
-      <Button disabled={!!busy || lockedLocal && !editing} onClick={() => void run('test')}>{busy === 'test' ? <Loader2 size={14} className="spin" /> : <Plug size={14} />}{busy === 'test' ? 'Connecting…' : 'Test connection'}</Button>
+      <Button disabled={!!busy || lockedLocal && !editing} onClick={() => void run('test')}>{busy === 'test' ? <Loader2 size={14} className="spin" /> : <Plug size={14} />}{busy === 'test' ? 'Connecting…' : 'Test connection'}</Button>{busy === 'test' && <Button onClick={tester.cancel}><X size={14} />Cancel</Button>}
       <Button disabled={!!busy} onClick={onClose}>Cancel</Button>
     </div>
   </Dialog>;
@@ -150,14 +152,16 @@ function TryDialog({ server, tool, onClose }: { server: { id: string; name: stri
   // Only the required arguments are filled in; the optional ones are listed above.
   const [args, setArgs] = useState(() => { const required: string[] = tool.inputSchema?.required || []; const all = skeleton(tool.inputSchema) as Record<string, unknown>; return JSON.stringify(Object.fromEntries(Object.entries(all || {}).filter(([k]) => required.includes(k))), null, 2); });
   const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [result, setResult] = useState<{ content?: any[]; isError?: boolean; structuredContent?: unknown; ms: number } | null>(null);
+  // A tool can run for a long time: Cancel stops waiting for it (the gateway ends the call), and closing the dialog cancels it too.
+  const { start, cancel } = useCancel(); const close = () => { cancel(); onClose(); };
   const run = async () => {
     let parsed: unknown; try { parsed = JSON.parse(args || '{}'); } catch { setError('The arguments are not valid JSON'); return; }
     setBusy(true); setError(''); setResult(null); const started = performance.now();
-    try { const r = await api('/admin/mcp/call', { server: server.id, tool: tool.name, arguments: parsed }); setResult({ ...r, ms: Math.round(performance.now() - started) }); }
-    catch (e: any) { setError(e?.message || 'The tool could not be run'); } finally { setBusy(false); }
+    try { const r = await api('/admin/mcp/call', { server: server.id, tool: tool.name, arguments: parsed }, start()); setResult({ ...r, ms: Math.round(performance.now() - started) }); }
+    catch (e: any) { setError(isCancelled(e) ? 'Cancelled. The tool may have done part of its work already.' : e?.message || 'The tool could not be run'); } finally { setBusy(false); }
   };
   const props = Object.entries((tool.inputSchema?.properties || {}) as Record<string, any>);
-  return <Dialog title={`Try ${server.name === 'polygate' ? 'polygate' : server.name} · ${tool.name}`} icon={<Wrench size={16} />} onClose={onClose} busy={busy} wide>
+  return <Dialog title={`Try ${server.name === 'polygate' ? 'polygate' : server.name} · ${tool.name}`} icon={<Wrench size={16} />} onClose={close} busy={false} wide>
     {tool.description && <p className="subtle mcp-tool-description">{tool.description}</p>}
     {props.length > 0 && <dl className="log-facts mcp-args">{props.map(([k, v]) => <Fragment key={k}><dt>{k}{tool.inputSchema?.required?.includes(k) ? ' *' : ''}</dt><dd>{[Array.isArray(v?.type) ? v.type.join(' or ') : v?.type, v?.description].filter(Boolean).join(' · ') || '-'}</dd></Fragment>)}</dl>}
     <Field label="Arguments (JSON)"><textarea rows={Math.min(14, Math.max(4, args.split('\n').length + 1))} className="mono" value={args} spellCheck={false} onChange={e => setArgs(e.target.value)} /></Field>
@@ -166,7 +170,7 @@ function TryDialog({ server, tool, onClose }: { server: { id: string; name: stri
       {(result.content || []).map((c, i) => c.type === 'text' ? <pre key={i}>{c.text}</pre> : c.type === 'image' ? <img key={i} alt={`Image ${i + 1} from the tool`} src={`data:${c.mimeType};base64,${c.data}`} /> : <pre key={i}>{JSON.stringify(c, null, 2)}</pre>)}
     </div></div>}
     {error && <div className="dialog-note error" role="alert"><AlertTriangle size={16} /><p>{error}</p></div>}
-    <div className="dialog-actions"><Button variant="primary" disabled={busy} onClick={() => void run()}>{busy ? <Loader2 size={14} className="spin" /> : <Play size={14} />}{busy ? 'Running…' : result ? 'Run again' : 'Run tool'}</Button><Button disabled={busy} onClick={onClose}>Close</Button></div>
+    <div className="dialog-actions"><Button variant="primary" disabled={busy} onClick={() => void run()}>{busy ? <Loader2 size={14} className="spin" /> : <Play size={14} />}{busy ? 'Running…' : result ? 'Run again' : 'Run tool'}</Button>{busy ? <Button onClick={cancel}><X size={14} />Cancel</Button> : <Button onClick={close}>Close</Button>}</div>
   </Dialog>;
 }
 function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: (added: string[]) => void }) {

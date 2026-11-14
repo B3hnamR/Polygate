@@ -5,7 +5,7 @@ import { Button } from './ui';
 import type { UpdateState } from '../desktop/releases.cjs';
 
 type DesktopUpdates = {
-  getState(): Promise<UpdateState>; check(): Promise<UpdateState>; install(): Promise<UpdateState>;
+  getState(): Promise<UpdateState>; check(): Promise<UpdateState>; install(): Promise<UpdateState>; cancel?(): Promise<UpdateState>;
   onState(callback: (state: UpdateState) => void): () => void;
 };
 declare global { interface Window { polygateUpdates?: DesktopUpdates } }
@@ -44,7 +44,8 @@ const busy = (state: UpdateState | null) => state?.status === 'downloading' || s
 function InstallButton({ updates }: { updates: Updates }) {
   const state = updates.state!;
   const label = state.status === 'downloading' ? `Downloading ${state.progress || 0}%` : state.status === 'installing' ? 'Restarting…' : 'Update & restart';
-  return <Button variant="primary" disabled={updates.working || busy(state)} onClick={() => void updates.install()}>{busy(state) ? <Loader2 size={15} className="spin" /> : <ArrowDownToLine size={15} />}{label}</Button>;
+  // While it downloads, the update can be cancelled: nothing is kept and the app stays as it is. Once it is installing it can no longer stop.
+  return <><Button variant="primary" disabled={updates.working || busy(state)} onClick={() => void updates.install()}>{busy(state) ? <Loader2 size={15} className="spin" /> : <ArrowDownToLine size={15} />}{label}</Button>{state.status === 'downloading' && window.polygateUpdates?.cancel && <Button onClick={() => void window.polygateUpdates!.cancel!()}>Cancel</Button>}</>;
 }
 export function UpdateBanner({ updates, openSettings }: { updates: Updates; openSettings: () => void }) {
   const state = updates.state;

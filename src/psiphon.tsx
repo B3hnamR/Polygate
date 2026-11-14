@@ -1,7 +1,7 @@
 import {useEffect,useState} from 'react';
-import {AlertCircle,Info,Loader2,Power,RefreshCw,Route as RouteIcon,ShieldHalf} from 'lucide-react';
-import {api} from './api';
-import {Badge,Button,Select,Toggle,usePoll} from './ui';
+import {AlertCircle,Info,Loader2,Power,RefreshCw,Route as RouteIcon,ShieldHalf,X} from 'lucide-react';
+import {api,isCancelled} from './api';
+import {Badge,Button,Select,Toggle,usePoll,useCancel} from './ui';
 import type {Notice} from './panels';
 
 // The Psiphon route (backend/psiphon.ts): one client per chosen region, together one route that takes turns or stays on one region.
@@ -9,7 +9,7 @@ type Region={region:string;state:'stopped'|'starting'|'ready'|'reconnecting'|'fa
 type PsiphonInfo={installed:boolean;problem:string;platform:string;busy:string;lastError:string;running:boolean;live:number;
   config:{enabled:boolean;autoStart:boolean;regions:string[];mode:'spread'|'single';pinned:string;skip:boolean;renew:boolean};
   available:string[];updatedAt:number;regions:Region[];spent:number;route:{exists:boolean;enabled:boolean;inUse:boolean}};
-const NAMES:Record<string,string>={AT:'Austria',BE:'Belgium',BG:'Bulgaria',CA:'Canada',CH:'Switzerland',CZ:'Czechia',DE:'Germany',DK:'Denmark',EE:'Estonia',ES:'Spain',FI:'Finland',FR:'France',GB:'United Kingdom',HU:'Hungary',IE:'Ireland',IN:'India',IT:'Italy',JP:'Japan',LT:'Lithuania',LV:'Latvia',NL:'Netherlands',NO:'Norway',PL:'Poland',PT:'Portugal',RO:'Romania',RS:'Serbia',SE:'Sweden',SG:'Singapore',SK:'Slovakia',US:'United States'};
+const NAMES:Record<string,string>={AE:'United Arab Emirates',AR:'Argentina',AT:'Austria',AU:'Australia',BE:'Belgium',BG:'Bulgaria',BR:'Brazil',CA:'Canada',CH:'Switzerland',CL:'Chile',CO:'Colombia',CZ:'Czechia',DE:'Germany',DK:'Denmark',EE:'Estonia',ES:'Spain',FI:'Finland',FR:'France',GB:'United Kingdom',GR:'Greece',HK:'Hong Kong',HR:'Croatia',HU:'Hungary',ID:'Indonesia',IE:'Ireland',IL:'Israel',IN:'India',IS:'Iceland',IT:'Italy',JP:'Japan',KR:'South Korea',LT:'Lithuania',LU:'Luxembourg',LV:'Latvia',MD:'Moldova',MX:'Mexico',MY:'Malaysia',NL:'Netherlands',NO:'Norway',NZ:'New Zealand',PH:'Philippines',PL:'Poland',PT:'Portugal',RO:'Romania',RS:'Serbia',SE:'Sweden',SG:'Singapore',SI:'Slovenia',SK:'Slovakia',TH:'Thailand',TR:'Türkiye',TW:'Taiwan',UA:'Ukraine',US:'United States',VN:'Vietnam',ZA:'South Africa'};
 const nameOf=(r:string)=>NAMES[r]||r;
 const stateLabel:Record<Region['state'],[string,string]>={ready:['healthy','Connected'],starting:['neutral','Connecting'],reconnecting:['cooldown','Reconnecting'],failed:['error','Failed'],stopped:['neutral','Not running']};
 const utc=(t:number)=>new Date(t).toISOString().slice(11,16)+' UTC';
@@ -19,7 +19,10 @@ export function PsiphonPanel({notice,onChanged}:{notice:Notice;onChanged:()=>voi
   const {data:s,reload,error}=usePoll<PsiphonInfo>('/admin/psiphon/status',3000);
   const [picked,setPicked]=useState<string[]>([]);const [dirty,setDirty]=useState(false);const [busy,setBusy]=useState('');
   useEffect(()=>{if(s&&!dirty)setPicked(s.config.regions);},[s,dirty]);
-  async function run(name:string,path:string,body:unknown={},done=''){setBusy(name);try{await api(path,body);if(done)notice(done);await reload();onChanged();return true;}catch(e){notice(String((e as Error)?.message||e),'error');await reload();return false;}finally{setBusy('');}}
+  // Updating servers can take a minute and a half: it can be cancelled (the gateway stops the client and keeps the old list).
+  const {start,cancel}=useCancel(false);
+  async function run(name:string,path:string,body:unknown={},done=''){setBusy(name);try{await api(path,body,name==='update'?start():undefined); // only the server update holds the cancel; a setting saved meanwhile must not stop it
+if(done)notice(done);await reload();onChanged();return true;}catch(e){if(isCancelled(e))notice(name==='update'?'Server update cancelled; the current list is kept':'Cancelled');else notice(String((e as Error)?.message||e),'error');await reload();return false;}finally{setBusy('');}}
   const save=(patch:Partial<PsiphonInfo['config']>,done='Psiphon settings saved')=>run('save','/admin/psiphon/settings',patch,done);
   if(!s)return <section className="section-block form-section psiphon-panel"><div className="section-top"><div className="section-title"><ShieldHalf size={19}/><h2>Psiphon</h2></div></div>
     {error?<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{error}</span><Button onClick={()=>void reload()}>Try again</Button></div>:<div className="loading"><Loader2 className="spin"/> Checking Psiphon…</div>}</section>;
@@ -35,7 +38,7 @@ export function PsiphonPanel({notice,onChanged}:{notice:Notice;onChanged:()=>voi
     {!s.installed?<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.problem}</span></div>:<>
       <div className="psi-head">
         <div><strong>Regions</strong><small>{s.updatedAt?`Servers updated ${ago(s.updatedAt)}`:'Servers from the bundled list'} · {s.available.length} regions offered</small></div>
-        <Button disabled={working} onClick={()=>run('update','/admin/psiphon/update',{},'Psiphon servers updated')} title="Connects once without a region; Psiphon's handshake brings its current servers and regions">{busy==='update'||s.busy==='updating nodes'?<Loader2 size={15} className="spin"/>:<RefreshCw size={15}/>}Update servers</Button>
+        <Button disabled={working} onClick={()=>run('update','/admin/psiphon/update',{},'Psiphon servers updated')} title="Connects once without a region; Psiphon's handshake brings its current servers and regions">{busy==='update'||s.busy==='updating nodes'?<Loader2 size={15} className="spin"/>:<RefreshCw size={15}/>}Update servers</Button>{busy==='update'&&<Button onClick={cancel}><X size={15}/>Cancel</Button>}
       </div>
       <div className="psi-regions" role="group" aria-label="Psiphon regions">{s.available.map(r=><label key={r} className={picked.includes(r)?'on':''}><input type="checkbox" checked={picked.includes(r)} onChange={()=>toggleRegion(r)}/><span className="mono">{r}</span><small>{nameOf(r)}</small></label>)}</div>
       {regionsChanged&&<div className="psi-apply"><span>{picked.length?`${picked.length} region${picked.length>1?'s':''} chosen.`:'Choose at least one region.'}{s.running?' Running regions follow at once.':''}</span><Button variant="primary" disabled={working||!picked.length} onClick={()=>void applyRegions()}>Save regions</Button><Button disabled={working} onClick={()=>{setDirty(false);setPicked(c.regions);}}>Undo</Button></div>}

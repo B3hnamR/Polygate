@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { stateDir, settings, models, saveModel, removeModel, usagePenalties, redactError } from './state';
+import { cancellable } from './cancel';
 import { networkFetch, routeContext, routeForProvider, providerRoutes } from './transport';
 import { GatewayError } from './queue';
 import { serve } from './serve';
@@ -41,7 +42,7 @@ export async function discover(){
         let found:any[]=[];let authoritative=true;
         if(p.kind==='free'){await bridge.discoverModels({strict:true});found=bridge.__getDiscoveryState().activeModels.map((x:any)=>typeof x==='string'?{id:x}:x);}
         else if(p.kind==='openai'){
-          try{const r=await networkFetch(p.baseUrl.replace(/\/$/,'')+'/models',{headers:p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{},signal:AbortSignal.timeout(15000)},catalogRoute(p));if(!r.ok)throw new Error(`Catalog HTTP ${r.status}`);const data:any=await r.json();const list=data.data||data.models;if(!Array.isArray(list))throw new Error('Catalog response has no model list');found=list;}
+          try{const r=await networkFetch(p.baseUrl.replace(/\/$/,'')+'/models',{headers:p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{},signal:cancellable(15000)},catalogRoute(p));if(!r.ok)throw new Error(`Catalog HTTP ${r.status}`);const data:any=await r.json();const list=data.data||data.models;if(!Array.isArray(list))throw new Error('Catalog response has no model list');found=list;}
           catch(e){if(!p.models.length)throw e;authoritative=false;}
           const listed=new Set(found.map(x=>x?.id??x));found=[...found,...p.models.filter(id=>!listed.has(id)).map(id=>({id}))];
         }

@@ -19,6 +19,8 @@ beforeAll(async () => {
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url); const headers = new Headers(init.headers);
     if (u.startsWith('https://api.vercel.com/')) {
+      // Is that project name already in use? Not here (a new relay must not take a name in use). Not recorded: the tests look at the deploy calls.
+      if ((init.method || 'GET') === 'GET' && /api\.vercel\.com\/v9\/projects\/[^/?]+/.test(u)) return Response.json({ error: 'not found' }, { status: 404 });
       sent.push({ url: u, auth: headers.get('authorization') || '', body: init.body ? JSON.parse(String(init.body)) : undefined });
       if (headers.get('authorization') !== 'Bearer ' + TOKEN) return Response.json({ error: { message: 'Not authorized' } }, { status: 403 });
       if (init.method === 'POST') { const region = JSON.parse(String(init.body)).regions[0]; return Response.json({ id: 'dpl_' + region, readyState: 'READY', alias: [`relay-${region}.vercel.app`], url: 'x.vercel.app' }); }

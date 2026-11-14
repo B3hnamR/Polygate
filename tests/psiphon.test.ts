@@ -300,3 +300,25 @@ test('the option is on by default', () => {
   delete (settings as any).psiphon;
   expect(P.psiphonConfig().renew).toBe(true);
 });
+
+test('a client reporting fewer regions does not shrink the list; Update servers replaces it; chosen regions always stay offered', () => {
+  settings.psiphon = { ...settings.psiphon!, available: [] };
+  P.__saveRegions(['AT', 'AU', 'DE', 'LT', 'NL', 'RO', 'RS']);
+  P.__saveRegions(['DE', 'NL']); // another client, connected through a server that knows fewer regions
+  expect(settings.psiphon!.available).toEqual(['AT', 'AU', 'DE', 'LT', 'NL', 'RO', 'RS']);
+  P.__saveRegions(['BE', 'DE']); // a new region is still added
+  expect(settings.psiphon!.available).toContain('BE');
+  P.__saveRegions(['DE', 'NL', 'SE'], true); // Update servers: the fresh list is the list
+  expect(settings.psiphon!.available).toEqual(['DE', 'NL', 'SE']);
+  settings.psiphon = { ...settings.psiphon!, regions: ['DE', 'RS'] }; // RS was chosen earlier and is not in the fresh list
+  expect(P.psiphonStatus().available).toEqual(['DE', 'NL', 'RS', 'SE']);
+});
+
+test('there is no limit on how many regions are chosen: all 25 Psiphon offers today, and more', async () => {
+  const codes = (n: number) => Array.from({ length: n }, (_, i) => String.fromCharCode(65 + Math.floor(i / 26)) + String.fromCharCode(65 + (i % 26)));
+  const before = settings.psiphon; P.__instances.clear();
+  try {
+    await P.setPsiphonSettings({ regions: codes(25) }); expect(settings.psiphon!.regions.length).toBe(25);
+    await P.setPsiphonSettings({ regions: codes(60) }); expect(settings.psiphon!.regions.length).toBe(60);
+  } finally { settings.psiphon = before; }
+});

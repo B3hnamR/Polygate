@@ -9,6 +9,7 @@ import { GatewayError } from './queue';
 import { socksBridge, socksConnect } from './socks-bridge';
 import { notify } from './notifications';
 import type { Route, WarpSettings } from './types';
+import { requestSignal } from './cancel';
 const run = promisify(execFile);
 const warpDir = path.join(stateDir, 'warp'); const binDir = path.join(stateDir, 'bin');
 const isWin = process.platform === 'win32';
@@ -344,6 +345,9 @@ export async function warpStatus() {
 export async function warpConnect() {
   if (status.busy) throw new GatewayError('WARP setup is already running', 409);
   status.busy = true; status.lastError = ''; stopping = false; const scheduled = epoch; const signal = lifecycle.signal;
+  // Cancel in the dashboard stops the setup the way Disconnect does: every step checks the lifecycle and no tunnel is left running.
+  const cancel = requestSignal(); const onCancel = () => { void stopTunnels().catch(() => {}); };
+  cancel?.addEventListener('abort', onCancel, { once: true });
   try {
     if (engineMode() === 'disabled') throw new GatewayError('WARP is turned off. Turn it on in the WARP settings first.', 400);
     await embeddedConnect();
@@ -356,8 +360,12 @@ export async function warpConnect() {
     if (egress.warp === 'off') { await stopTunnels(); throw new Error('Traffic reaches Cloudflare but is not tunnelled through WARP (warp=off).'); }
     status.egress = egress; status.state = 'connected'; status.checkedAt = Date.now();
     progress(100, 'connected', `Connected through Cloudflare (${egress.ip}${egress.colo ? ', ' + egress.colo : ''})`); clearExhausted(); ensureRoute(); startTimers();
-  } catch (e: any) { const message = fail(String(e.message || e)); status.busy = false; status.checkedAt = 0; await refreshStatus(true).catch(() => {}); status.lastError = message; throw e instanceof GatewayError ? e : new GatewayError(message, 502, 'warp_error'); }
-  finally { status.busy = false; }
+  } catch (e: any) {
+    // A cancel is not a failure: no error is kept for it.
+    if (cancel?.aborted) { status.busy = false; status.lastError = ''; progress(0, 'idle', 'WARP setup was cancelled'); throw cancel.reason; }
+    const message = fail(String(e.message || e)); status.busy = false; status.checkedAt = 0; await refreshStatus(true).catch(() => {}); status.lastError = message; throw e instanceof GatewayError ? e : new GatewayError(message, 502, 'warp_error');
+  }
+  finally { status.busy = false; cancel?.removeEventListener('abort', onCancel); }
   return warpStatus();
 }
 export async function warpDisconnect() {

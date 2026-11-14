@@ -396,6 +396,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname.startsWith('/admin/agent/')&&!serverConfig().desktop)throw new GatewayError('The agent runs in the desktop app only',404);
   // freeIdentity says whether the agent can use OpenCode Free now (the bridge presents the engine's OpenCode version).
   if(pathname==='/admin/agent/engine'&&method==='GET'){const presented=presentedOpenCodeVersion();return json(res,200,{...agentEngine.engineStatus(),backups:settings.agentBackups===true,freeIdentity:{presented,engine:agentEngine.ENGINE_VERSION,usable:!agentEngine.freeIdentityProblem(presented)}});}
+  if(pathname==='/admin/agent/engine/install/cancel'&&method==='POST'){await readJson(req);return json(res,200,{cancelled:agentEngine.cancelInstall(),...agentEngine.engineStatus()});}
   if(pathname==='/admin/agent/engine/install'&&method==='POST'){await readJson(req);agentEngine.installEngine().catch(()=>{/* the status carries the reason */});return json(res,202,agentEngine.engineStatus());}
   if(pathname==='/admin/agent/engine/start'&&method==='POST'){await readJson(req);if(agentEngine.freeIdentityProblem(presentedOpenCodeVersion()))await syncIdentity();return json(res,200,await agentEngine.startEngine());}
   if(pathname==='/admin/agent/engine/stop'&&method==='POST'){await readJson(req);const {stopAllTerminals}=await import('./agent-terminal');stopAllTerminals();await agentEngine.stopEngine();return json(res,200,agentEngine.engineStatus());}

@@ -1,5 +1,6 @@
 import { models, saveModel, redactError, KILO_ID, KILO_BASE } from './state';
 import { networkFetch } from './transport';
+import { cancellable } from './cancel';
 import type { Provider, Model } from './types';
 import type { GenerationAccounting } from './providers';
 // Kilo Gateway's free tier: OpenAI-compatible, no account. Behaviour below was measured against the live service and cross-checked with other
@@ -24,7 +25,7 @@ export function freeCatalog(list: any[]) {
   });
 }
 export async function kiloCatalog(p: Provider, routeId: string) {
-  const r = await networkFetch(base(p) + '/models', { headers: p.apiKey ? { authorization: `Bearer ${p.apiKey}` } : {}, signal: AbortSignal.timeout(30000) }, routeId);
+  const r = await networkFetch(base(p) + '/models', { headers: p.apiKey ? { authorization: `Bearer ${p.apiKey}` } : {}, signal: cancellable(30000) }, routeId);
   if (!r.ok) throw new Error(`Catalog HTTP ${r.status}`);
   const data: any = await r.json(); const list = data.data || data.models;
   if (!Array.isArray(list)) throw new Error('Catalog response has no model list');

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile } from 'node:child_process';
+import { cancellable, isCancelled, cancelledError, stopIfCancelled, detached } from './cancel';
 import { promisify } from 'node:util';
 import { settings, persist, redactError, tallyRoute } from './state';
 import { GatewayError } from './queue';
@@ -69,7 +70,7 @@ async function canaryResponse(routeId:string):Promise<Response|undefined>{
   for(const model of usable.slice(0,3)){
     canaryModel=model.name;
     try{
-      const r=await providerChat(provider,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},AbortSignal.timeout(20000),routeId,sessionFor('canary',[{role:'user',content:'canary'}],{}),newCanaryId());
+      const r=await providerChat(provider,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},cancellable(20000),routeId,sessionFor('canary',[{role:'user',content:'canary'}],{}),newCanaryId());
       // A refusal or success says something about the exit; a model-level error (unavailable, deprecated) says nothing, so the next model is tried.
       if(r.ok||r.status===429||![400,404,410,502,503].includes(r.status))return r;
       last?.body?.cancel().catch(()=>{});last=r;
@@ -125,7 +126,7 @@ export async function rerollRelay(route:Route,pauseMs=REROLL_PAUSE_MS):Promise<b
   }finally{rerolling.delete(route.id);}
 }
 // Called when a live request has just found a relay used up: the first re-ask comes a few seconds later, while requests use other exits.
-const scheduleReroll=(route:Route)=>{if(route.kind!=='relay'||settings.relayRecheck===false)return;const t=setTimeout(()=>void rerollRelay(route).catch(()=>{}),15000);t.unref?.();};
+const scheduleReroll=(route:Route)=>{if(route.kind!=='relay'||settings.relayRecheck===false)return;const t=detached(()=>setTimeout(()=>void rerollRelay(route).catch(()=>{}),15000));t.unref?.();};
 let exitVerifier=defaultVerifier;export const __setExitVerifier=(fn?:typeof defaultVerifier)=>{exitVerifier=fn||defaultVerifier;};
 // Returns the exhaustion to record, or undefined when the exit is fine and only this request was refused.
 // null: nothing could be confirmed either way, so the answer is left as it is (neither the exit's limit nor a refusal of this request).
@@ -298,7 +299,7 @@ export const relayInfo = (id: string) => ({ egress: liveEgress.get(id) || '', sp
 const markSpent = (id: string, ip: string | null | undefined, until: number) => { if (!ip) return; let m = spentEgress.get(id); if (!m) spentEgress.set(id, m = new Map()); m.set(ip, until); };
 const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function relayControl(route: Route, control: string): Promise<{ instance: string; egress: string }> {
-  const r = await fetch(route.url, { headers: { 'x-relay-key': route.token || '', 'x-relay-control': control }, signal: AbortSignal.timeout(10000) });
+  const r = await fetch(route.url, { headers: { 'x-relay-key': route.token || '', 'x-relay-control': control }, signal: cancellable(10000) });
   if (!r.ok) { await r.body?.cancel(); throw new Error('HTTP ' + r.status); } return await r.json() as any;
 }
 // One rotation at a time per relay; concurrent requests that hit the same used-up instance wait for the same new one.
@@ -517,7 +518,7 @@ async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:strin
   const usable=rankedModels().filter(m=>m.providerId===p.id&&m.state!=='unavailable'&&m.cooldownUntil<=Date.now()).sort((a,b)=>(a.state==='available'?0:1)-(b.state==='available'?0:1)||(a.latency||1e9)-(b.latency||1e9));
   const model=usable[0];if(!model)return {chat:'unknown',line:`a chat request could not be sent: no ${p.name} model is ready`};
   let r:Response;
-  try{r=await providerChat(p,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},AbortSignal.timeout(30000),route.id,sessionFor('route-test',[{role:'user',content:'route-test'}],{}),newCanaryId());}
+  try{r=await providerChat(p,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},cancellable(30000),route.id,sessionFor('route-test',[{role:'user',content:'route-test'}],{}),newCanaryId());}
   catch(e:any){return {chat:'unknown',line:`a chat request could not be sent (${redactError(String(e?.message||e)).slice(0,140)})`};}
   if(r.ok){const why=await unfinished(r);return why?{chat:'incomplete',model:model.name,line:`and ${p.name} accepted a small chat request to ${model.name}, but ${why}`}:{chat:'ok',model:model.name,line:`and ${model.name} answered a small ${p.name} chat request`};}
   const text=await r.text().catch(()=>'');const brief=redactError(text.replace(/\s+/g,' ')).slice(0,140);
@@ -557,7 +558,9 @@ setPsiphonChecker(async(region,scope)=>{
 });
 // Replaceable so tests can give each region's result without the network.
 let regionTester=(id:string,providerId?:string)=>testRoute(id,providerId);export const __setPsiphonRegionTester=(fn?:typeof regionTester)=>{regionTester=fn||((id,p)=>testRoute(id,p));};
-export async function testRoute(id:string,providerId?:string):Promise<RouteTest>{
+// A test cancelled from the dashboard reports the cancel, whichever step it was in (a check that is cut short only says "no answer").
+export async function testRoute(id:string,providerId?:string):Promise<RouteTest>{const r=await testRouteOnce(id,providerId);stopIfCancelled();return r;}
+async function testRouteOnce(id:string,providerId?:string):Promise<RouteTest>{
   if(typeof id!=='string'||!id)throw new GatewayError('Say which route to test',400);
   if(id===PSIPHON){const r=settings.routes.find(x=>x.id===PSIPHON);if(!r)throw new GatewayError('Route not found',404);return testPsiphon(r,providerId);}
   const route=id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):id.startsWith(PSIPHON+':')?psiphonVirtualRoute(id.slice(PSIPHON.length+1)):settings.routes.find(r=>r.id===id);if(!route)throw new GatewayError('Route not found',404);
@@ -566,7 +569,7 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
   try{
     // Reachability: OpenCode's catalog (not counted against any allowance), or the chosen provider's own catalog.
     const catalog=other&&other.kind!=='opencode'?other.baseUrl.replace(/\/$/,'')+'/models':'https://opencode.ai/inference/v1/models';
-    const r=other?.kind==='opencode'?undefined:await networkFetch(catalog,{headers:other?.apiKey?{authorization:`Bearer ${other.apiKey}`}:{},signal:AbortSignal.timeout(15000)},id);await r?.body?.cancel();
+    const r=other?.kind==='opencode'?undefined:await networkFetch(catalog,{headers:other?.apiKey?{authorization:`Bearer ${other.apiKey}`}:{},signal:cancellable(15000)},id);await r?.body?.cancel();
     const reached=r?r.ok:true;const code=r?.status??200;
     route.status=reached?'healthy':`HTTP ${code}`;route.latency=now()-start;if(code<500){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
     if(other){
@@ -581,5 +584,6 @@ export async function testRoute(id:string,providerId?:string):Promise<RouteTest>
       :check.chat==='refused'?`${route.name}: connected, but OpenCode Free refused a chat request${asked} through it.`
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
     return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat==='ok'&&check.unfinished?'incomplete':check.chat,summary,provider:'OpenCode Free',model:check.model,...(check.until?{until:check.until}:{})});
-  }catch(e){const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
+  }catch(e){if(isCancelled())throw cancelledError(); // a cancelled test leaves the route as it was
+    const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }

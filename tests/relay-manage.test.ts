@@ -21,6 +21,8 @@ beforeAll(async () => {
     let body: any; try { body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined; } catch { body = undefined; }
     if (/^https:\/\/api\.(vercel|netlify)\.com\//.test(u) || u.startsWith('https://api.cloudflare.com/')) {
       seen.push({ method, url: u, auth: headers.get('authorization') || '', body });
+      // Is that name already in use? Not on this stand-in platform (a new relay must not take a name in use).
+      if (method === 'GET' && (/api\.vercel\.com\/v9\/projects\/[^/?]+/.test(u) || /workers\/scripts\/[^/?]+$/.test(u))) return ok({ error: 'not found' }, 404);
       if (u.includes('api.vercel.com')) {
         if (method === 'POST') return ok({ id: 'dpl_1', readyState: 'READY', alias: [`${body.name}.vercel.app`], url: 'x.vercel.app' });
         return ok({});

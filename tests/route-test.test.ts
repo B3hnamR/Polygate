@@ -3,11 +3,12 @@ import { test, expect, beforeAll, afterAll } from 'bun:test';
 const {settings,models,saveModel,removeModels}=await import('../backend/state');
 const {testRoute}=await import('../backend/transport');
 // One stand-in server answers both ways a request can arrive: straight (the provider's own URL) and through a relay (x-relay-path says where it was going).
-let mode:'ok'|'limit'|'busy'|'refused'|'catalog500'|'cut'|'streamerror'='ok';const seen:{path:string;auth:string|null;relayKey:string|null;model?:string}[]=[];
+let mode:'ok'|'limit'|'busy'|'refused'|'catalog500'|'cut'|'streamerror'|'hang'='ok';const seen:{path:string;auth:string|null;relayKey:string|null;model?:string}[]=[];
 const upstream=Bun.serve({port:0,hostname:'127.0.0.1',async fetch(req){
   const path=req.headers.get('x-relay-path')||new URL(req.url).pathname;const call:any={path,auth:req.headers.get('authorization'),relayKey:req.headers.get('x-relay-key')};
   if(path.endsWith('/models')){seen.push(call);return mode==='catalog500'?new Response('down',{status:500}):Response.json({data:[{id:'a:free'}]});}
   const body=await req.json() as any;call.model=body.model;seen.push(call);
+  if(mode==='hang')return new Promise<Response>(()=>{}); // never answers: only a cancel or the timeout ends the wait
   if(mode==='limit')return Response.json({error:{code:'PROMOTION_MODEL_LIMIT_REACHED',message:'Sign up for free to continue'}},{status:429});
   if(mode==='busy')return Response.json({error:{message:'a:free is temporarily rate-limited upstream'}},{status:429});
   if(mode==='refused')return Response.json({error:{message:'blocked'}},{status:403});
@@ -61,4 +62,17 @@ test('unknown or disabled providers and routes are refused before anything is se
   reset();await expect(testRoute('direct','nope')).rejects.toThrow('not enabled');settings.providers[0].enabled=false;
   try{await expect(testRoute('direct','kilo')).rejects.toThrow('not enabled');}finally{settings.providers[0].enabled=true;}
   await expect(testRoute('missing','kilo')).rejects.toThrow('Route not found');await expect(testRoute('' as any)).rejects.toThrow('Say which route');expect(seen.length).toBe(0);
+});
+
+test('a route test cancelled from the dashboard stops at once and leaves the route as it was',async()=>{
+  const {withRequestCancel}=await import('../backend/cancel');const {EventEmitter}=await import('node:events');
+  reset('hang');const route=settings.routes.find(r=>r.id==='direct')!;route.status='healthy';route.failures=0;route.cooldownUntil=0;
+  // The dashboard's request, as the gateway sees it: dropping the connection is the cancel.
+  const res=Object.assign(new EventEmitter(),{writableEnded:false}) as any;const req=new EventEmitter() as any;
+  const start=Date.now();setTimeout(()=>res.emit('close'),300);
+  const err=await withRequestCancel(res,req,()=>testRoute('direct','kilo')).then(()=>undefined,e=>e);
+  expect(Date.now()-start).toBeLessThan(5000);
+  expect(err?.status).toBe(499);
+  expect(route.status).toBe('healthy');expect(route.failures||0).toBe(0);expect(route.cooldownUntil||0).toBe(0);
+  reset();
 });

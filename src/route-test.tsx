@@ -1,7 +1,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {Check,TriangleAlert,X,FlaskConical} from 'lucide-react';
-import {api} from './api';
-import {Button} from './ui';
+import {api,isCancelled} from './api';
+import {Button,useCancel} from './ui';
 import type {Provider,Route} from '../backend/types';
 // Testing a route means sending something through it, and what is sent depends on the provider: OpenCode Free and Kilo answer different
 // questions and have different limits. The dialog lets the user pick which provider the test goes through.
@@ -16,23 +16,26 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
   const enabled=providers.filter(p=>p.enabled&&p.kind!=='zai'); // Z.ai never goes through a route (backend/zai.ts).
   const usable=enabled.filter(p=>carries(route,p));
   const [chosen,setChosen]=useState((usable.find(p=>p.kind==='free')||usable[0])?.id||'');
-  const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);
+  const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);const [stopped,setStopped]=useState(false);
+  const {start,cancel}=useCancel();
+  // Closing while a test runs cancels it (the gateway stops it too); nothing is left running unseen.
+  const close=()=>{cancel();onClose();};
   const box=useRef<HTMLDivElement>(null);const first=useRef<HTMLInputElement>(null);const closing=useRef(onClose);
-  useEffect(()=>{closing.current=onClose;});
+  useEffect(()=>{closing.current=close;});
   useEffect(()=>{const opener=document.activeElement as HTMLElement|null;first.current?.focus();return()=>opener?.focus();},[]);
   useEffect(()=>{const key=(e:KeyboardEvent)=>{
-    if(e.key==='Escape'){if(!busy&&!e.defaultPrevented)closing.current();}
+    if(e.key==='Escape'){if(!e.defaultPrevented)closing.current();}
     else if(e.key==='Tab'&&box.current){const f=[...box.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled])')];const i=f.indexOf(document.activeElement as HTMLElement);if(!f.length)e.preventDefault();else if(e.shiftKey?i<=0:(i<0||i===f.length-1)){e.preventDefault();f[e.shiftKey?f.length-1:0].focus();}}
   };document.addEventListener('keydown',key);return()=>document.removeEventListener('keydown',key);},[busy]);
   async function run(){
-    setBusy(true);setError('');setResult(null);
-    try{setResult(await api('/admin/routes/test',{id:route.id,providerId:chosen}));onDone();}
-    catch(e:any){setError(e.message||'The test failed');onDone();}finally{setBusy(false);}
+    setBusy(true);setError('');setResult(null);setStopped(false);
+    try{setResult(await api('/admin/routes/test',{id:route.id,providerId:chosen},start()));onDone();}
+    catch(e:any){if(isCancelled(e))setStopped(true);else{setError(e.message||'The test failed');onDone();}}finally{setBusy(false);}
   }
   const good=result?.chat==='ok';
-  return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose();}}>
+  return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)close();}}>
     <div ref={box} className="dialog" role="dialog" aria-modal="true" aria-label={`Test ${route.name}`}>
-      <header className="dialog-head"><FlaskConical size={16}/><h2>Test {route.name}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>
+      <header className="dialog-head"><FlaskConical size={16}/><h2>Test {route.name}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" onClick={close}><X size={16}/></button></header>
       <div className="dialog-body">
         <p className="subtle">Pick the provider to send through this route. Each provider has its own limits, so a route can pass for one and fail for another.</p>
         {route.id==='psiphon'&&<div className="dialog-note info"><Check size={16}/><p>Every connected Psiphon region is tested at the same time, each through its own exit. A region found used up is skipped from then on; one that answers is cleared.</p></div>}
@@ -44,8 +47,9 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
         </fieldset>
         {result&&<div className={`dialog-note ${good?'good':'warn'}`} role="status">{good?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{result.summary}{result.latency!==undefined&&!result.regions&&<> <span className="subtle">({result.latency} ms to reach it)</span></>}{good&&<> <span className="subtle">One model was asked. Another model can still be refused or run out on its own.</span></>}</p></div>}
         {result?.regions&&<ul className="test-regions" aria-label="Each Psiphon region">{result.regions.map(r=><li key={r.region} className={r.ok?'ok':'bad'} title={r.summary}><strong className="mono">{r.region}</strong><span className="mono">{r.exitIp||'-'}</span><span>{regionWord[r.chat]||r.chat}</span><span className="subtle">{r.latency!==undefined?`${r.latency} ms`:''}</span></li>)}</ul>}
+        {stopped&&<div className="dialog-note info" role="status"><X size={16}/><p>Test cancelled. The route was left as it was.</p></div>}
         {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-        <div className="dialog-actions"><Button variant="primary" disabled={busy||!chosen} onClick={()=>void run()}><FlaskConical size={14}/>{busy?'Testing…':result||error?'Test again':'Run test'}</Button><Button disabled={busy} onClick={onClose}>Close</Button></div>
+        <div className="dialog-actions"><Button variant="primary" disabled={busy||!chosen} onClick={()=>void run()}><FlaskConical size={14}/>{busy?'Testing…':result||error?'Test again':'Run test'}</Button>{busy?<Button onClick={cancel}><X size={14}/>Cancel</Button>:<Button onClick={close}>Close</Button>}</div>
       </div>
     </div>
   </div>;

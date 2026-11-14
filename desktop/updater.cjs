@@ -19,12 +19,13 @@ async function fetchAsset(url, fetcher, signal) {
   if (!response.ok) { await response.body?.cancel().catch(() => {}); throw new Error(`The update download failed (${response.status}). Try again.`); }
   return response;
 }
-async function downloadRelease(release, directory, fetcher, onProgress = () => {}) {
+async function downloadRelease(release, directory, fetcher, onProgress = () => {}, cancel) {
   const name = `Polygate-${release.version}-Windows-x64.exe`;
   const asset = release.assets.find(item => item.name === name);
   const checksum = release.assets.find(item => item.name === name + '.sha256');
   if (!asset || !checksum) throw new Error('This release has no Windows executable and checksum yet. Try again later.');
-  const signal = AbortSignal.timeout(15 * 60 * 1000);
+  // The download stops after 15 minutes, or at once when the person cancels it.
+  const signal = cancel ? AbortSignal.any([cancel, AbortSignal.timeout(15 * 60 * 1000)]) : AbortSignal.timeout(15 * 60 * 1000);
   const checksumResponse = await fetchAsset(checksum.url, fetcher, signal);
   const text = await readLimited(checksumResponse, 4096);
   const lines = text.trim().split(/\r?\n/);
@@ -64,13 +65,15 @@ function removeStaleStaging(tempDir) {
   } catch { /* temp folder unreadable: nothing to clean */ }
 }
 function createPortableUpdater({ version, target, tempDir, resultPath, fetcher = fetch, onState = () => {}, onReady = () => {}, launchHelper = startHelper }) {
-  let state, busy = false;
+  let state, busy = false, cancelling;
   const canInstall = !!target;
   const emit = patch => { state = { ...state, ...patch, kind: 'windows', canInstall }; onState({ ...state }); return { ...state }; };
   const checker = createReleaseChecker({ version, kind: 'windows', fetcher, onState: next => { if (!busy) emit(next); } });
   state = { ...checker.getState(), canInstall };
   const result = {
     getState: () => ({ ...state }),
+    // Stops a download in progress. Once the update is being installed it can no longer be stopped.
+    cancel() { if (state.status === 'downloading' && cancelling) cancelling.abort(); return { ...state }; },
     async check(force = false) { if (busy) return { ...state }; await checker.check(force); return { ...state }; },
     async install() {
       if (busy) return { ...state };
@@ -87,7 +90,9 @@ function createPortableUpdater({ version, target, tempDir, resultPath, fetcher =
         emit({ ...checked, status: 'downloading', progress: 0, error: '' });
         removeStaleStaging(tempDir);
         directory = fs.mkdtempSync(path.join(tempDir, 'polygate-update-'));
-        const downloaded = await downloadRelease(checker.getRelease(), directory, fetcher, progress => emit({ progress }));
+        cancelling = new AbortController();
+        const downloaded = await downloadRelease(checker.getRelease(), directory, fetcher, progress => emit({ progress }), cancelling.signal);
+        cancelling = undefined;
         const script = path.join(directory, 'apply-update.ps1'), configPath = path.join(directory, 'update.json');
         fs.writeFileSync(script, fs.readFileSync(path.join(__dirname, 'apply-update.ps1')));
         fs.writeFileSync(configPath, JSON.stringify({ ...downloaded, target, parentPid: process.pid, resultPath, version: checked.latestVersion }));
@@ -99,6 +104,9 @@ function createPortableUpdater({ version, target, tempDir, resultPath, fetcher =
         // Only remove the unique staging folder created in our own temp directory.
         try { if (directory && path.dirname(path.resolve(directory)) === path.resolve(tempDir) && path.basename(directory).startsWith('polygate-update-')) fs.rmSync(directory, { recursive: true, force: true }); } catch { /* A locked temporary file must not suppress the update error or keep the app busy. */ }
         busy = false;
+        // Cancelled: back to "an update is available", with nothing downloaded kept and no error shown.
+        if (cancelling?.signal.aborted) { cancelling = undefined; return emit({ status: 'available', error: '', progress: undefined }); }
+        cancelling = undefined;
         const message = error?.code === 'EACCES' || error?.code === 'EPERM' ? 'The app cannot replace this executable. Move it to a folder you can write to, then try again.' : error?.message || 'The update failed. Your current app has not changed.';
         return emit({ status: 'error', error: message, progress: undefined });
       }

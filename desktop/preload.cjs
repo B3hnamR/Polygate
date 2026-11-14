@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('polygateUpdates', {
   getState: () => ipcRenderer.invoke('polygate:updates:state'),
   check: () => ipcRenderer.invoke('polygate:updates:check'),
   install: () => ipcRenderer.invoke('polygate:updates:install'),
+  cancel: () => ipcRenderer.invoke('polygate:updates:cancel'),
   onState: callback => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on('polygate:updates:changed', listener);

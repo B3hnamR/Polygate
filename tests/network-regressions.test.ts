@@ -29,6 +29,8 @@ const base = (settings: any = {}) => ({
   // transport.ts's Psiphon route (backend/psiphon.ts): not connected in these fixtures.
   PSIPHON: 'psiphon', psiphonLive: () => 0, psiphonVirtualRoute: () => undefined, pickPsiphon: () => null, psiphonSkips: () => true,
   psiphonSpent() {}, psiphonFailed() {}, psiphonOk() {}, psiphonUnavailable: () => 'Psiphon is not connected.',
+  // Outside a dashboard request there is no cancel signal (backend/cancel.ts).
+  requestSignal: () => undefined, detached: (fn: () => any) => fn(), cancellable: (ms: number) => AbortSignal.timeout(ms), isCancelled: () => false, stopIfCancelled() {}, cancelledError: () => new GatewayError('Cancelled.', 499, 'cancelled'), takeExhaustion() {},
   psiphonReady: () => 0, setPsiphonChecker() {}, psiphonKiloLimited() {}, psiphonClean() {}, psiphonRegionsReady: () => [], scopeOfUrl: () => 'other', scopeOfKind: () => 'other',
 });
 

@@ -1,7 +1,7 @@
 // Loaded before every test file (bunfig.toml). Test files share one process, so backend/state is loaded once with whichever
 // POLYGATE_STATE is set first; a per-file folder that one file deletes would break every later file. One temporary folder for the
 // whole run, removed at process exit, also keeps tests away from the real state under %LOCALAPPDATA% or ~/.local/state.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
@@ -9,6 +9,20 @@ import tls from 'node:tls';
 import dns from 'node:dns';
 
 const harness = process.env.POLYGATE_HARNESS === '1';
+// Test files make their own temporary folders (projects, agent data, libraries, TLS files), and on Windows `bun test` never fires the
+// process's exit event, so nothing removed them: a few hundred piled up per run. Each run therefore starts by removing the test folders
+// earlier runs left. Only folders older than half an hour go (a run going on in another terminal keeps its own), and never the app's
+// update staging folders (polygate-update-…).
+if (!harness) {
+  try {
+    const tmp = os.tmpdir(); const old = Date.now() - 30 * 60000;
+    for (const e of readdirSync(tmp, { withFileTypes: true })) {
+      if (!e.isDirectory() || !/^(pg-|pgrelay-|polygate-)/.test(e.name) || e.name.startsWith('polygate-update-')) continue;
+      const full = path.join(tmp, e.name);
+      try { if (statSync(full).mtimeMs < old) rmSync(full, { recursive: true, force: true }); } catch { /* in use */ }
+    }
+  } catch { /* the temp directory could not be read */ }
+}
 const dir = harness ? process.env.POLYGATE_STATE! : mkdtempSync(path.join(os.tmpdir(), 'polygate-test-'));
 if (!dir) throw new Error('A harness must supply its temporary POLYGATE_STATE');
 process.env.POLYGATE_STATE = dir;

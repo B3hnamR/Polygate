@@ -1,7 +1,7 @@
 import {useEffect,useRef,useState,type ReactNode} from 'react';
 import {Check,Cloud,Diamond,ExternalLink,CloudUpload,TriangleAlert,X} from 'lucide-react';
-import {api} from './api';
-import {Button,Field,Select} from './ui';
+import {api,isCancelled} from './api';
+import {Button,Field,Select,useCancel} from './ui';
 // One-click relay deployment. The platform's API token goes to the local gateway for this one call; the gateway deploys the bundled relay,
 // stores a freshly generated access token as the relay's secret, and saves the relay as a route. Nothing here keeps the API token.
 type Platform='vercel'|'netlify'|'cloudflare';
@@ -41,11 +41,14 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
   const [remember,setRemember]=useState(false);const [another,setAnother]=useState(false);const usingSaved=saved&&!another;const needsAccount=spec.id==='cloudflare'&&!(usingSaved&&savedAccount);
   const [picked,setPicked]=useState<string[]>(['fra1']);const [batch,setBatch]=useState<Row[]|null>(null);const stop=useRef(false);const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [result,setResult]=useState<Result|null>(null);
   const first=useRef<HTMLInputElement>(null);const box=useRef<HTMLDivElement>(null);const note=useRef<HTMLDivElement>(null);const closing=useRef(onClose);const [done,setDone]=useState<string[]>([]);const [plan,setPlan]=useState<any>(null);const [next,setNext]=useState('');
-  useEffect(()=>{closing.current=onClose;});
+  // Closing while a deploy runs cancels it; the gateway removes what that deploy had created on the platform.
+  const {start,cancel}=useCancel();const [cancelled,setCancelled]=useState(false);
+  const close=()=>{stop.current=true;cancel();onClose();};
+  useEffect(()=>{closing.current=close;});
   useEffect(()=>{const opener=document.activeElement as HTMLElement|null;first.current?.focus();return()=>opener?.focus();},[]);
   useEffect(()=>{if(result)note.current?.focus();},[result]);
   useEffect(()=>{const key=(e:KeyboardEvent)=>{
-    if(e.key==='Escape'){if(!busy&&!e.defaultPrevented)closing.current();}
+    if(e.key==='Escape'){if(!e.defaultPrevented)closing.current();}
     else if(e.key==='Tab'&&box.current){const f=[...box.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled])')];const i=f.indexOf(document.activeElement as HTMLElement);if(!f.length)e.preventDefault();else if(e.shiftKey?i<=0:(i<0||i===f.length-1)){e.preventDefault();f[e.shiftKey?f.length-1:0].focus();}}
   };document.addEventListener('keydown',key);return()=>document.removeEventListener('keydown',key);},[busy]);
   // Regions that already have a relay: the ones deployed from this window and the Vercel relays already saved (their route names carry the region).
@@ -55,9 +58,9 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
   const ready=haveToken&&(!needsAccount||/^[a-fA-F0-9]{32}$/.test(form.accountId.trim()))&&(spec.id!=='vercel'||chosen.length>0);
   const credentials=()=>usingSaved?{useSaved:true}:{token:form.token.trim(),remember};
   async function deploy(region=form.region,name=form.name.trim()){
-    setBusy(true);setError('');
-    try{const r:Result=await api('/admin/relays/deploy',{platform:spec.id,...credentials(),name,region,runtime:form.runtime,accountId:form.accountId.trim()});if(r.region)setDone(d=>[...d,r.region!]);setResult(r);setNext('');onDone(r);}
-    catch(e:any){setError(e.message||'Deployment failed');}finally{setBusy(false);}
+    setBusy(true);setError('');setCancelled(false);
+    try{const r:Result=await api('/admin/relays/deploy',{platform:spec.id,...credentials(),name,region,runtime:form.runtime,accountId:form.accountId.trim()},start());if(r.region)setDone(d=>[...d,r.region!]);setResult(r);setNext('');onDone(r);}
+    catch(e:any){if(isCancelled(e))setCancelled(true);else setError(e.message||'Deployment failed');}finally{setBusy(false);}
   }
   // Several regions, one after the other: each is its own Vercel project, so a failure in one does not undo the others.
   // Only a rejected token ends the run early; Stop ends it after the region that is being deployed.
@@ -69,18 +72,19 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
     for(let i=0;i<regions.length;i++){
       if(stop.current||rejected){set(i,{status:'skipped'});continue;}
       set(i,{status:'running'});
-      try{const r:Result=await api('/admin/relays/deploy',{platform:'vercel',...credentials(),name:base?`${base}-${regions[i]}`:'',region:regions[i],runtime:form.runtime});setDone(d=>[...d,regions[i]]);set(i,{status:'done',result:r});onDone(r);}
-      catch(e:any){const message=e.message||'Deployment failed';if(/check the token/i.test(message))rejected=true;set(i,{status:'failed',error:message});}
+      try{const r:Result=await api('/admin/relays/deploy',{platform:'vercel',...credentials(),name:base?`${base}-${regions[i]}`:'',region:regions[i],runtime:form.runtime},start());setDone(d=>[...d,regions[i]]);set(i,{status:'done',result:r});onDone(r);}
+      catch(e:any){if(isCancelled(e)){stop.current=true;set(i,{status:'failed',error:'Cancelled. Its Vercel project was removed again.'});continue;}const message=e.message||'Deployment failed';if(/check the token/i.test(message))rejected=true;set(i,{status:'failed',error:message});}
     }
     setBusy(false);
   }
-  async function checkPlan(){setBusy(true);setError('');try{setPlan(await api('/admin/relays/inspect',{platform:'vercel',...(usingSaved?{useSaved:true}:{token:form.token.trim()})}));}catch(e:any){setError(e.message||'Could not read the account');}finally{setBusy(false);}}
+  async function checkPlan(){setBusy(true);setError('');try{setPlan(await api('/admin/relays/inspect',{platform:'vercel',...(usingSaved?{useSaved:true}:{token:form.token.trim()})},start()));}catch(e:any){if(!isCancelled(e))setError(e.message||'Could not read the account');}finally{setBusy(false);}}
+  const cancelNote=cancelled&&<div className="dialog-note info" role="status"><X size={16}/><p>Deploy cancelled. Anything it had already created on {spec.name} was removed again.</p></div>;
   const toggle=(v:string)=>setPicked(p=>p.includes(v)?p.filter(x=>x!==v):[...p,v]);
   const planNote=plan?<div className={`dialog-note ${plan.plan==='hobby'||plan.plan==='pro'||plan.plan==='enterprise'?'info':'warn'}`}><Check size={16}/><p><strong>{String(plan.plan).charAt(0).toUpperCase()+String(plan.plan).slice(1)} plan</strong> ({plan.team}). {plan.limits?<>A project can run in {plan.limits.regionsPerProject>=99?'any number of':`up to ${plan.limits.regionsPerProject}`} function region{plan.limits.regionsPerProject===1?'':'s'}, so {plan.limits.regionsPerProject===1?'each region you add is its own project':'one project can cover several regions, but Polygate still deploys one region per project so it can choose between them'}. You have {plan.projectsMore?'100+':plan.projects} projects{plan.limits.projects?` of ${plan.limits.projects}`:''} and may create {plan.limits.deploymentsPerDay.toLocaleString()} deployments a day.</>:'Its limits are not known to Polygate; check the Vercel dashboard.'}</p></div>:null;
   const title=`Deploy ${spec.name} Relay`;
-  return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose();}}>
+  return <div className="dialog-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)close();}}>
     <div ref={box} className="dialog" role="dialog" aria-modal="true" aria-label={title}>
-      <header className="dialog-head"><span className="deploy-icon" style={{'--brand':spec.color} as any}>{spec.icon}</span><h2>{title}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16}/></button></header>
+      <header className="dialog-head"><span className="deploy-icon" style={{'--brand':spec.color} as any}>{spec.icon}</span><h2>{title}</h2><span className="toolbar-spacer"/><button type="button" className="icon-button" aria-label="Close" onClick={close}><X size={16}/></button></header>
       {batch?<div className="dialog-body">
         <p className="subtle">{busy?'Deploying one region after another. Each one takes up to a minute or two; keep this window open.':`${batch.filter(r=>r.status==='done').length} of ${batch.length} relays deployed.`}</p>
         <ul className="batch-list" aria-live="polite">{batch.filter(r=>r.status!=='skipped').map(r=><li key={r.region} className={`batch-row ${r.status}`}>
@@ -88,17 +92,17 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
           {r.result&&<input readOnly aria-label={`Relay URL for ${r.region}`} value={r.result.url} onFocus={e=>e.currentTarget.select()}/>}
           {r.error&&<p className="batch-error">{r.error}</p>}</li>)}</ul>
         {batch.some(r=>r.status==='skipped')&&<p className="subtle">{batch.filter(r=>r.status==='skipped').length} more region{batch.filter(r=>r.status==='skipped').length===1?' was':'s were'} not deployed because the run ended early. Close this window and tick them again to retry.</p>}
-        {busy&&<p className="subtle">Stop ends the run after the region that is being deployed now; relays already deployed stay.</p>}
-        <div className="dialog-actions">{busy?<Button onClick={()=>{stop.current=true;}}>Stop after this one</Button>:<><Button variant="primary" onClick={onClose}>Done</Button></>}</div>
+        {busy&&<p className="subtle">Stop after this one lets the region being deployed now finish. Cancel now stops it at once and removes its project; relays already deployed stay.</p>}
+        <div className="dialog-actions">{busy?<><Button onClick={()=>{stop.current=true;}}>Stop after this one</Button><Button onClick={()=>{stop.current=true;cancel();}}><X size={14}/>Cancel now</Button></>:<><Button variant="primary" onClick={close}>Done</Button></>}</div>
       </div>:result?<div className="dialog-body">
         <div ref={note} tabIndex={-1} className={`dialog-note ${result.reachable?'good':'warn'}`}>{result.reachable?<Check size={16}/>:<TriangleAlert size={16}/>}<p><strong>{result.reachable?'Relay deployed and answering.':'Relay deployed, not answering yet.'}</strong> {result.detail}</p></div>
         <Field label="Relay URL"><input readOnly value={result.url} onFocus={e=>e.currentTarget.select()}/></Field>
         <p className="subtle">It was added under Relays as a route with its generated access token. Select it on Routing to use it, or on a provider to send that provider through it.</p>
         {spec.verdict.text&&<div className={`dialog-note ${spec.verdict.tone}`}>{spec.verdict.tone==='good'?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{spec.verdict.text}</p></div>}
         {spec.id==='vercel'&&<div className="more-regions">{planNote}<strong>Another region?</strong><p className="subtle">Each region sends from its own pool of addresses, and a relay that is used up in one region can hand over to the next. Deploy them one at a time: each is a separate Vercel project and counts toward your Vercel plan's limits, so nothing is deployed until you press the button.</p>
-          {free.length?<div className="more-row"><Select value={next||free[0][0]} onChange={setNext}>{free.map(([v,l])=><option key={v} value={v}>{l}</option>)}</Select><Button disabled={busy} onClick={()=>void deploy(next||free[0][0],form.name.trim()?`${form.name.trim()}-${next||free[0][0]}`:'')}><CloudUpload size={14}/>{busy?'Deploying…':`Deploy ${next||free[0][0]}`}</Button></div>:<p className="subtle">Every listed region already has a relay.</p>}
-          {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}</div>}
-        <div className="dialog-actions"><Button variant="primary" disabled={busy} onClick={onClose}>Done</Button></div>
+          {free.length?<div className="more-row"><Select value={next||free[0][0]} onChange={setNext}>{free.map(([v,l])=><option key={v} value={v}>{l}</option>)}</Select><Button disabled={busy} onClick={()=>void deploy(next||free[0][0],form.name.trim()?`${form.name.trim()}-${next||free[0][0]}`:'')}><CloudUpload size={14}/>{busy?'Deploying…':`Deploy ${next||free[0][0]}`}</Button>{busy&&<Button onClick={cancel}><X size={14}/>Cancel</Button>}</div>:<p className="subtle">Every listed region already has a relay.</p>}
+          {cancelNote}{error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}</div>}
+        <div className="dialog-actions"><Button variant="primary" disabled={busy} onClick={close}>Done</Button></div>
       </div>:<form className="dialog-body" onSubmit={e=>{e.preventDefault();if(!ready||busy)return;if(spec.id!=='vercel')void deploy();else if(chosen.length>1)void deployMany();else void deploy(chosen[0]);}} autoComplete="off">
         <div className="dialog-note info"><div><strong>What is a {spec.name} relay?</strong><p>{spec.intro}</p><ul>{spec.bullets.map(b=><li key={b}>{b}</li>)}</ul><strong>How to get the token</strong><ol>{spec.steps.map(x=><li key={x}>{x}</li>)}</ol></div></div>
         {spec.verdict.text&&<div className={`dialog-note ${spec.verdict.tone}`}>{spec.verdict.tone==='good'?<Check size={16}/>:<TriangleAlert size={16}/>}<p>{spec.verdict.text}</p></div>}
@@ -114,8 +118,8 @@ function DeployDialog({spec,onClose,onDone,existing,saved,savedAccount,onForget}
           <div className="region-grid" role="group" aria-label="Regions">{REGIONS.map(([v,l])=>{const has=taken.has(v);return <label key={v} className={has?'taken':''}><input type="checkbox" disabled={has} checked={!has&&picked.includes(v)} onChange={()=>toggle(v)}/>{l}{has&&<small>already has a relay</small>}</label>;})}</div>
           <small>Each region sends from its own pool of addresses. Tick one to deploy it, or several to deploy them one after another. Every region is a separate Vercel project and counts toward your plan’s limits{chosen.length>1?`, so ${chosen.length} projects will be created`:''}.</small></div>}
         {spec.id==='vercel'&&<Field label="Runtime" hint="Bun is the default and stays accepted if OpenCode's check changes. Node sends Bun's TLS cipher list itself and works the same today; use it if Vercel's Bun runtime gives you trouble."><Select value={form.runtime} onChange={v=>setForm({...form,runtime:v})}><option value="bun">Bun (recommended)</option><option value="node">Node</option></Select></Field>}
-        {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-        <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!ready||busy}><CloudUpload size={14}/>{busy?'Deploying…':chosen.length>1?`Deploy ${chosen.length} relays`:'Deploy'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
+        {cancelNote}{error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
+        <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!ready||busy}><CloudUpload size={14}/>{busy?'Deploying…':chosen.length>1?`Deploy ${chosen.length} relays`:'Deploy'}</Button>{busy?<Button onClick={cancel}><X size={14}/>Cancel deploy</Button>:<Button onClick={close}>Close</Button>}</div>
       </form>}
     </div>
   </div>;

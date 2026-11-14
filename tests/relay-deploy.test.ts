@@ -6,10 +6,14 @@ const realFetch = globalThis.fetch; afterEach(() => { globalThis.fetch = realFet
 type Call = { url: string; method: string; headers: Headers; body: any };
 const API_TOKEN = 'platform-api-token-123456';
 const isApi = (url: string) => url.startsWith('https://api.vercel.com/') || url.startsWith('https://api.netlify.com/') || url.startsWith('https://api.cloudflare.com/');
+// Names already in use on the platform (a new relay must not take one): the existence check finds these, and nothing else.
+let taken: string[] = []; afterEach(() => { taken = []; });
+const existenceCheck = (c: Call) => c.method === 'GET' && (/api\.vercel\.com\/v9\/projects\/([^/?]+)/.exec(c.url) || /workers\/scripts\/([^/?]+)$/.exec(c.url));
 function platform(answer: (c: Call) => Response | undefined) {
   const calls: Call[] = [];
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const call = { url: String(url), method: init.method || 'GET', headers: new Headers(init.headers), body: init.body }; calls.push(call);
+    const exists = existenceCheck(call); if (exists) return taken.includes(decodeURIComponent(exists[1])) ? Response.json({ id: 'existing' }) : Response.json({ error: 'not found' }, { status: 404 });
     // The relay itself answers the verification request that follows a deployment.
     if (!isApi(call.url) && call.headers.has('x-relay-key')) return Response.json({ data: [] });
     return answer(call) || Response.json({}, { status: 404 });
@@ -21,7 +25,7 @@ test('Vercel: deploys the Bun-runtime function to production with the access tok
   const calls = platform(c => c.method === 'POST' ? ok({ id: 'dpl_1', readyState: 'QUEUED' }) : ok({ id: 'dpl_1', readyState: 'READY', alias: ['my-relay-abc123def-team.vercel.app', 'my-relay.vercel.app'], url: 'x.vercel.app' }));
   const r = await deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-relay', region: 'iad1' });
   expect(r.url).toBe('https://my-relay.vercel.app'); expect(r.runtime).toBe('bun');
-  const body = JSON.parse(String(calls[0].body)); expect(body.target).toBe('production'); expect(body.env.POLYGATE_RELAY_TOKEN).toBe(r.accessToken);
+  const body = JSON.parse(String(calls.find(c => c.method === 'POST')!.body)); expect(body.target).toBe('production'); expect(body.env.POLYGATE_RELAY_TOKEN).toBe(r.accessToken);
   expect(body.projectSettings.serverlessFunctionRegion).toBe('iad1'); const config = JSON.parse(body.files.find((f: any) => f.file === 'vercel.json').data); expect(config.bunVersion).toBe('1.x'); expect(config.regions).toEqual(['iad1']);
   expect(body.files.find((f: any) => f.file === 'api/relay.js').data).toContain('x-relay-runtime');
 });
@@ -73,11 +77,11 @@ test('Vercel: the Node runtime option leaves out bunVersion, marks the package a
   const calls = platform(c => c.method === 'POST' ? ok({ id: 'dpl_3', readyState: 'QUEUED' }) : ok({ id: 'dpl_3', readyState: 'READY', alias: ['my-node-relay.vercel.app'], url: 'x.vercel.app' }));
   const r = await deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-node-relay', region: 'fra1', runtime: 'node' });
   expect(r.runtime).toBe('node-bun-ciphers'); expect(r.url).toBe('https://my-node-relay.vercel.app');
-  const body = JSON.parse(String(calls[0].body)); const config = JSON.parse(body.files.find((f: any) => f.file === 'vercel.json').data);
+  const body = JSON.parse(String(calls.find(c => c.method === 'POST')!.body)); const config = JSON.parse(body.files.find((f: any) => f.file === 'vercel.json').data);
   expect(config.bunVersion).toBeUndefined(); expect(config.regions).toEqual(['fra1']); expect(config.functions['api/relay.js'].maxDuration).toBe(300);
   expect(JSON.parse(body.files.find((f: any) => f.file === 'package.json').data).type).toBe('module');
   const bun = platform(c => c.method === 'POST' ? ok({ id: 'dpl_4', readyState: 'QUEUED' }) : ok({ id: 'dpl_4', readyState: 'READY', alias: ['my-bun-relay.vercel.app'], url: 'y.vercel.app' }));
-  await deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-bun-relay' }); const b = JSON.parse(String(bun[0].body));
+  await deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-bun-relay' }); const b = JSON.parse(String(bun.find(c => c.method === 'POST')!.body));
   expect(JSON.parse(b.files.find((f: any) => f.file === 'vercel.json').data).bunVersion).toBe('1.x'); expect(JSON.parse(b.files.find((f: any) => f.file === 'package.json').data).type).toBeUndefined();
 });
 
@@ -110,4 +114,14 @@ test('Cloudflare: a Worker whose address could not be turned on is removed again
   const error: any = await deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT, name: 'half-made' }).catch(e => e);
   expect(String(error.message)).toContain('subdomain refused'); expect(String(error.message)).not.toContain(API_TOKEN);
   expect(calls.some(c => c.method === 'DELETE' && c.url === `${CF}/workers/scripts/half-made`)).toBe(true);
+});
+
+test('a new relay never takes a name already in use: Vercel and Cloudflare refuse it and change nothing', async () => {
+  taken = ['my-relay'];
+  const vercel = platform(() => ok({ id: 'd1', readyState: 'READY', alias: ['my-relay.vercel.app'] }));
+  await expect(deployRelay({ platform: 'vercel', token: API_TOKEN, name: 'my-relay' })).rejects.toThrow('already exists');
+  expect(vercel.some(c => c.method !== 'GET')).toBe(false); // nothing was created or deleted
+  const cloudflare = platform(c => c.url.endsWith('/workers/subdomain') ? ok({ result: { subdomain: 'acct' } }) : ok({ success: true }));
+  await expect(deployRelay({ platform: 'cloudflare', token: API_TOKEN, name: 'my-relay', accountId: 'a'.repeat(32) })).rejects.toThrow('already exists');
+  expect(cloudflare.some(c => c.method === 'PUT' || c.method === 'DELETE')).toBe(false); // the existing Worker was neither overwritten nor deleted
 });

@@ -8,6 +8,7 @@ import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, 
 import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
 import { logEvent } from './logbook';
+import { requestSignal } from './cancel';
 import { KILO_ID, KILO_LIMIT_PAUSE_MS, KILO_MODEL_PAUSE_MS, isAddressLimit, pauseKilo } from './kilo';
 import { explainError, pausedModel } from './explain';
 import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagnostics';
@@ -335,6 +336,8 @@ export async function probeResult(id:string,slots=1):Promise<{model:Model;status
   const m=models.get(id);if(!m)throw new GatewayError('Model not found',404);if(m.cooldownUntil>Date.now())throw new GatewayError('Model is cooling down; probing is deferred until its retry time.',429);
   const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)throw new GatewayError('Provider is disabled',400);
   const route=routeForProvider(p,id);const start=Date.now();const c=new AbortController();let timedOut=false;const timer=setTimeout(()=>{timedOut=true;c.abort();},30000);let release:(()=>void)|undefined;
+  // Cancel in the dashboard ends the check; a cancelled check says nothing about the model.
+  const cancel=requestSignal();const onCancel=()=>c.abort();cancel?.addEventListener('abort',onCancel,{once:true});
   try{
     release=await queue.acquire('availability-probe',slots,c.signal);
     const r=await providerChat(p,m,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:16,stream:true},c.signal,route.id,'probe-'+crypto.randomUUID());
@@ -344,7 +347,8 @@ export async function probeResult(id:string,slots=1):Promise<{model:Model;status
     return {model:m,status:r.status,...(!r.ok&&r.headers.get(LIMIT_SCOPE)==='model'?{scope:'model' as const}:{})};
   }catch(e){
     // A full queue or cancelled wait says nothing about the model; only failures after admission are its verdict.
+    if(cancel?.aborted)throw cancel.reason;
     if(release&&!(e instanceof GatewayError))classifyModel(m,timedOut?504:502,String(e),Date.now()-start);
     throw e;
-  }finally{clearTimeout(timer);release?.();}
+  }finally{clearTimeout(timer);release?.();cancel?.removeEventListener('abort',onCancel);}
 }

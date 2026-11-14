@@ -1,7 +1,7 @@
 import {useState,type ReactNode} from 'react';
-import {Check,RefreshCw,Trash2,TriangleAlert} from 'lucide-react';
-import {api} from './api';
-import {Button,Field,usePoll,compact} from './ui';
+import {Check,RefreshCw,Trash2,TriangleAlert,X} from 'lucide-react';
+import {api,isCancelled} from './api';
+import {Button,Field,usePoll,compact,useCancel} from './ui';
 import {Dialog} from './mcp';
 import type {Route,Settings} from '../backend/types';
 // Looking after relays Polygate deployed: update one to the current relay code, remove one from its platform, and see how each has done lately.
@@ -38,27 +38,30 @@ function useToken(platform:Platform,settings:Settings){
 }
 export function RelayUpdateDialog({route,settings,onClose,onDone,notice}:{route:Route;settings:Settings;onClose:()=>void;onDone:()=>void;notice:(s:string)=>void}){
   const platform=platformOf(route)!;const t=useToken(platform,settings);const [busy,setBusy]=useState(false);const [error,setError]=useState('');
-  async function run(){setBusy(true);setError('');try{const r=await api('/admin/relays/update',{id:route.id,...t.credentials()});notice(r.reachable?`${route.name} updated`:`${route.name} updated, not answering yet`);onDone();onClose();}catch(e:any){setError(e.message||'The update failed');}finally{setBusy(false);}}
-  return <Shell title="Update relay" onClose={onClose} busy={busy}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if(t.ready&&!busy)void run();}}>
+  // Cancel stops the update; the relay keeps the code it had. Closing the dialog cancels too.
+  const {start,cancel}=useCancel();const close=()=>{cancel();onClose();};
+  async function run(){setBusy(true);setError('');try{const r=await api('/admin/relays/update',{id:route.id,...t.credentials()},start());notice(r.reachable?`${route.name} updated`:`${route.name} updated, not answering yet`);onDone();onClose();}catch(e:any){if(isCancelled(e))notice('Relay update cancelled');else setError(e.message||'The update failed');}finally{setBusy(false);}}
+  return <Shell title="Update relay" onClose={close} busy={false}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if(t.ready&&!busy)void run();}}>
     <p className="subtle">Deploys the current relay code to the {KIND[platform]} <strong>{platformName(route)}</strong> on {LABEL[platform]} again. Its address and access token stay the same, so nothing else needs changing. Use this after a Polygate update that changes the relay.</p>
     {t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-    <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!t.ready||busy}><RefreshCw size={14}/>{busy?'Updating…':'Update relay'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
+    <div className="dialog-actions"><Button variant="primary" type="submit" disabled={!t.ready||busy}><RefreshCw size={14}/>{busy?'Updating…':'Update relay'}</Button>{busy?<Button onClick={cancel}><X size={14}/>Cancel update</Button>:<Button onClick={close}>Close</Button>}</div>
   </form></Shell>;
 }
 export function RelayRemoveDialog({route,settings,onClose,onDone,notice}:{route:Route;settings:Settings;onClose:()=>void;onDone:()=>void;notice:(s:string)=>void}){
   const platform=platformOf(route)!;const t=useToken(platform,settings);const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [both,setBoth]=useState(true);
+  const {start,cancel}=useCancel();const close=()=>{cancel();onClose();};
   async function run(){
     setBusy(true);setError('');
-    try{if(both)await api('/admin/relays/remove',{id:route.id,...t.credentials()});else await api('/admin/routes/delete',{id:route.id});notice(both?`${route.name} removed from ${LABEL[platform]} and from Polygate`:'Route removed');onDone();onClose();}
-    catch(e:any){setError(e.message||'Could not remove the relay');}finally{setBusy(false);}
+    try{if(both)await api('/admin/relays/remove',{id:route.id,...t.credentials()},start());else await api('/admin/routes/delete',{id:route.id});notice(both?`${route.name} removed from ${LABEL[platform]} and from Polygate`:'Route removed');onDone();onClose();}
+    catch(e:any){if(isCancelled(e))setError('Cancelled. The relay is still in Polygate; it may or may not have been deleted from the platform already.');else setError(e.message||'Could not remove the relay');}finally{setBusy(false);}
   }
-  return <Shell title="Delete relay" onClose={onClose} busy={busy}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if((!both||t.ready)&&!busy)void run();}}>
+  return <Shell title="Delete relay" onClose={close} busy={false}><form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if((!both||t.ready)&&!busy)void run();}}>
     <p className="subtle">Delete <strong>{route.name}</strong>? Requests can no longer use it.</p>
     <div className="check-row"><input id="remove-both" type="checkbox" checked={both} onChange={e=>setBoth(e.target.checked)}/><label htmlFor="remove-both"><span>Also delete the {KIND[platform]} <strong>{platformName(route)}</strong> from {LABEL[platform]}</span><small>This deletes that whole {KIND[platform]}, so check the name is the relay's own. Otherwise it keeps running on your {LABEL[platform]} account and counts toward its limits.</small></label></div>
     {both&&t.fields}
     {error&&<div className="dialog-note error" role="alert"><TriangleAlert size={16}/><p>{error}</p></div>}
-    <div className="dialog-actions"><Button variant="primary" type="submit" disabled={(both&&!t.ready)||busy}><Trash2 size={14}/>{busy?'Deleting…':'Delete relay'}</Button><Button disabled={busy} onClick={onClose}>Cancel</Button></div>
+    <div className="dialog-actions"><Button variant="primary" type="submit" disabled={(both&&!t.ready)||busy}><Trash2 size={14}/>{busy?'Deleting…':'Delete relay'}</Button>{busy?<Button onClick={cancel}><X size={14}/>Cancel</Button>:<Button onClick={close}>Close</Button>}</div>
   </form></Shell>;
 }
 type Report={days:number;relays:{id:string;name:string;region:string;platform:string;enabled:boolean;ok:number;refused:number;usedUp:number;redirected:number;failed:number;activeDays:number;tone:'good'|'warn'|'bad'|'neutral';advice:string}[]};

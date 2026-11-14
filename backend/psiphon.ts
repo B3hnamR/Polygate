@@ -10,11 +10,14 @@ import { GatewayError } from './queue';
 import { freePort, traceVia } from './warp';
 import { logEvent } from './logbook';
 import { notify } from './notifications';
+import { requestSignal, stopIfCancelled, detached } from './cancel';
 import type { PsiphonSettings, Route } from './types';
 
 const isWin = process.platform === 'win32';
 const appDir = process.env.POLYGATE_APP_DIR || process.cwd();
 const dataDir = path.join(stateDir, 'psiphon');
+// Each region is its own client on its own port, counted up from here. There is no limit on how many regions are chosen: every port is
+// checked free before it is used (freePort), so regions and the server update (from BASE_PORT + 90) never take the same one.
 const BASE_PORT = 47100;
 export const ROUTE_ID = 'psiphon';
 const REGION = /^[A-Z]{2}$/;
@@ -63,11 +66,15 @@ const nodesDir = path.join(dataDir, 'nodes');
 const storeOf = (dir: string) => path.join(dir, 'ca.psiphon.PsiphonTunnel.tunnel-core');
 const used = () => new Set([...instances.values()].map(i => i.port));
 
-function saveRegions(regions: unknown) {
+// Each running client reports the regions it knows, and clients connected through different servers know different lists: saving the
+// last report made the list jump between lengths (25, then 18) and hid chosen regions. So a client's report only adds regions; Update
+// servers, which fetches Psiphon's current list on purpose, replaces it (replace = true).
+function saveRegions(regions: unknown, replace = false) {
   if (!Array.isArray(regions)) return;
-  const list = [...new Set(regions.map(r => String(r).toUpperCase()).filter(r => REGION.test(r)))].sort();
-  if (!list.length) return;
-  const c = psiphonConfig(); if (JSON.stringify(c.available || []) === JSON.stringify(list)) return;
+  const reported = regions.map(r => String(r).toUpperCase()).filter(r => REGION.test(r));
+  if (!reported.length) return;
+  const c = psiphonConfig(); const list = [...new Set([...(replace ? [] : c.available || []), ...reported])].sort();
+  if (JSON.stringify(c.available || []) === JSON.stringify(list)) return;
   settings.psiphon = { ...c, available: list }; persist();
 }
 // Starts one client. `region` empty: no region chosen (used to update the node list). Resolves when it is listening or has failed to start.
@@ -94,7 +101,9 @@ const exitOf = (proc: ChildProcess) => new Promise<void>(r => { if (proc.exitCod
 let epoch = 0; const starting = new Map<string, Promise<Instance>>();
 function startInstance(region: string, fresh = false): Promise<Instance> {
   const running = starting.get(region); if (running) return running;
-  const job = startOnce(region, fresh, epoch).finally(() => { if (starting.get(region) === job) starting.delete(region); });
+  // A client outlives the request that started it (a connect, a route test that found an exit used up): it runs detached from that
+  // request, so a cancelled request never cuts short the client's later checks.
+  const job = detached(() => startOnce(region, fresh, epoch)).finally(() => { if (starting.get(region) === job) starting.delete(region); });
   starting.set(region, job); return job;
 }
 const stopped = () => new GatewayError('Psiphon was stopped', 409, 'psiphon_stopped');
@@ -152,7 +161,7 @@ function tryRenew(inst: Instance, scope: PsiphonScope) {
   const now = Date.now(); inst.renewedAt = inst.renewedAt.filter(t => now - t < 3600000);
   if (inst.renewedAt.length >= 3) return false;
   inst.renewedAt.push(now); recheck.set(inst.region, scope);
-  const t = setTimeout(() => { if (instances.get(inst.region) === inst) void renewRegion(inst.region, true).catch(() => recheck.delete(inst.region)); }, 3000); t.unref?.(); return true;
+  const t = detached(() => setTimeout(() => { if (instances.get(inst.region) === inst) void renewRegion(inst.region, true).catch(() => recheck.delete(inst.region)); }, 3000)); t.unref?.(); return true;
 }
 // The check is a request, so backend/transport.ts sends it and registers itself here: one small chat request to that provider through
 // exactly this region's exit. 'unknown' (the check could not be sent or read) lets real requests decide, as before the option existed.
@@ -184,7 +193,7 @@ function onExit(inst: Instance, code: number | null) {
   // Restarted with a growing wait, so a client that keeps failing does not spin. Five failures in a row leave it stopped until asked.
   if (!psiphonConfig().enabled || inst.restarts >= 5) return;
   const wait = Math.min(120000, 5000 * 2 ** inst.restarts); inst.restarts++;
-  const t = setTimeout(() => { if (instances.get(inst.region) === inst && !inst.stopping) void startInstance(inst.region).catch(() => {}); }, wait); t.unref?.();
+  const t = detached(() => setTimeout(() => { if (instances.get(inst.region) === inst && !inst.stopping) void startInstance(inst.region).catch(() => {}); }, wait)); t.unref?.();
 }
 
 // --- used-up exits ---
@@ -322,6 +331,8 @@ export function psiphonUpdateNodes() {
       const port = await freePort(BASE_PORT + 90, used());
       const done = new Promise<void>(resolve => {
         const t = setTimeout(resolve, 90000); t.unref?.();
+        // Cancel in the dashboard ends the wait at once; the client is stopped below and nothing is saved.
+        requestSignal()?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
         void launch('', nodesDir, port, n => {
           if (n?.noticeType === 'AvailableEgressRegions' && Array.isArray(n.data?.regions)) regions = n.data.regions;
           if (n?.noticeType === 'Tunnels' && n.data?.count > 0 && !connected) { connected = true; const w = setTimeout(() => { clearTimeout(t); resolve(); }, 15000); w.unref?.(); }
@@ -329,8 +340,9 @@ export function psiphonUpdateNodes() {
       });
       await done;
     } finally { stopProcess(proc); if (proc) await exitOf(proc); updating = false; }
+    stopIfCancelled();
     if (!connected && !regions.length) throw new GatewayError('Psiphon could not connect to update its servers. Check this computer\'s connection and try again.', 502, 'psiphon_error');
-    saveRegions(regions); const c = psiphonConfig(); settings.psiphon = { ...c, updatedAt: Date.now() }; persist();
+    saveRegions(regions, true); const c = psiphonConfig(); settings.psiphon = { ...c, updatedAt: Date.now() }; persist();
     // Regions not running pick up the new list on their next start; running ones keep their connection.
     for (const r of c.regions) if (!instances.has(r)) { try { rmSync(storeOf(regionDir(r)), { recursive: true, force: true }); } catch { /* in use */ } }
     logEvent('info', 'psiphon', `Psiphon servers updated: ${(c.available || []).length} regions`, { connected });
@@ -349,7 +361,6 @@ export async function setPsiphonSettings(patch: Partial<PsiphonSettings>) {
     if (!Array.isArray(patch.regions)) throw new GatewayError('Regions must be a list', 400);
     const list = [...new Set(patch.regions.map(r => String(r).toUpperCase()))];
     const bad = list.find(r => !REGION.test(r)); if (bad) throw new GatewayError(`"${bad}" is not a region code`, 400);
-    if (list.length > 18) throw new GatewayError('Choose at most 18 regions', 400);
     next.regions = list;
   }
   if (patch.pinned !== undefined) { const p = String(patch.pinned || '').toUpperCase(); if (p && !REGION.test(p)) throw new GatewayError(`"${p}" is not a region code`, 400); next.pinned = p; }
@@ -387,7 +398,8 @@ export function psiphonStatus() {
     installed: !!found, problem: found ? '' : psiphonMissing(), platform: `${process.platform}-${process.arch}`,
     busy, lastError, running: instances.size > 0, live: psiphonLive(),
     config: { enabled: c.enabled, autoStart: c.autoStart, regions: c.regions, mode: c.mode, pinned: c.pinned, skip: c.skip, renew: c.renew },
-    available: c.available?.length ? c.available : KNOWN, updatedAt: c.updatedAt || 0,
+    // The regions on offer, always with the chosen ones in it: a chosen region never disappears from the list it is picked in.
+    available: [...new Set([...(c.available?.length ? c.available : KNOWN), ...c.regions])].sort(), updatedAt: c.updatedAt || 0,
     regions: c.regions.map(region => { const i = instances.get(region); const until = i?.exitIp ? spentUntil(i.exitIp) : 0;
       return { region, state: i ? i.state : 'stopped', port: i?.port || 0, exitIp: i?.exitIp || '', location: i?.location || '', since: i?.readyAt || 0, usedUpUntil: until, kiloUntil: i?.exitIp ? kiloUntil(i.exitIp) : 0, checking: i && recheck.get(region) ? recheck.get(region) : '', error: i?.state === 'failed' ? i.error : '' }; }),
     spent: Object.entries(c.spent || {}).filter(([, until]) => until > now).length,
@@ -404,5 +416,6 @@ export async function startPsiphon() {
 }
 export async function stopPsiphon() { if (monitor) clearInterval(monitor); monitor = undefined; await stopAll(); }
 export const __instances = instances;
+export const __saveRegions = saveRegions;
 // Tests: what happens once a region has reconnected and its exit is known (the client says so in real use).
 export const __connected = (region: string) => { const i = instances.get(region); return i ? learnExit(i, false) : Promise.resolve(); };

@@ -17,19 +17,57 @@ const killTree=()=>{
   if(process.platform==='win32'&&child.pid){const r=spawnSync(path.join(process.env.SystemRoot||'C:\\Windows','System32','taskkill.exe'),['/pid',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore',timeout:5000});if(r.error||r.status)child.kill();}
   else child.kill();
 };
+// The portable exe unpacks the whole app into %TEMP% on every start, and Windows (Storage Sense, disk cleanup) deletes files there that
+// are not open at that moment, even while the app runs. Psiphon's settings, the dashboard's files, the WARP helper between two starts and
+// Electron's own startup files (needed whenever a window process starts again) have gone missing that way. So the app copies itself once
+// per build to %LOCALAPPDATA%\Polygate\app\<version> (on this computer only, never in a roaming profile), starts that copy and steps aside;
+// the portable wrapper then removes its temp folder as usual. Updates still replace the portable exe (PORTABLE_EXECUTABLE_FILE is passed on).
+// If the copy cannot be made (a full disk, a locked file), the app simply runs from the unpacked files as before.
+const RELOCATED='POLYGATE_RELOCATED';
+function relocate(){
+  if(!app.isPackaged||process.platform!=='win32'||!process.env.PORTABLE_EXECUTABLE_DIR||process.env[RELOCATED]==='1')return '';
+  // Electron's fs reads app.asar as a folder; original-fs copies it as the file it is.
+  const ofs=require('original-fs');
+  const source=path.dirname(process.execPath);const base=path.join(process.env.LOCALAPPDATA||app.getPath('appData'),'Polygate','app');
+  try{
+    const asar=ofs.statSync(path.join(process.resourcesPath,'app.asar')),gw=ofs.statSync(path.join(process.resourcesPath,'gateway.js'));
+    const stamp=`${app.getVersion()} ${asar.size} ${gw.size} ${Math.round(gw.mtimeMs)}`;
+    const target=path.join(base,app.getVersion());const marker=path.join(target,'.polygate-copy');
+    let ready=false;try{ready=ofs.readFileSync(marker,'utf8')===stamp&&ofs.existsSync(path.join(target,'Polygate.exe'));}catch{/* not copied yet */}
+    if(!ready){
+      const staging=`${target}.copy-${process.pid}`;ofs.rmSync(staging,{recursive:true,force:true});
+      ofs.cpSync(source,staging,{recursive:true});ofs.writeFileSync(path.join(staging,'.polygate-copy'),stamp);
+      ofs.rmSync(target,{recursive:true,force:true});ofs.renameSync(staging,target);
+    }
+    return path.join(target,'Polygate.exe');
+  }catch(e){console.error('[desktop] running from the unpacked files; the copy failed:',e.message);return '';}
+}
+// Copies made for other versions are no longer needed. One that is still in use is left for the next start.
+function pruneCopies(log){
+  if(!app.isPackaged||process.env[RELOCATED]!=='1')return;
+  const ofs=require('original-fs');const base=path.dirname(path.dirname(process.execPath));
+  try{for(const name of ofs.readdirSync(base))if(name!==app.getVersion())try{ofs.rmSync(path.join(base,name),{recursive:true,force:true});}catch{/* in use */}}catch{/* nothing to prune */}
+  try{fs.writeSync(log,`[desktop] running from ${path.dirname(process.execPath)}\n`);}catch{/* logging never blocks the start */}
+}
+// The running-app check comes first: when Polygate already runs, this start only brings it forward and never touches the copy it runs
+// from (refreshing that folder would delete its files from under it). The lock is handed to the copy when this start steps aside.
+// The lock is released before the copy starts, so the copy can take it; the copy is started detached and this start then steps aside.
+let copy='';
 if(!app.requestSingleInstanceLock())app.quit();
+else if((copy=relocate())){app.releaseSingleInstanceLock();spawn(copy,process.argv.slice(1),{detached:true,stdio:'ignore',env:{...process.env,[RELOCATED]:'1'}}).unref();app.exit(0);}
 else{
 app.on('second-instance',()=>{if(win&&!win.isDestroyed()){if(win.isMinimized())win.restore();win.show();win.focus();}});
 app.whenReady().then(async()=>{
   if(process.env.POLYGATE_USER_DATA)app.setPath('userData',process.env.POLYGATE_USER_DATA);
   Menu.setApplicationMenu(null);app.setAppUserModelId('dev.polygate.desktop');
-  const root=app.isPackaged?process.resourcesPath:path.resolve(__dirname,'..');
-  const exe=app.isPackaged?path.join(root,'bin','bun.exe'):(process.env.BUN_EXE||path.join(process.env.USERPROFILE,'.bun','bin','bun.exe'));
-  const entry=app.isPackaged?path.join(root,'gateway.js'):path.join(root,'backend','main.ts');
   const logDir=app.getPath('userData');fs.mkdirSync(logDir,{recursive:true});const logFile=path.join(logDir,'gateway.log');
   // The gateway's output is appended for as long as the app is installed; past 5 MB the old part is set aside (one previous file is kept).
   try{if(fs.statSync(logFile).size>5*1024*1024)fs.renameSync(logFile,logFile+'.1');}catch{/* no log yet, or it is in use: keep appending */}
   const log=fs.openSync(logFile,'a');
+  pruneCopies(log);
+  const root=app.isPackaged?process.resourcesPath:path.resolve(__dirname,'..');
+  const exe=app.isPackaged?path.join(root,'bin','bun.exe'):(process.env.BUN_EXE||path.join(process.env.USERPROFILE,'.bun','bin','bun.exe'));
+  const entry=app.isPackaged?path.join(root,'gateway.js'):path.join(root,'backend','main.ts');
   // Desktop preferences: the API port (clients are set up with it, so it must not change between launches) and what closing the window does.
   const prefsFile=path.join(logDir,'desktop.json');let prefs={};
   try{const saved=JSON.parse(fs.readFileSync(prefsFile,'utf8'));if(saved&&typeof saved==='object')prefs=saved;}catch{/* first launch or an unreadable file: use the defaults */}
@@ -50,6 +88,7 @@ app.whenReady().then(async()=>{
     ipcMain.handle('polygate:updates:state',fromDashboard(()=>updater.getState()));
     ipcMain.handle('polygate:updates:check',fromDashboard(()=>updater.check(true)));
     ipcMain.handle('polygate:updates:install',fromDashboard(()=>updater.install()));
+    ipcMain.handle('polygate:updates:cancel',fromDashboard(()=>updater.cancel()));
     const desktopPrefs=()=>({closeToTray:prefs.closeToTray!==false});
     ipcMain.handle('polygate:desktop:prefs',fromDashboard(desktopPrefs));
     ipcMain.handle('polygate:desktop:close-to-tray',fromDashboard(value=>{if(typeof value!=='boolean')throw new Error('Expected true or false');savePrefs({closeToTray:value});return desktopPrefs();}));

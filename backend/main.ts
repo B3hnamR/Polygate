@@ -1,5 +1,6 @@
 import type { IncomingMessage } from 'node:http';
 import path from 'node:path';
+import { withRequestCancel } from './cancel';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { settings, models, stateDir, equal, redactError, saveModel } from './state';
@@ -80,7 +81,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
           else if(p==='/admin/reset-password'&&req.method==='POST'){if(!(req as any).polygateManager)throw new GatewayError('Only the local manager can reset the password',403);const b=await readJson(req);resetPassword(String(b.password||''));json(res,200,{ok:true});}
           else if(p==='/admin/signout-all'&&req.method==='POST'){signOutEverywhere();res.setHeader('set-cookie',sessionCookie('',isHttps(req),0));json(res,200,{ok:true});}
           else if(p==='/admin/shutdown'&&req.method==='POST'){json(res,200,{ok:true});setTimeout(()=>close().then(()=>process.exit(0)),100);}
-          else await admin(req,res,p);
+          else await withRequestCancel(res,req,()=>admin(req,res,p));
           if(action)logEvent('info',action[0],action[1]);return;
         }catch(e:any){if(action)logEvent('warn',action[0],`${action[2]} failed: ${redactError(e?.message||String(e))}`);throw e;}
       }

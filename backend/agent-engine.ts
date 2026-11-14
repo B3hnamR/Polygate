@@ -118,6 +118,9 @@ class TarPicker {
 
 export type InstallOptions = { arch?: string; fetcher?: typeof fetch; source?: { url: string; integrity: string } };
 let installing: Promise<void> | undefined;
+// Cancel for the download: the Agent page's Cancel button ends it here, and nothing is installed.
+let installAbort: AbortController | undefined;
+export function cancelInstall() { if (!installing || !installAbort) return false; installAbort.abort(new Error('cancelled')); return true; }
 // Downloads and checks the pinned engine. `source` replaces the npm address in tests only; it is not reachable from the admin API.
 export function installEngine(o: InstallOptions = {}) {
   installing ||= doInstall(o).finally(() => { installing = undefined; });
@@ -135,7 +138,8 @@ async function doInstall(o: InstallOptions) {
   setStatus({ state: 'installing', progress: 0, message: `Downloading OpenCode ${ENGINE_VERSION}`, problems: [] });
   const staging = path.join(path.dirname(p.bin), `.download-${randomBytes(4).toString('hex')}`); mkdirSync(staging, { recursive: true });
   try {
-    const r = await (o.fetcher || fetch)(src.url, { redirect: 'error', signal: AbortSignal.timeout(15 * 60000) });
+    installAbort = new AbortController();
+    const r = await (o.fetcher || fetch)(src.url, { redirect: 'error', signal: AbortSignal.any([installAbort.signal, AbortSignal.timeout(15 * 60000)]) });
     if (!o.source) assertRegistry(r.url || src.url);
     if (!r.ok || !r.body) throw new Error(`The engine download failed (${r.status}). Try again.`);
     const total = Number(r.headers.get('content-length')) || 0;
@@ -147,6 +151,7 @@ async function doInstall(o: InstallOptions) {
     const ended = new Promise<void>((resolve, reject) => { gunzip.once('end', resolve); gunzip.once('error', reject); });
     let bytes = 0, shown = 0;
     for await (const chunk of r.body as unknown as AsyncIterable<Uint8Array>) {
+      if (installAbort.signal.aborted) throw new Error('cancelled');
       bytes += chunk.byteLength; if (bytes > MAX_DOWNLOAD) throw new Error('The engine download is larger than any engine package.');
       if (failure) break;
       hash.update(chunk); if (!gunzip.write(chunk)) await once(gunzip, 'drain');
@@ -165,6 +170,8 @@ async function doInstall(o: InstallOptions) {
     logEvent('info', 'agent', `Agent engine OpenCode ${ENGINE_VERSION} installed (${pkg.name}, checksum verified)`);
   } catch (e: any) {
     rmSync(staging, { recursive: true, force: true });
+    // A cancel says so and is not logged as a failure.
+    if (installAbort?.signal.aborted) { setStatus({ state: 'idle', progress: undefined, message: 'The engine download was cancelled. Nothing was installed.' }); logEvent('info', 'agent', 'Agent engine download cancelled'); throw new GatewayError('Cancelled.', 499, 'cancelled'); }
     const message = e?.name === 'TimeoutError' ? 'The engine download took too long. Try again.' : e?.message || String(e);
     setStatus({ state: 'idle', progress: undefined, message });
     logEvent('warn', 'agent', `Agent engine install failed: ${message}`);
