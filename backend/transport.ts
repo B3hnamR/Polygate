@@ -359,6 +359,23 @@ export function routeFailed(route:Route,reason:string,immediate=false){
 // A relay deployed before relays could reach any host answers a host outside OpenCode and Kilo with this refusal (Netlify words it differently).
 const relayRefusedHost=async(r:Response)=>/Target (host not allowed|is not in the HTTPS host allowlist)/i.test(await r.clone().text().catch(()=>''));
 const relayRejectedKey=async(r:Response)=>/Unauthorized relay request/i.test(await r.clone().text().catch(()=>''));
+// The hosting platform answered instead of the relay: it switched the deployment off (Vercel's DEPLOYMENT_DISABLED once the free usage is spent,
+// a paused, blocked or deleted project), Cloudflare stopped the Worker for the day (error 1027), or Netlify paused the site at its usage limit.
+// The bundled relays mark every answer of theirs with x-relay-runtime, so an answer without it, saying one of these, came from the platform.
+// Nothing sent to that relay will get through, so the request moves to another route and the relay rests for a while.
+const nextUtcMidnight=()=>{const d=new Date();d.setUTCHours(24,0,0,0);return d.getTime();};
+export async function relayPlatformOff(r:Response,name:string):Promise<{message:string;until:number}|undefined>{
+  if(r.status<400||r.headers.get('x-relay-runtime'))return undefined;
+  const header=r.headers.get('x-vercel-error')||'';const text=(await r.clone().text().catch(()=>'')).slice(0,2000);
+  const vercel=/^DEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)$/.exec(header)||/\bDEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)\b/.exec(text);
+  if(vercel){const code=`DEPLOYMENT_${vercel[1]}`;const gone=vercel[1]==='NOT_FOUND'||vercel[1]==='DELETED';
+    // Vercel switches the whole account off, so another instance of the same relay never helps; the usage rarely comes back within hours.
+    return {until:now()+6*3600000,message:gone?`Vercel no longer has this relay's deployment (${name}, ${code}): the project was deleted or renamed. Deploy the relay again on the Relays page, or remove it. Requests use the other routes meanwhile.`
+      :`Vercel has switched off this relay's deployment (${name}, ${code}). This usually means the Vercel account went over its free usage this month, or the project was paused or blocked; see the project on vercel.com. Deploy the relay on another account or platform, or wait for the usage to reset. Requests use the other routes meanwhile.`};}
+  if(/error code:?\s*1027\b/i.test(text))return {until:nextUtcMidnight(),message:`Cloudflare has stopped this relay Worker for today (${name}, error 1027): the free plan's daily request limit is used up. It works again after 00:00 UTC. Requests use the other routes meanwhile.`};
+  if(/(paused|suspended)[^.]{0,80}usage limit|usage limit[^.]{0,80}(paused|suspended)/i.test(text)&&/netlify/i.test(text+(r.headers.get('server')||'')))return {until:now()+6*3600000,message:`Netlify has paused this relay site (${name}): the account reached its usage limits. See the site on netlify.com, or deploy the relay on another platform. Requests use the other routes meanwhile.`};
+  return undefined;
+}
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
 // A caller-side abort (client disconnect, request deadline) says nothing about the route; a timeout the caller set on the route itself does.
 const callerCancelled=(init:any)=>{const s=init?.signal as AbortSignal|undefined;return !!s?.aborted&&(s.reason as any)?.name!=='TimeoutError';};
@@ -461,6 +478,10 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
         if(ex&&!ex.refused&&spin<max){markSpent(route.id,egress,ex.until);if(await rotateRelay(route)){await response.body?.cancel().catch(()=>{});judged=undefined;continue;}}
         break;
       }
+      const off=await relayPlatformOff(response,route.name);
+      if(off){await response.body?.cancel().catch(()=>{});
+        if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
+        throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
     }
     else if(route.kind==='warp'){
       const target=warpTarget();if(!target)throw new GatewayError('Cloudflare WARP is not connected. Connect it under Routing → WARP.',503,'route_unavailable');
@@ -495,7 +516,10 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     // put an exit to rest. Only requests that send something (chat) count toward the breaker.
     if(quiet||callerCancelled(init)||route.id.startsWith('pool:')||route.id.startsWith(PSIPHON+':')||isReadOnly(init))throw e;
     if(warpPort)warpFailure(warpPort);
-    routeFailed(route,String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');throw e;
+    routeFailed(route,e instanceof GatewayError?e.message:String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');
+    // A relay its platform switched off rests until it may be back, not the breaker's few minutes, when another exit can stand in.
+    const restUntil=Number((e as any)?.restUntil)||0;if(restUntil&&route.cooldownUntil&&route.cooldownUntil>now()){route.cooldownUntil=Math.max(route.cooldownUntil,restUntil);persist();}
+    throw e;
   }
 }
 // What a route test sends, and how its answer is read, depends on the provider chosen in the dialog. OpenCode Free keeps its own check (the model list
