@@ -79,6 +79,21 @@ test('only the program and its package file are taken from the archive, whatever
   expect(engine.engineStatus()).toMatchObject({ installed: true, state: 'installed' });
 });
 
+test('old engine versions and an interrupted download are removed after an install; the pinned engine and anything else stay', async () => {
+  const p = paths(), dir = path.dirname(p.bin);
+  for (const n of ['2.0.32', '2.2.6', '.download-dead1234']) { mkdirSync(path.join(dir, n), { recursive: true }); writeFileSync(path.join(dir, n, 'opencode.exe'), 'old'); }
+  mkdirSync(path.join(dir, 'notes'), { recursive: true });
+  rmSync(p.bin, { recursive: true, force: true });
+  await engine.installEngine({ source: source('/good.tgz'), arch: 'x64' });
+  expect(readdirSync(dir).sort()).toEqual([engine.ENGINE_VERSION, 'notes'].sort());
+  expect(engine.engineStatus().installed).toBe(true);
+  // At start, the same: an old folder left by an earlier version is removed, the installed engine is kept.
+  mkdirSync(path.join(dir, '2.2.5'));
+  expect(engine.pruneOldEngines()).toEqual(['2.2.5']);
+  expect(engine.engineStatus().installed).toBe(true);
+  rmSync(path.join(dir, 'notes'), { recursive: true, force: true });
+});
+
 test('a changed engine program is not started', async () => {
   await engine.installEngine({ source: source('/good.tgz'), arch: 'x64' });
   const p = paths(); const saved = readFileSync(p.exe);

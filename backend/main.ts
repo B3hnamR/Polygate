@@ -23,7 +23,7 @@ import { version } from './version';
 import { closeSocksBridges } from './socks-bridge';
 import { logEvent, captureConsole, adminAction } from './logbook';
 import { handleMcp, syncMcp, stopMcp } from './mcp';
-import { setEngineGateway, stopEngine } from './agent-engine';
+import { setEngineGateway, stopEngine, pruneOldEngines } from './agent-engine';
 import { pruneAgentBackups, stopAgent } from './agent';
 const mimeTypes:Record<string,string>={'.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.map':'application/json','.txt':'text/plain'};
 export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),host=serverConfig().host){
@@ -139,6 +139,7 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
   if(process.env.POLYGATE_NO_DISCOVERY!=='1')discover().catch(e=>console.error('[catalog]',redactError(String(e))));
   startWarp().catch(e=>console.error('[warp]',redactError(String(e))));
   startPsiphon().catch(e=>console.error('[psiphon]',redactError(String(e))));
+  setTimeout(()=>{try{pruneOldEngines();}catch(e){console.error('[agent]',redactError(String(e)));}},5000).unref?.();
   syncMcp();
   const stopPool=startPoolMaintenance();
   if(!desktop)startHttps(rebind,{port:secure.tls?port:actual,host}).catch(e=>console.error('[https]',redactError(String(e))));

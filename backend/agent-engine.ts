@@ -166,6 +166,7 @@ async function doInstall(o: InstallOptions) {
     if (info.name !== pkg.name || info.version !== ENGINE_VERSION) throw new Error(`The engine package is ${info.name}@${info.version}, not ${pkg.name}@${ENGINE_VERSION}. Nothing was installed.`);
     writeFileAtomic(path.join(staging, 'manifest.json'), JSON.stringify({ version: ENGINE_VERSION, package: pkg.name, integrity: src.integrity, exeSha256: exe.sha256, installedAt: Date.now() } satisfies Manifest));
     rmSync(p.bin, { recursive: true, force: true }); renameSync(staging, p.bin);
+    pruneOldEngines(p, true);
     setStatus({ state: 'idle', progress: undefined, message: '' });
     logEvent('info', 'agent', `Agent engine OpenCode ${ENGINE_VERSION} installed (${pkg.name}, checksum verified)`);
   } catch (e: any) {
@@ -177,6 +178,20 @@ async function doInstall(o: InstallOptions) {
     logEvent('warn', 'agent', `Agent engine install failed: ${message}`);
     throw e instanceof GatewayError ? e : new GatewayError(message, 502, 'agent_engine_install');
   }
+}
+// Each Polygate update pins a new OpenCode, and every engine is about 250 MB. Only the pinned one is ever run, so older version folders,
+// and a download an interrupted install left behind, are removed: after an install and when Polygate starts. Anything else is left alone.
+export function pruneOldEngines(p: Paths = enginePaths(), afterInstall = false) {
+  const dir = path.dirname(p.bin), removed: string[] = [];
+  let names: string[] = []; try { names = readdirSync(dir); } catch { return removed; }
+  for (const name of names) {
+    if (name === ENGINE_VERSION) continue;
+    const old = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(name), leftover = name.startsWith('.download-') && (afterInstall || !installing);
+    if (!old && !leftover) continue;
+    try { rmSync(path.join(dir, name), { recursive: true, force: true }); removed.push(name); } catch { /* in use: tried again next start */ }
+  }
+  if (removed.some(n => !n.startsWith('.'))) logEvent('info', 'agent', `Removed old Agent engines: ${removed.filter(n => !n.startsWith('.')).join(', ')}`);
+  return removed;
 }
 // The installed program is checked against the hash recorded at install before every start.
 function verifiedExe(p: Paths) {
