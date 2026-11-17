@@ -1062,3 +1062,79 @@ nav.ag-q-tabs{flex-direction:row;align-items:center}.agent-folder-trust>p.subtle
 /* The project's GitHub page, beside the gateway state */
 .local-status>span:nth-child(2){flex:1;min-width:0}.github-link{display:inline-flex;padding:6px;border-radius:5px;color:var(--rail-ink2);transition:color 140ms,background 140ms}.github-link:hover{color:var(--rail-ink);background:color-mix(in srgb,var(--rail-ink) 11%,transparent)}
 @media(max-width:850px){.github-link{display:none}}
+
+/* Thinking and tool steps take one small line each and sit close to the text around them, so a long turn is mostly the agent's words. */
+.ag-line>summary{font-size:12.5px;gap:6px;padding:0;line-height:1.5}.ag-kinds{gap:2px 12px}.ag-kind{gap:5px}
+.ag-thread>.ag-column>.ag-line,.ag-thread>.ag-column>.ag-changes{margin-block:-9px}
+.ag-steps{gap:4px;margin:6px 0 8px;font-size:13px}.ag-steps .ag-thought{margin:0;font-size:13px}
+
+/* Agent settings as a desktop app's settings window: sections on the left, the chosen one on the right as rows of name, sentence and control. */
+.dialog.dialog-settings{width:min(940px,100%);height:min(720px,90vh);display:flex;flex-direction:column}
+.dialog-settings-body{flex:1;min-height:0;display:grid;grid-template-columns:210px minmax(0,1fr)}
+.ag-settings-nav{display:flex;flex-direction:column;gap:2px;padding:12px 10px;border-inline-end:1px solid var(--line);overflow:auto}
+.ag-settings-nav>button{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border:0;border-radius:8px;background:transparent;color:var(--text-secondary);font-size:14px;text-align:start;cursor:pointer}
+.ag-settings-nav>button:hover{background:var(--surface-raised);color:var(--text)}.ag-settings-nav>button.active{background:var(--surface-raised);color:var(--text);font-weight:600}
+.ag-settings-nav>button>svg{flex:none;color:var(--muted)}.ag-settings-nav>p{margin:6px 10px;font-size:12.5px}
+.ag-settings-search{display:flex;align-items:center;gap:7px;padding:0 10px;margin-bottom:8px;border:1px solid var(--line);border-radius:8px;background:var(--canvas);color:var(--muted)}
+.ag-settings-search input{flex:1;min-width:0;border:0;background:transparent;padding:7px 0;font-size:13.5px;box-shadow:none!important;outline:none}
+.ag-settings-search:focus-within{border-color:var(--accent-line)}
+.ag-settings-pane{position:relative;overflow:auto;padding:18px 24px 0;display:flex;flex-direction:column}
+.ag-settings-pane>*:last-child{margin-bottom:20px}
+.ag-settings-title{margin:0 0 8px;font:650 17px/1.3 var(--font);color:var(--text)}
+.ag-settings-lead{margin:0 0 12px;font-size:13.5px;line-height:1.6;color:var(--text-secondary)}.ag-settings-lead kbd{font-size:12px}
+.ag-settings-sub{display:flex;align-items:center;gap:8px;margin:18px 0 6px;font:600 13px/1.3 var(--font);color:var(--text-secondary)}
+.ag-settings-pane .ag-set>h3{display:none}.ag-settings-pane .ag-set>p.subtle:first-of-type{font-size:13.5px}
+.ag-row{display:flex;align-items:center;gap:16px;padding:13px 0;border-bottom:1px solid var(--line)}
+.ag-row>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}.ag-row>div>strong{font-size:14px;font-weight:600;color:var(--text)}.ag-row>div>small{font-size:13px;line-height:1.5;color:var(--muted)}
+.ag-row-engine>.ag-engine{flex:1}
+.ag-switch{position:relative;display:inline-flex;align-items:center;gap:8px;flex:none;cursor:pointer}
+.ag-switch>input{position:absolute;opacity:0;width:1px;height:1px}
+.ag-switch>span:last-child{position:relative;width:36px;height:20px;border-radius:999px;background:var(--line-strong);transition:background .15s}
+.ag-switch>span:last-child::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .15s}
+.ag-switch>input:checked+span{background:var(--accent)}.ag-switch>input:checked+span::after{transform:translateX(16px)}
+.ag-switch>input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
+.ag-switch-text{font-size:12px;color:var(--muted)}
+.ag-savebar{position:sticky;bottom:0;display:flex;align-items:center;gap:8px;margin:12px -24px 0;padding:10px 24px;border-top:1px solid var(--line);background:var(--surface);font-size:13px;color:var(--text-secondary)}
+.ag-savebar>span{flex:1}.ag-savebar .button{margin:0}
+.ag-library-foot{margin-top:12px;align-items:center}.ag-library-foot .green{display:inline-flex;align-items:center;gap:5px;font-size:13px}
+.ag-prompt{width:100%;min-height:220px;font-size:13.5px;line-height:1.6}
+.ag-skills{border-radius:10px;transition:background .15s}.ag-skills.dropping{background:var(--accent-soft);outline:2px dashed var(--accent-line);outline-offset:6px}
+.ag-skill-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.ag-skill-tools .ag-settings-search{flex:1;min-width:180px;margin:0}.ag-skill-tools .button{margin:0}
+.ag-skill-list .ag-skill-row{padding:4px 0;border-bottom:0}
+.ag-skill-row .ag-skill-head{flex:1;min-width:0;align-items:flex-start}.ag-skill-row .ag-skill-head>svg{margin-top:3px}
+.ag-skill-row .ag-skill-head>span{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.ag-skill-row .ag-skill-head small{font-size:12.5px;color:var(--muted);white-space:normal;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.ag-skill-builtin .ag-row{padding:9px 2px}.ag-tag{flex:none;font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+.ag-empty{display:flex;align-items:center;gap:10px;padding:14px;border:1px dashed var(--line-strong);border-radius:10px;color:var(--muted);font-size:13px}.ag-empty p{margin:0}.ag-empty>svg{flex:none}
+.ag-inline-icon{vertical-align:-2px}
+.ag-skill-menu-foot{display:flex;align-items:center;gap:7px;margin-top:2px;padding:8px 10px;border:0;border-top:1px solid var(--line);border-radius:0 0 10px 10px;background:transparent;color:var(--text-secondary);font-size:12.5px;cursor:pointer;text-align:start}
+.ag-skill-menu-foot:hover{color:var(--text);background:var(--surface-raised)}
+@media(max-width:720px){.dialog.dialog-settings{height:calc(100vh - 32px)}.dialog-settings-body{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
+  .ag-settings-nav{flex-direction:row;flex-wrap:nowrap;overflow-x:auto;border-inline-end:0;border-bottom:1px solid var(--line);padding:8px}.ag-settings-nav>button{width:auto;flex:none;padding:6px 10px}
+  .ag-settings-search{flex:none;width:130px;margin:0 4px 0 0}.ag-settings-pane{padding:14px 16px 0}.ag-savebar{margin:12px -16px 0;padding:10px 16px}}
+
+/* The task workspace: one row of tabs that scrolls sideways when the panel is narrow. */
+.ag-workspace-tabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;gap:2px;padding:0 10px 8px}.ag-workspace-tabs::-webkit-scrollbar{display:none}
+.ag-workspace-tabs button{flex:none;padding:5px 9px;font-size:12.5px;gap:5px;cursor:pointer}
+.ag-workspace-tabs button[aria-selected=true]{background:var(--surface-raised);border-color:var(--line);color:var(--text)}
+.ag-workspace-tabs button:hover{color:var(--text)}
+
+/* Rules: saved approvals for the folder, in the workspace. */
+.ag-workspace .agent-project-rules{padding:0;border:0;max-height:none;background:transparent;font-size:13px;display:flex;flex-direction:column;gap:8px}
+.ag-workspace .agent-project-rules>p{margin:0}
+.ag-rules-head{display:flex;align-items:center;gap:8px;font-size:13.5px}
+.agent-project-rules ul.ag-rules{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.agent-project-rules .ag-rules li{display:flex;align-items:flex-start;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:var(--canvas)}
+.ag-rules li>div{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.ag-rules li strong{font-size:13px}
+.ag-rules code,.ag-rules-inspections code{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary)}
+.ag-rule-effect{flex:none;font-size:11px;font-weight:650;padding:1px 7px;border-radius:999px;margin-top:1px}.ag-rule-effect.allow{background:var(--green-soft);color:var(--green)}.ag-rule-effect.deny{background:var(--red-soft);color:var(--red)}
+.ag-rules li .icon-button{width:28px;height:28px;flex:none}
+.ag-rules-how summary{cursor:pointer;color:var(--muted);font-size:12.5px}.ag-rules-how p{margin:6px 0 0;font-size:12.5px}
+.ag-rules-inspections{display:flex;flex-direction:column;gap:4px}
+/* The copy button under an agent message takes a slim row, so short notes between step lines stay close together. */
+.ag-msg-agent .ag-message-actions{min-height:0;height:22px;margin-top:0}.ag-msg-agent .ag-message-actions .icon-button{width:24px;height:24px}
+
+/* Surfshark: the key pair and the location picker (the rest reuses the Psiphon styles) */
+.ss-keys{border:1px solid var(--line);border-radius:6px;padding:14px 16px;margin:4px 0 18px;background:var(--surface-raised)}.ss-keys .psi-head{margin:0 0 8px}.ss-keys strong{display:inline-flex;align-items:center;gap:6px}
+.ss-saved{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--text-secondary);overflow-wrap:anywhere}.ss-saved>svg{color:var(--green);flex-shrink:0}.ss-key-form>p{margin-bottom:12px}.ss-key-form .form-actions{margin-top:4px}
+.ss-search{margin:6px 0 12px}.ss-locations{max-height:440px;overflow:auto;padding:2px 4px 2px 0;margin-bottom:14px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}.ss-locations span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

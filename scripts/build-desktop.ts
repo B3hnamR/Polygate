@@ -12,14 +12,17 @@ const files = (dir: string, prefix = ''): string[] => {
   }).sort();
 };
 
-type Resource = { from: string; to: string };
+type Resource = { from: string; to: string; filter?: string[] };
+// A folder's local link to a hosting account (the Vercel CLI writes .vercel/ beside a relay it deployed) never ships: package.json filters
+// it out of the relays, and it is left out of the expected list here, so verifyResources refuses a build that still carries it.
+export const LOCAL_ONLY = /(^|\/)\.vercel(\/|$)/;
 export function resourceManifest(root: string, resources: Resource[]) {
   const manifest = new Map<string, string>();
   for (const { from, to } of resources) {
     if ([from, to].some(p => path.isAbsolute(p) || p.split(/[\\/]/).includes('..'))) throw new Error('Resource paths must remain inside the build');
     const source = path.join(root, from), entry = lstatSync(source);
     if (entry.isSymbolicLink() || (!entry.isFile() && !entry.isDirectory())) throw new Error(`Untrusted resource entry: ${source}`);
-    for (const file of entry.isDirectory() ? files(source) : ['']) {
+    for (const file of (entry.isDirectory() ? files(source) : ['']).filter(f => !LOCAL_ONLY.test(f))) {
       const target = path.posix.join(to.replace(/\\/g, '/'), file);
       if (manifest.has(target)) throw new Error(`Duplicate resource: ${target}`);
       manifest.set(target, hash(file ? path.join(source, file) : source));
@@ -46,6 +49,8 @@ function buildDesktop() {
   if (process.env.POLYGATE_ALLOW_ANY_BUN === '1') throw new Error('Desktop artifacts require the pinned Bun runtime.');
   if (existsSync(output)) throw new Error(`Build folder already exists: ${output}`);
   for (const dir of ['release', 'build', 'dist']) if (existsSync(path.join(root, dir)) && lstatSync(path.join(root, dir)).isSymbolicLink()) throw new Error(`Untrusted build directory: ${dir}`);
+  const helper = Bun.spawnSync(['python', 'scripts/fetch-wireproxy.py', 'windows-amd64'], { cwd: root, stdio: ['inherit', 'inherit', 'inherit'] });
+  if (helper.exitCode !== 0) throw new Error('Verified wireproxy provisioning failed; Python 3 must be available on PATH.');
   mkdirSync(output, { recursive: true });
   const runtime = path.join(root, 'build/runtime/1.4.4/windows-x64/bun.exe');
   const env = { ...process.env, ...(existsSync(runtime) && !process.env.POLYGATE_BUN_RUNTIME ? { POLYGATE_BUN_RUNTIME: runtime } : {}) };

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { RoutePreview } from './route-preview';
 import { Brain, BookmarkPlus, Code2, Columns2, Copy, Eraser, Eye, Loader2, RotateCcw, Send, Square, Terminal, Trash2, Wrench } from 'lucide-react';
 import { at, BASE } from './api';
-import { Button, Empty, Field, Select, Toggle, ms, type Snapshot } from './ui';
+import { Button, Empty, Field, Select, Toggle, ms, tabKeys, type Snapshot } from './ui';
 import { Dialog } from './mcp';
 import { AUTO_LABEL } from './chains';
 
@@ -87,7 +87,7 @@ function ExportDialog({ request, onClose, notice }: { request: { path: string; b
     python: `import requests\n\nr = requests.post(\n    "${url}",\n    headers={"Authorization": "Bearer pg_your_key", "Content-Type": "application/json"},\n    data=r\'\'\'${safe}\'\'\',\n)\nprint(r.text)`,
     javascript: `const r = await fetch("${url}", {\n  method: "POST",\n  headers: { Authorization: "Bearer pg_your_key", "Content-Type": "application/json" },\n  body: JSON.stringify(${json.replace(/\n/g, '\n  ')}),\n});\nconsole.log(await r.text());`, body: json }[tab];
   return <Dialog title="Use this request in code" icon={<Code2 size={18} />} onClose={onClose} wide>
-    <div className="seg" role="tablist" aria-label="Format">{(['curl', 'python', 'javascript', 'body'] as const).map(t => <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t === 'body' ? 'JSON body' : t === 'curl' ? 'curl' : t === 'python' ? 'Python' : 'JavaScript'}</button>)}</div>
+    <div className="seg" role="tablist" aria-label="Format" onKeyDown={tabKeys}>{(['curl', 'python', 'javascript', 'body'] as const).map(t => <button type="button" key={t} role="tab" aria-selected={tab === t} tabIndex={tab === t ? 0 : -1} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t === 'body' ? 'JSON body' : t === 'curl' ? 'curl' : t === 'python' ? 'Python' : 'JavaScript'}</button>)}</div>
     <pre className="pg-code">{code}</pre>
     <p className="subtle">Replace <code>pg_your_key</code> with a client key from Overview. The key is never put in this snippet.</p>
     <div className="dialog-actions"><Button variant="primary" onClick={() => void copyText(code, notice)}><Copy size={14} />Copy</Button><Button onClick={onClose}>Close</Button></div>

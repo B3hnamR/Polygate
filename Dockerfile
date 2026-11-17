@@ -17,6 +17,13 @@ COPY vendor/protocols ./vendor/protocols
 COPY relays ./relays
 RUN bun build backend/main.ts --target bun --outfile /out/gateway.js && bun build backend/manage.ts --target bun --outfile /out/manage.js
 
+FROM python:3.13-slim-bookworm AS wireproxy
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY scripts/fetch-wireproxy.py ./scripts/fetch-wireproxy.py
+COPY resources/surfshark/LICENSE resources/surfshark/README.md resources/surfshark/sha256.txt ./resources/surfshark/
+RUN python scripts/fetch-wireproxy.py linux-amd64 && python scripts/fetch-wireproxy.py linux-arm64
+
 FROM oven/bun:1.4.4
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -26,6 +33,8 @@ COPY --from=ui /src/dist /app/dist
 COPY relays /app/relays
 COPY resources/warp /app/warp
 RUN chmod 0755 /app/warp/usque-linux-amd64 /app/warp/usque-linux-arm64
+COPY --from=wireproxy /src/resources/surfshark /app/surfshark
+RUN chmod 0755 /app/surfshark/wireproxy-linux-amd64 /app/surfshark/wireproxy-linux-arm64
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 COPY vendor/bridge/LICENSE /app/vendor/bridge/LICENSE
 COPY vendor/protocols/LICENSE /app/vendor/protocols/LICENSE

@@ -132,6 +132,19 @@ test('runs of tool calls fold into one line of steps, said the way a person woul
   expect(stepsSummary([tool('t7', 'mystery') as any])).toBe('Used mystery');
 });
 
+test('thinking joins the run of steps around it: one line per run, opening to each thought and step in order', () => {
+  const tool = (key: string, name: string): Item => ({ kind: 'tool', key, name, input: {}, status: 'done' });
+  const thought = (key: string, text: string, done = true): Item => ({ kind: 'reasoning', key, text, done });
+  const items: Item[] = [{ kind: 'user', key: 'u', text: 'go' }, thought('r1', 'plan'), tool('t1', 'bash'), thought('r2', 'more'), tool('t2', 'bash'),
+    { kind: 'text', key: 'x', text: 'Looking further.' }, thought('r3', ''), thought('r4', 'last', false)];
+  const b = blocks(items) as any[];
+  expect(b.map(x => x.kind)).toEqual(['user', 'steps', 'text', 'steps']);
+  expect(b[1].items.map((i: any) => i.key)).toEqual(['r1', 't1', 'r2', 't2']);
+  expect(b[1].thoughts.length).toBe(2); expect(stepsSummary(b[1].tools)).toBe('Ran 2 commands');
+  // An empty finished thought is left out; one still streaming is kept, so the line can say "Thinking".
+  expect(b[3].items.map((i: any) => i.key)).toEqual(['r4']); expect(b[3].tools).toEqual([]);
+});
+
 test("the agent's newest task list is read from its todo tool", () => {
   const write = (key: string, todos: any[]): Item => ({ kind: 'tool', key, name: 'todowrite', input: { todos }, status: 'done' });
   expect(latestTodos([write('a', [{ content: 'old', status: 'pending' }]), write('b', [{ content: 'Read the code', status: 'completed' }, { content: 'Fix it', status: 'in_progress' }, { content: 'Test', status: 'weird' }])]))

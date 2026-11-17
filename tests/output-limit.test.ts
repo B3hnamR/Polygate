@@ -28,3 +28,32 @@ test('with no limit named, 8k is tried once; other 400s and requests without an 
   expect(r.status).toBe(400); expect(other.sent).toEqual([32000]); expect(await r.text()).toContain('invalid role');
   const none = refusing(0, 'max_tokens'); expect((await withOutputLimit(model(), { messages: [] }, none.send)).status).toBe(200); expect(none.sent).toEqual([undefined as any]);
 });
+
+test('every supplied output limit is clamped without raising smaller limits or mutating input', async () => {
+  const body = { max_tokens: 1024, max_completion_tokens: 32000, max_output_tokens: 24000 };
+  let sent: any;
+  await withOutputLimit(model(8192), body, async value => { sent = value; return new Response('ok'); });
+  expect(sent).toEqual({ max_tokens: 1024, max_completion_tokens: 8192, max_output_tokens: 8192 });
+  expect(body).toEqual({ max_tokens: 1024, max_completion_tokens: 32000, max_output_tokens: 24000 });
+});
+
+test('a refusal retries all output limit aliases and retains the learned ceiling', async () => {
+  const sent: any[] = [], m = model();
+  const send = async (value: any) => { sent.push(value); return value.max_completion_tokens > 4096
+    ? Response.json({ error: { message: 'max_completion_tokens maximum is 4096' } }, { status: 400 }) : new Response('ok'); };
+  const body = { max_tokens: 1000, max_completion_tokens: 32000 };
+  expect((await withOutputLimit(m, body, send)).ok).toBe(true);
+  expect(sent).toEqual([body, { max_tokens: 1000, max_completion_tokens: 4096 }]);
+  expect(m.output).toBe(4096);
+  expect(body.max_completion_tokens).toBe(32000);
+});
+
+test('converted Responses output limit reaches the provider below its known ceiling', async () => {
+  const { toChat } = await import('../backend/protocols');
+  const chat = toChat({ model: 'fixture', input: 'hello', max_output_tokens: 32000 }, 'responses');
+  let sent: any;
+  await withOutputLimit(model(8192), chat, async value => { sent = value; return new Response('ok'); });
+  expect(sent.max_completion_tokens).toBe(8192);
+  expect(chat.max_completion_tokens).toBe(32000);
+  for (const key of ['max_tokens', 'max_completion_tokens', 'max_output_tokens']) if (typeof sent[key] === 'number') expect(sent[key]).toBeLessThanOrEqual(8192);
+});

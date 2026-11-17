@@ -1,12 +1,53 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 const root = new URL('../', import.meta.url);
 const bytes = (path: string) => readFileSync(new URL(path, root));
 const text = (path: string) => bytes(path).toString('utf8');
 const sha256 = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
 const gitBlob = (data: Uint8Array) => createHash('sha1').update(`blob ${data.length}\0`).update(data).digest('hex');
+
+// Execute the actual parser, not the build recipe: no Go, downloads or supplied binary writes.
+const manifestParser = text('scripts/build-warp-helper.sh').replaceAll('\r\n', '\n').match(/^manifest_hash\(\) \{\n[\s\S]*?^\}/m)?.[0];
+if (!manifestParser) throw new Error('Cannot locate the WARP manifest parser');
+// Never fall through to WSL or a host shell with different path semantics.
+const shellTest = test.skipIf(process.platform !== 'linux' || !existsSync('/bin/bash'));
+shellTest('WARP comparison parses text and binary markers and fails duplicate or missing exact names', () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), 'polygate-manifest-'));
+  const file = 'usque-linux-amd64', digest = 'a'.repeat(64);
+  const cases = [
+    { manifest: `${digest}  ${file}\n`, ok: true },
+    { manifest: `${digest} *${file}\n`, ok: true },
+    { manifest: `${digest} *usque-linux-arm64\n${digest} *${file}\n`, ok: true },
+    { manifest: `${digest}  ${file}\n${digest} *${file}\n`, ok: false },
+    { manifest: `${digest} *${file}\n${'b'.repeat(64)} *${file}\n`, ok: false },
+    { manifest: `${digest} *${file}.bak\n`, ok: false },
+    { manifest: `${digest} *dir/${file}\n`, ok: false },
+    { manifest: `${digest} **${file}\n`, ok: false },
+    { manifest: `*${digest} ${file}\n`, ok: false },
+    { manifest: `${digest} ${file} extra\n`, ok: false },
+    { manifest: `${'g'.repeat(64)} ${file}\n`, ok: false },
+    { manifest: `${digest.slice(1)} ${file}\n`, ok: false },
+    { manifest: '', ok: false },
+  ];
+  try {
+    for (const fixture of cases) {
+      const manifest = path.join(scratch, 'hash fixture.txt');
+      writeFileSync(manifest, fixture.manifest);
+      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', `set -euo pipefail\n${manifestParser}\nmanifest_hash "$1" "$2"\n`, 'manifest-test', file, manifest], {
+        cwd: scratch, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, encoding: 'utf8', timeout: 10000,
+      });
+      expect(result.error).toBeUndefined(); expect(result.signal).toBeNull();
+      expect(result.status).toBe(fixture.ok ? 0 : 1);
+      expect(result.stdout).toBe(fixture.ok ? `${digest}\n` : '');
+      expect(readFileSync(manifest, 'utf8')).toBe(fixture.manifest);
+    }
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+});
 
 describe('retained runtime provenance (offline source contracts)', () => {
   test('retains the exact upstream license blobs, not guessed license templates', () => {

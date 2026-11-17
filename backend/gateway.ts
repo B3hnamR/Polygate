@@ -4,8 +4,9 @@ import { authenticate, checkTokenRate, modelAllowed, reserveTokens } from './key
 import { AdmissionQueue, GatewayError } from './queue';
 import { toChat, fromChat, collect, stream, observeSse, lfBody, type Protocol } from './protocols';
 import { rankedModels, providerChat, sessionFor } from './providers';
-import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch, kiloLimitRoute, takePsiphonRegion } from './transport';
-import { exhaustionOf, takeExhaustion, takeRefused, resetTime, type Exhaustion } from './exhaustion';
+import { routeForProvider, routeAfter, exhaustedRouteAfter, providerPicksAgain, providerSwitches, networkFetch, kiloLimitRoute, takeExitRegion } from './transport';
+import { exitGroupOf } from './exit-group';
+import { exhaustionOf, takeExhaustion, takeRefused, takeInconclusive, resetTime, type Exhaustion } from './exhaustion';
 import { notify } from './notifications';
 import { logEvent } from './logbook';
 import { requestSignal } from './cancel';
@@ -15,7 +16,7 @@ import { describeBody, describeHeaders, takeAttempts, egressInfo } from './diagn
 import { chainFor, modelFor, AUTO_STEPS } from './chains';
 import { coreOnly, knownTrim, learnTrim, forgetTrim } from './tooltrim';
 import { toolArgRepair } from './toolargs';
-import { autoOrder, needsOf, pickFrom, type Needs } from './plan';
+import { autoOrder, needsOf, pickFrom, withoutImages, refusesImages, type Needs } from './plan';
 import { checklist } from './checklist';
 import { LIMIT_SCOPE, type Model, type ApiKey, type Chain, type Provider } from './types';
 import { freeIdentityProblem } from './agent-engine';
@@ -34,7 +35,7 @@ function chainModels(chain:Chain,ranked:Model[],key:ApiKey|undefined,needs:Needs
   const out:Model[]=[];
   for(const step of chain.models){
     if(AUTO_STEPS.includes(step)){for(const m of pickFrom(autoOrder(step,ranked),3,key,needs,skipped))if(!out.includes(m))out.push(m);continue;}
-    const m=modelFor(step);if(m&&ranked.includes(m)&&!out.includes(m)&&(!key?.agent||m.tools===true&&(!needs.images||m.images!==false)))out.push(m);
+    const m=modelFor(step);if(m&&ranked.includes(m)&&!out.includes(m)&&(!key?.agent||m.tools===true))out.push(m);
   }
   if(out.length)return out;
   const resting=chain.models.map(modelFor).filter((m):m is Model=>!!m&&m.state!=='unavailable'&&m.cooldownUntil>Date.now());
@@ -83,8 +84,8 @@ function outputAllowance(p:Provider,m:Model,chat:any){
   else{
     const requested=fields.map(field=>chat[field]).filter((value):value is number=>typeof value==='number');
     output=requested.length?Math.max(...requested):m.output;
-    // Only the plain OpenAI adapter clamps a supplied field to the learned ceiling.
-    if(p.kind==='openai'&&requested.length===1&&m.output>0)output=Math.min(output,m.output);
+    // The plain OpenAI adapter clamps every supplied output-limit alias to the learned ceiling.
+    if(p.kind==='openai'&&requested.length&&m.output>0)output=Math.min(output,m.output);
   }
   if(!Number.isSafeInteger(output)||output<=0)throw new GatewayError(`Cannot establish an output token bound for ${m.id} with this token-limited API key. Set max_completion_tokens/max_tokens, or use a provider/model with a known output ceiling (OpenCode servers ignore these request fields).`,400,'invalid_request_error');
   const allowance=output*Math.max(n,chat.best_of??n);
@@ -112,8 +113,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   // The deadline covers the wait for the first byte. Once an answer is streaming, only silence counts, so a long answer that is still arriving is
   // not cut off; a stream that never stops is ended after an hour.
-  let idle:ReturnType<typeof setTimeout>|undefined,ceiling:ReturnType<typeof setTimeout>|undefined;
-  const armIdle=()=>{clearTimeout(idle);idle=setTimeout(()=>controller.abort(new GatewayError('The upstream stopped sending data',504,'timeout')),settings.timeoutMs);};
+  let idle:ReturnType<typeof setTimeout>|undefined,ceiling:ReturnType<typeof setTimeout>|undefined,backpressured=false;
+  const armIdle=()=>{clearTimeout(idle);if(!backpressured&&!controller.signal.aborted)idle=setTimeout(()=>controller.abort(new GatewayError('The upstream stopped sending data',504,'timeout')),settings.timeoutMs);};
   const streaming=()=>{clearTimeout(timer);armIdle();ceiling||=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),3600000);};
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
@@ -130,7 +131,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   // keepRoute: the next attempt goes through the exit just switched to, not a fresh pick (which could be the refusing one again).
   // region: the Psiphon region the last answer came through, shown in the log line.
   let keepRoute=false;let region='';
-  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;const exitsTried=new Set<string>();let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;
+  let retryAfter='';let fault=false;let tried=false;let t0=start;let exhausted:Exhaustion|undefined;let confirmedClean=false;let switches=0;const exitsTried=new Set<string>();let upstreamMessage='';let trimmed:string[]=[];let trimmedFor='';let trimRetried=false;let imagesDropped=false;
   // The first provider whose exit was used up: kept while later providers (not on that allowance) are tried, and reported if none of them answers.
   let spent:{ex:Exhaustion;message:string;status:number;used:typeof used;route:string}|undefined;
   try{
@@ -143,7 +144,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     const limited=new Set<string>();
     for(const m of candidates){if(limited.has(m.providerId))continue;
       // A trimmed tool list was chosen for the provider that refused the full one; the next candidate starts from what the client sent.
-      if(trimmed.length){chat=askedChat;trimmed=[];}
+      if(trimmed.length||imagesDropped){chat=askedChat;trimmed=[];imagesDropped=false;}
+      // A model listed (or found) to take no images gets the conversation with each image replaced by a short note.
+      if(needs.images&&m.images===false){const w=withoutImages(chat);if(w.count){chat=w.chat;imagesDropped=true;}}
       used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
       // A provider whose chosen routes cannot take the request right now is skipped like one that failed, so the next provider is still tried.
       let r:ReturnType<typeof routeForProvider>;
@@ -177,9 +180,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
               accountingStarted=true;outputChars=0;reportedInput=0;reportedOutput=0;finalUsage=undefined;complete=false;
             },
             failed(usage:any){for(const [field,target] of [['prompt_tokens','input'],['input_tokens','input'],['completion_tokens','output'],['output_tokens','output']] as const){const value=usage?.[field];if(Number.isSafeInteger(value)&&value>=0){if(target==='input')reportedInput=Math.max(reportedInput,value);else reportedOutput=Math.max(reportedOutput,value);}}}
-          }:undefined);status=upstream.status;region=r.id==='psiphon'?takePsiphonRegion(requestId)||'':'';
+          }:undefined);status=upstream.status;region=exitGroupOf(r.id)?takeExitRegion(requestId)||'':'';
           if(upstream.ok){retained=true;break;}
           fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
+          // The model refused the images: it is marked as taking none, and the same request goes again with each image replaced by a note, so the
+          // conversation keeps working (an agent session otherwise sends the picture with every later message and fails each time).
+          if(!imagesDropped&&needs.images&&refusesImages(status,message)){const w=withoutImages(chat);if(w.count){m.images=false;saveModel(m);chat=w.chat;imagesDropped=true;fault=false;
+            logEvent('info','requests',`${m.id} does not accept images; sent again with ${w.count} image${w.count===1?'':'s'} replaced by a note`,{model:m.id,requestId});attempts++;continue;}}
           try{const usage=JSON.parse(message)?.usage;if(Number.isSafeInteger(usage?.prompt_tokens)&&usage.prompt_tokens>=0)reportedInput=Math.max(reportedInput,usage.prompt_tokens);if(Number.isSafeInteger(usage?.completion_tokens)&&usage.completion_tokens>=0)reportedOutput=Math.max(reportedOutput,usage.completion_tokens);}catch{}
           // Kilo's anonymous limit covers every Kilo model at once: they all rest together and the rest of this request skips them.
           // The limit belongs to the exit's address, not to the model: that exit is set aside for Kilo and the request moves on to another one.
@@ -191,15 +198,15 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
             const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from ${switches?'every exit Polygate could try':'this one'}. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
             notify('Kilo free limit reached',plain,'warning','kilo-limit',3600000);message=plain;break;}
           // The network layer confirmed this exit still has allowance, so the countdown in the answer belongs to a refused request, not to the model.
-          const refused=takeRefused(requestId);if(refused)confirmedClean=true;
+          const refused=takeRefused(requestId),inconclusive=takeInconclusive(requestId);if(refused)confirmedClean=true;
           // The exit is fine, so the refusal belongs to this request. When it carries tools OpenCode may object to, ask again with the standard ones only.
           if(refused&&settings.trimTools!==false&&!k.agent&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}
           // Still refused: OpenCode can limit one model on an exit where a small check with another still answers, so the request tries
           // another exit before the refusal goes back. Nothing is marked: the exit stays in turn for every other request.
           if(refused&&switches<maxSwitches()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;logEvent('info','routes',`${r.name} refused this request though a small check passed; trying it through ${alt.name}`,{route:r.id,to:alt.id,model:m.id});r=alt;route=r.name;keepRoute=true;attempts++;continue;}}
-          const retryMs=!refused&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
+          const retryMs=!refused&&!inconclusive&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
-          const ex=takeExhaustion(requestId)||(refused?undefined:exhaustionOf(status,after,message));
+          const ex=takeExhaustion(requestId)||(refused||inconclusive?undefined:exhaustionOf(status,after,message));
           if(ex){
             exhausted=ex;notify(ex.refused?'Network exit refused':'Network exit used up',ex.refused?`${r.name} was refused by the Free tier; it is skipped until ${resetTime(ex.until)}.`:`${r.name} has used its daily Free allowance (resets ${resetTime(ex.until)}).`,'warning','exhausted|'+r.id,3600000);
             const alt=switches<maxSwitches()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
@@ -270,7 +277,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     let repaired=0;const repair=/text\/event-stream/i.test(upstream.headers.get('content-type')||'')?toolArgRepair(askedChat.tools,(tool,renamed)=>{if(repaired++<3)logEvent('info','requests',`${used.id} misnamed an argument of the "${tool}" tool (${renamed.join(', ')}); Polygate renamed it so the call works.`,{model:used.id,route});}):undefined;
     const wrapped=new Response(repair?observed.pipeThrough(repair):observed,{headers:upstream.headers,status:upstream.status});
     if(body.stream){
-      status=200;await stream(req,res,wrapped,protocol,used.id,asked);
+      status=200;await stream(req,res,wrapped,protocol,used.id,asked,{onBackpressure(waiting:boolean){backpressured=waiting;if(waiting)clearTimeout(idle);else if(firstAt)armIdle();}});
       if(!controller.signal.aborted&&!ended){status=502;fault=true;message='Upstream stream ended before a terminal event';}
     }else{
       const data=await collect(wrapped);
@@ -291,13 +298,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     if(nice)message=nice.message;
     if(!res.headersSent){const wait=nice?.retryAfter||e.retryAfter;if(retryAfter&&!nice?.retryAfter)res.setHeader('Retry-After',retryAfter);else if(wait)res.setHeader('Retry-After',String(wait));const type=gateway?.type||e.type;const body={type:nice?.code||type||(protocol==='anthropic'?'api_error':'gateway_error'),message,...(nice?{code:nice.code,...nice.extra}:{})};json(res,status,protocol==='anthropic'?{type:'error',error:body}:{error:body});}else if(!res.writableEnded)res.end();
   }
-  finally{pipeController?.abort();clearTimeout(timer);clearTimeout(idle);clearTimeout(ceiling);res.removeListener('close',cancel);
+  finally{pipeController?.abort();clearTimeout(timer);clearTimeout(idle);clearTimeout(ceiling);res.removeListener('close',cancel);takeExhaustion(requestId);takeRefused(requestId);takeInconclusive(requestId);
     // Missing or interrupted usage is not free. Estimate JSON text, never SSE framing/metadata; complete reported usage wins.
     try{settleAttempt();input=settledInput;output=settledOutput;}finally{release?.();}
     let detail:string|undefined;
     if(tried){try{
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
-      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||'',...(region?{region}:{})},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
+      detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||'',...(region?{region}:{})},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro&&ro.kind!=='warp'?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
     const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail,
       // The agent engine names its session in each request; kept for the agent's key only (per-session usage on the Agent page).

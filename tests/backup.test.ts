@@ -1,5 +1,7 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 process.env.POLYGATE_ADMIN_TOKEN = 'backup-test-secret';
 const { startGateway } = await import('../backend/main');
@@ -67,6 +69,32 @@ test('a restore from a session that cannot manage this machine keeps the current
     restoreBackup(planted, 'a long passphrase', false); expect(settings.warp!.helperPath).toBe('C:\mine\helper.exe');
     restoreBackup(planted, 'a long passphrase', true); expect(settings.warp!.helperPath).toBe('C:\planted\evil.exe');
   } finally { settings.warp = before; }
+});
+
+test('backup prototype properties are rejected before live settings or the vault change', async () => {
+  const { restoreBackup } = await import('../backend/backup');
+  const passphrase = 'prototype regression passphrase';
+  const file = JSON.parse(createBackup(passphrase).content);
+  const key = scryptSync(passphrase, Buffer.from(file.kdf.salt, 'base64'), 32, { N: file.kdf.N, r: file.kdf.r, p: file.kdf.p, maxmem: 128 * 1024 * 1024 });
+  const decrypt = createDecipheriv('aes-256-gcm', key, Buffer.from(file.iv, 'base64'));
+  decrypt.setAuthTag(Buffer.from(file.tag, 'base64'));
+  const original = JSON.parse(Buffer.concat([decrypt.update(Buffer.from(file.data, 'base64')), decrypt.final()]).toString());
+  const before = JSON.stringify(settings), prototype = Object.getPrototypeOf(settings), files = readdirSync(stateDir).sort();
+  const vault = path.join(stateDir, 'settings.vault'), vaultBytes = existsSync(vault) ? readFileSync(vault) : undefined;
+  for (const providers of [original.providers, []]) {
+    const content = { ...original, providers };
+    delete content.mcp;
+    // Parsed JSON has an own data property, unlike object-literal prototype syntax.
+    Object.defineProperty(content, '__proto__', { enumerable: true, value: { mcp: { enabled: true, builtin: false, servers: [{ id: 'injected', name: 'injected', enabled: true, transport: 'stdio', command: 'must-not-start' }] } } });
+    const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, iv);
+    const encrypted = Buffer.concat([cipher.update(JSON.stringify(content)), cipher.final()]);
+    const raw = JSON.stringify({ ...file, iv: iv.toString('base64'), data: encrypted.toString('base64'), tag: cipher.getAuthTag().toString('base64') });
+    for (const local of [false, true]) expect(() => restoreBackup(raw, passphrase, local)).toThrow('usable settings');
+    expect(Object.getPrototypeOf(settings)).toBe(prototype);
+    expect(JSON.stringify(settings)).toBe(before);
+    expect(readdirSync(stateDir).sort()).toEqual(files);
+    expect(existsSync(vault) ? readFileSync(vault) : undefined).toEqual(vaultBytes);
+  }
 });
 
 test('on a server, a signed-in dashboard session must type the dashboard password again to export or restore', async () => {

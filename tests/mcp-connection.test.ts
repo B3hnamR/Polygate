@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 const { settings } = await import('../backend/state');
-const { mcpConfig, saveServers, callTool, settle, stopMcp, serverStatus } = await import('../backend/mcp');
+const { mcpConfig, saveServers, callTool, settle, stopMcp, serverStatus, cleanServer } = await import('../backend/mcp');
 const dir = mkdtempSync(path.join(os.tmpdir(), 'pg-mcp-'));
 const saved = { mcp: settings.mcp };
 afterAll(() => { stopMcp(); settings.mcp = saved.mcp; rmSync(dir, { recursive: true, force: true }); fixture.stop(true); });
@@ -28,6 +28,28 @@ const fixture = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
 } });
 const http = (pathname: string) => ({ id: 'srv', name: 'srv', enabled: true, transport: 'http' as const, url: `http://127.0.0.1:${fixture.port}${pathname}`, timeoutSec: 30 });
 const text = async (scope: string) => (await callTool('where', {}, undefined, scope, 'dashboard') as any).content[0].text;
+
+test('remote transport edits honor HTTP/SSE while preserving credentials and the local-program boundary', () => {
+  const routes = settings.routes;
+  settings.routes = [{ id: 'mcp-fixture', name: 'Fixture', kind: 'direct', url: '', enabled: true, models: [] }];
+  try {
+    const saved = { ...http('/mcp'), routeId: 'mcp-fixture', headers: { Authorization: 'fixture-credential' } };
+    const sse = cleanServer({ transport: 'sse', url: saved.url!.replace('/mcp', '/legacy') }, saved, false);
+    expect(sse.transport).toBe('sse'); expect(sse.headers).toEqual(saved.headers);
+    expect(cleanServer({ transport: 'http' }, sse, false).transport).toBe('http');
+    expect(cleanServer({}, sse, false).transport).toBe('sse');
+    expect(() => cleanServer({ transport: '' }, saved, false)).toThrow('Choose how to connect');
+    expect(() => cleanServer({ transport: 'sse', url: 'https://other.example/mcp' }, saved, false)).toThrow('Enter its header values again');
+    for (const local of [false, true]) {
+      expect(() => cleanServer({ transport: 'stdio', command: 'fixture' }, saved, local)).toThrow('Create a new server');
+      expect(() => cleanServer({ transport: 'http', url: saved.url }, { id: 'local-fixture', name: 'local-fixture', enabled: true, transport: 'stdio', command: 'fixture' }, local)).toThrow('Create a new server');
+    }
+    expect(() => cleanServer({ name: 'new-local-fixture', transport: 'stdio', command: 'fixture' }, undefined, false)).toThrow('Windows app');
+    const program = { id: 'local-fixture', name: 'local-fixture', enabled: true, transport: 'stdio' as const, command: 'fixture' };
+    expect(() => cleanServer({ command: 'changed' }, program, false)).toThrow('Windows app');
+    expect(cleanServer({ enabled: false, disabledTools: ['where'] }, program, false).command).toBe('fixture');
+  } finally { settings.routes = routes; }
+});
 
 test('saving a changed address while a connection is still being made replaces it: the next call reaches the new address', async () => {
   mcpConfig().servers = []; mcpConfig().enabled = true;

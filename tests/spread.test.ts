@@ -5,11 +5,11 @@ const { startGateway } = await import('../backend/main');
 const { settings } = await import('../backend/state');
 const { routeFor } = await import('../backend/transport');
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = '';
-const saved = { routes: settings.routes.slice(), routeId: settings.routeId, rotate: settings.rotate, strategy: settings.strategy, spreadDirect: settings.spreadDirect, failover: settings.failover };
+const saved = { routes: settings.routes.slice(), routeId: settings.routeId, rotate: settings.rotate, strategy: settings.strategy, spreadDirect: settings.spreadDirect, failover: settings.failover, allowDirect: settings.allowDirect };
 const relay = (id: string): any => { const r: any = { id, name: id, kind: 'relay', url: `https://${id}.example.vercel.app`, enabled: true, models: [] }; settings.routes.push(r); return r; };
 beforeAll(async () => { gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`; });
 afterAll(async () => { await gateway?.close(); });
-afterEach(() => { saved.routes.forEach(r => { r.exhaustedUntil = 0; r.cooldownUntil = 0; r.enabled = true; }); settings.routes.length = 0; settings.routes.push(...saved.routes); settings.routeId = saved.routeId; settings.rotate = saved.rotate; settings.strategy = saved.strategy; settings.spreadDirect = saved.spreadDirect; settings.failover = saved.failover; });
+afterEach(() => { saved.routes.forEach(r => { r.exhaustedUntil = 0; r.cooldownUntil = 0; r.enabled = true; }); settings.routes.length = 0; settings.routes.push(...saved.routes); settings.routeId = saved.routeId; settings.rotate = saved.rotate; settings.strategy = saved.strategy; settings.spreadDirect = saved.spreadDirect; settings.failover = saved.failover; settings.allowDirect = saved.allowDirect; });
 const picks = (n: number, model = 'opencode/x', kind = 'free') => Array.from({ length: n }, () => routeFor(model, '', kind).id);
 
 test('spreading with the old "Selected route" order now takes turns instead of sticking to the first exit', () => {
@@ -50,7 +50,7 @@ test('the dashboard can switch Direct in and out of the spread', async () => {
 
 test('with spreading on and nothing but Direct left, the refusal says Direct is left out of the spread', () => {
   settings.routes.length = 0; settings.routes.push(...saved.routes.filter(r => r.id === 'direct'));
-  settings.routeId = 'direct'; settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false;
+  settings.routeId = 'direct'; settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false; settings.allowDirect = false;
   let err: any; try { routeFor('opencode/x', '', 'free'); } catch (e) { err = e; }
   expect(err.status).toBe(503); expect(String(err.message)).toContain('"In the spread"');
   settings.spreadDirect = true; expect(routeFor('opencode/x', '', 'free').id).toBe('direct'); // included: it carries the request

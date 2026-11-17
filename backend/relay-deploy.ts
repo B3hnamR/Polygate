@@ -1,6 +1,7 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { GatewayError } from './queue';
-import { cancellable, isCancelled, cancelledError, stopIfCancelled, afterCancel } from './cancel';
+import { cancellable, isCancelled, cancelledError, stopIfCancelled, afterCancel, requestSignal } from './cancel';
+import { setTimeout as delay } from 'node:timers/promises';
 import vercelModule from '../relays/vercel-bun/api/relay.js' with { type: 'text' };
 import netlifyModule from '../relays/netlify-relay.js' with { type: 'text' };
 import cloudflareModule from '../relays/cloudflare-worker.js' with { type: 'text' };
@@ -26,7 +27,7 @@ const named = (i: DeployInput, fallback: string) => {
   return String(i.name);
 };
 const accessToken = () => randomBytes(24).toString('base64url');
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const sleep = async (ms: number) => { stopIfCancelled(); await delay(ms, undefined, { signal: requestSignal() }).catch(e => { stopIfCancelled(); throw e; }); };
 // Waits between status checks; tests shorten them.
 export const __timing = { poll: 2000, verify: 2500 };
 // What a platform said went wrong, without echoing a secret back to the dashboard.
@@ -60,7 +61,7 @@ async function deployVercel(i: DeployInput, access: string): Promise<{ name: str
   const config = JSON.stringify({ ...(node ? {} : { bunVersion: '1.x' }), regions: [region], rewrites: [{ source: '/(.*)', destination: '/api/relay' }], functions: { 'api/relay.js': { maxDuration: 300 } } });
   // A new relay never goes into a project that already exists (typing the name of one would deploy over it, and a cancel or failure
   // would then delete it). So everything removed below on a cancel is a project this deploy created.
-  if (!i.update) { const r = await fetch(`https://api.vercel.com/v9/projects/${encodeURIComponent(name)}${i.teamId ? `?teamId=${encodeURIComponent(i.teamId)}` : ''}`, { headers: { authorization: 'Bearer ' + i.token }, signal: cancellable(30000) }).catch(e => { if (isCancelled()) throw cancelledError(); throw fail(`Vercel could not be reached: ${reason(undefined, String(e?.message || e), secrets)}`); }); await r.body?.cancel().catch(() => {}); if (r.ok) throw fail(`A Vercel project named "${name}" already exists in this account. Choose another name, or leave the name empty for a generated one.`, 409); }
+  if (!i.update) { const r = await fetch(`https://api.vercel.com/v9/projects/${encodeURIComponent(name)}${i.teamId ? `?teamId=${encodeURIComponent(i.teamId)}` : ''}`, { headers: { authorization: 'Bearer ' + i.token }, signal: cancellable(30000) }).catch(e => { if (isCancelled()) throw cancelledError(); throw fail(`Vercel could not be reached: ${reason(undefined, String(e?.message || e), secrets)}`); }); await r.body?.cancel().catch(() => {}); if (r.ok) throw fail(`A Vercel project named "${name}" already exists in this account. Choose another name, or leave the name empty for a generated one.`, 409); if (r.status !== 404) throw fail(`Vercel could not confirm that the project name is available (HTTP ${r.status}). Nothing was deployed.`); }
   // Cancelled at any step: the new project is removed again (an update keeps its project).
   const dropProject = () => afterCancel(() => api('Vercel', `https://api.vercel.com/v9/projects/${encodeURIComponent(name)}${i.teamId ? `?teamId=${encodeURIComponent(i.teamId)}` : ''}`, { method: 'DELETE', headers: { authorization: 'Bearer ' + i.token } }, secrets, [404])).catch(() => {});
   let d: any;
@@ -73,7 +74,7 @@ async function deployVercel(i: DeployInput, access: string): Promise<{ name: str
     if (d.readyState === 'ERROR' || d.readyState === 'CANCELED') throw fail(`Vercel could not build the relay (${d.readyState}${d.errorMessage ? ': ' + reason(undefined, d.errorMessage, secrets) : ''}).`);
     await sleep(__timing.poll); stopIfCancelled(); d = await api('Vercel', `https://api.vercel.com/v13/deployments/${created.id}?${team.slice(1)}`, { headers: json(i.token) }, secrets);
   }
-  } catch (e) { if (isCancelled() && !i.update) await dropProject(); throw e; }
+  } catch (e) { if (isCancelled() && !i.update && d) await dropProject(); throw e; }
   if (d.readyState !== 'READY') throw fail('Vercel did not finish the deployment within two minutes. Check the project in the Vercel dashboard.');
   const alias: string = (d.alias || []).find((a: string) => a.endsWith('.vercel.app') && !/-[a-z0-9]{9}-/.test(a)) || (d.alias || [])[0] || d.url;
   return { name, url: 'https://' + alias, buffered: false, runtime: node ? 'node-bun-ciphers' : 'bun', region };
@@ -121,14 +122,16 @@ async function deployCloudflare(i: DeployInput, access: string): Promise<{ name:
   const subdomain = (await api('Cloudflare', `${base}/workers/subdomain`, { headers: auth }, secrets))?.result?.subdomain;
   if (!subdomain) throw fail('This Cloudflare account has no workers.dev address yet. Open Workers & Pages in the Cloudflare dashboard once to create it, then deploy again.', 400);
   // A new relay never replaces a Worker that already exists (the upload would overwrite it, and a failure would then delete it).
-  if (!i.update) { const r = await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { headers: auth, signal: cancellable(30000) }).catch(e => { if (isCancelled()) throw cancelledError(); throw fail(`Cloudflare could not be reached: ${reason(undefined, String(e?.message || e), secrets)}`); }); await r.body?.cancel().catch(() => {}); if (r.ok) throw fail(`A Worker named "${name}" already exists in this Cloudflare account. Choose another name, or leave the name empty for a generated one.`, 409); }
+  if (!i.update) { const r = await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { headers: auth, signal: cancellable(30000) }).catch(e => { if (isCancelled()) throw cancelledError(); throw fail(`Cloudflare could not be reached: ${reason(undefined, String(e?.message || e), secrets)}`); }); await r.body?.cancel().catch(() => {}); if (r.ok) throw fail(`A Worker named "${name}" already exists in this Cloudflare account. Choose another name, or leave the name empty for a generated one.`, 409); if (r.status !== 404) throw fail(`Cloudflare could not confirm that the Worker name is available (HTTP ${r.status}). Nothing was deployed.`); }
   const form = new FormData();
   form.append('metadata', new Blob([JSON.stringify({ main_module: 'worker.js', compatibility_date: '2025-01-01', bindings: [{ type: 'secret_text', name: 'RELAY_TOKEN', text: access }] })], { type: 'application/json' }));
   form.append('worker.js', new Blob([sources.cloudflare], { type: 'application/javascript+module' }), 'worker.js');
-  // If the upload or anything after it fails or is cancelled, the half-made Worker is removed so nothing is left behind.
+  // A failed upload does not establish ownership: never delete a name after an uncertain write.
+  let uploaded = false;
   try { await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'PUT', headers: auth, body: form }, secrets);
+    uploaded = true;
     await api('Cloudflare', `${base}/workers/scripts/${encodeURIComponent(name)}/subdomain`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json' }, body: JSON.stringify({ enabled: true }) }, secrets); }
-  catch (e) { if (!i.update) await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
+  catch (e) { if (!i.update && uploaded) await fetch(`${base}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE', headers: auth, signal: AbortSignal.timeout(30000) }).catch(() => {}); throw e; }
   return { name, url: `https://${name}.${subdomain}.workers.dev`, buffered: false, runtime: 'cloudflare-worker', only: 'kilo', account };
 }
 // What the Vercel account allows. Limits are the published ones (vercel.com/docs/limits and /docs/functions/configuring-functions/region, read 26 October 2026).
@@ -151,16 +154,18 @@ export async function inspectVercel(rawToken: string, teamId?: string): Promise<
 async function verifyWorker(url: string, token: string): Promise<{ reachable: boolean; status: number }> {
   let status = 0, streak = 0;
   for (let i = 0; i < 60 && streak < 4; i++) {
-    try { const r = await fetch(url, { headers: { 'x-relay-key': token, 'x-relay-control': 'ping' }, signal: cancellable(15000) }); status = r.status; const json = (r.headers.get('content-type') || '').includes('json'); await r.body?.cancel(); streak = r.ok && json ? streak + 1 : 0; } catch { streak = 0; }
-    await sleep(__timing.verify);
+    stopIfCancelled();
+    try { const r = await fetch(url, { headers: { 'x-relay-key': token, 'x-relay-control': 'ping' }, signal: cancellable(15000) }); status = r.status; const json = (r.headers.get('content-type') || '').includes('json'); await r.body?.cancel(); streak = r.ok && json ? streak + 1 : 0; } catch { stopIfCancelled(); streak = 0; }
+    if (streak < 4 && i < 59) await sleep(__timing.verify);
   }
   return { reachable: streak >= 4, status };
 }
 export async function verifyRelay(url: string, token: string): Promise<{ reachable: boolean; status: number }> {
   let status = 0;
   for (let i = 0; i < 8; i++) {
-    try { const r = await fetch(url, { headers: { 'x-relay-key': token, 'x-relay-target': 'https://opencode.ai', 'x-relay-path': '/inference/v1/models' }, signal: cancellable(15000) }); status = r.status; await r.body?.cancel(); if (r.ok) return { reachable: true, status }; } catch { status = 0; }
-    await sleep(__timing.verify);
+    stopIfCancelled();
+    try { const r = await fetch(url, { headers: { 'x-relay-key': token, 'x-relay-target': 'https://opencode.ai', 'x-relay-path': '/inference/v1/models' }, signal: cancellable(15000) }); status = r.status; await r.body?.cancel(); if (r.ok) return { reachable: true, status }; } catch { stopIfCancelled(); status = 0; }
+    if (i < 7) await sleep(__timing.verify);
   }
   return { reachable: false, status };
 }

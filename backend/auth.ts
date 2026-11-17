@@ -95,11 +95,14 @@ export function verifyPassword(password: string, adminToken: string) {
   if (settings.admin?.password) return passwordMatches(password, settings.admin.password);
   return equal(password, adminToken); // no password configured: the admin token doubles as the dashboard password
 }
-export function changePassword(current: string, next: string, adminToken: string) {
+export function changePassword(current: string, next: string, adminToken: string, ip: string) {
   if (passwordManagedByEnv()) throw new GatewayError('The dashboard password is set by POLYGATE_ADMIN_PASSWORD; change it there.', 409);
-  if (!verifyPassword(current, adminToken)) throw new GatewayError('Current password is incorrect', 403);
+  const wait = loginGate.retryAfter(ip);
+  if (wait) throw new GatewayError(`Too many attempts. Try again in ${Math.ceil(wait / 60)} minute(s).`, 429, 'rate_limit_error', wait);
+  if (!verifyPassword(current, adminToken)) { loginGate.fail(ip); throw new GatewayError('Current password is incorrect', 403); }
   if (next.length < 12) throw new GatewayError('Use a password of at least 12 characters', 400);
   settings.admin = { password: hashPassword(next), epoch: (settings.admin?.epoch || 0) + 1 }; persist();
+  loginGate.clear(ip);
   try { if (existsSync(passwordFile)) unlinkSync(passwordFile); } catch { /* best effort */ }
 }
 // The local manager's reset (the admin token proves it is on this machine): no current password needed, every signed-in session ends.

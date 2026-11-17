@@ -6,7 +6,17 @@ build
 dist
 .state
 .test-state
+.env
+.env.*
+.kilo
+.claude
+.agents
+**/settings.vault
+**/vault.key
 .impeccable
 **/__pycache__
 **/*.pyc
 *.log
+**/.vercel
+# Never send locally provisioned helper binaries to the build context.
+resources/surfshark/wireproxy-*

@@ -934,18 +934,20 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       placeholderNote: buildPlaceholderNote(fingerprintNames),
       aliasToOriginal: EMPTY_MAP,
       originalToAlias: EMPTY_MAP,
+      allowedTools: new Map(),
     };
   }
 
   const aliasToOriginal = new Map();
   const originalToAlias = new Map();
+  const allowedTools = new Map();
   const normalized = [];
-  const takenNames = new Set(clientTools.map(getToolName).filter(Boolean));
+  const takenNames = new Set([...fingerprintNames, ...clientTools.map(getToolName).filter(Boolean)]);
   const presentExactFingerprints = new Set();
 
   for (const t of clientTools) {
     const name = getToolName(t);
-    if (!name) continue;
+    if (!name || (t.type && t.type !== "function")) continue;
     const def = t.function && typeof t.function === "object" ? t.function : t;
     const description = def.description || "";
     const parameters = def.parameters || { type: "object", properties: {} };
@@ -954,6 +956,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       if (presentExactFingerprints.has(name)) continue;
       if (isExactFingerprintDef(t, name)) {
         presentExactFingerprints.add(name);
+        allowedTools.set(name, name);
         normalized.push(
           flat
             ? { type: "function", name, description, parameters, strict: false }
@@ -971,6 +974,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       takenNames.add(alias);
       aliasToOriginal.set(alias, name);
       originalToAlias.set(name, alias);
+      allowedTools.set(alias, name);
       normalized.push(
         flat
           ? { type: "function", name: alias, description, parameters }
@@ -979,6 +983,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       continue;
     }
 
+    allowedTools.set(name, name);
     normalized.push(
       flat
         ? { type: "function", name, description, parameters }
@@ -1004,6 +1009,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
         : buildPlaceholderNote(appended),
     aliasToOriginal,
     originalToAlias,
+    allowedTools,
   };
 }
 
@@ -1018,6 +1024,108 @@ function prepareChatTools(clientTools = [], modelId = null) {
 function restoreClientToolName(name, aliasToOriginal) {
   if (!name || !aliasToOriginal || aliasToOriginal.size === 0) return name;
   return aliasToOriginal.get(name) || name;
+}
+
+function toolContractError() {
+  const error = new Error("Upstream returned a tool call not permitted by the client's offered tools or tool_choice");
+  error.type = "upstream_tool_error";
+  return error;
+}
+
+function streamContractError(message) {
+  const error = new Error(message);
+  error.type = "upstream_stream_error";
+  return error;
+}
+
+function parseStreamData(raw) {
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    return value;
+  } catch {
+    throw streamContractError("Upstream sent malformed SSE data");
+  }
+}
+
+// Hold chat calls until their complete names are known. Valid name prefixes and
+// injected fingerprint names must never expose unintended commands downstream.
+function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128) {
+  const pending = new Map();
+  const open = new Set();
+  const closed = new Set();
+  let done = false;
+  let bufferedBytes = 0;
+  let callCount = 0;
+  const release = (index) => {
+    const calls = pending.get(index);
+    if (!calls) return [];
+    const out = [...calls.values()].map((call) => {
+      if (!allowedTools.has(call.function.name)) throw toolContractError();
+      return { ...call, function: { ...call.function, name: allowedTools.get(call.function.name) } };
+    });
+    pending.delete(index);
+    return out;
+  };
+  return {
+    get terminal() { return done || (closed.size > 0 && open.size === 0); },
+    get done() { return done; },
+    feed(chunk) {
+      if (chunk?.error) return chunk;
+      if (!Array.isArray(chunk?.choices)) return chunk;
+      chunk.choices = chunk.choices.filter((choice) => {
+        const delta = choice.delta;
+        if (delta?.function_call || choice.message?.function_call || choice.message?.tool_calls) throw toolContractError();
+        const index = choice.index ?? 0;
+        if (done || closed.has(index)) {
+          if (choice.finish_reason && !choice.message && Object.keys(delta || {}).length === 0 && closed.has(index)) return false;
+          throw streamContractError("Upstream sent choice data after its terminal event");
+        }
+        const incoming = delta?.tool_calls;
+        if (incoming !== undefined) {
+          if (!Array.isArray(incoming) || (incoming.length && !allowedTools.size)) throw toolContractError();
+          const calls = pending.get(index) || new Map();
+          if (incoming.length) pending.set(index, calls);
+          for (const tc of incoming) {
+            if (!tc || (tc.type && tc.type !== "function")) throw toolContractError();
+            if ((tc.function?.name !== undefined && typeof tc.function.name !== "string") ||
+                (tc.function?.arguments !== undefined && typeof tc.function.arguments !== "string")) throw toolContractError();
+            const i = tc.index ?? 0;
+            if (!calls.has(i) && ++callCount > maxCalls) throw streamContractError("Upstream exceeded the buffered tool-call count limit");
+            bufferedBytes += Buffer.byteLength(tc.function?.name || "") + Buffer.byteLength(tc.function?.arguments || "") + Buffer.byteLength(String(tc.id || ""));
+            if (bufferedBytes > maxBytes) throw streamContractError("Upstream exceeded the buffered tool-call byte limit");
+            const call = calls.get(i) || { index: i, type: "function", function: { name: "", arguments: "" } };
+            if (tc.id) {
+              if (call.id && call.id !== tc.id) throw toolContractError();
+              call.id = tc.id;
+            }
+            if (tc.function?.name) call.function.name += tc.function.name;
+            if (call.function.name && ![...allowedTools.keys()].some(name => name.startsWith(call.function.name))) throw toolContractError();
+            if (tc.function?.arguments) call.function.arguments += tc.function.arguments;
+            calls.set(i, call);
+          }
+          delete delta.tool_calls;
+        }
+        if (choice.finish_reason) {
+          const calls = release(index);
+          if (calls.length) (choice.delta ||= {}).tool_calls = calls;
+          else if (choice.finish_reason === "tool_calls" || choice.finish_reason === "function_call") throw toolContractError();
+          open.delete(index);
+          closed.add(index);
+        } else open.add(index);
+        return incoming === undefined || choice.finish_reason || Object.keys(choice.delta || {}).length > 0;
+      });
+      return chunk.choices.length || chunk.usage ? chunk : null;
+    },
+    finish() {
+      if (done) return null;
+      const choices = [...pending.keys()].map((index) => ({ index, delta: { tool_calls: release(index) }, finish_reason: "tool_calls" }));
+      for (const index of open) closed.add(index);
+      open.clear();
+      done = true;
+      return choices.length ? { choices } : null;
+    },
+  };
 }
 
 function extractContent(content) {
@@ -1319,12 +1427,15 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   const requestedTokens =
     body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = effectiveMaxTokens(requestedTokens, targetModel, body);
-  const { tools, placeholderNote, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
+  const { tools, placeholderNote, aliasToOriginal, originalToAlias, allowedTools } = prepareToolsWithFingerprint(
     body.tools,
     useResponses,
     scope,
     targetModel
   );
+  if (body.tool_choice === "none" || body.tool_choice?.type === "none") allowedTools.clear();
+  const forcedTool = body.tool_choice?.function?.name || body.tool_choice?.name;
+  if (forcedTool) for (const [wire, client] of allowedTools) if (client !== forcedTool) allowedTools.delete(wire);
   if (useResponses) {
     const upstreamBody = {
       model: targetModel,
@@ -1344,7 +1455,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
     if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
     if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
-    return { upstreamBody, aliasToOriginal };
+    return { upstreamBody, aliasToOriginal, allowedTools };
   }
 
   // Field names and order match the CLI's own request: `max_completion_tokens`
@@ -1366,8 +1477,8 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   if (body.response_format !== undefined) upstreamBody.response_format = body.response_format;
   if (body.reasoning_effort !== undefined) upstreamBody.reasoning_effort = body.reasoning_effort;
 
-  // Upstream v2 rejects tool_choice: "none" with 403 FreeTierError.
-  if (body.tool_choice && body.tool_choice !== "none") {
+  // Keep the gate-compatible wire shape; allowedTools enforces "none" locally.
+  if (body.tool_choice && body.tool_choice !== "none" && body.tool_choice?.type !== "none") {
     if (
       typeof body.tool_choice === "object" &&
       body.tool_choice.function?.name &&
@@ -1385,7 +1496,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
   }
 
-  return { upstreamBody, aliasToOriginal };
+  return { upstreamBody, aliasToOriginal, allowedTools };
 }
 
 /**
@@ -2149,7 +2260,7 @@ function handleRequest(req, res) {
 
       let reader = null;
       try {
-        let { upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses);
+        let { upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(body, targetModel, useResponses);
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
@@ -2179,7 +2290,7 @@ function handleRequest(req, res) {
           ) {
             useResponses = !useResponses;
             markProtocolSupport(targetModel, useResponses);
-            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
+            ({ upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(body, targetModel, useResponses));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
@@ -2431,7 +2542,7 @@ function handleRequest(req, res) {
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
             );
-            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+            ({ upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(
               body,
               targetModel,
               useResponses,
@@ -2606,7 +2717,43 @@ function handleRequest(req, res) {
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = "";
+        const chatTools = chatToolGuard(allowedTools);
+        const responseTools = { output_index: new Map(), item_id: new Map(), call_id: new Map() };
+        const checkResponseTools = (ev) => {
+          const bind = (selectors, name, added = false) => {
+            const supplied = Object.entries(selectors).filter(([, value]) => value !== undefined);
+            const found = new Set(supplied.map(([kind, value]) => responseTools[kind].get(String(value))).filter(Boolean));
+            if (found.size > 1 || !supplied.length) throw toolContractError();
+            let record = [...found][0];
+            if (added) {
+              if (record) throw toolContractError();
+              record = { name };
+            }
+            if (!record || (name !== undefined && (record.name !== name || !allowedTools.has(name)))) throw toolContractError();
+            for (const [kind, value] of supplied) {
+              const key = String(value);
+              if (record[kind] !== undefined && record[kind] !== key) throw toolContractError();
+              record[kind] = key;
+              responseTools[kind].set(key, record);
+            }
+            return record;
+          };
+          let record;
+          if (ev.item?.type === "function_call") {
+            if (!allowedTools.has(ev.item.name)) throw toolContractError();
+            if (ev.item_id !== undefined && ev.item.id !== undefined && ev.item_id !== ev.item.id) throw toolContractError();
+            if (ev.call_id !== undefined && ev.item.call_id !== undefined && ev.call_id !== ev.item.call_id) throw toolContractError();
+            record = bind({ output_index: ev.output_index, item_id: ev.item.id ?? ev.item_id, call_id: ev.item.call_id ?? ev.call_id }, ev.item.name, ev.type === "response.output_item.added");
+          }
+          if (ev.type === "response.function_call_arguments.delta" || ev.type === "response.function_call_arguments.done") {
+            record = bind({ output_index: ev.output_index, item_id: ev.item_id, call_id: ev.call_id }, ev.name);
+          }
+          for (const [index, item] of (ev.response?.output || []).entries()) if (item?.type === "function_call") {
+            if (!allowedTools.has(item.name)) throw toolContractError();
+            bind({ output_index: index, item_id: item.id, call_id: item.call_id }, item.name);
+          }
+          return record;
+        };
 
         // ==========================================
         // PATH A: Client requested streaming (SSE)
@@ -2663,11 +2810,18 @@ function handleRequest(req, res) {
 
             const handleResponsesStreamLine = (line) => {
               if (streamAbortedByError) return;
-              if (!line.startsWith("data: ")) return;
-              const rawJson = line.slice(6).trim();
+              if (!line.startsWith("data:")) return;
+              const rawJson = line.slice(5).trim();
               if (!rawJson || rawJson === "[DONE]") return;
               try {
-                const ev = JSON.parse(rawJson);
+                const ev = parseStreamData(rawJson);
+                const toolRecord = checkResponseTools(ev);
+                for (const [record, index] of toolIndexMap) {
+                  if (record.call_id && !record.sentId) {
+                    writeSse(`data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created, model: targetModel, choices: [{ index: 0, delta: { tool_calls: [{ index, id: record.call_id }] }, finish_reason: null }] })}\n\n`);
+                    record.sentId = record.call_id;
+                  }
+                }
                 const inStreamError = extractStreamError(ev);
                 if (inStreamError) {
                   streamAbortedByError = true;
@@ -2701,19 +2855,16 @@ function handleRequest(req, res) {
                   );
                 } else if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
                   hasToolCalls = true;
-                  const key =
-                    ev.output_index !== undefined
-                      ? String(ev.output_index)
-                      : ev.item.call_id || ev.item.id || String(nextToolIndex);
+                  const key = toolRecord;
                   let toolIdx = toolIndexMap.get(key);
                   if (toolIdx === undefined) {
                     toolIdx = nextToolIndex++;
                     toolIndexMap.set(key, toolIdx);
-                    if (ev.item.call_id) toolIndexMap.set(ev.item.call_id, toolIdx);
-                    if (ev.item.id) toolIndexMap.set(ev.item.id, toolIdx);
-                    if (ev.output_index !== undefined) toolIndexMap.set(String(ev.output_index), toolIdx);
                   }
-                  const restoredName = restoreClientToolName(ev.item.name, aliasToOriginal);
+                  const restoredName = allowedTools.get(ev.item.name);
+                  // Chat IDs are concatenated by stream consumers. Do not emit
+                  // the item ID as a provisional ID when call_id may arrive later.
+                  toolRecord.sentId = toolRecord.call_id;
                   writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
@@ -2727,7 +2878,7 @@ function handleRequest(req, res) {
                             tool_calls: [
                               {
                                 index: toolIdx,
-                                id: ev.item.call_id || ev.item.id || `call_${toolIdx}`,
+                                ...(toolRecord.sentId ? { id: toolRecord.sentId } : {}),
                                 type: "function",
                                 function: { name: restoredName, arguments: "" },
                               },
@@ -2739,8 +2890,9 @@ function handleRequest(req, res) {
                     })}\n\n`
                   );
                 } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
-                  const key = ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
-                  const toolIdx = key !== undefined && toolIndexMap.has(key) ? toolIndexMap.get(key) : 0;
+                  const key = toolRecord;
+                  if (!toolIndexMap.has(key)) throw toolContractError();
+                  const toolIdx = toolIndexMap.get(key);
                   writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
@@ -2768,7 +2920,7 @@ function handleRequest(req, res) {
                     };
                   }
                 }
-              } catch {}
+              } catch (err) { throw err.type ? err : streamContractError("Upstream sent malformed SSE data"); }
             };
 
             await consumeSseLines(reader, decoder, handleResponsesStreamLine, onUpstreamChunk);
@@ -2782,6 +2934,11 @@ function handleRequest(req, res) {
               emitStreamError("Upstream Responses stream ended without a terminal event", "upstream_error");
               if (!res.writableEnded) res.end();
               return;
+            }
+            for (const [record, index] of toolIndexMap) {
+              if (record.sentId) continue;
+              record.sentId = record.call_id || record.item_id || `call_${index}`;
+              writeSse(`data: ${JSON.stringify({ id: completionId, object: "chat.completion.chunk", created, model: targetModel, choices: [{ index: 0, delta: { tool_calls: [{ index, id: record.sentId }] }, finish_reason: null }] })}\n\n`);
             }
             const finalFinishReason = upstreamFinishReason;
             writeSse(
@@ -2809,15 +2966,16 @@ function handleRequest(req, res) {
             return res.end();
           } else {
             // Chat Completions API SSE stream
-            const hasAliases = aliasToOriginal.size > 0;
             let streamAbortedByError = false;
             const handleChatStreamLine = (line) => {
               if (streamAbortedByError) return;
-              if (!line.startsWith("data: ")) return;
-              const raw = line.slice(6).trim();
+              if (!line.startsWith("data:")) return;
+              const raw = line.slice(5).trim();
               if (!raw) return;
               if (raw === "[DONE]") {
-                writeSse("data: [DONE]\n\n");
+                if (chatTools.done) return;
+                const final = chatTools.finish();
+                if (final) writeSse(`data: ${JSON.stringify(final)}\n\n`);
                 return;
               }
               // A failure inside the stream is not a completion. If no chunk has
@@ -2832,35 +2990,28 @@ function handleRequest(req, res) {
                   return;
                 }
               } catch {}
-              // Zero-parse fast path: when no client tools are aliased and the chunk
-              // carries no `"reasoning":` field to normalize, forward raw SSE bytes directly.
-              if (!hasAliases && !raw.includes('"reasoning"')) {
-                writeSse(`data: ${raw}\n\n`);
-                return;
-              }
               try {
-                const chunk = JSON.parse(raw);
-                const delta = chunk.choices?.[0]?.delta;
-                if (delta && delta.reasoning && !delta.reasoning_content) {
-                  delta.reasoning_content = delta.reasoning;
-                }
-                if (hasAliases && Array.isArray(delta?.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    if (tc.function?.name) {
-                      tc.function.name = restoreClientToolName(tc.function.name, aliasToOriginal);
-                    }
+                const chunk = chatTools.feed(parseStreamData(raw));
+                if (!chunk) return;
+                for (const choice of chunk.choices || []) {
+                  const delta = choice.delta;
+                  if (delta?.reasoning && !delta.reasoning_content) {
+                    delta.reasoning_content = delta.reasoning;
                   }
                 }
                 writeSse(`data: ${JSON.stringify(chunk)}\n\n`);
-              } catch {
-                writeSse(`data: ${raw}\n\n`);
+              } catch (err) {
+                throw err.type ? err : streamContractError("Upstream sent malformed SSE data");
               }
             };
 
             await consumeSseLines(reader, decoder, handleChatStreamLine, onUpstreamChunk);
             abortController.signal.throwIfAborted();
+            if (!streamAbortedByError && !chatTools.terminal) {
+              emitStreamError("Upstream chat stream ended without a terminal event", "upstream_error");
+            }
             if (!res.writableEnded) {
-              if (!sseHeadersSent) writeSse("data: [DONE]\n\n");
+              if (!streamAbortedByError && chatTools.done) writeSse("data: [DONE]\n\n");
               res.end();
             }
             return;
@@ -2879,12 +3030,21 @@ function handleRequest(req, res) {
         let streamError = null;
 
         const handleNonStreamLine = (line) => {
-          if (!line.startsWith("data: ")) return;
-          const rawJson = line.slice(6).trim();
-          if (!rawJson || rawJson === "[DONE]") return;
+          if (streamError || !line.startsWith("data:")) return;
+          const rawJson = line.slice(5).trim();
+          if (!rawJson || (useResponses && rawJson === "[DONE]")) return;
 
           try {
-            const ev = JSON.parse(rawJson);
+            let ev = rawJson === "[DONE]" ? chatTools.finish() : parseStreamData(rawJson);
+            if (!ev) return;
+            const toolRecord = useResponses ? checkResponseTools(ev) : null;
+            if (useResponses) {
+              for (const record of nonStreamToolMap.keys()) {
+                if (record.call_id) nonStreamToolMap.get(record).id = record.call_id;
+              }
+            }
+            else if (rawJson !== "[DONE]") ev = chatTools.feed(ev);
+            if (!ev) return;
 
             // A 200 followed by an in-stream error is a failure, not an empty
             // completion. Without this the client would receive content: null
@@ -2906,31 +3066,22 @@ function handleRequest(req, res) {
               ) {
                 reasoningText += ev.delta;
               } else if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
-                const key =
-                  ev.output_index !== undefined
-                    ? String(ev.output_index)
-                    : ev.item.call_id || ev.item.id || String(toolCalls.length);
+                const key = toolRecord;
                 const tc = {
                   id: ev.item.call_id || ev.item.id || `call_${toolCalls.length}`,
                   type: "function",
                   function: {
-                    name: restoreClientToolName(ev.item.name, aliasToOriginal),
+                    name: allowedTools.get(ev.item.name),
                     arguments: "",
                   },
                 };
                 toolCalls.push(tc);
                 nonStreamToolMap.set(key, tc);
-                if (ev.item.call_id) nonStreamToolMap.set(ev.item.call_id, tc);
-                if (ev.item.id) nonStreamToolMap.set(ev.item.id, tc);
-                if (ev.output_index !== undefined) nonStreamToolMap.set(String(ev.output_index), tc);
               } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
-                const key =
-                  ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
-                const targetTc =
-                  key !== undefined && nonStreamToolMap.has(key)
-                    ? nonStreamToolMap.get(key)
-                    : toolCalls[toolCalls.length - 1];
-                if (targetTc) targetTc.function.arguments += ev.delta;
+                const key = toolRecord;
+                const targetTc = nonStreamToolMap.get(key);
+                if (!targetTc) throw toolContractError();
+                targetTc.function.arguments += ev.delta;
               } else if (ev.type === "response.completed" || ev.type === "response.incomplete") {
                 upstreamFinishReason = extractResponsesFinishReason(ev, toolCalls.length > 0);
                 if (ev.response?.usage) {
@@ -2959,7 +3110,7 @@ function handleRequest(req, res) {
                       id: tc.id || `call_${idx}`,
                       type: "function",
                       function: {
-                        name: restoreClientToolName(tc.function?.name || "", aliasToOriginal),
+                        name: tc.function?.name || "",
                         arguments: "",
                       },
                     };
@@ -2968,10 +3119,7 @@ function handleRequest(req, res) {
                       toolCalls[idx].id = tc.id;
                     }
                     if (tc.function?.name && !toolCalls[idx].function.name) {
-                      toolCalls[idx].function.name = restoreClientToolName(
-                        tc.function.name,
-                        aliasToOriginal
-                      );
+                      toolCalls[idx].function.name = tc.function.name;
                     }
                   }
                   if (tc.function?.arguments) {
@@ -2987,13 +3135,13 @@ function handleRequest(req, res) {
                 };
               }
             }
-          } catch {}
+          } catch (err) { throw err.type ? err : streamContractError("Upstream sent malformed SSE data"); }
         };
 
         await consumeSseLines(reader, decoder, handleNonStreamLine, onUpstreamChunk);
         abortController.signal.throwIfAborted();
-        if (useResponses && !upstreamFinishReason && !streamError) {
-          streamError = "Upstream Responses stream ended without a terminal event";
+        if (!(useResponses ? upstreamFinishReason : chatTools.terminal) && !streamError) {
+          streamError = "Upstream stream ended without a terminal event";
         }
 
         if (streamError) {
@@ -3043,6 +3191,14 @@ function handleRequest(req, res) {
         }
         if (clientDisconnected || res.writableEnded) {
           return;
+        }
+        if (err.type === "upstream_tool_error" || err.type === "upstream_stream_error") {
+          const payload = JSON.stringify({ error: { type: err.type, message: err.message, code: 502 } });
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(payload);
+          }
+          return res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);
         }
         if (timedOut) {
           if (!res.headersSent) {
@@ -3219,6 +3375,7 @@ module.exports = {
   prepareResponsesTools,
   prepareChatTools,
   restoreClientToolName,
+  __chatToolGuard: chatToolGuard,
   buildUpstreamPayload,
   isNewerVersion,
   checkAndApplyUpdate,

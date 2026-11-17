@@ -49,6 +49,16 @@ source_tree=$(git -C "$work/usque" rev-parse 'HEAD^{tree}')
 hash() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
 }
+manifest_hash() {
+  awk -v file="$1" '
+    { name = $2; sub(/^\*/, "", name) }
+    name == file { matches++; digest = $1; if (NF != 2) invalid = 1 }
+    END {
+      if (matches != 1 || invalid || length(digest) != 64 || digest ~ /[^a-f0-9]/) exit 1
+      print digest
+    }
+  ' "$2"
+}
 patch_sha=$(hash "$PATCH" | cut -d ' ' -f 1)
 source_sha=$(git -C "$work/usque" archive --format=tar HEAD | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -d ' ' -f 1)
 script_sha=$(hash "$PWD/scripts/build-warp-helper.sh" | cut -d ' ' -f 1)
@@ -84,7 +94,11 @@ if [ "$MODE" = --compare ]; then
   # Compare exact filenames and hashes, not paths supplied by an untrusted manifest.
   result=matched
   for file in "${files[@]}"; do
-    expected=$(awk -v file="$file" '$2 == file {print $1}' "$MANIFEST")
+    if ! expected=$(manifest_hash "$file" "$MANIFEST"); then
+      echo "Invalid manifest: expected exactly one SHA-256 entry for $file" >&2
+      result=mismatched; status=1
+      continue
+    fi
     actual=$(hash "$work/output/$file" | cut -d ' ' -f 1)
     if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]] || [ "$actual" != "$expected" ]; then
       echo "Mismatch: $file expected=$expected actual=$actual" >&2

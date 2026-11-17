@@ -122,3 +122,17 @@ test('resource manifests refuse directory aliases instead of hashing outside the
     expect(() => resourceManifest(temp, [{ from: 'licenses', to: 'licenses' }])).toThrow('Untrusted resource entry');
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
+
+test("a relay folder's local .vercel link never ships: it is not expected, and a build that still carries it is refused", () => {
+  const temp = mkdtempSync(path.join(tmpdir(), 'polygate-resource-gate-'));
+  const source = path.join(temp, 'source'), packaged = path.join(temp, 'packaged');
+  for (const root of [source, packaged]) { mkdirSync(path.join(root, 'relays', 'vercel-bun', 'api'), { recursive: true }); writeFileSync(path.join(root, 'relays', 'vercel-bun', 'api', 'relay.js'), 'relay'); }
+  mkdirSync(path.join(source, 'relays', 'vercel-bun', '.vercel')); writeFileSync(path.join(source, 'relays', 'vercel-bun', '.vercel', 'project.json'), '{"projectId":"x","orgId":"y"}');
+  try {
+    const manifest = resourceManifest(source, [{ from: 'relays', to: 'relays' }]);
+    expect([...manifest.keys()]).toEqual(['relays/vercel-bun/api/relay.js']);
+    expect(() => verifyResources(packaged, manifest)).not.toThrow();
+    mkdirSync(path.join(packaged, 'relays', 'vercel-bun', '.vercel')); writeFileSync(path.join(packaged, 'relays', 'vercel-bun', '.vercel', 'project.json'), '{}');
+    expect(() => verifyResources(packaged, manifest)).toThrow('Unexpected packaged resource');
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});

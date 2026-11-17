@@ -47,9 +47,10 @@ export function lfBody(response: Response): Response {
 }
 export async function collect(response: Response) { return await adapters.collectChatCompletion(lfBody(response)); }
 // `choices` is how many answers were asked for (n); a stream that ends without [DONE] is complete only when that many have finished.
-export async function stream(req: IncomingMessage, res: ServerResponse, raw: Response, protocol: Protocol, model: string, choices = 1) {
+export type RelayOptions = { onBackpressure?: (waiting: boolean) => void };
+export async function stream(req: IncomingMessage, res: ServerResponse, raw: Response, protocol: Protocol, model: string, choices = 1, options: RelayOptions = {}) {
   const response = lfBody(raw);
-  if(protocol==='anthropic') return await adapters.relayAnthropicStream(req,res,adapters.sseChunks(response),model,model);
-  if(protocol==='responses') return await adapters.relayChatAsResponsesStream(req,res,response,model);
-  return await adapters.relayStream(req,res,response,model,false,null,null,choices);
+  if(protocol==='anthropic') return await adapters.relayAnthropicStream(req,res,adapters.sseChunks(response),model,model,false,null,null,options);
+  if(protocol==='responses') return await adapters.relayChatAsResponsesStream(req,res,response,model,false,null,null,options);
+  return await adapters.relayStream(req,res,response,model,false,null,null,choices,options);
 }

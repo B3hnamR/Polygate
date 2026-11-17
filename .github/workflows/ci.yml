@@ -19,6 +19,8 @@ jobs:
         with:
           bun-version: '1.4.4'
       - run: npm ci --ignore-scripts
+      - name: Provision pinned wireproxy helpers before offline tests
+        run: python3 scripts/fetch-wireproxy.py all
       - run: npm run check
       - run: bun test tests
       - run: docker build .
@@ -38,6 +40,11 @@ jobs:
         with:
           bun-version: '1.4.4'
       - run: npm ci --ignore-scripts
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Provision pinned wireproxy helpers before the offline firewall
+        run: python scripts/fetch-wireproxy.py all
       - name: Prepare browser and native fixture toolchains
         shell: pwsh
         run: |
@@ -56,7 +63,7 @@ jobs:
           # Dynamically created/renamed executables are NOT covered: this is not
           # a full process-tree network sandbox. The disposable hosted VM is the
           # machine isolation boundary; app guards keep fixtures off production.
-          $programs = @('bun','node','powershell.exe','pwsh','cmd.exe','git') | ForEach-Object { (Get-Command $_ -ErrorAction Stop).Source }
+          $programs = @('bun','node','python','powershell.exe','pwsh','cmd.exe','git') | ForEach-Object { (Get-Command $_ -ErrorAction Stop).Source }
           $programs += "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
           $programs += 'C:\Program Files\Git\usr\bin\openssl.exe'
           $programs += @(Get-ChildItem "$env:LOCALAPPDATA\ms-playwright" -Filter *.exe -Recurse | ForEach-Object FullName)

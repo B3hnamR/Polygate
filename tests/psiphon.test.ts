@@ -45,7 +45,8 @@ beforeEach(() => {
   P.__psiphonTest.scope = 'opencode';
   __setExitVerifier(async () => 'exhausted');
 });
-const post = () => networkFetch('http://127.0.0.9/v1/chat', { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } }, 'psiphon');
+// Each fixture request gets its own socket; the HTTP-to-SOCKS bridge closes after one request.
+const post = () => networkFetch('http://127.0.0.9/v1/chat', { method: 'POST', body: '{}', keepalive: false, headers: { 'content-type': 'application/json' } }, 'psiphon');
 
 test('taking turns: each pick is the next connected region', () => {
   const picks = Array.from({ length: 6 }, () => P.pickPsiphon()!.region);

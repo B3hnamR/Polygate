@@ -1,9 +1,9 @@
-import {useEffect,useRef,useState} from 'react';
-import {Hammer,CheckCircle2,Circle,Copy,FileText,GitBranch,ListChecks,Loader2,Play,RefreshCw,Square,Terminal,Undo2,X} from 'lucide-react';
+import {useEffect,useRef,useState,type ReactNode} from 'react';
+import {Hammer,CheckCircle2,Circle,Copy,FileText,Files,GitBranch,ListChecks,Loader2,Play,RefreshCw,ShieldCheck,Square,Terminal,Undo2,X} from 'lucide-react';
 import {api} from './api';
 import {AgentDiff} from './agent-diff';
 import {useConfirm} from './confirm';
-import {Button,usePoll,when} from './ui';
+import {Button,usePoll,when,tabKeys} from './ui';
 import type {Item,Todo} from './agent-logic';
 import {AgentProject} from './agent-project';
 import {AgentChildren} from './agent-children';
@@ -12,9 +12,10 @@ type Turn=Extract<Item,{kind:'changes'}>;
 type GitFile={file:string;from?:string;index:string;worktree:string};
 type GitState={repository:boolean;branch?:string;files?:GitFile[];commits?:{hash:string;subject:string}[];at?:number};
 type GitPatch={repository:boolean;file?:string;staged?:string;worktree?:string;truncated?:boolean};
-export function AgentWorkspace({id,turns,todos=[],initialTab='changes',busy,blocked,onUndo,onClose,onInsert}:{id:string;turns:Turn[];todos?:Todo[];initialTab?:'changes'|'plan';busy:boolean;blocked:Map<string,string>;onUndo:(message:string)=>void;onClose:()=>void;onInsert:(text:string)=>void}){
-  const [tab,setTab]=useState<'changes'|'git'|'terminal'|'plan'|'project'|'children'>(initialTab),[git,setGit]=useState<GitState|null>(null),[patch,setPatch]=useState<GitPatch|null>(null),[error,setError]=useState(''),[loading,setLoading]=useState(false);
-  useEffect(()=>setTab(initialTab),[initialTab]);
+export type WorkspaceTab='changes'|'plan'|'rules'|'project'|'git'|'terminal'|'children';
+// The panel beside the conversation. Its tab is the session's (the header's Changes, Plan and Rules buttons open it at theirs).
+export function AgentWorkspace({id,turns,todos=[],tab,onTab:setTab,rules,busy,blocked,onUndo,onClose,onInsert}:{id:string;turns:Turn[];todos?:Todo[];tab:WorkspaceTab;onTab:(t:WorkspaceTab)=>void;rules:ReactNode;busy:boolean;blocked:Map<string,string>;onUndo:(message:string)=>void;onClose:()=>void;onInsert:(text:string)=>void}){
+  const [git,setGit]=useState<GitState|null>(null),[patch,setPatch]=useState<GitPatch|null>(null),[error,setError]=useState(''),[loading,setLoading]=useState(false);
   const consent=useRef(false),serial=useRef(0);const {confirm,dialog}=useConfirm();
   useEffect(()=>()=>{serial.current++;},[]);
   const inspect=async(file?:string)=>{
@@ -26,8 +27,9 @@ export function AgentWorkspace({id,turns,todos=[],initialTab='changes',busy,bloc
   const count=new Set(turns.flatMap(t=>t.files.map(f=>f.file))).size;
   return <aside className="ag-workspace" id="agent-workspace" aria-label="Task changes and Git">
     <header><strong>Task workspace</strong><button type="button" className="icon-button" aria-label="Close task workspace" onClick={onClose}><X size={16}/></button></header>
-    <div className="ag-workspace-tabs" role="group" aria-label="Workspace view"><button type="button" aria-pressed={tab==='changes'} onClick={()=>setTab('changes')}>Agent changes{count?` (${count})`:''}</button><button type="button" aria-pressed={tab==='plan'} onClick={()=>setTab('plan')}><ListChecks size={13}/>Plan</button><button type="button" aria-pressed={tab==='git'} onClick={()=>setTab('git')}><GitBranch size={13}/>Git</button><button type="button" aria-pressed={tab==='terminal'} onClick={()=>setTab('terminal')}><Terminal size={13}/>Terminal</button><button type="button" aria-label="Project instructions, commands & skills" aria-pressed={tab==='project'} onClick={()=>setTab('project')}><FileText size={13}/>Project</button></div>
-    <div className="ag-workspace-tabs ag-workspace-subtabs"><button type="button" aria-pressed={tab==='children'} onClick={()=>setTab('children')}><Hammer size={13}/>Subagents</button></div>
+    {/* One row of tabs; it scrolls sideways in a narrow panel instead of wrapping onto more lines. */}
+    <div className="ag-workspace-tabs" role="tablist" aria-label="Workspace view" onKeyDown={tabKeys}>{([['changes',Files,'Changes'+(count?` ${count}`:'')],['plan',ListChecks,'Plan'],['rules',ShieldCheck,'Rules'],['project',FileText,'Project'],['git',GitBranch,'Git'],['terminal',Terminal,'Terminal'],['children',Hammer,'Subagents']] as const).map(([id,Icon,label])=>
+      <button type="button" role="tab" key={id} aria-selected={tab===id} tabIndex={tab===id?0:-1} title={id==='project'?'Project instructions, commands & skills':id==='rules'?'Saved approvals for this folder':undefined} onClick={()=>setTab(id)}><Icon size={13}/>{label}</button>)}</div>
     <div className="ag-workspace-content">
       {tab==='changes'?<>
         <p className="subtle">Recorded changes for this session, newest turn first. Patches show what was recorded at the end of a turn, not the current file contents.</p>
@@ -38,7 +40,7 @@ export function AgentWorkspace({id,turns,todos=[],initialTab='changes',busy,bloc
           {t.files.map(f=><details className="agent-change" key={f.file}><summary><span className="agent-change-status">{f.status}</span><code title={f.file}>{f.file}</code><small className="green">+{f.additions}</small><small className="red">−{f.deletions}</small></summary>{f.patch?<AgentDiff patch={f.patch}/>:<p className="subtle">No patch was recorded. Without a backup or engine diff, only the file name is available.</p>}</details>)}
           {blocked.get(t.message)?<p className="ag-workspace-undo-reason">{blocked.get(t.message)}</p>:<Button disabled={busy} onClick={()=>onUndo(t.message)}><Undo2 size={13}/>Undo this turn and later changes</Button>}
         </section>)}
-      </>:tab==='children'?<AgentChildren id={id}/>:tab==='project'?<AgentProject id={id} busy={busy} onInsert={onInsert}/>:tab==='plan'?<AgentPlan todos={todos} busy={busy}/>:tab==='terminal'?<AgentTerminal id={id} busy={busy}/>:<>
+      </>:tab==='rules'?rules:tab==='children'?<AgentChildren id={id}/>:tab==='project'?<AgentProject id={id} busy={busy} onInsert={onInsert}/>:tab==='plan'?<AgentPlan todos={todos} busy={busy}/>:tab==='terminal'?<AgentTerminal id={id} busy={busy}/>:<>
         <p className="subtle">The working folder’s Git state, including your changes and changes from other sessions. This is not limited to Agent edits.</p>
         <Button disabled={loading} onClick={()=>inspect()}>{loading?<Loader2 size={14} className="spin"/>:<RefreshCw size={14}/>} {git?'Refresh Git':'Inspect Git'}</Button>
         {git&&!git.repository&&<p className="ag-workspace-empty">This folder is not in a Git repository. No repository was created.</p>}

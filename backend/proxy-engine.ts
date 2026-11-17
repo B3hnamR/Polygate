@@ -9,7 +9,7 @@ import { socksConnect } from './socks-bridge';
 import { PROXY_SOURCES } from './proxy-sources';
 // Finds and keeps public proxies. It downloads the lists in proxy-sources.ts (or reads a pasted list), asks each proxy to load the OpenCode API
 // and keeps the ones that answer fast enough. Whether a proxy can carry a model request is decided later, by pool.ts, with a real request.
-export type Proto = 'http' | 'socks4' | 'socks5';
+export type Proto = 'http' | 'socks4' | 'socks4a' | 'socks5';
 export type Candidate = { url: string; proxy: string; proto: Proto; host: string; port: number };
 export type StoredProxy = Candidate & { latencyMs?: number; addedAt: number };
 export type ApiResult = { latency: number; status: number };
@@ -41,7 +41,8 @@ export function isPublicHost(raw: string) {
   return true;
 }
 const LINE = /^(?:(https?|socks4a?|socks5h?):\/\/)?(?:([^:@\s/]+):([^@\s/]*)@)?(\[[0-9a-f:]+\]|[a-z0-9][a-z0-9.-]*):(\d{1,5})(?![\w.-])/i;
-const SCHEME: Record<string, Proto> = { http: 'http', https: 'http', socks4: 'socks4', socks4a: 'socks4', socks5: 'socks5', socks5h: 'socks5' };
+const SCHEME: Record<string, Proto> = { http: 'http', socks4: 'socks4', socks4a: 'socks4a', socks5: 'socks5', socks5h: 'socks5' };
+const TLS_PROXY_UNSUPPORTED = 'Skipped explicit https:// proxies: TLS-to-proxy is not supported by the pool checker; no plaintext fallback was attempted.';
 export type Hint = Proto | 'https' | 'all';
 // Anywhere in a text: [scheme://][user:pass@]ip[/range]:port[:user:pass] (the same rules as ProxyHive). The trailing ":user:pass" is how many
 // paid providers hand out logins; "ip:port:US:elite" style lists put facts there instead, which are not taken as a login.
@@ -60,7 +61,7 @@ function rangeHosts(host: string, prefix: number) {
 // Finds every proxy in a pasted list, a downloaded file, a saved web page (an HTML table) or a JSON document.
 // An address without a scheme is tried as the hint says; "all" tries http, socks5 and socks4. ipOnly (downloaded lists) drops host names,
 // which could point at this machine's own network; a pasted list may use names.
-export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false): Candidate[] {
+export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false, warning?: (message: string) => void): Candidate[] {
   const seen = new Map<string, Candidate>();
   const fallback = (): Proto[] => hint === 'all' ? ['http', 'socks5', 'socks4'] : [hint === 'https' ? 'http' : hint];
   const add = (protos: Proto[], host: string, port: number, login?: [string, string], rawLogin = false) => {
@@ -91,40 +92,79 @@ export function parseProxyText(text: string, hint: Hint = 'all', ipOnly = false)
       for (const h of range ? rangeHosts(host, Number(range)) : [host]) if (validIp(h, port)) add(proto ? [proto] : fallback(), h, port, login);
     }
   };
-  const body = text.slice(0, 8_000_000); scan(body);
-  // <td>1.2.3.4</td><td>8080</td> in a saved web page.
-  if (/<\/t[dh]/i.test(body.slice(0, 3_000_000))) scan(body.replace(/\s*<\/t[dh]\s*>\s*<t[dh][^>]*>\s*/gi, ':').replace(/<[^>]+>/g, ' '));
-  // JSON records such as {"ip": "1.2.3.4", "port": 8080, "protocols": ["socks5"]}, at any depth.
-  if (/^\s*[[{]/.test(body)) {
-    try {
+  // Structured records are classified before any text scanning, including their decoded URL escapes.
+  let rejectedTls = false;
+  const original = text.slice(0, 8_000_000);
+  let structured: unknown; let isJson = false;
+  try { structured = JSON.parse(original); isJson = true; } catch { /* a text or HTML list */ }
+  if (isJson) {
+      const credentialKeys = new Set(['username', 'user', 'login', 'password', 'pass', 'pwd', 'auth', 'authorization', 'proxyauthorization', 'token', 'accesstoken', 'refreshtoken', 'apikey', 'secret', 'credentials']);
+      const credential = (key: string) => credentialKeys.has(key.toLowerCase().replace(/[_-]/g, ''));
+      const isTls = (value: unknown) => {
+        if (typeof value !== 'string') return false;
+        try { if (new URL(value).protocol === 'https:') return true; } catch { /* embedded endpoint text is checked below */ }
+        return /https:\/\//i.test(value) || /^\s*https:/i.test(value);
+      };
+      const readText = (value: string) => {
+        for (const c of parseProxyText(value, hint, ipOnly, () => { rejectedTls = true; })) {
+          if (seen.size >= MAX_CANDIDATES) break;
+          if (!seen.has(c.url) || (!seen.get(c.url)!.proxy.includes('@') && c.proxy.includes('@'))) seen.set(c.url, c);
+        }
+      };
       const walk = (o: any, depth: number): void => {
-        if (depth > 12 || !o || typeof o !== 'object') return;
+        if (depth > 12 || seen.size >= MAX_CANDIDATES || !o) return;
+        if (typeof o === 'string') { readText(o); return; }
+        if (typeof o !== 'object') return;
         if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+        // An explicit TLS endpoint rejects this record and all its aliases/children, not sibling records.
+        const fields = Object.entries(o).filter(([key]) => !credential(key));
+        if (fields.some(([, value]) => isTls(value))) { rejectedTls = true; return; }
         const host = HOST_KEYS.map(k => o[k]).find(v => typeof v === 'string'); const port = Number(PORT_KEYS.map(k => o[k]).find(v => v !== undefined && v !== ''));
         if (host && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host.trim()) && validIp(host.trim(), port)) {
-          const named = PROTO_KEYS.flatMap(k => Array.isArray(o[k]) ? o[k] : [o[k]]).map(v => typeof v === 'string' ? SCHEME[v.toLowerCase()] : undefined).filter(Boolean) as Proto[];
+          // Public-list protocol labels describe HTTPS destination support, not TLS to the proxy itself.
+          const named = PROTO_KEYS.flatMap(k => Array.isArray(o[k]) ? o[k] : [o[k]]).map(v => typeof v === 'string' ? (v.toLowerCase() === 'https' ? 'http' : SCHEME[v.toLowerCase()]) : undefined).filter(Boolean) as Proto[];
           const user = ['username', 'user', 'login'].map(k => o[k]).find(v => typeof v === 'string' && v); const pw = ['password', 'pass', 'pwd'].map(k => o[k]).find(v => typeof v === 'string') || '';
           add(named.length ? [...new Set(named)] : fallback(), host.trim(), port, user ? [user, pw] : undefined, true);
         }
-        for (const v of Object.values(o)) if (v && typeof v === 'object') walk(v, depth + 1);
+        for (const [, value] of fields) {
+          if (typeof value === 'string') readText(value);
+          else if (value && typeof value === 'object') walk(value, depth + 1);
+        }
       };
-      walk(JSON.parse(body), 0);
-    } catch { /* not JSON after all */ }
+      walk(structured, 0);
+      if (rejectedTls) warning?.(TLS_PROXY_UNSUPPORTED);
+      return [...seen.values()];
   }
+  // Only an unambiguous new URL may end a rejected token; arbitrary credential punctuation does not.
+  const withoutTls = (input: string): string => input.replace(/https:\/\/[^\s<>"']*/gi, token => {
+    rejectedTls = true;
+    for (const m of token.matchAll(/[,;|](?=(?:https?|socks4a?|socks5h?):\/\/)/gi)) {
+      const prefix = token.slice(0, m.index); const rest = token.slice(m.index! + 1);
+      if (!/^https:\/\/(?:[^\s/]*@)?(?:\[[^\]]+\]|[^\s/:,@;|]+):\d{1,5}\/?$/i.test(prefix) || rest.includes('@')) continue;
+      return '\n' + withoutTls(rest.replace(/[,;|](?=(?:https?|socks4a?|socks5h?):\/\/)/gi, '\n'));
+    }
+    return '';
+  });
+  const body = withoutTls(original);
+  scan(body);
+  // <td>1.2.3.4</td><td>8080</td> in a saved web page.
+  if (/<\/t[dh]/i.test(original.slice(0, 3_000_000))) scan(withoutTls(original.replace(/\s*<\/t[dh]\s*>\s*<t[dh][^>]*>\s*/gi, ':').replace(/<[^>]+>/g, ' ')));
   // IPv6 addresses, and host names (pasted lists only), one per line as before.
   for (const line of body.split(/[\r\n]+/)) {
     const m = LINE.exec(line.trim()); if (!m) continue;
     const [, scheme, user, pass, host, portText] = m; const port = Number(portText); const ip = net.isIP(host.replace(/^\[|\]$/g, ''));
     if (ip === 4 || (ipOnly && !ip) || !(port > 0 && port < 65536) || !isPublicHost(host)) continue;
-    add(scheme ? [SCHEME[scheme.toLowerCase()]] : fallback(), host, port, user ? [user, pass || ''] : undefined);
+    const proto = scheme ? SCHEME[scheme.toLowerCase()] : undefined; if (scheme && !proto) continue;
+    add(proto ? [proto] : fallback(), host, port, user ? [user, pass || ''] : undefined);
   }
+  if (rejectedTls) warning?.(TLS_PROXY_UNSUPPORTED);
   return [...seen.values()];
 }
 // A pasted text may mix proxies with links to lists: a line that is only a web address (and not a proxy) is a list to download.
 export function splitLinks(text: string) {
   const links: string[] = []; const rest: string[] = [];
   for (const raw of text.split(/[\r\n]+/)) {
-    const line = raw.trim(); if (/^https?:\/\/\S+$/i.test(line) && !/^https?:\/\/(?:[^\s:@/]+:[^\s@/]*@)?[^\s/:]+:\d{1,5}\/?$/i.test(line)) { if (!links.includes(line)) links.push(line); }
+    const line = raw.trim(); if (/^https?:\/\/\S+$/i.test(line) && !/[,;|](?:https?|socks4a?|socks5h?):\/\//i.test(line) && !/^https:\/\/[^\s/]*@/i.test(line) && !/^https?:\/\/(?:[^\s/]*@)?(?:\[[^\]]+\]|[^\s/:]+):\d{1,5}\/?$/i.test(line)) { if (!links.includes(line)) links.push(line); }
     else rest.push(raw);
   }
   return { links, text: rest.join('\n') };
@@ -132,6 +172,7 @@ export function splitLinks(text: string) {
 // --- one request through one proxy ---
 function httpConnect(c: Candidate, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
   const u = new URL(c.proxy);
+  if (u.protocol !== 'http:') throw new Error(TLS_PROXY_UNSUPPORTED);
   const auth = u.username ? `Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')}\r\n` : '';
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 80 }); let buffer = Buffer.alloc(0); let done = false;
@@ -150,9 +191,11 @@ function httpConnect(c: Candidate, host: string, port: number, timeoutMs: number
   });
 }
 function openTunnel(c: Candidate, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
-  if (c.proto === 'http') return httpConnect(c, host, port, timeoutMs);
   const u = new URL(c.proxy);
-  return socksConnect({ host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 1080, username: u.username ? decodeURIComponent(u.username) : undefined, password: u.username ? decodeURIComponent(u.password) : undefined, version: c.proto === 'socks4' ? 4 : 5 }, host, port, timeoutMs);
+  if (u.protocol === 'https:' || /^https:/i.test(c.url)) throw new Error(TLS_PROXY_UNSUPPORTED);
+  if (!['http', 'socks4', 'socks4a', 'socks5'].includes(c.proto) || u.protocol !== c.proto + ':') throw new Error('Proxy protocol does not match its URL');
+  if (c.proto === 'http') return httpConnect(c, host, port, timeoutMs);
+  return socksConnect({ host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 1080, username: u.username ? decodeURIComponent(u.username) : undefined, password: u.username ? decodeURIComponent(u.password) : undefined, version: c.proto === 'socks4' || c.proto === 'socks4a' ? 4 : 5, remoteDns: c.proto === 'socks4a' }, host, port, timeoutMs);
 }
 // Loads the OpenCode model list through the proxy. Reaching it proves the proxy can tunnel to the provider (not hijacked, not blocking it) and how fast.
 export async function checkApi(c: Candidate, timeoutMs: number, api: string): Promise<ApiResult | null> {
@@ -178,7 +221,7 @@ export async function verify(list: Candidate[], o: VerifyOptions): Promise<Map<s
 }
 // --- the saved pool ---
 const dir = path.join(stateDir, 'proxies'); const file = path.join(dir, 'polygate-pool.json');
-const valid = (s: any): s is StoredProxy => !!s && typeof s.url === 'string' && typeof s.proxy === 'string' && ['http', 'socks4', 'socks5'].includes(s.proto) && typeof s.host === 'string' && Number(s.port) > 0;
+const valid = (s: any): s is StoredProxy => !!s && typeof s.url === 'string' && typeof s.proxy === 'string' && ['http', 'socks4', 'socks4a', 'socks5'].includes(s.proto) && typeof s.host === 'string' && Number(s.port) > 0;
 function load(): StoredProxy[] { try { if (existsSync(file)) { const j = JSON.parse(readFileSync(file, 'utf8')); if (Array.isArray(j)) return j.filter(valid); } } catch { /* start empty */ } return []; }
 let stored: StoredProxy[] = load();
 const save = () => { try { mkdirSync(dir, { recursive: true }); writeFileAtomic(file, JSON.stringify(stored)); } catch { /* the pool is rebuilt by the next scan */ } };
@@ -190,7 +233,7 @@ export function addVerified(list: Candidate[], found: Map<string, ApiResult>) {
 }
 export function removeProxies(urls?: string[]) { stored = urls ? stored.filter(s => !urls.includes(s.url)) : []; save(); }
 // --- jobs: scan the public lists, or check a pasted list ---
-export type EngineJob = { running: boolean; kind: 'idle' | 'scan' | 'import'; phase: 'idle' | 'download' | 'check' | 'done' | 'stopped' | 'error'; total: number; done: number; passed: number; message: string; startedAt: number; finishedAt: number };
+export type EngineJob = { running: boolean; kind: 'idle' | 'scan' | 'import'; phase: 'idle' | 'download' | 'check' | 'done' | 'stopped' | 'error'; total: number; done: number; passed: number; message: string; warning?: string; startedAt: number; finishedAt: number };
 const idle: EngineJob = { running: false, kind: 'idle', phase: 'idle', total: 0, done: 0, passed: 0, message: '', startedAt: 0, finishedAt: 0 };
 let job: EngineJob = { ...idle }; let stopFlag = false;
 export const engineJob = () => ({ ...job });
@@ -201,6 +244,7 @@ function shuffle<T>(list: T[]) { for (let i = list.length - 1; i > 0; i--) { con
 // --- list links: the built-in public lists plus the user's own ---
 // A list with more than this many addresses is junk (or not a proxy list) and is refused, as in ProxyHive.
 const MAX_PER_LIST = 150000;
+const MAX_LIST_BYTES = 8_000_000;
 export const proxyLists = () => (settings.proxyLists ||= { builtin: true, sources: [] });
 // Fetches an address that must lead to the public internet. A name is resolved first and every address it gives must be public, and a redirect is
 // followed by hand so its target is checked the same way; otherwise a name or a redirect could point this machine at its own network.
@@ -221,14 +265,30 @@ async function publicGet(start: URL, signal: AbortSignal): Promise<Response> {
 export async function fetchList(url: string, hint: Hint): Promise<{ found: Candidate[]; error?: string }> {
   let u: URL; try { u = new URL(url); } catch { return { found: [], error: 'Not a web address' }; }
   if (!['http:', 'https:'].includes(u.protocol) || !isPublicHost(u.hostname)) return { found: [], error: 'Only public http(s) addresses can be downloaded' };
+  const controller = new AbortController();
   try {
-    const r = await publicGet(u, AbortSignal.timeout(25000));
+    const r = await publicGet(u, AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]));
     if (!r.ok) { await r.body?.cancel().catch(() => {}); return { found: [], error: `HTTP ${r.status}` }; }
-    const found = parseProxyText((await r.text()).slice(0, 8_000_000), hint, true);
+    let text = ''; let bytes = 0;
+    const reader = r.body?.getReader(); const decoder = new TextDecoder();
+    if (reader) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          bytes += value.byteLength;
+          if (bytes > MAX_LIST_BYTES) throw new Error('Refused: proxy list exceeds 8,000,000 decoded bytes');
+          text += decoder.decode(value, { stream: true });
+        }
+        text += decoder.decode();
+      } catch (e) { void reader.cancel().catch(() => {}); controller.abort(); throw e; }
+      finally { reader.releaseLock(); }
+    }
+    let warning: string | undefined;
+    const found = parseProxyText(text, hint, true, message => { warning = message; });
     // Counted by address: "any type" tries each address three ways, which must not make a normal list look too big.
     const addresses = new Set(found.map(c => `${c.host}:${c.port}`)).size;
     if (addresses > MAX_PER_LIST) return { found: [], error: `Refused: ${addresses.toLocaleString()} addresses is more than a proxy list should hold` };
-    return { found, ...(found.length ? {} : { error: 'No proxy addresses in it' }) };
+    return { found, ...(warning ? { error: warning } : found.length ? {} : { error: 'No proxy addresses in it' }) };
   } catch (e: any) { return { found: [], error: e?.name === 'TimeoutError' ? 'No answer within 25 s' : String(e?.message || e).slice(0, 120) }; }
 }
 // Your own lists come first: when there are more addresses than one run checks, the public lists' share is cut, not yours.
@@ -240,6 +300,7 @@ async function downloadSources(): Promise<Candidate[]> {
   await Promise.all(Array.from({ length: 6 }, async () => {
     while (next < lists.length && !stopFlag) {
       const item = lists[next++]; const r = await fetchList(item.url, item.hint);
+      if (r.error === TLS_PROXY_UNSUPPORTED) job.warning = r.error;
       for (const c of r.found) (item.mine ? mine : pub).set(c.url, c);
       if (item.mine) Object.assign(item.mine, { lastAt: Date.now(), lastCount: r.found.length, lastError: r.error });
       job.done = ++done; job.message = `Downloaded ${done} of ${lists.length} lists (${(mine.size + pub.size).toLocaleString()} proxy addresses)…`;
@@ -253,10 +314,10 @@ async function downloadSources(): Promise<Candidate[]> {
 // A pasted list: proxies and links to lists, mixed. A plain ip:port means what the hint says.
 async function readPasted(text: string, hint: Hint): Promise<Candidate[]> {
   const { links, text: rest } = splitLinks(text.slice(0, 4_000_000)); const all = new Map<string, Candidate>();
-  for (const c of parseProxyText(rest, hint)) all.set(c.url, c);
+  for (const c of parseProxyText(rest, hint, false, message => { job.warning = message; })) all.set(c.url, c);
   if (links.length) { job.phase = 'download'; job.total = links.length; job.message = `Downloading ${links.length} list(s)…`; }
   let done = 0; const failed: string[] = [];
-  await Promise.all(links.map(async url => { const r = await fetchList(url, hint); for (const c of r.found) all.set(c.url, c); if (r.error && !r.found.length) failed.push(`${url}: ${r.error}`); job.done = ++done; }));
+  await Promise.all(links.map(async url => { const r = await fetchList(url, hint); for (const c of r.found) all.set(c.url, c); if (r.error === TLS_PROXY_UNSUPPORTED) job.warning = r.error; if (r.error && !r.found.length) failed.push(r.error); job.done = ++done; }));
   if (!all.size && failed.length) throw new Error(`Nothing found. ${failed.slice(0, 3).join(' · ')}`);
   const list = [...all.values()]; return list.length > MAX_CANDIDATES ? shuffle(list).slice(0, MAX_CANDIDATES) : list;
 }
@@ -266,11 +327,12 @@ function run(kind: 'scan' | 'import', gather: () => Promise<Candidate[]>, o: Eng
   void (async () => {
     try {
       const list = await gather();
-      if (!list.length) { job = { ...job, running: false, phase: stopFlag ? 'stopped' : 'done', finishedAt: Date.now(), message: stopFlag ? 'Stopped.' : 'No proxy addresses were found.' }; return; }
+      if (!list.length) { job = { ...job, running: false, phase: stopFlag ? 'stopped' : 'done', finishedAt: Date.now(), message: stopFlag ? 'Stopped.' : job.warning || 'No proxy addresses were found.' }; return; }
       job = { ...job, phase: 'check', done: 0, total: list.length, message: `Checking ${list.length.toLocaleString()} proxies against the OpenCode API…` };
       const found = await verify(list, { api: o.api, timeoutMs: o.timeoutSec * 1000, concurrency: o.concurrency, cancelled: () => stopFlag, progress: (d, t, p) => { job.done = d; job.total = t; job.passed = p; } });
       const fast = new Map([...found].filter(([, r]) => r.latency <= o.gateMs)); addVerified(list, fast);
       job = { ...job, running: false, phase: stopFlag ? 'stopped' : 'done', finishedAt: Date.now(), passed: fast.size, message: `${stopFlag ? 'Stopped. ' : ''}${fast.size.toLocaleString()} of ${list.length.toLocaleString()} reached the OpenCode API within ${o.gateMs} ms and ${fast.size === 1 ? 'was' : 'were'} added to the pool.` };
+      if (job.warning) job.message += ' ' + job.warning;
       if (!stopFlag) o.after?.();
     } catch (e: any) { job = { ...job, running: false, phase: 'error', finishedAt: Date.now(), message: String(e?.message || e).slice(0, 200) }; }
   })();

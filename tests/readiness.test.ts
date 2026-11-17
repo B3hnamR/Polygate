@@ -3,7 +3,7 @@ import { test, expect, afterEach } from 'bun:test';
 const { settings, saveModel, models } = await import('../backend/state');
 const { readiness } = await import('../backend/gateway');
 const { routeFor, routeForProvider } = await import('../backend/transport');
-const saved = { providers: settings.providers, routes: settings.routes.slice(), keys: settings.keys, enabled: settings.enabled, rotate: settings.rotate, strategy: settings.strategy, routeId: settings.routeId, spreadDirect: settings.spreadDirect };
+const saved = { providers: settings.providers, routes: settings.routes.slice(), keys: settings.keys, enabled: settings.enabled, rotate: settings.rotate, strategy: settings.strategy, routeId: settings.routeId, spreadDirect: settings.spreadDirect, allowDirect: settings.allowDirect };
 const model = (id: string, providerId: string) => saveModel({ id, upstreamId: id.split('/')[1], providerId, name: id, context: 0, output: 0, tools: true, reasoning: false, state: 'available', latency: 0, score: 50, priority: 1, failCount: 0, cooldownUntil: 0, checkedAt: 0, error: '' } as any);
 const own = () => ({ id: 'rd', name: 'Own', kind: 'openai', enabled: true, baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: [], routeId: '' });
 afterEach(() => { Object.assign(settings, saved); settings.routes = saved.routes.slice(); models.delete('rd/m'); });
@@ -23,7 +23,7 @@ test('no switched-on provider and no models are named, with the page that fixes 
   if (process.uptime() >= 30) expect(r.issues.map(i => i.code)).toContain('no_models'); else expect(['starting', 'attention']).toContain(r.state);
 });
 test('spreading with nothing but Direct left is not ready, and the reason says why', () => {
-  healthy(); settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false;
+  healthy(); settings.rotate = true; settings.strategy = 'round_robin'; settings.spreadDirect = false; settings.allowDirect = false;
   settings.routes = settings.routes.filter(r => r.id === 'direct');
   const r = readiness(); expect(r.state).toBe('attention'); expect(r.issues[0]).toMatchObject({ code: 'no_route', page: 'Routing' }); expect(r.issues[0].message).toContain('"In the spread"');
   settings.spreadDirect = true; expect(readiness().state).toBe('ready');

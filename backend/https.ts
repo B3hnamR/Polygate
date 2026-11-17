@@ -16,7 +16,9 @@ const day = 86400000;
 export const httpsConfig = (): HttpsSettings => ({ mode: 'off', httpPort: 80, redirect: true, ...settings.https });
 type Tls = { cert: string; key: string };
 type Rebind = (opts: { port: number; host: string; tls?: Tls }) => Promise<number>;
-let rebind: Rebind | undefined; let plain = { port: 4317, host: '127.0.0.1' }; let challengeServer: ReturnType<typeof Bun.serve> | undefined; let renewTimer: ReturnType<typeof setInterval> | undefined;
+let rebind: Rebind | undefined; let plain = { port: 4317, host: '127.0.0.1' }; let challengeServer: ReturnType<typeof Bun.serve> | undefined; let pendingChallengeServer: ReturnType<typeof Bun.serve> | undefined;
+let renewTimer: ReturnType<typeof setInterval> | undefined; let initialRenewTimer: ReturnType<typeof setTimeout> | undefined;
+let generation = 0; let lifecycle = new AbortController();
 const challenges = new Map<string, string>();
 let job = { running: false, startedAt: 0, finishedAt: 0, steps: [] as { t: number; msg: string; level: 'info' | 'ok' | 'warn' | 'error' }[], error: '', url: '' };
 const log = (msg: string, level: 'info' | 'ok' | 'warn' | 'error' = 'info') => { job.steps.push({ t: Date.now(), msg, level }); if (job.steps.length > 60) job.steps.shift(); };
@@ -40,38 +42,44 @@ const expiryOf = (c: X509Certificate) => Date.parse(c.validTo);
 // --- environment checks ---
 const privateV4 = (ip: string) => { const p = ip.split('.').map(Number); return p[0] === 10 || p[0] === 127 || p[0] === 0 || (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || (p[0] === 100 && p[1] >= 64 && p[1] <= 127) || p[0] >= 224; };
 let publicIpCache: { ip: string; at: number } | undefined;
-export async function detectPublicIp(force = false): Promise<string> {
+export async function detectPublicIp(force = false, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   if(process.env.POLYGATE_PUBLIC_IP && net.isIPv4(process.env.POLYGATE_PUBLIC_IP))return process.env.POLYGATE_PUBLIC_IP;
   if (!force && publicIpCache && Date.now() - publicIpCache.at < 600000) return publicIpCache.ip;
   for (const url of ['https://1.1.1.1/cdn-cgi/trace', 'https://api.ipify.org', 'https://ifconfig.me/ip']) {
-    try { const text = await (await fetch(url, { signal: AbortSignal.timeout(6000) })).text(); const ip = text.match(/^ip=(.+)$/m)?.[1] || text.trim(); if (net.isIPv4(ip)) { publicIpCache = { ip, at: Date.now() }; return ip; } } catch { /* try the next one */ }
+    try { const text = await (await fetch(url, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(6000)]) : AbortSignal.timeout(6000) })).text(); signal?.throwIfAborted(); const ip = text.match(/^ip=(.+)$/m)?.[1] || text.trim(); if (net.isIPv4(ip)) { publicIpCache = { ip, at: Date.now() }; return ip; } } catch { signal?.throwIfAborted(); /* try the next one */ }
   }
   return '';
 }
 // --- ACME client ---
 class Acme {
   private nonce = ''; private dir: any; private kid = ''; private key!: KeyObject; private jwk!: { kty: string; crv: string; x: string; y: string };
-  constructor(private directoryUrl: string) {}
-  private fetch(url: string, init: RequestInit = {}) { return fetch(url, { ...init, signal: AbortSignal.timeout(30000), ...(process.env.POLYGATE_ACME_INSECURE === '1' ? { tls: { rejectUnauthorized: false } } : {}) } as any); }
+  constructor(private directoryUrl: string, private signal: AbortSignal) {}
+  private async fetch(url: string, init: RequestInit = {}) {
+    this.signal.throwIfAborted();
+    const response = await fetch(url, { ...init, signal: AbortSignal.any([this.signal, AbortSignal.timeout(30000)]), ...(process.env.POLYGATE_ACME_INSECURE === '1' ? { tls: { rejectUnauthorized: false } } : {}) } as any);
+    this.signal.throwIfAborted(); return response;
+  }
   async init() {
-    this.dir = await (await this.fetch(this.directoryUrl)).json();
+    this.dir = await (await this.fetch(this.directoryUrl)).json(); this.signal.throwIfAborted();
     const file = path.join(tlsDir, 'acme-account.json'); mkdirSync(tlsDir, { recursive: true, mode: 0o700 });
     let stored: { pem?: string; directory?: string; kid?: string } = {}; try { stored = JSON.parse(readFileSync(file, 'utf8')); } catch { /* new account */ }
     if (stored.pem && stored.directory === this.directoryUrl) { this.key = createPrivateKey(stored.pem); this.kid = stored.kid || ''; }
     else { this.key = generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey; this.kid = ''; }
     const pub = (await import('node:crypto')).createPublicKey(this.key).export({ format: 'jwk' }) as any; this.jwk = { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y };
-    this.save = () => writeFileSync(file, JSON.stringify({ pem: this.key.export({ type: 'pkcs8', format: 'pem' }), directory: this.directoryUrl, kid: this.kid }), { mode: 0o600 });
+    this.signal.throwIfAborted();
+    this.save = () => { this.signal.throwIfAborted(); writeFileSync(file, JSON.stringify({ pem: this.key.export({ type: 'pkcs8', format: 'pem' }), directory: this.directoryUrl, kid: this.kid }), { mode: 0o600 }); };
   }
   private save = () => {};
   get thumbprint() { return b64u(createHash('sha256').update(JSON.stringify({ crv: this.jwk.crv, kty: this.jwk.kty, x: this.jwk.x, y: this.jwk.y })).digest()); }
   private async freshNonce() { const r = await this.fetch(this.dir.newNonce, { method: 'HEAD' }); return r.headers.get('replay-nonce') || ''; }
   // POST-as-GET when payload is null. Retries once on badNonce, as the protocol expects.
   async post(url: string, payload: unknown, withJwk = false, retried = false): Promise<{ body: any; headers: Headers; text: string }> {
-    const nonce = this.nonce || await this.freshNonce();
+    const nonce = this.nonce || await this.freshNonce(); this.signal.throwIfAborted();
     const protectedHeader = b64u(JSON.stringify({ alg: 'ES256', nonce, url, ...(withJwk || !this.kid ? { jwk: this.jwk } : { kid: this.kid }) }));
     const body = payload === null ? '' : b64u(JSON.stringify(payload)); const signature = b64u(signData('sha256', Buffer.from(`${protectedHeader}.${body}`), { key: this.key, dsaEncoding: 'ieee-p1363' }));
     const r = await this.fetch(url, { method: 'POST', headers: { 'content-type': 'application/jose+json' }, body: JSON.stringify({ protected: protectedHeader, payload: body, signature }) });
-    this.nonce = r.headers.get('replay-nonce') || ''; const text = await r.text(); let parsed: any = {}; try { parsed = JSON.parse(text); } catch { /* certificate downloads are PEM */ }
+    this.nonce = r.headers.get('replay-nonce') || ''; const text = await r.text(); this.signal.throwIfAborted(); let parsed: any = {}; try { parsed = JSON.parse(text); } catch { /* certificate downloads are PEM */ }
     if (!r.ok) {
       if (!retried && /badNonce/.test(parsed.type || '')) return this.post(url, payload, withJwk, true);
       throw new Error(`${parsed.detail || parsed.type || 'ACME request failed'} (HTTP ${r.status})`);
@@ -84,20 +92,21 @@ class Acme {
   }
   get directory() { return this.dir; }
 }
-async function issue(cfg: HttpsSettings, identifier: { type: 'dns' | 'ip'; value: string }): Promise<{ cert: string; key: string }> {
-  const acme = new Acme(process.env.POLYGATE_ACME_DIRECTORY || (cfg.staging ? LETSENCRYPT_STAGING : LETSENCRYPT));
-  log('Contacting the certificate authority…'); await acme.init();
-  log('Creating the ACME account…'); await acme.account(cfg.email);
+async function issue(cfg: HttpsSettings, identifier: { type: 'dns' | 'ip'; value: string }, signal: AbortSignal): Promise<{ cert: string; key: string }> {
+  const acme = new Acme(process.env.POLYGATE_ACME_DIRECTORY || (cfg.staging ? LETSENCRYPT_STAGING : LETSENCRYPT), signal);
+  log('Contacting the certificate authority…'); await acme.init(); signal.throwIfAborted();
+  log('Creating the ACME account…'); await acme.account(cfg.email); signal.throwIfAborted();
   log(`Placing an order for ${identifier.value}${identifier.type === 'ip' ? ' (short-lived IP certificate)' : ''}…`);
   const order = await acme.post(acme.directory.newOrder, { identifiers: [identifier], ...(identifier.type === 'ip' ? { profile: 'shortlived' } : {}) });
+  signal.throwIfAborted();
   const orderUrl = order.headers.get('location') || '';
   for (const authzUrl of order.body.authorizations as string[]) {
-    const authz = (await acme.post(authzUrl, null)).body; if (authz.status === 'valid') continue;
+    const authz = (await acme.post(authzUrl, null)).body; signal.throwIfAborted(); if (authz.status === 'valid') continue;
     const challenge = (authz.challenges as any[]).find(c => c.type === 'http-01'); if (!challenge) throw new Error('The certificate authority offered no http-01 challenge for this address.');
     challenges.set(challenge.token, `${challenge.token}.${acme.thumbprint}`);
     log(`Proving control of ${identifier.value} on port ${cfg.httpPort}…`); await acme.post(challenge.url, {});
     for (let i = 0; ; i++) {
-      await Bun.sleep(i < 3 ? 1000 : 2000); const current = (await acme.post(authzUrl, null)).body;
+      await Bun.sleep(i < 3 ? 1000 : 2000); signal.throwIfAborted(); const current = (await acme.post(authzUrl, null)).body; signal.throwIfAborted();
       if (current.status === 'valid') break;
       if (current.status === 'invalid') { const detail = (current.challenges as any[]).find(c => c.error)?.error?.detail; throw new Error(detail ? `Validation failed: ${detail}` : 'Validation failed.'); }
       if (i > 45) throw new Error('Validation timed out.');
@@ -107,9 +116,10 @@ async function issue(cfg: HttpsSettings, identifier: { type: 'dns' | 'ip'; value
   log('Generating the certificate request…');
   const keys = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   await acme.post(order.body.finalize, { csr: b64u(buildCsr(identifier, keys.privateKey, keys.publicKey)) });
+  signal.throwIfAborted();
   let current = order.body;
   for (let i = 0; current.status !== 'valid'; i++) {
-    await Bun.sleep(1500); current = (await acme.post(orderUrl, null)).body;
+    await Bun.sleep(1500); signal.throwIfAborted(); current = (await acme.post(orderUrl, null)).body; signal.throwIfAborted();
     if (current.status === 'invalid') throw new Error('The certificate order was rejected.'); if (i > 40) throw new Error('Issuing the certificate timed out.');
   }
   const cert = (await acme.post(current.certificate, null)).text;
@@ -128,9 +138,8 @@ export function buildCsr(identifier: { type: 'dns' | 'ip'; value: string }, priv
   return der(0x30, info, der(0x30, oid('1.2.840.10045.4.3.2')), der(0x03, Buffer.from([0]), signature));
 }
 // --- port 80: ACME challenges and the HTTP→HTTPS redirect ---
-export async function startChallengeServer() {
-  const cfg = httpsConfig(); if (challengeServer) return;
-  challengeServer = Bun.serve({
+function createChallengeServer(cfg: HttpsSettings) {
+  return Bun.serve({
     port: cfg.httpPort, hostname: '0.0.0.0',
     fetch(req) {
       const url = new URL(req.url); const token = url.pathname.startsWith('/.well-known/acme-challenge/') ? url.pathname.slice('/.well-known/acme-challenge/'.length) : '';
@@ -144,6 +153,7 @@ export async function startChallengeServer() {
     },
   });
 }
+export async function startChallengeServer() { if (!challengeServer) challengeServer = createChallengeServer(httpsConfig()); }
 export function stopChallengeServer() { challengeServer?.stop(true); challengeServer = undefined; }
 // --- public API ---
 export function httpsRuntime(): { tls?: Tls; port?: number } {
@@ -174,41 +184,60 @@ let applying = false;
 export async function httpsApply(b: any) {
   if (job.running || applying) throw new GatewayError('A certificate request is already running', 409);
   applying = true;
-  try { return await applyHttps(b); } finally { applying = false; }
+  try { return await applyHttps(b, lifecycle.signal); } finally { applying = false; }
 }
-async function applyHttps(b: any) {
+async function applyHttps(b: any, signal: AbortSignal) {
   if (job.running) throw new GatewayError('A certificate request is already running', 409);
   const mode = String(b.mode || ''); if (!['domain', 'ip', 'custom'].includes(mode)) throw new GatewayError('Choose domain, ip or custom', 400);
-  const next: HttpsSettings = { ...httpsConfig(), mode: mode as HttpsSettings['mode'], port: Number(b.port) || 443, httpPort: Number(b.httpPort) || 80, redirect: b.redirect !== false, staging: !!b.staging, email: b.email ? String(b.email).trim() : undefined, lastError: '' };
+  const previous = { ...httpsConfig() }; const previousSettings = settings.https;
+  const next: HttpsSettings = { ...previous, mode: mode as HttpsSettings['mode'], port: Number(b.port) || 443, httpPort: Number(b.httpPort) || 80, redirect: b.redirect !== false, staging: !!b.staging, email: b.email ? String(b.email).trim() : undefined, lastError: '' };
   if (next.port! < 1 || next.port! > 65535 || next.httpPort < 1 || next.httpPort > 65535) throw new GatewayError('Ports must be between 1 and 65535', 400);
   if (next.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(next.email)) throw new GatewayError('Enter a valid e-mail address or leave it empty', 400);
   let identifier: { type: 'dns' | 'ip'; value: string } | undefined; let custom: { cert: string; key: string } | undefined;
   if (mode === 'domain') { const d = String(b.domain || '').trim().toLowerCase(); if (!hostnameOk(d)) throw new GatewayError('Enter a full domain name such as panel.example.com (wildcards are not supported)', 400); next.domain = d; next.ip = undefined; identifier = { type: 'dns', value: d }; }
-  if (mode === 'ip') { const ip = String(b.ip || '').trim() || await detectPublicIp(true); if (!net.isIPv4(ip) || privateV4(ip)) throw new GatewayError(ip ? 'That is not a public IPv4 address, so a certificate cannot be issued for it.' : 'Could not detect this server\'s public IP address. Enter it manually.', 400); next.ip = ip; next.domain = undefined; identifier = { type: 'ip', value: ip }; }
+  if (mode === 'ip') { const ip = String(b.ip || '').trim() || await detectPublicIp(true, signal); signal.throwIfAborted(); if (!net.isIPv4(ip) || privateV4(ip)) throw new GatewayError(ip ? 'That is not a public IPv4 address, so a certificate cannot be issued for it.' : 'Could not detect this server\'s public IP address. Enter it manually.', 400); next.ip = ip; next.domain = undefined; identifier = { type: 'ip', value: ip }; }
   if (mode === 'custom') {
     const cert = String(b.certPem || '').trim(), key = String(b.keyPem || '').trim(); if (!cert || !key) throw new GatewayError('Paste both the certificate chain and the private key', 400);
     try { const c = new X509Certificate(cert); if (!c.checkPrivateKey(createPrivateKey(key))) throw new Error('The private key does not match the certificate.'); if (expiryOf(c) < Date.now()) throw new Error('The certificate has expired.'); const names = c.subjectAltName || c.subject; next.domain = names.match(/DNS:([^,\s]+)/)?.[1] || c.subject.match(/CN=(.+)/)?.[1] || undefined; next.ip = names.match(/IP Address:([^,\s]+)/)?.[1] || undefined; }
     catch (e: any) { throw new GatewayError(`Invalid certificate: ${e.message}`, 400); }
     custom = { cert: cert + '\n', key: key + '\n' };
   }
+  signal.throwIfAborted();
+  if (settings.https !== previousSettings) throw new GatewayError('HTTPS settings changed during the certificate request.', 409);
   job = { running: true, startedAt: Date.now(), finishedAt: 0, steps: [], error: '', url: '' };
-  const previous = { ...httpsConfig() };
+  const previousServer = challengeServer;
+  let candidate: typeof challengeServer; let ownsConfig = false;
   let pemBefore: { id: string; files: ReturnType<typeof readPemPair> } | undefined;
   void (async () => {
     try {
       let result = custom;
       if (identifier) {
-        if (identifier.type === 'dns') { log(`Checking DNS for ${identifier.value}…`); const ips = await dns.resolve4(identifier.value).catch(() => [] as string[]); const mine = await detectPublicIp(); if (!ips.length) throw new Error(`${identifier.value} has no A record yet. Point it at ${mine || 'this server'} and try again.`); if (mine && !ips.includes(mine)) log(`${identifier.value} points to ${ips.join(', ')}, but this server's public IP looks like ${mine}. Validation will fail unless that is the same machine.`, 'warn'); else log('DNS points at this server.', 'ok'); }
-        log(`Opening port ${next.httpPort} for the validation request…`); settings.https = { ...next }; stopChallengeServer(); try { await startChallengeServer(); } catch (e: any) { throw new Error(`Could not listen on port ${next.httpPort} (${e.code || e.message}). Free it, or run the service with permission to bind low ports.`); }
-        result = await issue(next, identifier);
+        if (identifier.type === 'dns') { log(`Checking DNS for ${identifier.value}…`); const ips = await dns.resolve4(identifier.value).catch(() => [] as string[]); signal.throwIfAborted(); const mine = await detectPublicIp(false, signal); signal.throwIfAborted(); if (!ips.length) throw new Error(`${identifier.value} has no A record yet. Point it at ${mine || 'this server'} and try again.`); if (mine && !ips.includes(mine)) log(`${identifier.value} points to ${ips.join(', ')}, but this server's public IP looks like ${mine}. Validation will fail unless that is the same machine.`, 'warn'); else log('DNS points at this server.', 'ok'); }
+        signal.throwIfAborted();
+        log(`Opening port ${next.httpPort} for the validation request…`);
+        // Keep the previous listener alive until the replacement has actually succeeded.
+        try { if (!previousServer || previousServer.port !== next.httpPort) pendingChallengeServer = candidate = createChallengeServer(next); } catch (e: any) { throw new Error(`Could not listen on port ${next.httpPort} (${e.code || e.message}). Free it, or run the service with permission to bind low ports.`); }
+        result = await issue(next, identifier, signal);
       }
+      signal.throwIfAborted();
+      if (settings.https !== previousSettings) throw new Error('HTTPS settings changed during the certificate request.');
       const id = mode === 'custom' ? 'custom' : mode; pemBefore = { id, files: readPemPair(id) }; writeCert(id, result!.cert, result!.key);
-      const c = new X509Certificate(result!.cert); next.issuedAt = Date.parse(c.validFrom); next.expiresAt = expiryOf(c); settings.https = next; persist();
-      log('Certificate installed. Switching the listener to HTTPS…', 'ok'); await applyListener();
-      if (mode === 'custom') { stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined; } else { await startChallengeServer().catch(() => {}); startRenewal(); }
+      const c = new X509Certificate(result!.cert); next.issuedAt = Date.parse(c.validFrom); next.expiresAt = expiryOf(c); settings.https = next; ownsConfig = true; persist();
+      log('Certificate installed. Switching the listener to HTTPS…', 'ok'); await applyListener(next);
+      signal.throwIfAborted();
+      if (settings.https !== next) throw new Error('HTTPS settings changed during the listener change.');
+      if (mode === 'custom') { stopChallengeServer(); stopRenewal(); } else { if (candidate) { previousServer?.stop(true); challengeServer = candidate; pendingChallengeServer = undefined; } startRenewal(); }
       job.url = `https://${next.domain || next.ip}${next.port === 443 ? '' : ':' + next.port}${serverConfig().dashboardPath}/`; log(`HTTPS is active at ${job.url}`, 'ok');
       notify('HTTPS enabled', `The dashboard is now served at ${job.url}`, 'success', 'https-on', 0);
-    } catch (e: any) { job.error = redactError(String(e.message || e)); log(job.error, 'error'); if (pemBefore) restorePemPair(pemBefore.id, pemBefore.files); settings.https = { ...previous, lastError: job.error }; persist(); }
+    } catch (e: any) {
+      if (signal.aborted) return;
+      job.error = redactError(String(e.message || e)); log(job.error, 'error');
+      if (candidate && pendingChallengeServer === candidate) { candidate.stop(true); pendingChallengeServer = undefined; }
+      if (settings.https === (ownsConfig ? next : previousSettings)) {
+        if (pemBefore) restorePemPair(pemBefore.id, pemBefore.files);
+        settings.https = { ...previous, lastError: job.error }; persist();
+      }
+    }
     finally { challenges.clear(); job.running = false; job.finishedAt = Date.now(); }
   })();
   return httpsStatus();
@@ -222,19 +251,22 @@ async function applyListener(cfg = httpsConfig()) {
 export async function httpsDisable() {
   if (job.running || applying) throw new GatewayError('A certificate request or listener change is already running', 409);
   applying = true;
+  const signal = lifecycle.signal;
   const previous = settings.https;
   const next: HttpsSettings = { ...httpsConfig(), mode: 'off', lastError: '' };
   let changed = false;
   try {
     // Do not discard TLS settings or renewal until the replacement listener is available.
-    await applyListener(next); changed = true;
+    await applyListener(next); signal.throwIfAborted(); changed = true;
     settings.https = next; persist();
-    stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined;
+    stopChallengeServer(); stopRenewal();
     job.url = '';
   } catch (error) {
+    if (signal.aborted) throw error;
     settings.https = previous;
     if (changed) {
       await applyListener();
+      signal.throwIfAborted();
       persist();
     }
     throw error;
@@ -249,16 +281,20 @@ export async function httpsRenew() {
 }
 function startRenewal() {
   if (renewTimer) return;
+  const currentGeneration = generation;
   const check = () => {
-    const cfg = httpsConfig(); if (cfg.mode !== 'domain' && cfg.mode !== 'ip') return; const tls = readTls(cfg); if (job.running) return;
+    if (currentGeneration !== generation) return;
+    const cfg = httpsConfig(); if (cfg.mode !== 'domain' && cfg.mode !== 'ip') return; const tls = readTls(cfg); if (job.running || applying) return;
     const expires = tls ? expiryOf(tls.cert509) : 0; const lifetime = tls ? expires - Date.parse(tls.cert509.validFrom) : 0; const threshold = Math.max(day, lifetime / 3);
-    if (!tls || expires - Date.now() < threshold) { notify('Renewing the HTTPS certificate', `Requesting a new certificate for ${cfg.domain || cfg.ip}.`, 'info', 'https-renew', 3600000); void httpsRenew().catch(e => notify('HTTPS renewal failed', String(e.message || e), 'error', 'https-renew-fail', 3600000)); }
+    if (!tls || expires - Date.now() < threshold) { notify('Renewing the HTTPS certificate', `Requesting a new certificate for ${cfg.domain || cfg.ip}.`, 'info', 'https-renew', 3600000); void httpsRenew().catch(e => { if (currentGeneration === generation) notify('HTTPS renewal failed', String(e.message || e), 'error', 'https-renew-fail', 3600000); }); }
   };
-  renewTimer = setInterval(check, 6 * 3600000); renewTimer.unref?.(); setTimeout(check, 30000).unref?.();
+  renewTimer = setInterval(check, 6 * 3600000); renewTimer.unref?.(); initialRenewTimer = setTimeout(() => { if (currentGeneration !== generation) return; initialRenewTimer = undefined; check(); }, 30000); initialRenewTimer.unref?.();
 }
+function stopRenewal() { if (initialRenewTimer) clearTimeout(initialRenewTimer); if (renewTimer) clearInterval(renewTimer); initialRenewTimer = undefined; renewTimer = undefined; }
 export async function startHttps(rebindFn: Rebind, plainListener: { port: number; host: string }) {
+  stopHttps(); const currentGeneration = generation;
   rebind = rebindFn; plain = plainListener; const cfg = httpsConfig(); if (cfg.mode === 'off' || cfg.mode === 'custom') return;
-  await startChallengeServer().catch(e => notify('HTTPS redirect unavailable', `Could not listen on port ${cfg.httpPort}: ${e.code || e.message}`, 'warning', 'https-80'));
-  startRenewal();
+  await startChallengeServer().catch(e => { if (currentGeneration === generation) notify('HTTPS redirect unavailable', `Could not listen on port ${cfg.httpPort}: ${e.code || e.message}`, 'warning', 'https-80'); });
+  if (currentGeneration === generation) startRenewal();
 }
-export function stopHttps() { stopChallengeServer(); if (renewTimer) clearInterval(renewTimer); renewTimer = undefined; }
+export function stopHttps() { generation++; lifecycle.abort(); lifecycle = new AbortController(); rebind = undefined; stopChallengeServer(); pendingChallengeServer?.stop(true); pendingChallengeServer = undefined; stopRenewal(); challenges.clear(); }

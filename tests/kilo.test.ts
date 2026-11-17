@@ -172,6 +172,6 @@ test('A relay that carries one provider only is never chosen for another provide
     settings.rotate = true; settings.strategy = 'round_robin'; settings.routes = [direct, only, open];
     for (let i = 0; i < 6; i++) expect(routeFor('x', '', 'free').id).toBe('r-open');
     expect(new Set(Array.from({ length: 6 }, () => routeFor('x', '', 'kilo').id))).toEqual(new Set(['r-only', 'r-open']));
-    settings.routes = [direct, only]; expect(() => routeFor('x', '', 'free')).toThrow('unavailable');
+    settings.routes = [direct, only]; settings.allowDirect = false; expect(() => routeFor('x', '', 'free')).toThrow('unavailable');
   } finally { Object.assign(settings, saved); }
 });

@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, Check, ChevronRight, Copy, Download, Globe, Loader2, Play, Plug, Plus, RefreshCw, Server, Terminal, Trash2, Upload, X, Pencil, Wrench } from 'lucide-react';
 import { api, BASE, isCancelled } from './api';
-import { Button, Empty, Field, Select, Toggle, useCancel, type Snapshot } from './ui';
+import { Button, Empty, Field, Select, Toggle, tabKeys, useCancel, type Snapshot } from './ui';
 import type { McpServer } from '../backend/types';
 import { useConfirm } from './confirm';
 
@@ -36,11 +36,12 @@ function skeleton(schema: any): unknown {
   return type === 'string' ? '' : type === 'number' || type === 'integer' ? 0 : type === 'boolean' ? false : type === 'array' ? [] : null;
 }
 const dialogs: { box: HTMLDivElement; opener: HTMLElement | null }[] = [];
-export function Dialog({ title, icon, onClose, busy, wide, children }: { title: string; icon: ReactNode; onClose: () => void; busy?: boolean; wide?: boolean; children: ReactNode }) {
+// variant 'settings': a large window whose body is laid out by its content (a section list beside the chosen section), with no padding of its own.
+export function Dialog({ title, icon, onClose, busy, wide, variant, children }: { title: string; icon: ReactNode; onClose: () => void; busy?: boolean; wide?: boolean; variant?: 'settings'; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null); const closing = useRef(onClose);
   const opener = useRef(typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null);
   useEffect(() => { closing.current = onClose; });
-  const focusable = () => [...(box.current?.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]') || [])].filter(el => el.tabIndex >= 0 && !el.matches(':disabled') && !el.closest('[hidden],[inert],[aria-hidden="true"]') && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+  const focusable = () => [...(box.current?.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,summary,[tabindex]') || [])].filter(el => el.tabIndex >= 0 && !el.matches(':disabled') && !el.closest('[hidden],[inert],[aria-hidden="true"]') && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
   const topmost = () => dialogs.at(-1)?.box === box.current;
   useEffect(() => {
     const element = box.current!;
@@ -75,9 +76,9 @@ export function Dialog({ title, icon, onClose, busy, wide, children }: { title: 
     document.addEventListener('keydown', key); return () => document.removeEventListener('keydown', key);
   }, [busy]);
   return <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy && topmost()) onClose(); }}>
-    <div ref={box} className={`dialog${wide ? ' dialog-wide' : ''}`} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
+    <div ref={box} className={`dialog${wide ? ' dialog-wide' : ''}${variant ? ' dialog-' + variant : ''}`} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
       <header className="dialog-head">{icon}<h2>{title}</h2><span className="toolbar-spacer" /><button type="button" className="icon-button" aria-label="Close" disabled={busy} onClick={onClose}><X size={16} /></button></header>
-      <div className="dialog-body">{children}</div>
+      <div className={variant ? `dialog-${variant}-body` : 'dialog-body'}>{children}</div>
     </div>
   </div>;
 }
@@ -109,9 +110,9 @@ function ServerDialog({ initial, hub, data, onClose, onSaved }: { initial: Draft
     } catch (e: any) { if (!isCancelled(e)) setError(e?.message || 'That did not work'); } finally { setBusy(''); }
   };
   return <Dialog title={editing ? `Edit ${initial.name}` : 'Add an MCP server'} icon={<Plug size={16} />} onClose={close} busy={busy === 'save'} wide>
-    {!editing && <div className="seg mcp-kind" role="tablist" aria-label="Kind of server">
-      <button role="tab" aria-selected={!local} className={!local ? 'on' : ''} onClick={() => set({ transport: 'http' })}><Globe size={14} />Remote server</button>
-      <button role="tab" aria-selected={local} className={local ? 'on' : ''} onClick={() => set({ transport: 'stdio' })}><Terminal size={14} />Local program</button>
+    {!editing && <div className="seg mcp-kind" role="tablist" aria-label="Kind of server" onKeyDown={tabKeys}>
+      <button type="button" role="tab" aria-selected={!local} tabIndex={!local ? 0 : -1} className={!local ? 'on' : ''} onClick={() => set({ transport: 'http' })}><Globe size={14} />Remote server</button>
+      <button type="button" role="tab" aria-selected={local} tabIndex={local ? 0 : -1} className={local ? 'on' : ''} onClick={() => set({ transport: 'stdio' })}><Terminal size={14} />Local program</button>
     </div>}
     {lockedLocal && <div className="dialog-note warn"><AlertTriangle size={16} /><p>{editing ? 'This program runs on the server. Its command can only be changed there:' : 'For safety, programs can only be added on the server itself, never from a web page:'} <code>sudo polygate mcp add-local NAME COMMAND ARGS</code>. You can still switch it on or off, limit its keys and choose its tools here.</p></div>}
     <div className="form-grid">
@@ -209,7 +210,7 @@ function ConnectPanel({ hub, data, copy, onToggle }: { hub: HubState; data: Snap
       <div><span className="pairs-label">Address</span><div className="mcp-copy-line"><code>{url}</code><button className="icon-button" aria-label="Copy the MCP address" onClick={() => copy(url)}><Copy size={14} /></button></div></div>
       <div><span className="pairs-label">Client API key</span>{keys.length ? <Select aria-label="Client API key" value={key?.id} onChange={setKeyId}>{keys.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}</Select> : <p className="subtle">Create a client API key in Settings first.</p>}</div>
     </div>
-    <div className="seg mcp-clients" role="tablist" aria-label="Client">{list.map(s => <button key={s.id} role="tab" aria-selected={s.id === current.id} className={s.id === current.id ? 'on' : ''} onClick={() => { setTab(s.id); try { localStorage.setItem('polygate-mcp-client', s.id); } catch { /* storage can be disabled */ } }}>{s.label}</button>)}</div>
+    <div className="seg mcp-clients" role="tablist" aria-label="Client" onKeyDown={tabKeys}>{list.map(s => <button type="button" key={s.id} role="tab" aria-selected={s.id === current.id} tabIndex={s.id === current.id ? 0 : -1} className={s.id === current.id ? 'on' : ''} onClick={() => { setTab(s.id); try { localStorage.setItem('polygate-mcp-client', s.id); } catch { /* storage can be disabled */ } }}>{s.label}</button>)}</div>
     <div className="mcp-snippet"><div className="mcp-snippet-head"><span className="subtle">{current.where}</span><Button onClick={() => copy(current.text)}><Copy size={14} />Copy</Button></div><pre><code>{current.text}</code></pre></div>
     <p className="subtle">The key is included in what you copy: keep it private. One server alone (with its tools' own names) is at <code>{url}/NAME</code>.</p>
   </section>;
@@ -223,9 +224,9 @@ function ToolRows({ server, tools, onToggle, onTry, busy }: { server: { id: stri
     </div>
   </li>)}</ul>;
 }
-function ServerCard({ s, data, hub, onEdit, onChanged, onTry, notice }: { s: ServerView; data: Snapshot; hub: HubState; onEdit: () => void; onChanged: () => void; onTry: (t: ToolInfo) => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
+function ServerCard({ s, data, hub, onEdit, onChanged, onTry, notice }: { s: ServerView; data: Snapshot; hub: HubState; onEdit: () => void; onChanged: (server: ServerView | null, id: string) => Promise<void>; onTry: (t: ToolInfo) => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
   const [open, setOpen] = useState(false); const [busy, setBusy] = useState(''); const { confirm, dialog } = useConfirm();
-  const act = async (what: string, path: string, body: unknown, done?: string) => { setBusy(what); try { await api(path, body); if (done) notice(done); onChanged(); } catch (e: any) { notice(e?.message || 'That did not work', 'error'); } finally { setBusy(''); } };
+  const act = async (what: string, path: string, body: unknown, done?: string) => { setBusy(what); try { const server = await api(path, body); const refreshing = onChanged(what === 'delete' ? null : server, s.id); if (done) notice(done); await refreshing; } catch (e: any) { notice(e?.message || 'That did not work', 'error'); } finally { setBusy(''); } };
   const st = s.status; const route = data.settings.routes.find(r => r.id === (s.routeId || 'direct'));
   const where = s.transport === 'stdio' ? [s.command, ...(s.args || [])].join(' ') : s.url;
   const offered = st.tools.filter(t => !t.disabled).length;
@@ -259,11 +260,36 @@ export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: stri
   const [hub, setHub] = useState<HubState | null>(null); const [error, setError] = useState('');
   const [editing, setEditing] = useState<Draft | null>(null); const [importing, setImporting] = useState(false);
   const [trying, setTrying] = useState<{ server: { id: string; name: string }; tool: ToolInfo } | null>(null); const [builtinOpen, setBuiltinOpen] = useState(false);
-  const load = useCallback(async () => { try { setHub(await api('/admin/mcp')); setError(''); } catch (e: any) { setError(e?.message || 'Could not read the MCP settings'); } }, []);
-  useEffect(() => { void load(); }, [load]);
+  const generation = useRef(0);
+  const mounted = useRef(true), settingsQueue = useRef<Promise<void>>(Promise.resolve());
+  const load = useCallback(async () => { if (!mounted.current) return; const seq = ++generation.current; try { const next = await api('/admin/mcp'); if (seq !== generation.current || !mounted.current) return; setHub(next); setError(''); } catch (e: any) { if (seq === generation.current && mounted.current) setError(e?.message || 'Could not read the MCP settings'); } }, []);
+  useEffect(() => { mounted.current = true; void load(); return () => { mounted.current = false; generation.current++; }; }, [load]);
+  // A successful mutation is authoritative even if its follow-up read fails. Older polls cannot undo it.
+  const changed = async (server: ServerView | null, id: string) => {
+    if (!mounted.current) return;
+    generation.current++;
+    setHub(current => current && { ...current, servers: server ? current.servers.some(s => s.id === id) ? current.servers.map(s => s.id === id ? server : s) : [...current.servers, server] : current.servers.filter(s => s.id !== id) });
+    await load();
+  };
   // While a server is still connecting (a first npx start can take a minute), the page checks back every few seconds.
   useEffect(() => { if (!hub?.servers.some(s => s.status.state === 'connecting')) return; const t = setTimeout(() => void load(), 3000); return () => clearTimeout(t); }, [hub, load]);
-  const settingsChange = async (patch: Record<string, unknown>, done: string) => { try { setHub(await api('/admin/mcp/settings', patch)); notice(done); } catch (e: any) { notice(e?.message || 'Not saved', 'error'); } };
+  // Serialize settings writes so opposite toggles reach the server in order. Their full-state
+  // responses own only the submitted settings, never servers or unrelated capability metadata.
+  const settingsChange = (patch: Partial<Pick<HubState, 'enabled' | 'builtin' | 'builtinKeys'>>, done: string) => {
+    const pending = settingsQueue.current.then(async () => {
+      if (!mounted.current) return;
+      try {
+        const next: HubState = await api('/admin/mcp/settings', patch);
+        if (!mounted.current) return;
+        const fields = Object.fromEntries((['enabled', 'builtin', 'builtinKeys'] as const).filter(key => patch[key] !== undefined).map(key => [key, next[key]]));
+        generation.current++;
+        setHub(current => current && { ...current, ...fields }); setError(''); notice(done);
+        await load();
+      } catch (e: any) { if (mounted.current) notice(e?.message || 'Not saved', 'error'); }
+    });
+    settingsQueue.current = pending;
+    return pending;
+  };
   if (!hub) return error ? <section className="section-block"><Empty icon={Plug} title="MCP is unavailable" action={<Button onClick={() => void load()}>Try again</Button>}>{error}</Empty></section> : <section className="section-block"><div className="logs-loading"><Loader2 size={18} className="spin" />Loading MCP…</div></section>;
   const ready = hub.servers.filter(s => s.status.state === 'ready').length;
   const toolCount = hub.servers.reduce((n, s) => n + (s.enabled ? s.status.tools.filter(t => !t.disabled).length : 0), 0) + (hub.builtin ? hub.builtinTools.length : 0);
@@ -277,7 +303,8 @@ export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: stri
         <Button onClick={() => setImporting(true)}><Download size={14} />Import</Button>
         <Button variant="primary" onClick={() => setEditing(blankDraft())}><Plus size={14} />Add server</Button>
       </div>
-      {hub.servers.length ? <div className="mcp-server-list">{hub.servers.map(s => <ServerCard key={s.id} s={s} data={data} hub={hub} notice={notice} onChanged={() => void load()} onEdit={() => setEditing(toDraft(s))} onTry={tool => setTrying({ server: s, tool })} />)}</div>
+      {error && <p className="mcp-error" role="alert">{error}</p>}
+      {hub.servers.length ? <div className="mcp-server-list">{hub.servers.map(s => <ServerCard key={s.id} s={s} data={data} hub={hub} notice={notice} onChanged={changed} onEdit={() => setEditing(toDraft(s))} onTry={tool => setTrying({ server: s, tool })} />)}</div>
         : <Empty icon={Server} title="No MCP servers yet">Add one below, paste the settings from another tool with Import, or start with a ready-made one.</Empty>}
       <div className="mcp-presets"><h3>Ready-made servers</h3><div className="mcp-preset-grid">{PRESETS.map(p => {
         const blocked = p.local && !hub.canAddLocal; const taken = hub.servers.some(s => s.name === p.draft.name);
@@ -293,7 +320,7 @@ export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: stri
       <button className="mcp-expand text-button" aria-expanded={builtinOpen} onClick={() => setBuiltinOpen(!builtinOpen)}><ChevronRight size={14} className={builtinOpen ? 'turned' : ''} />{builtinOpen ? 'Hide tools' : `Show tools (${hub.builtinTools.length})`}</button>
       {builtinOpen && <ToolRows server={{ id: 'polygate', name: 'polygate' }} tools={hub.builtinTools.map(t => ({ ...t, disabled: !hub.builtin }))} onTry={tool => setTrying({ server: { id: 'polygate', name: 'polygate' }, tool })} />}
     </section>
-    {editing && <ServerDialog initial={editing} hub={hub} data={data} onClose={() => setEditing(null)} onSaved={s => { setEditing(null); notice(s.status.state === 'ready' ? `${s.name} connected with ${s.status.tools.length} tool(s)` : s.status.state === 'error' ? `${s.name} saved, but it could not connect` : `${s.name} saved`, s.status.state === 'error' ? 'error' : 'ok'); void load(); }} />}
+    {editing && <ServerDialog initial={editing} hub={hub} data={data} onClose={() => setEditing(null)} onSaved={s => { setEditing(null); notice(s.status.state === 'ready' ? `${s.name} connected with ${s.status.tools.length} tool(s)` : s.status.state === 'error' ? `${s.name} saved, but it could not connect` : `${s.name} saved`, s.status.state === 'error' ? 'error' : 'ok'); void changed(s, s.id); }} />}
     {importing && <ImportDialog onClose={() => setImporting(false)} onDone={() => void load()} />}
     {trying && <TryDialog server={trying.server} tool={trying.tool} onClose={() => setTrying(null)} />}
   </>;

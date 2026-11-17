@@ -1,4 +1,4 @@
-import {useState,useEffect,useLayoutEffect,useCallback,useRef,useId,Children,Fragment,isValidElement,type CSSProperties,type ReactNode,type KeyboardEvent} from 'react';
+import {useState,useEffect,useLayoutEffect,useCallback,useRef,useId,Children,Fragment,isValidElement,type CSSProperties,type ReactNode,type KeyboardEvent,type ButtonHTMLAttributes} from 'react';
 import {createPortal} from 'react-dom';
 import {Activity,Box,Check,ChevronDown} from 'lucide-react';
 import {api} from './api';
@@ -14,7 +14,7 @@ export function Logo({size=36}:{size?:number}){
 export const ms=(n:number)=>n?`${Math.round(n).toLocaleString()} ms`:'-';
 export const time=(n:number)=>new Date(n).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 export const statusState=(n:number)=>n<400?'available':n===429||n===499?'cooldown':'error';
-export function Button({children,onClick,variant='',disabled=false,className='',title='',type='button'}:{children:ReactNode;onClick?:()=>void;variant?:string;disabled?:boolean;className?:string;title?:string;type?:'button'|'submit'}){return <button type={type} title={title} disabled={disabled} className={`button ${variant} ${className}`} onClick={onClick}>{children}</button>;}
+export function Button({children,variant='',disabled=false,className='',title='',type='button',...props}:ButtonHTMLAttributes<HTMLButtonElement>&{variant?:string}){return <button {...props} type={type} title={title} disabled={disabled} className={`button ${variant} ${className}`}>{children}</button>;}
 // Says when a setting takes effect, so nobody has to guess whether a change needs Save or a restart.
 export function ApplyTag({when}:{when:'now'|'save'|'restart'}){const text={now:'Applies immediately',save:'Applies when saved',restart:'Needs a restart'}[when];return <span className={`apply-tag ${when}`}>{text}</span>;}
 // A sticky row of links to the sections that are on the page (sections that rendered nothing are left out).
@@ -66,8 +66,8 @@ export function useCancel(onLeave=true){
   return {start:()=>{ref.current?.abort();const c=new AbortController();ref.current=c;return c.signal;},cancel:()=>{ref.current?.abort();ref.current=null;}};
 }
 export function Progress({value,label}:{value:number;label?:string}){return <div className="progress" role="progressbar" aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100} aria-label={label}><i style={{width:Math.max(2,Math.min(100,value))+'%'}}/></div>;}
-// Left and right arrows move between the tabs of a tablist whose selected tab is its only tab stop.
-export const tabKeys=(e:KeyboardEvent<HTMLElement>)=>{const d=e.key==='ArrowRight'?1:e.key==='ArrowLeft'?-1:0;const tabs=[...e.currentTarget.querySelectorAll<HTMLElement>('[role=tab]')];const i=tabs.indexOf(e.target as HTMLElement);if(!d||i<0)return;e.preventDefault();const t=tabs[(i+d+tabs.length)%tabs.length];t.focus();t.click();};
+// Arrows wrap; Home/End select the first/last enabled tab. Only the selected tab is a tab stop.
+export const tabKeys=(e:KeyboardEvent<HTMLElement>)=>{if(e.defaultPrevented||!['ArrowRight','ArrowLeft','Home','End'].includes(e.key))return;const tabs=[...e.currentTarget.querySelectorAll<HTMLElement>('[role=tab]')].filter(t=>!t.matches(':disabled,[aria-disabled="true"]'));const i=tabs.indexOf(e.target as HTMLElement);if(i<0)return;e.preventDefault();const t=tabs[e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length];t.focus();t.click();};
 // A dropdown in the app's own style (the browser's native list ignores the theme). It reads plain <option> children, so a
 // <select> becomes a <Select> without restructuring. Keyboard: arrows, Home/End, Enter/Space, Escape, type to jump.
 type Opt={value:string;label:string;disabled?:boolean};

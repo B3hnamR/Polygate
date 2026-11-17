@@ -38,7 +38,8 @@ export function openBackup(raw: unknown, rawPassphrase: unknown): Settings {
   } catch { throw new GatewayError('Wrong passphrase, or the backup file is damaged', 400); }
   let parsed: any; try { parsed = JSON.parse(text); } catch { throw new GatewayError('The backup could not be read', 400); }
   const arrays = ['providers', 'routes', 'keys'];
-  if (!parsed || typeof parsed !== 'object' || arrays.some(k => !Array.isArray(parsed[k]))) throw new GatewayError('The backup does not hold usable settings', 400);
+  // Object.assign below must never invoke the prototype setter: local-program checks run on this plain parsed object.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.hasOwn(parsed, '__proto__') || arrays.some(k => !Array.isArray(parsed[k]))) throw new GatewayError('The backup does not hold usable settings', 400);
   if (parsed.routes.some((r: any) => !r || typeof r.id !== 'string' || typeof r.kind !== 'string') || parsed.providers.some((p: any) => !p || typeof p.id !== 'string') || parsed.keys.some((k: any) => !k || typeof k.id !== 'string' || typeof k.value !== 'string')) throw new GatewayError('The backup does not hold usable settings', 400);
   const next = withBuiltIns({ ...initialSettings(), ...parsed });
   if (!next.routes.some(r => r.id === 'direct')) next.routes.unshift(initialSettings().routes[0]);

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { models, persist, saveModel, settings, ZAI_BASE, ZAI_ID } from './state';
 import { resetTime } from './exhaustion';
 import { networkFetch, routeForProvider } from './transport';
+import { GatewayError } from './queue';
 import { LIMIT_SCOPE, type Model, type Provider, type ZaiAccount } from './types';
 // Z.ai's ZCode coding plan (GLM-5.3, GLM-5.3-Flash), ported from AutoZCoder's gateway (zcode_gateway/zcode_protocol.py, upstream.py, quota.py,
 // model_retry.py; its docs/reference/PROTOCOL.md). Requests go to the plan's Anthropic-style messages endpoint with the ZCode desktop app's
@@ -13,8 +14,10 @@ import { LIMIT_SCOPE, type Model, type Provider, type ZaiAccount } from './types
 export { ZAI_ID, ZAI_BASE };
 // Model and billing requests leave the same way. Quiet: Z.ai's answers say nothing about the route's own health or any exit's Free allowance.
 const zaiFetch = (url: string, init: RequestInit) => {
-  const p = settings.providers.find(x => x.id === ZAI_ID); const route = p ? routeForProvider(p, '') : undefined;
-  return !route || route.kind === 'direct' ? fetch(url, init) : networkFetch(url, { ...init, polygateQuiet: true }, route.id);
+  const p = settings.providers.find(x => x.id === ZAI_ID);
+  if (!p) throw new GatewayError('Z.ai provider is missing', 503, 'route_unavailable');
+  const route = routeForProvider(p, '');
+  return networkFetch(url, { ...init, polygateQuiet: true }, route.id);
 };
 export const ZAI_MODELS = ['GLM-5.3', 'GLM-5.3-Flash'];
 const CONTEXT = 1_000_000, MAX_OUTPUT = 128_000;

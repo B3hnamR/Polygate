@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll } from 'bun:test';
+import { test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { preserveTestState } from './setup';
 const restore = preserveTestState();
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -79,7 +79,9 @@ test('Route selection and rotation strategies',()=>{
   const origRotate = settings.rotate;
   const origStrategy = settings.strategy;
   const origRouteId = settings.routeId;
+  const origAllowDirect = settings.allowDirect, origSpreadDirect = settings.spreadDirect;
   try {
+    settings.allowDirect = false; settings.spreadDirect = false;
     settings.routes = [
       { id: 'direct', name: 'Direct', kind: 'direct', url: '', enabled: true, models: [] },
       { id: 'p1', name: 'Proxy 1', kind: 'proxy', url: 'http://127.0.0.1:8001', enabled: true, models: [], latency: 150 },
@@ -114,6 +116,7 @@ test('Route selection and rotation strategies',()=>{
     settings.rotate = origRotate;
     settings.strategy = origStrategy;
     settings.routeId = origRouteId;
+    settings.allowDirect = origAllowDirect; settings.spreadDirect = origSpreadDirect;
   }
 });
 
@@ -246,7 +249,7 @@ test('Request shape is recorded with each request and holds no prompt or credent
   const all=await admin('/admin/diagnostics');expect(all.failures.some((x:any)=>x.id===failed.id)).toBe(true);expect(all.baseline.some((x:any)=>x.id===good.id)).toBe(true);
   expect((await fetch(base+'/admin/request?id=nope',{headers:{authorization:'Bearer test-admin-secret'}})).status).toBe(404);
 });});
-// --- Used-up exits: a 429 with a Retry-After that counts down to the daily reset is the exit's allowance, not the model's fault ---
+// --- Confirmed used-up exits: the advertised Retry-After belongs to the exit, not the model ---
 const FREE_LIMIT_BODY=JSON.stringify({error:{message:'Free usage limit reached. Free models work in OpenCode (https://opencode.ai)',type:'FreeUsageLimitError',code:429,log_id:'l'}});
 const proxyEntry=(n:number,port:number,ms:number)=>({url:`http://127.0.0.1:${port}`,proxy:`http://127.0.0.1:${port}`,proto:'http',host:'127.0.0.1',port,https:true,latencyMs:ms,exitIp:`exit-${n}`});
 const sseOk=()=>new Response(sse('\n\n'),{headers:{'content-type':'text/event-stream'}});
@@ -264,23 +267,29 @@ test('A pool proxy whose exit is used up is retired and the same request moves t
   const exhaustedProxy=()=>new Response(FREE_LIMIT_BODY,{status:429,headers:{'content-type':'application/json','retry-after':'7200'}});
   await withPool([exhaustedProxy,()=>sseOk()],async({entries,hits})=>{await scoped([viaPoolProvider()],async()=>{
     freshModel('remote','pooled');poolReport(entries[0].url,'ok',10);poolReport(entries[1].url,'ok',50);
+    __setExitVerifier(async()=>'exhausted');
+    try{
     const r=await chat('remote/pooled');expect(r.status).toBe(200);await r.text();
     expect(hits).toEqual([1,1]);
     const a=__poolHealth.get(entries[0].url)!;expect(a.status).toBe('exhausted');expect(a.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);
     const m=models.get('remote/pooled')!;expect(m.state).not.toBe('cooldown');expect(m.cooldownUntil).toBe(0);
     const again=await chat('remote/pooled');expect(again.status).toBe(200);await again.text();expect(hits).toEqual([1,2]);
+    }finally{__setExitVerifier();}
   });});
 });
 test('When every exit is used up the client gets one clear message with the reset time and the model is not paused',async()=>{
   const exhaustedProxy=()=>new Response(FREE_LIMIT_BODY,{status:429,headers:{'content-type':'application/json','retry-after':'7200'}});
   await withPool([exhaustedProxy,exhaustedProxy],async({entries})=>{await scoped([viaPoolProvider()],async()=>{
     freshModel('remote','allgone');poolReport(entries[0].url,'ok',10);poolReport(entries[1].url,'ok',50);
+    __setExitVerifier(async()=>'exhausted');
+    try{
     const r=await chat('remote/allgone',{stream:false});const x:any=await r.json();
     expect(r.status).toBe(429);expect(Number(r.headers.get('retry-after'))).toBeGreaterThan(7000);expect(Number(r.headers.get('retry-after'))).toBeLessThanOrEqual(7200);
     expect(x.error).toMatchObject({code:'egress_exhausted',type:'egress_exhausted'});expect(x.error.message).toContain('limit/access error');expect(x.error.message).toContain('UTC');expect(x.error.message).toMatch(/in 1 h|in 2 h/);expect(x.error.message).not.toContain('{"error"');
     expect(x.error.retry_after_seconds).toBeGreaterThan(7000);expect(new Date(x.error.resets_at).getTime()).toBeGreaterThan(Date.now());
     const m=models.get('remote/allgone')!;expect(m.state).not.toBe('cooldown');expect(m.cooldownUntil).toBe(0);
     const row=await until(()=>logs(5).find(l=>l.model==='remote/allgone'));expect(faultOf(row.id)).toBe(0);expect(row.error).toContain('limit/access error');
+    }finally{__setExitVerifier();}
   });});
 });
 test('The default strategy sticks to the proxy that carried the last request, and the warm-up keeps good proxies warm and drops dead ones',async()=>{
@@ -329,12 +338,15 @@ test('With Direct switched off, catalog reads go through the pool too: nothing l
 test('A used-up direct exit sends requests to a clean pool proxy, and keeps doing so until the reset',async()=>{
   await withPool([()=>sseOk()],async({entries,hits})=>{await scoped([{...remoteProvider(),routeId:'direct',routes:{ids:['direct'],backups:true}}],async()=>{
     freshModel('remote','drained');poolReport(entries[0].url,'ok',10);
+    __setExitVerifier(async()=>'exhausted');
+    try{
     const r=await chat('remote/drained');expect(r.status).toBe(200);await r.text();expect(hits).toEqual([1]);
     const direct=settings.routes.find(x=>x.id==='direct')!;expect(direct.exhaustedUntil!).toBeGreaterThan(Date.now()+7000e3);expect(direct.status).toContain('OpenCode limit/access error');
     const before=seen.length;const again=await chat('remote/drained');expect(again.status).toBe(200);await again.text();
     expect(seen.length).toBe(before);expect(hits).toEqual([2]);
     expect(models.get('remote/drained')!.state).not.toBe('cooldown');
     settings.exhaustedFailover=false;const off=await chat('remote/drained',{stream:false});expect(off.status).toBe(429);settings.exhaustedFailover=undefined;
+    }finally{__setExitVerifier();}
   });});
 });
 test('A 429 without a reset time is explained as a refused request and still pauses the model',async()=>{await scoped([remoteProvider()],async()=>{
@@ -497,12 +509,33 @@ test('A Bun relay instance that does not answer is replaced by a new one before 
     relayInstance=1;relayCalls.length=0;const r=await call();expect(r.status).toBe(200);await r.text();expect(relayCalls).toEqual(['ping','recycle','ping']);expect(relayInstance).toBe(2);
   }finally{settings.routes=saved;settings.relayRotations=undefined;}
 });
+// Replace only Free dispatch; selection, route context, proxy traffic and SSE collection remain real.
+async function withFreePoolProvider(entries:{url:string}[],run:()=>Promise<void>){
+  const providers=await import('../backend/providers');const original=providers.providerChat;
+  const {removeModel}=await import('../backend/state');
+  const {stopPoolTest,poolJob}=await import('../backend/pool');
+  const provider={...remoteProvider(),id:'core-pool-free',kind:'free' as const};
+  const id=provider.id+'/fine',previous=models.get(id);const saved=previous&&structuredClone(previous);
+  await scoped([provider],async()=>{
+    freshModel(provider.id,'fine');
+    const dispatch=spyOn(providers,'providerChat').mockImplementation(async(p,m,body,signal,routeId,session,requestId,accounting)=>{
+      expect(p).toBe(provider);expect(p.kind).toBe('free');expect(m.id).toBe(id);
+      expect(entries.map(e=>'pool:'+e.url)).toContain(routeId);expect(requestId).toStartWith('pool-test-');
+      return original({...p,kind:'openai'},m,body,signal,routeId,session,requestId,accounting);
+    });
+    try{await run();}
+    finally{
+      try{stopPoolTest();await until(()=>!poolJob().running||undefined,6000);}
+      finally{dispatch.mockRestore();removeModel(id);if(saved)saveModel(saved);}
+    }
+  });
+}
 test('The standby keeps distinct clean exits ready by testing only what is missing, and retires used-up ones',async()=>{
   const forward=async(req:Request)=>fetch(req.url,{method:req.method,headers:req.headers,body:req.method==='GET'||req.method==='HEAD'?undefined:await req.arrayBuffer()});
   const usedUp=async(req:Request)=>req.method==='POST'?new Response(FREE_LIMIT_BODY,{status:429,headers:{'content-type':'application/json','retry-after':'7200'}}):forward(req);
-  const {standbyTick,hasCleanStandby,__setApiRunner,engineApiRunner}=await import('../backend/pool');const savedCatalog=process.env.POLYGATE_POOL_CATALOG_URL;process.env.POLYGATE_POOL_CATALOG_URL=`http://127.0.0.2:${remote.port}/v1/models`;
-  await withPool([usedUp,forward,forward,forward],async({entries,hits})=>{await scoped([remoteProvider()],async()=>{
-    freshModel('remote','fine');entries[3].exitIp=entries[2].exitIp;settings.pool={...settings.pool!,standby:true,standbyTarget:2,standbyFreshMinutes:20};
+  const {standbyTick,hasCleanStandby,__setApiRunner}=await import('../backend/pool');const savedCatalog=process.env.POLYGATE_POOL_CATALOG_URL;process.env.POLYGATE_POOL_CATALOG_URL=`http://127.0.0.2:${remote.port}/v1/models`;
+  try{await withPool([usedUp,forward,forward,forward],async({entries,hits})=>{await withFreePoolProvider(entries,async()=>{
+    entries[3].exitIp=entries[2].exitIp;settings.pool={...settings.pool!,standby:true,standbyTarget:2,standbyFreshMinutes:20};
     __setApiRunner(async()=>new Map(entries.map(e=>[e.url,{latency:40,status:200}])));
     expect(hasCleanStandby()).toBe(false);
     await standbyTick();
@@ -515,15 +548,14 @@ test('The standby keeps distinct clean exits ready by testing only what is missi
     for(const e of entries.slice(1,3))__poolHealth.get(e.url)!.checkedAt=Date.now()-3*3600e3;
     await standbyTick();expect(hits[1]+hits[2]).toBeGreaterThan(after[1]+after[2]);
   });});
-  __setApiRunner(engineApiRunner);
-  if(savedCatalog===undefined)delete process.env.POLYGATE_POOL_CATALOG_URL;else process.env.POLYGATE_POOL_CATALOG_URL=savedCatalog;
+  }finally{if(savedCatalog===undefined)delete process.env.POLYGATE_POOL_CATALOG_URL;else process.env.POLYGATE_POOL_CATALOG_URL=savedCatalog;}
 });
 test('The pool test checks the OpenCode API first, applies the speed gate and sends model requests only through the survivors',async()=>{
   const forward=async(req:Request)=>fetch(req.url,{method:req.method,headers:req.headers,body:req.method==='GET'||req.method==='HEAD'?undefined:await req.arrayBuffer()});
   const posts=[0,0,0,0];const px=(i:number)=>async(req:Request)=>{if(req.method==='POST')posts[i]++;return forward(req);};
-  const {testPool,poolJob,stageOf,__setApiRunner,engineApiRunner,scanApi}=await import('../backend/pool');
-  await withPool([px(0),px(1),px(2),px(3)],async({entries})=>{await scoped([remoteProvider()],async()=>{
-    freshModel('remote','fine');settings.pool={...settings.pool!,standby:false,apiMaxLatencyMs:2000,maxTested:10};
+  const {testPool,poolJob,stageOf,__setApiRunner,scanApi}=await import('../backend/pool');
+  await withPool([px(0),px(1),px(2),px(3)],async({entries})=>{await withFreePoolProvider(entries,async()=>{
+    settings.pool={...settings.pool!,standby:false,apiMaxLatencyMs:2000,maxTested:10};
     // 0 never answers the API, 1 answers but too slowly, 2 and 3 are fast.
     __setApiRunner(async(_list,{progress})=>{progress(2,4);return new Map([[entries[1].url,{latency:9000,status:200}],[entries[2].url,{latency:120,status:200}],[entries[3].url,{latency:300,status:200}]]);});
     const started=await testPool({deep:true,api:true});expect(started.phase).toBe('api');
@@ -537,7 +569,6 @@ test('The pool test checks the OpenCode API first, applies the speed gate and se
     // A scan that fails outright leaves the proxy list as it was.
     __setApiRunner(async()=>null);expect(await scanApi(entries)).toBeNull();
   });});
-  __setApiRunner(engineApiRunner);
 });
 test('The pool is either the active route or standby, and standby gives the previous route back',async()=>{
   const {setPoolRole}=await import('../backend/pool');const {describeRoutes,backupChain}=await import('../backend/transport');

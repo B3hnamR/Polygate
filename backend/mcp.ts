@@ -24,6 +24,7 @@ const MASK = '••••••••';
 type Msg = { jsonrpc: '2.0'; id?: string | number | null; method?: string; params?: any; result?: any; error?: { code: number; message: string; data?: unknown } };
 export type McpTool = { name: string; title?: string; description?: string; inputSchema?: any; outputSchema?: any; annotations?: any };
 class RpcError extends Error { constructor(message: string, public code: number) { super(message); } }
+class AccessChanged extends RpcError { constructor(message: string) { super(message, -32602); } }
 class SessionExpired extends Error { constructor() { super('The server ended the session'); } }
 export const mcpConfig = (): McpSettings => (settings.mcp ||= { enabled: true, builtin: true, servers: [] });
 const allowed = (key: ApiKey | undefined, keys?: string[]) => !key || !keys?.length || keys.includes(key.id);
@@ -326,19 +327,38 @@ export function saveAgentMcpSelection(input: unknown) {
   }
   mcpConfig().agentTools = selections; persist();
 }
-async function hubTools(key: ApiKey | undefined, scope: string) {
-  const cfg = mcpConfig(); const out: McpTool[] = [];
-  if ((!scope || scope === 'polygate') && cfg.builtin && allowed(key, cfg.builtinKeys)) for (const t of BUILTIN) if (agentToolAllowed(key, undefined, t.def)) out.push({ ...t.def, name: scope ? t.def.name : `polygate__${t.def.name}` });
+type AdmittedKey = { key: ApiKey; id: string; fingerprint: string };
+const keyFingerprint = (key: ApiKey) => createHash('sha256').update(key.value).digest('hex');
+const admitKey = (key: ApiKey | undefined): AdmittedKey | undefined => key ? { key, id: key.id, fingerprint: keyFingerprint(key) } : undefined;
+// Revalidation never calls authenticate: no quota accounting, failure-gate changes or notifications.
+function checkAccess(key: ApiKey | undefined, admitted: AdmittedKey | undefined, via: 'client' | 'dashboard') {
+  if (!admitted) { if (via !== 'dashboard' || key) throw new AccessChanged('A client API key is required'); }
+  else {
+    const current = settings.keys.find(k => k.id === admitted.id);
+    if (!current || current !== admitted.key || current !== key || keyFingerprint(current) !== admitted.fingerprint) throw new AccessChanged('The client API key changed or was removed');
+    if (!current.enabled || (current.expiresAt && current.expiresAt < Date.now()) || (current.budget && (current.used || 0) >= current.budget)) throw new AccessChanged('The client API key is disabled, expired or has exhausted its budget');
+  }
+  if (!mcpConfig().enabled) throw new AccessChanged('The MCP hub is switched off');
+}
+async function hubTools(key: ApiKey, scope: string, admitted: AdmittedKey) {
+  checkAccess(key, admitted, 'client');
+  let cfg = mcpConfig(); const out: McpTool[] = [];
   const servers = cfg.servers.filter(s => s.enabled && (!scope || s.name === scope) && allowed(key, s.keys) && (!key?.agent || cfg.agentTools?.some(x => x.server === s.id)));
   await Promise.all(servers.map(s => ready(s, 15000).catch(() => {})));
+  checkAccess(key, admitted, 'client'); cfg = mcpConfig();
+  if ((!scope || scope === 'polygate') && cfg.builtin && allowed(key, cfg.builtinKeys)) for (const t of BUILTIN) if (agentToolAllowed(key, undefined, t.def)) out.push({ ...t.def, name: scope ? t.def.name : `polygate__${t.def.name}` });
   const named = scope ? undefined : hubMap(); const nameOf = (s: McpServer, t: McpTool) => [...named!].find(([, v]) => v.server.id === s.id && v.tool === t.name)?.[0] || hubName(s.name, t.name);
-  for (const s of servers) { const l = live.get(s.id); if (l?.state !== 'ready') continue; for (const t of l.tools) if (!s.disabledTools?.includes(t.name) && agentToolAllowed(key, s, t)) out.push({ ...t, name: scope ? t.name : nameOf(s, t) }); }
+  for (const s of cfg.servers) {
+    if (!servers.includes(s) || !s.enabled || (scope && s.name !== scope) || !allowed(key, s.keys)) continue;
+    const l = live.get(s.id); if (l?.state !== 'ready' || !l.client || l.client.closed || l.signature !== signature(s)) continue;
+    for (const t of l.tools) if (!s.disabledTools?.includes(t.name) && agentToolAllowed(key, s, t)) out.push({ ...t, name: scope ? t.name : nameOf(s, t) });
+  }
   return out;
 }
 // Runs one tool. A failure inside the tool is reported to the model as a tool error (isError), so it can react; an unknown tool is a protocol error.
-export async function callTool(name: string, args: any, key: ApiKey | undefined, scope: string, via: 'client' | 'dashboard') {
+export async function callTool(name: string, args: any, key: ApiKey | undefined, scope: string, via: 'client' | 'dashboard', admitted = admitKey(key)) {
+  checkAccess(key, admitted, via);
   const cfg = mcpConfig(); const started = Date.now(); args = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
-  if (!cfg.enabled) throw new RpcError('The MCP hub is switched off', -32602);
   const who = key ? key.name : 'dashboard';
   const builtinName = scope === 'polygate' ? name : !scope && name.startsWith('polygate__') ? name.slice(10) : '';
   if (builtinName) {
@@ -356,6 +376,13 @@ export async function callTool(name: string, args: any, key: ApiKey | undefined,
     if (!definition || !agentToolAllowed(key, server, definition)) throw new RpcError(`This MCP tool is not shared with the agent: ${name}`, -32602);
   }
   const s = server; const timeout = timeoutOf(s);
+  const checkServer = (l?: Live) => {
+    checkAccess(key, admitted, via);
+    if (mcpConfig().servers.find(x => x.id === s.id) !== s || !s.enabled || !allowed(key, s.keys) || s.disabledTools?.includes(tool)) throw new AccessChanged('This MCP server or tool is no longer available to this caller');
+    if (l && (live.get(s.id) !== l || l.state !== 'ready' || !l.client || l.client.closed || l.signature !== signature(s))) throw new AccessChanged('The MCP connection changed before dispatch');
+    const definition = (l || live.get(s.id))?.tools.find(t => t.name === tool);
+    if (key?.agent && (!definition || !agentToolAllowed(key, s, definition))) throw new AccessChanged('This MCP tool is no longer shared with the agent. Review Agent settings.');
+  };
   const finish = (ok: boolean, result: any, error?: string) => {
     const l = live.get(s.id); const ms = Date.now() - started;
     if (l) { l.calls++; l.totalMs += ms; l.lastCallAt = Date.now(); if (!ok || result?.isError) l.failures++; }
@@ -364,14 +391,20 @@ export async function callTool(name: string, args: any, key: ApiKey | undefined,
   };
   for (let attempt = 0; ; attempt++) {
     try {
+      checkServer();
       const l = await ready(s, Math.min(timeout, 60000));
-      const definition = l.tools.find(t => t.name === tool);
-      if (key?.agent && (mcpConfig().servers.find(x => x.id === s.id) !== s || !s.enabled || !mcpConfig().enabled || !allowed(key, s.keys) || s.disabledTools?.includes(tool) || !definition || !agentToolAllowed(key, s, definition))) throw new RpcError('This MCP tool is no longer shared with the agent. Review Agent settings.', -32602);
+      if (!l) throw new AccessChanged('The MCP connection was removed before dispatch');
+      checkServer(l);
       return finish(true, await l.client!.request('tools/call', { name: tool, arguments: args }, timeout));
     }
     catch (e) {
       // An HTTP server that forgot the session gets one fresh connection.
-      if (e instanceof SessionExpired && attempt === 0) { await connect(s).catch(() => {}); continue; }
+      if (e instanceof AccessChanged) throw e;
+      if (e instanceof SessionExpired && attempt === 0) {
+        const current = live.get(s.id);
+        if (!current) throw new AccessChanged('The MCP connection was removed before reconnecting');
+        checkServer(current); await connect(s).catch(() => {}); continue;
+      }
       const message = e instanceof RpcError ? `${s.name} answered: ${e.message}` : plain(e);
       return finish(false, { content: [{ type: 'text', text: message }], isError: true }, message);
     }
@@ -397,6 +430,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, p: st
   let key: ApiKey;
   try { key = authenticate(req, false); }
   catch (e: any) { logEvent('warn', 'mcp', `MCP client refused from ${clientIp(req)}: ${e.message}`); throw e; }
+  const admitted = admitKey(key)!;
   // No server-initiated stream: tools changes are picked up when the client lists them again.
   if (req.method === 'GET') { res.writeHead(405, { allow: 'POST, DELETE' }); res.end(); return; }
   if (req.method === 'DELETE') { sessions.delete(String(req.headers['mcp-session-id'] || '')); res.writeHead(204); res.end(); return; }
@@ -408,6 +442,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, p: st
     if (!m || m.jsonrpc !== '2.0' || typeof m.method !== 'string') { if (m && m.id !== undefined) out.push(rpcError(m.id, -32600, 'Invalid request')); continue; }
     if (m.id === undefined || m.id === null) continue;   // a notification needs no answer
     try {
+      checkAccess(key, admitted, 'client');
       if (m.method === 'initialize') {
         const asked = String(m.params?.protocolVersion || ''); const client = [m.params?.clientInfo?.name, m.params?.clientInfo?.version].filter(Boolean).join(' ') || 'An MCP client';
         sessionId = randomUUID(); sessions.set(sessionId, { keyId: key.id, client, last: Date.now() });
@@ -417,11 +452,11 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, p: st
           instructions: scope ? undefined : 'Tools from the MCP servers connected to Polygate. Each name starts with its server, as in server__tool; polygate__ tools report on the gateway itself.' } });
       }
       else if (m.method === 'ping') out.push({ jsonrpc: '2.0', id: m.id, result: {} });
-      else if (m.method === 'tools/list') out.push({ jsonrpc: '2.0', id: m.id, result: { tools: await hubTools(key, scope) } });
+      else if (m.method === 'tools/list') out.push({ jsonrpc: '2.0', id: m.id, result: { tools: await hubTools(key, scope, admitted) } });
       else if (m.method === 'tools/call') {
         const name = String(m.params?.name || ''); if (!name) { out.push(rpcError(m.id, -32602, 'Tool name missing')); continue; }
         const s = sessions.get(String(req.headers['mcp-session-id'] || '')); if (s) s.last = Date.now();
-        out.push({ jsonrpc: '2.0', id: m.id, result: await callTool(name, m.params?.arguments, key, scope, 'client') });
+        out.push({ jsonrpc: '2.0', id: m.id, result: await callTool(name, m.params?.arguments, key, scope, 'client', admitted) });
       }
       else out.push(rpcError(m.id, -32601, `Polygate does not offer ${m.method}`));
     } catch (e: any) { out.push(rpcError(m.id, e instanceof RpcError ? e.code : -32603, plain(e))); }
@@ -458,8 +493,9 @@ function secrets(input: unknown, saved: Record<string, string> | undefined, kind
 }
 export function cleanServer(input: any, saved: McpServer | undefined, local: boolean): McpServer {
   if (!input || typeof input !== 'object') throw new GatewayError('Server details are missing', 400);
-  const cfg = mcpConfig(); const transport = (saved?.transport || input.transport) as McpServer['transport'];
+  const cfg = mcpConfig(); const transport = (input.transport === undefined ? saved?.transport : input.transport) as McpServer['transport'];
   if (!['http', 'sse', 'stdio'].includes(transport)) throw new GatewayError('Choose how to connect: remote (HTTP), remote (SSE) or a local program', 400);
+  if (saved && (saved.transport === 'stdio') !== (transport === 'stdio')) throw new GatewayError('Create a new server to change between a remote server and a local program', 400);
   const name = String(input.name ?? saved?.name ?? '').trim().toLowerCase();
   if (!NAME.test(name)) throw new GatewayError('Name: 1–24 lowercase letters, digits or dashes, starting with a letter. Tool names start with it.', 400);
   if (name === 'polygate') throw new GatewayError('The name "polygate" is used by Polygate\'s own tools', 400);

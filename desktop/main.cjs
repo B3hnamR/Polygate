@@ -24,29 +24,81 @@ const killTree=()=>{
 // the portable wrapper then removes its temp folder as usual. Updates still replace the portable exe (PORTABLE_EXECUTABLE_FILE is passed on).
 // If the copy cannot be made (a full disk, a locked file), the app simply runs from the unpacked files as before.
 const RELOCATED='POLYGATE_RELOCATED';
+const COPY_VERSION=/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const copyBase=()=>path.join(process.env.LOCALAPPDATA||app.getPath('appData'),'Polygate','app');
+const samePath=(a,b)=>path.resolve(a).toLowerCase()===path.resolve(b).toLowerCase();
+// Reject links/junctions and resolved aliases, including ancestors. Missing paths are allowed only before creating the cache.
+function plainCopyPath(ofs,file,allowMissing=false){
+  if(!path.isAbsolute(file))return false;
+  for(let current=path.resolve(file);;current=path.dirname(current)){
+    try{if(ofs.lstatSync(current).isSymbolicLink()||!samePath(ofs.realpathSync(current),current))return false;}
+    catch(e){if(!allowMissing||e.code!=='ENOENT')return false;}
+    if(path.dirname(current)===current)return true;
+  }
+}
+function ownedCopy(ofs,base,version){
+  if(!COPY_VERSION.test(version))return false;
+  const folder=path.join(base,version),marker=path.join(folder,'.polygate-copy');
+  try{
+    if(!plainCopyPath(ofs,folder)||!ofs.lstatSync(folder).isDirectory())return false;
+    for(const file of [marker,path.join(folder,'Polygate.exe'),path.join(folder,'resources','app.asar'),path.join(folder,'resources','gateway.js')]){
+      if(!plainCopyPath(ofs,file)||!ofs.lstatSync(file).isFile())return false;
+    }
+    if(ofs.statSync(marker).size>256)return false;
+    const stamp=ofs.readFileSync(marker,'utf8').split(' ');
+    // cpSync does not preserve mtimes; the marker's timestamp describes the source, not the cached gateway.
+    return stamp.length===4&&stamp[0]===version&&stamp.slice(1).every(n=>/^\d+$/.test(n))&&
+      Number(stamp[1])===ofs.statSync(path.join(folder,'resources','app.asar')).size&&
+      Number(stamp[2])===ofs.statSync(path.join(folder,'resources','gateway.js')).size;
+  }catch{return false;}
+}
+function runningCopy(ofs){
+  const base=copyBase(),version=app.getVersion();
+  return COPY_VERSION.test(version)&&samePath(process.execPath,path.join(base,version,'Polygate.exe'))&&ownedCopy(ofs,base,version);
+}
 function relocate(){
-  if(!app.isPackaged||process.platform!=='win32'||!process.env.PORTABLE_EXECUTABLE_DIR||process.env[RELOCATED]==='1')return '';
+  if(!app.isPackaged||process.platform!=='win32'||!process.env.PORTABLE_EXECUTABLE_DIR)return '';
   // Electron's fs reads app.asar as a folder; original-fs copies it as the file it is.
   const ofs=require('original-fs');
-  const source=path.dirname(process.execPath);const base=path.join(process.env.LOCALAPPDATA||app.getPath('appData'),'Polygate','app');
+  if(runningCopy(ofs))return '';
+  // Older update helpers pass this flag into a fresh temp extraction. It is not proof of relocation.
+  delete process.env[RELOCATED];
+  const source=path.dirname(process.execPath),base=copyBase(),version=app.getVersion();let staging='';
   try{
+    if(!COPY_VERSION.test(version)||!plainCopyPath(ofs,base,true))throw new Error('Unsafe portable cache path');
+    const target=path.join(base,version),marker=path.join(target,'.polygate-copy');
+    if(samePath(source,target))throw new Error('The running cache copy is not valid');
     const asar=ofs.statSync(path.join(process.resourcesPath,'app.asar')),gw=ofs.statSync(path.join(process.resourcesPath,'gateway.js'));
-    const stamp=`${app.getVersion()} ${asar.size} ${gw.size} ${Math.round(gw.mtimeMs)}`;
-    const target=path.join(base,app.getVersion());const marker=path.join(target,'.polygate-copy');
-    let ready=false;try{ready=ofs.readFileSync(marker,'utf8')===stamp&&ofs.existsSync(path.join(target,'Polygate.exe'));}catch{/* not copied yet */}
+    const stamp=`${version} ${asar.size} ${gw.size} ${Math.round(gw.mtimeMs)}`;
+    if(!plainCopyPath(ofs,target,true))throw new Error('Unsafe portable copy path');
+    const exists=ofs.existsSync(target),owned=ownedCopy(ofs,base,version);
+    if(exists&&!owned)throw new Error('The portable cache folder is not an owned copy');
+    const ready=owned&&ofs.readFileSync(marker,'utf8')===stamp;
     if(!ready){
-      const staging=`${target}.copy-${process.pid}`;ofs.rmSync(staging,{recursive:true,force:true});
+      ofs.mkdirSync(base,{recursive:true});
+      if(!plainCopyPath(ofs,base))throw new Error('Unsafe portable cache path');
+      staging=ofs.mkdtempSync(path.join(base,`${version}.copy-`));
       ofs.cpSync(source,staging,{recursive:true});ofs.writeFileSync(path.join(staging,'.polygate-copy'),stamp);
-      ofs.rmSync(target,{recursive:true,force:true});ofs.renameSync(staging,target);
+      if(exists){
+        if(!ownedCopy(ofs,base,version))throw new Error('The portable copy changed during relocation');
+        ofs.rmSync(target,{recursive:true,force:true});
+      }
+      ofs.renameSync(staging,target);staging='';
     }
+    if(!ownedCopy(ofs,base,version))throw new Error('The portable copy could not be verified');
     return path.join(target,'Polygate.exe');
-  }catch(e){console.error('[desktop] running from the unpacked files; the copy failed:',e.message);return '';}
+  }catch(e){
+    // Only this invocation's freshly allocated staging directory can be removed on failure.
+    try{if(staging&&plainCopyPath(ofs,staging))ofs.rmSync(staging,{recursive:true,force:true});}catch{/* in use */}
+    console.error('[desktop] running from the unpacked files; the copy failed:',e.message);return '';
+  }
 }
 // Copies made for other versions are no longer needed. One that is still in use is left for the next start.
 function pruneCopies(log){
-  if(!app.isPackaged||process.env[RELOCATED]!=='1')return;
-  const ofs=require('original-fs');const base=path.dirname(path.dirname(process.execPath));
-  try{for(const name of ofs.readdirSync(base))if(name!==app.getVersion())try{ofs.rmSync(path.join(base,name),{recursive:true,force:true});}catch{/* in use */}}catch{/* nothing to prune */}
+  if(!app.isPackaged||process.platform!=='win32'||!process.env.PORTABLE_EXECUTABLE_DIR)return;
+  const ofs=require('original-fs'),base=copyBase();
+  if(!runningCopy(ofs))return;
+  try{for(const name of ofs.readdirSync(base))if(!samePath(path.join(base,name),path.dirname(process.execPath))&&ownedCopy(ofs,base,name))try{ofs.rmSync(path.join(base,name),{recursive:true,force:true});}catch{/* in use */}}catch{/* nothing to prune */}
   try{fs.writeSync(log,`[desktop] running from ${path.dirname(process.execPath)}\n`);}catch{/* logging never blocks the start */}
 }
 // The running-app check comes first: when Polygate already runs, this start only brings it forward and never touches the copy it runs

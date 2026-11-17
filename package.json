@@ -1,6 +1,6 @@
 {
   "name": "polygate",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "private": true,
   "license": "MIT",
   "description": "A free model gateway for Windows and Linux with WARP and a proxy pool",
@@ -120,6 +120,22 @@
         "to": "psiphon/sha256.txt"
       },
       {
+        "from": "resources/surfshark/wireproxy-windows-amd64.exe",
+        "to": "surfshark/wireproxy-windows-amd64.exe"
+      },
+      {
+        "from": "resources/surfshark/LICENSE",
+        "to": "surfshark/LICENSE"
+      },
+      {
+        "from": "resources/surfshark/README.md",
+        "to": "surfshark/README.md"
+      },
+      {
+        "from": "resources/surfshark/sha256.txt",
+        "to": "surfshark/sha256.txt"
+      },
+      {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
       },
@@ -137,7 +153,12 @@
       },
       {
         "from": "relays",
-        "to": "relays"
+        "to": "relays",
+        "filter": [
+          "**/*",
+          "!**/.vercel",
+          "!**/.vercel/**"
+        ]
       },
       {
         "from": "vendor/licenses",

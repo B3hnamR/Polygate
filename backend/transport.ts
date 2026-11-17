@@ -6,10 +6,13 @@ import { settings, persist, redactError, tallyRoute } from './state';
 import { GatewayError } from './queue';
 import type { Route, Provider, ProviderRoutes } from './types';
 import { socksBridge, parseSocksUrl } from './socks-bridge';
-import { warpTarget, warpFailure, warpSuccess } from './warp';
+import { warpTarget, warpFailure, warpSuccess, warpTargetActive, pinWarpTarget, releaseWarpPin, warpPinnedTarget, warpVirtualRoute, warpSpent } from './warp';
 import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanStandby, poolSummary } from './pool';
-import { pickPsiphon, psiphonSpent, psiphonKiloLimited, psiphonClean, setPsiphonChecker, psiphonFailed, psiphonOk, psiphonUnavailable, psiphonVirtualRoute, psiphonSkips, psiphonLive, psiphonReady, psiphonRegionsReady, scopeOfUrl, scopeOfKind, ROUTE_ID as PSIPHON } from './psiphon';
-import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
+import { exitGroupOf, exitGroups, exitOfVirtual, scopeOfUrl, scopeOfKind, type ExitGroup } from './exit-group';
+// Loaded here so their exit groups are registered before the first request (backend/exit-group.ts).
+import './psiphon';
+import './surfshark';
+import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, noteInconclusive, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
 const exec = promisify(execFile);
@@ -18,7 +21,7 @@ export const routeContext = new AsyncLocalStorage<{routeId: string; requestId?: 
 let cursor=0;
 const now=()=>Date.now();
 // A route is out of play while it cools down after connection failures, or while its exit address has used up its daily Free allowance.
-const coolingDown=(r:Route)=>(!!r.cooldownUntil&&r.cooldownUntil>now())||(!!r.exhaustedUntil&&r.exhaustedUntil>now());
+const coolingDown=(r:Route)=>(!!r.cooldownUntil&&r.cooldownUntil>now())||isExhausted(r);
 // "Used up today" is OpenCode Free's allowance for an exit address. A provider on its own server (or Kilo, which has its own limit) is not affected by it,
 // so a route that is used up for OpenCode is still the right one for them.
 const exhaustionApplies=(kind?:string)=>!kind||kind==='free';
@@ -33,14 +36,14 @@ export function kiloLimitRoute(r:Route,until:number){const fresh=!kiloLimited(r)
 export const __resetKiloLimits=()=>kiloLimits.clear();
 const coolingDownFor=(r:Route,kind?:string)=>exhaustionApplies(kind)?coolingDown(r):(!!r.cooldownUntil&&r.cooldownUntil>now())||(kind==='kilo'&&kiloLimited(r));
 // Out of play for this provider because of an allowance that belongs to the exit's address: OpenCode Free's, or Kilo's.
-const spentFor=(r:Route,kind?:string)=>(exhaustionApplies(kind)&&isExhausted(r))||(kind==='kilo'&&kiloLimited(r));
+const spentFor=(r:Route,kind?:string)=>(exhaustionApplies(kind)&&(isExhausted(r)||(r.kind==='warp'&&!!warpTarget(undefined,true)&&!warpTarget('free',true))))||(kind==='kilo'&&kiloLimited(r));
 // The exits a spread takes turns over, before each request's own filters (provider, model list, health). Shared with the dashboard's list and map.
 export const spreadRoutes=()=>settings.routes.filter(r=>r.enabled&&(r.kind!=='direct'||settings.spreadDirect===true));
 // Direct is the route that sends from this computer's own address; switched off, nothing may leave from it.
 const directOn=()=>settings.routes.some(r=>r.kind==='direct'&&r.enabled);
-export const isExhausted=(r:Route)=>!!r.exhaustedUntil&&r.exhaustedUntil>now();
+export const isExhausted=(r:Route)=>r.kind!=='warp'&&!!r.exhaustedUntil&&r.exhaustedUntil>now();
 // Counted once, when the mark is first set: the periodic re-asks of an exit that is still used up renew the mark without being new events.
-export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by OpenCode; cause unconfirmed (recheck ${resetTime(ex.until)})`:`OpenCode limit/access error (retry after ${resetTime(ex.until)})`;persist();}
+export function routeExhausted(route:Route,ex:Exhaustion){if(route.kind==='warp'){const target=warpPinnedTarget(route.id);if(target)warpSpent(target,ex.until);return;}if(route.kind==='relay'&&!isExhausted(route))tallyRoute(route.id,ex.refused?'refused':'used_up');route.exhaustedUntil=ex.until;route.status=ex.refused?`Refused by OpenCode; cause unconfirmed (recheck ${resetTime(ex.until)})`:`OpenCode limit/access error (retry after ${resetTime(ex.until)})`;persist();}
 // A relay is judged like a direct connection only when it says its TLS handshake is Bun's: it runs on Bun, or on Node with Bun's cipher list (relays/netlify-relay.js).
 const trustedRuntime=(v:string|null)=>/^(bun|node-bun-ciphers)/i.test(v||'');
 // A 429 with a countdown is only a suspicion of a used-up exit: a wrong request shape or a TLS client other than Bun's gets the same answer.
@@ -72,23 +75,30 @@ async function canaryResponse(routeId:string):Promise<Response|undefined>{
     try{
       const r=await providerChat(provider,model,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:8,stream:true},cancellable(20000),routeId,sessionFor('canary',[{role:'user',content:'canary'}],{}),newCanaryId());
       // A refusal or success says something about the exit; a model-level error (unavailable, deprecated) says nothing, so the next model is tried.
-      if(r.ok||r.status===429||![400,404,410,502,503].includes(r.status))return r;
+       if(r.ok||r.status===429||![400,404,410,502,503].includes(r.status)){last?.body?.cancel().catch(()=>{});return r;}
       last?.body?.cancel().catch(()=>{});last=r;
     }catch(e:any){canaryNote=redactError(String(e?.message||e)).slice(0,160);return;}
   }
   canaryNote='';return last;
 }
-// 'unknown': no check could be sent (no OpenCode Free model to ask, for one). A countdown is still trusted then; a limit without one is not.
+// Unrelated errors and unavailable checks prove nothing, even when the original response had a countdown.
 async function defaultVerifier(routeId:string):Promise<'exhausted'|'refused'|'unknown'>{
-  const r=await canaryResponse(routeId);if(!r)return 'unknown';
-  r.body?.cancel().catch(()=>{});return r.ok?'refused':'exhausted';
+  const r=await canarySender(routeId);if(!r)return 'unknown';
+  try{return r.ok?'refused':await suspectExhaustion(r)?'exhausted':'unknown';}
+  finally{r.body?.cancel().catch(()=>{});}
 }
 let canarySender=canaryResponse;export const __setCanarySender=(fn?:typeof canaryResponse)=>{canarySender=fn||canaryResponse;};
 // `model` is the one the request went to; `unfinished` (only asked for by a route test) says why an accepted request did not complete.
 export type ChatCheck={chat:'ok'|'used-up'|'refused'|'unknown';until?:number;note?:string;model?:string;unfinished?:string};
 // A "used up" mark is only the countdown the provider announced. Asking again settles it: a passing request clears the mark, a refusal renews it.
 export async function checkChat(route:Route,complete=false):Promise<ChatCheck>{
+  if(route.kind==='warp'&&!route.id.startsWith('warp-pin:')){
+    const target=warpTarget();const pin=target&&pinWarpTarget(route.id,target);
+    if(!pin)return {chat:'unknown',note:'the WARP tunnel is unavailable'};
+    try{return await checkChat({...route,id:pin},complete);}finally{releaseWarpPin(pin);}
+  }
   canaryModel='';const r=await canarySender(route.id);const model=canaryModel||undefined;if(!r)return {chat:'unknown',note:canaryNote};
+  if(route.id.startsWith('warp-pin:')){const target=warpPinnedTarget(route.id);if(!target){void r.body?.cancel().catch(()=>{});return {chat:'unknown',note:'the WARP tunnel changed during the check'};}if(r.ok)warpSpent(target,0);}
   // Being accepted is what settles the used-up mark. Whether the answer also finishes is a separate fact, read only when the caller asks.
   if(r.ok){route.exhaustedUntil=0;route.recheckedAt=0;route.cooldownUntil=0;route.status='healthy';persist();if(!complete){r.body?.cancel().catch(()=>{});return {chat:'ok',model};}const why=await unfinished(r);return {chat:'ok',model,...(why?{unfinished:why}:{})};}
   // Never invent a midnight reset when upstream did not advertise a retry time.
@@ -100,7 +110,7 @@ export async function checkChat(route:Route,complete=false):Promise<ChatCheck>{
 }
 // Routes marked used up are asked again every few minutes, so a stale mark (an address that recovered, a wrong countdown) does not keep a working exit out of play.
 export function startExitRecheck(){
-  const run=async()=>{for(const r of settings.routes)if(r.enabled&&isExhausted(r)&&!r.status?.startsWith('Refused')&&r.id!=='proxy-pool'&&r.id!==PSIPHON)await (r.kind==='relay'&&settings.relayRecheck!==false?rerollRelay(r):checkChat(r)).catch(()=>{});};
+  const run=async()=>{for(const r of settings.routes)if(r.enabled&&isExhausted(r)&&!r.status?.startsWith('Refused')&&r.id!=='proxy-pool'&&!exitGroupOf(r.id))await (r.kind==='relay'&&settings.relayRecheck!==false?rerollRelay(r):checkChat(r)).catch(()=>{});};
   const first=setTimeout(()=>void run(),60000);const timer=setInterval(()=>void run(),10*60000);first.unref?.();timer.unref?.();
   return ()=>{clearTimeout(first);clearInterval(timer);};
 }
@@ -134,9 +144,10 @@ async function judgeExhaustion(routeId:string,viaRelay:boolean,response:Response
   if(rid?.startsWith('pool-test-'))return ex; // pool tests already are the known-good request
   // A relay is the TLS client the provider sees. Only one that says it runs Bun can be judged like a direct connection (relays/vercel-bun).
   if(viaRelay&&!trustedRuntime(response.headers.get('x-relay-runtime')))return refusedExhaustion();
-  const verdict=await exitVerifier(routeId);
-  // A limit without a retry time moves the request to another exit only when the check through the same exit was refused too.
-  return verdict==='refused'?undefined:verdict==='unknown'&&ex.refused?null:ex;
+  if(routeId.startsWith('warp-pin:')&&!warpPinnedTarget(routeId))return null;
+  let verdict:Awaited<ReturnType<typeof defaultVerifier>>;try{verdict=await exitVerifier(routeId);}catch{return null;}
+  if(routeId.startsWith('warp-pin:')&&!warpPinnedTarget(routeId))return null;
+  return verdict==='refused'?undefined:verdict==='exhausted'?ex:null;
 }
 // Where a request goes when its route's exit is used up: a pool proxy that just proved itself clean, else the next healthy route.
 // Some relays carry one provider only (the Cloudflare Worker forwards to Kilo and refuses every other host), so they are skipped for any other.
@@ -150,11 +161,12 @@ export function exhaustedAlternative(current:Route,excluded:readonly string[]=[]
   if(pool&&hasCleanStandby())return pool;
   return failoverRoutes(current,kind).find(r=>r.id!=='proxy-pool'&&!excluded.includes(r.id));
 }
-// The Psiphon route can take a request only while one of its regions could: connected, and not used up for that provider (backend/psiphon.ts).
-const psiphonCan=(r:Route,kind?:string)=>r.id!==PSIPHON||psiphonReady(scopeOfKind(kind))>0;
+// An exit group's route (Psiphon, Surfshark) can take a request only while one of its exits could: connected, and not used up for that provider.
+const groupCan=(r:Route,kind?:string)=>{const g=exitGroupOf(r.id);return (!g||g.ready(scopeOfKind(kind))>0)&&(r.kind!=='warp'||!!warpTarget(kind||'free',true));};
 // Virtual routes ("pool:<proxy>") let the pool tester send real traffic through one specific proxy without saving a route for it.
-// "psiphon:<region>" does the same for one Psiphon region, so a used-up check goes through exactly the exit that was refused.
-export const findRoute=(id:string):Route|undefined=>id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):id.startsWith(PSIPHON+':')?psiphonVirtualRoute(id.slice(PSIPHON.length+1)):settings.routes.find(r=>r.id===id&&r.enabled);
+// "<group>:<exit>" does the same for one exit of a group ("psiphon:NL", "surfshark:de-fra"), so a used-up check goes through exactly that exit.
+const virtualExit=(id:string)=>{const v=exitOfVirtual(id);return v?v.group.virtualRoute(v.region):undefined;};
+export const findRoute=(id:string):Route|undefined=>id.startsWith('warp-pin:')?warpVirtualRoute(id):id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):exitOfVirtual(id)?virtualExit(id):settings.routes.find(r=>r.id===id&&r.enabled);
 // peek: only ask which route would be chosen. The rotation does not move on, so a readiness check never changes where real requests go.
 export function routeFor(model='', explicit='', kind?: string, peek=false): Route {
   const selected=explicit||settings.routeId;
@@ -166,7 +178,7 @@ export function routeFor(model='', explicit='', kind?: string, peek=false): Rout
   if(!rotating&&current&&spentFor(current,kind)){const alt=exhaustedAlternative(current,[],kind);if(alt&&carries(alt,kind))return alt;}
   if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
   // Direct is left out of the spread unless the user includes it.
-  const pool=spreadRoutes().filter(r=>carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind)&&psiphonCan(r,kind));
+  const pool=spreadRoutes().filter(r=>carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind)&&groupCan(r,kind));
   if(!pool.length){
     // Nothing in the rotation can take it: the backup exits (and Direct, when allowed) are the last resort.
     const last=current&&spentFor(current,kind)?exhaustedAlternative(current,[],kind):undefined;if(last)return last;
@@ -193,7 +205,7 @@ export function providerRoutes(p: Provider): ProviderRoutes | undefined {
   return p.routeId ? { ids: [p.routeId], backups: p.kind === 'free' } : undefined;
 }
 const spreadAt = new Map<string, number>();
-const routeUsable = (r: Route | undefined, kind?: string): r is Route => !!r && r.enabled && carries(r, kind) && !coolingDownFor(r, kind) && (r.kind !== 'warp' || !!warpTarget()) && psiphonCan(r, kind);
+const routeUsable = (r: Route | undefined, kind?: string): r is Route => !!r && r.enabled && carries(r, kind) && !coolingDownFor(r, kind) && (r.kind !== 'warp' || !!warpTarget(kind, true)) && groupCan(r, kind);
 function whyNot(id: string, kind?: string): string {
   const r = settings.routes.find(x => x.id === id);
   if (!r) return `${id} was deleted`;
@@ -202,19 +214,19 @@ function whyNot(id: string, kind?: string): string {
   if (exhaustionApplies(kind) && isExhausted(r)) return `${r.name} is used up until ${resetTime(r.exhaustedUntil!)}`;
   if (kind === 'kilo' && kiloLimited(r)) return `${r.name} has reached Kilo's free limit for its address until ${resetTime(kiloLimitUntil(r))}`;
   if (r.kind === 'warp' && !warpTarget()) return `${r.name} is not connected`;
-  if (!psiphonCan(r, kind)) return psiphonUnavailable(scopeOfKind(kind));
+  if (!groupCan(r, kind)) return exitGroupOf(r.id)?.unavailable(scopeOfKind(kind)) || `${r.name} has no exit available for this provider`;
   return `${r.name} is resting after errors${r.cooldownUntil && r.cooldownUntil > now() ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}. Resume it on the Routes page if the connection is back` : ''}`;
 }
 // Z.ai's coding plan keeps one steady address: Direct, or one proxy the user added. A relay, the proxy pool and WARP change address between requests, which is
 // what an account's unusual-activity check looks at, so they are not offered, and nothing moves Z.ai to another exit on its own (zai.ts).
-export const steadyExit = (r: Route) => r.kind === 'direct' || (r.kind === 'proxy' && r.id !== 'proxy-pool' && r.id !== PSIPHON && !r.poolUrls?.length);
-const ZAI_DIRECT: Route = { id: 'direct', name: 'Direct connection', kind: 'direct', url: '', enabled: true, models: [] };
+export const steadyExit = (r: Route) => r.kind === 'direct' || (r.kind === 'proxy' && r.id !== 'proxy-pool' && !exitGroupOf(r.id) && !r.poolUrls?.length);
 export function routeForProvider(p: Provider, model: string, peek=false): Route {
   if (p.kind === 'zai') {
-    const id = p.routes?.ids?.[0]; if (!id) return settings.routes.find(r => r.id === 'direct') || ZAI_DIRECT;
+    const id = p.routes?.ids?.[0] || 'direct';
     const r = settings.routes.find(x => x.id === id);
-    if (p.routes!.paused?.includes(id)) throw new GatewayError(`The route of ${p.name} is paused. Resume it on the Routing page.`, 503, 'route_unavailable');
+    if (p.routes?.paused?.includes(id)) throw new GatewayError(`The route of ${p.name} is paused. Resume it on the Routing page.`, 503, 'route_unavailable');
     if (!r || !r.enabled) throw new GatewayError(`The route chosen for ${p.name} (${r?.name || 'a deleted route'}) is switched off. Choose another on the Routing page.`, 503, 'route_unavailable');
+    if (!steadyExit(r) || (!p.routes?.ids?.length && r.kind !== 'direct')) throw new GatewayError('Z.ai requires Direct or one steady proxy', 503, 'route_unavailable');
     return r;
   }
   const set = providerRoutes(p);
@@ -253,7 +265,7 @@ export const providerPicksAgain = (p: Provider) => { const set = providerRoutes(
 export const providerSwitches = (p: Provider) => !providerPicksAgain(p);
 // Deterministic order used when a connection fails: WARP first, then the other routes in the order they were added, direct only if allowed.
 export function failoverRoutes(current: Route, kind?: string): Route[] {
-  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!publicPool(r,kind)&&!coolingDownFor(r,kind)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget())&&psiphonCan(r,kind));
+  const usable=settings.routes.filter(r=>r.enabled&&r.id!==current.id&&carries(r,kind)&&!publicPool(r,kind)&&!coolingDownFor(r,kind)&&(r.kind!=='direct'||settings.allowDirect===true)&&(r.kind!=='warp'||!!warpTarget())&&groupCan(r,kind));
   return [...usable.filter(r=>r.kind==='warp'),...usable.filter(r=>r.kind!=='warp'&&r.kind!=='direct'),...usable.filter(r=>r.kind==='direct')];
 }
 // One description of every route, used by the Routing page and the Proxies page so they cannot disagree.
@@ -266,7 +278,7 @@ export function describeRoutes(): Record<string, RouteInfo> {
     let label = r.status || 'Not tested'; let tone: RouteInfo['tone'] = 'neutral'; let detail = '';
     if (!r.enabled) { label = 'Disabled'; }
     else if (isExhausted(r)) { const refused = !!r.status?.startsWith('Refused'); label = refused ? 'OpenCode refused; cause unconfirmed' : 'OpenCode limit/access error'; tone = 'cooldown'; detail = refused ? `Recheck after ${resetTime(r.exhaustedUntil!)}. This is not evidence of relay transport failure.` : rerolling.has(r.id) ? 'Rechecking the relay…' : `Provider retry time ${resetTime(r.exhaustedUntil!)}; reset not guaranteed` + (r.recheckedAt ? ` · checked ${new Date(r.recheckedAt).toISOString().slice(11, 16)} UTC` : ''); }
-    else if (r.id === PSIPHON) { const live = psiphonLive(); const out = live - psiphonReady('opencode'); label = !r.enabled ? 'Not running' : live ? `${live} region${live > 1 ? 's' : ''} connected` : 'Connecting'; tone = !r.enabled ? 'neutral' : live && out < live ? 'healthy' : 'cooldown'; detail = live && out ? `${out} used up for OpenCode Free today` : 'Managed on the Routing page, under Psiphon'; }
+    else if (exitGroupOf(r.id)) { const g = exitGroupOf(r.id)!; const live = g.live(); const out = live - g.ready('opencode'); label = !r.enabled ? 'Not running' : live ? `${live} ${g.unit}${live > 1 ? 's' : ''} connected` : 'Connecting'; tone = !r.enabled ? 'neutral' : live && out < live ? 'healthy' : 'cooldown'; detail = live && out ? `${out} used up for OpenCode Free today` : `Managed under Routing → ${g.label}`; }
     else if (r.id === 'proxy-pool') { const s = poolSummary(); label = s.clean ? `${s.clean} clean exit${s.clean > 1 ? 's' : ''} ready` : s.ready ? `${s.ready} model-ready` : 'No clean proxy yet'; tone = s.clean || s.ready ? 'healthy' : 'cooldown'; detail = `${s.exhausted} used up today · keeps ${s.target} ready`; }
     else if (r.kind === 'warp') { const up = !!warpTarget(); label = up ? 'Connected' : 'Not connected'; tone = up ? 'healthy' : 'neutral'; detail = up ? '' : 'Connect it in the WARP panel below'; }
     else if (coolingDown(r)) { label = 'Cooling down'; tone = 'cooldown'; detail = `Until ${new Date(r.cooldownUntil!).toISOString().slice(11, 16)} UTC`; }
@@ -285,7 +297,7 @@ export function backupChain(): { id: string; name: string; usable: boolean; why:
   const pool = settings.routes.find(r => r.id === 'proxy-pool' && r.id !== current?.id);
   if (pool) { const s = poolSummary(); const ok = pool.enabled && !coolingDown(pool) && s.ready > 0; add(pool, ok, !pool.enabled ? 'disabled' : s.ready ? `${s.ready} model-ready` : 'no clean proxy yet'); }
   const others = settings.routes.filter(r => r.id !== 'proxy-pool' && r.id !== current?.id && r.kind !== 'direct');
-  for (const r of [...others.filter(r => r.kind === 'warp'), ...others.filter(r => r.kind !== 'warp')]) add(r, r.enabled && !coolingDown(r) && (r.kind !== 'warp' || !!warpTarget()) && (r.id !== PSIPHON || psiphonReady('opencode') > 0), !r.enabled ? 'disabled' : isExhausted(r) ? 'used up today' : coolingDown(r) ? 'cooling down' : r.kind === 'warp' && !warpTarget() ? 'not connected' : r.id === PSIPHON && !psiphonLive() ? 'not connected' : r.id === PSIPHON && !psiphonReady('opencode') ? 'every region used up' : r.id === PSIPHON ? `${psiphonReady('opencode')} region${psiphonReady('opencode') > 1 ? 's' : ''} ready` : 'ready');
+  for (const r of [...others.filter(r => r.kind === 'warp'), ...others.filter(r => r.kind !== 'warp')]) { const g = exitGroupOf(r.id); add(r, r.enabled && !coolingDown(r) && (r.kind !== 'warp' || !!warpTarget()) && (!g || g.ready('opencode') > 0), !r.enabled ? 'disabled' : isExhausted(r) ? 'used up today' : coolingDown(r) ? 'cooling down' : r.kind === 'warp' && !warpTarget() ? 'not connected' : g && !g.live() ? 'not connected' : g && !g.ready('opencode') ? `every ${g.unit} used up` : g ? `${g.ready('opencode')} ${g.unit}${g.ready('opencode') > 1 ? 's' : ''} ready` : 'ready'); }
   const direct = settings.routes.find(r => r.kind === 'direct' && r.id !== current?.id); if (direct) add(direct, direct.enabled && settings.allowDirect === true && !coolingDown(direct), !direct.enabled ? 'switched off' : settings.allowDirect === true ? (isExhausted(direct) ? 'used up today' : 'allowed as last resort') : 'not a backup (see Your own address)');
   return chain;
 }
@@ -396,7 +408,7 @@ async function viaPool(route:Route,url:string,init:any):Promise<Response>{
     try{
       const response=await fetch(url,{...init,proxy:await usableProxy(pick.proxy)});
       // A used-up daily allowance belongs to this proxy's exit address: retire it until the reset and try the next clean one.
-      if(response.status===429){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion('pool:'+pick.url,false,response,seen,rid);if(ex){poolExhausted(pick.url,ex);noteExhaustion(rid,ex);exhausted?.body?.cancel().catch(()=>{});exhausted=response;continue;}noteRefused(rid);}}
+      if(response.status===429){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion('pool:'+pick.url,false,response,seen,rid);if(ex){poolExhausted(pick.url,ex);noteExhaustion(rid,ex);exhausted?.body?.cancel().catch(()=>{});exhausted=response;continue;}if(ex===undefined)noteRefused(rid);else noteInconclusive(rid);}}
       // 403 is how the free tier answers an IP it dislikes; the proxy is rotated out instead of blamed on the model.
       poolReport(pick.url,response.status===403?'blocked':response.status<500?'ok':'bad',now()-started,false);return response;
     }catch(e){if(callerCancelled(init))throw e;poolReport(pick.url,'unreachable',0);failedProxies.add(pick.url);last=e;}
@@ -404,45 +416,80 @@ async function viaPool(route:Route,url:string,init:any):Promise<Response>{
   if(exhausted)return exhausted;
   throw last;
 }
-// The Psiphon route: one region's client per request (backend/psiphon.ts). A confirmed used-up exit is remembered by its address and the
-// request goes on through the next region; with skipping off, the refusal is returned as it is.
+// An exit group's route (Psiphon, Surfshark): one exit per request. A confirmed used-up exit is remembered by its address and the
+// request goes on through the next exit; with skipping off, the refusal is returned as it is.
 // OpenCode's daily allowance and Kilo's per-address limit are each judged for the service the request goes to: an exit used up for one
 // stays in turn for the other and for every other provider.
-// The region each request's answer came through, read once by the gateway for the request log (the route name stays "Psiphon").
-const psiphonRegions=new Map<string,string>();
-export const takePsiphonRegion=(rid:string|undefined)=>{if(!rid)return;const r=psiphonRegions.get(rid);psiphonRegions.delete(rid);return r;};
-async function viaPsiphon(url:string,init:any):Promise<Response>{
+// The exit each request's answer came through, read once by the gateway for the request log (the route name stays "Psiphon").
+const exitRegions=new Map<string,string>();
+export const takeExitRegion=(rid:string|undefined)=>{if(!rid)return;const r=exitRegions.get(rid);exitRegions.delete(rid);return r;};
+export const takePsiphonRegion=takeExitRegion;
+async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
   const rid=routeContext.getStore()?.requestId;const scope=scopeOfUrl(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
   // A request refused through a region whose small check passed: OpenCode's limits are not all per address and per day (one model can be
   // limited on an exit where another still answers), so it goes on to another region, at most twice, before the refusal is returned.
   let refused:Response|undefined;let refusedAt='';let refusals=0;
-  const via=(r:Response,region:string)=>{if(rid&&!isCanary(rid)){psiphonRegions.set(rid,region);if(psiphonRegions.size>300)psiphonRegions.delete(psiphonRegions.keys().next().value!);}return r;};
+  const via=(r:Response,region:string)=>{if(rid&&!isCanary(rid)){exitRegions.set(rid,region);if(exitRegions.size>300)exitRegions.delete(exitRegions.keys().next().value!);}return r;};
   // A refusal goes back as a refusal: a used-up note from an earlier region is dropped, or the gateway would read the next exit's failure as used up.
   const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt);}return exhausted&&via(exhausted,exhaustedAt);};
   // Why the request left the region it was on, said in the log line when it reaches the next one.
   let moved:{from:string;why:string}|undefined;
-  const attempts=Math.max(1,Math.min(6,psiphonLive()));
+  const attempts=Math.max(1,Math.min(6,g.live()));
   for(let i=0;i<attempts;i++){
-    const pick=pickPsiphon(tried,scope);
-    if(!pick){const r=giveUp();if(r)return r;if(last)throw last;throw new GatewayError(psiphonUnavailable(scope),503,'route_unavailable');}
+    const pick=g.pick(tried,scope);
+    if(!pick){const r=giveUp();if(r)return r;if(last)throw last;throw new GatewayError(g.unavailable(scope),503,'route_unavailable');}
     tried.add(pick.region);
-    if(moved&&!isCanary(rid))logEvent('info','psiphon',`A request moved from Psiphon ${moved.from} (${moved.why}) to ${pick.region}`,{from:moved.from,to:pick.region,request:rid});
+    if(moved&&!isCanary(rid))logEvent('info',g.source,`A request moved from ${g.label} ${moved.from} (${moved.why}) to ${pick.region}`,{from:moved.from,to:pick.region,request:rid});
     moved=undefined;
     try{
       const response=await fetch(url,{...init,proxy:await socksBridge({host:'127.0.0.1',port:pick.port})});
-      if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(PSIPHON+':'+pick.region,false,response,seen,rid);
-        if(ex){if(!ex.refused)psiphonSpent(pick.region,ex.until);noteExhaustion(rid,ex);if(!psiphonSkips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
-        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&psiphonSkips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}}}
+      if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(g.id+':'+pick.region,false,response,seen,rid);
+        if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
+        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&g.skips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
       // Kilo's anonymous limit belongs to the exit's address (backend/kilo.ts): set this region aside for Kilo and try the next one. When every
       // region is limited the last answer goes back, and the gateway rests the whole route for Kilo as it does for any exit.
-      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){psiphonKiloLimited(pick.region,now()+30*60000);if(!psiphonSkips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:"Kilo's free limit for its address"};continue;}}
-      psiphonOk(pick.region);return via(response,pick.region);
-    }catch(e){if(callerCancelled(init))throw e;psiphonFailed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
+      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){g.kiloLimited(pick.region,now()+30*60000);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:"Kilo's free limit for its address"};continue;}}
+      g.ok(pick.region);return via(response,pick.region);
+    }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
   }
   const r=giveUp();if(r)return r;
   throw last;
 }
 const isReadOnly=(init:any)=>['GET','HEAD'].includes(String(init?.method||'GET').toUpperCase());
+// Keep gateway failover semantics without treating a provider's allowance as a broken connection.
+class WarpFreeUnavailable extends GatewayError {
+  constructor(){super('Cloudflare WARP has no tunnel with available OpenCode Free allowance.',503,'route_unavailable');}
+}
+async function viaWarp(route:Route,url:string,init:any,quiet:boolean){
+  const rid=routeContext.getStore()?.requestId;
+  const check=!quiet&&!isCanary(rid)&&!isReadOnly(init)&&scopeOfUrl(url)==='opencode';
+  const tried=new Set<number>();
+  for(let i=0;i<4;i++){
+    const target=route.id.startsWith('warp-pin:')?warpPinnedTarget(route.id):warpTarget(check?'free':undefined,false,tried);
+    if(!target){
+      if(check&&!route.id.startsWith('warp-pin:')&&warpTarget(undefined,true,tried))throw new WarpFreeUnavailable();
+      throw new GatewayError('Cloudflare WARP has no usable tunnel for this request.',503,'route_unavailable');
+    }
+    tried.add(target.port);
+    let response:Response;
+    try{const proxy=await socksBridge(target);if(!warpTargetActive(target))throw new GatewayError('The selected WARP tunnel changed before dispatch.',503,'route_unavailable');response=await fetch(url,{...init,proxy});}
+    catch(e){if(!callerCancelled(init)&&!quiet&&!isCanary(rid)&&!isReadOnly(init)&&warpTargetActive(target))warpFailure(target.port);throw e;}
+    const seen=check?await suspectExhaustion(response):undefined;
+    let ex:Exhaustion|undefined|null;
+    if(seen){
+      const pin=pinWarpTarget(route.id,target);
+      try{ex=pin?await judgeExhaustion(pin,false,response,seen,rid):null;}
+      finally{if(pin)releaseWarpPin(pin);}
+      if(ex){
+        warpSpent(target,ex.until);
+        if(i<3&&settings.exhaustedFailover!==false&&warpTarget('free',true,tried)){void response.body?.cancel().catch(()=>{});continue;}
+      }
+    }
+    if(warpTargetActive(target)&&!quiet)warpSuccess(target.port);
+    return {response,judged:{seen,ex}};
+  }
+  throw new GatewayError('Cloudflare WARP has no usable tunnel for this request.',503,'route_unavailable');
+}
 export async function networkFetch(raw: string|URL|Request, init: any = {}, explicit?: string): Promise<Response> {
   const url=typeof raw==='string'?raw:raw instanceof URL?raw.toString():raw.url;
   const local=new URL(url);if(LOOPBACK.includes(local.hostname)) return fetch(url,init);
@@ -450,7 +497,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   const route=findRoute(id);
   if(!route)throw new GatewayError('Network route is disabled or missing',503,'route_unavailable');
   if(route.kind==='relay'&&!relayReaches(local))return fetch(url,init);
-  const started=now();let warpPort=0;let judged:{seen?:Exhaustion;ex?:Exhaustion|null}|undefined;
+  const started=now();let judged:{seen?:Exhaustion;ex?:Exhaustion|null}|undefined;
   // Diagnostic lookups (egress identity) must not move a route's health or open its breaker.
   const quiet=!!init?.polygateQuiet;if(quiet){init={...init};delete init.polygateQuiet;}
   const attempt=quiet?undefined:beginAttempt(routeContext.getStore()?.requestId||'',url,init);
@@ -483,16 +530,13 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
         if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
         throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
     }
-    else if(route.kind==='warp'){
-      const target=warpTarget();if(!target)throw new GatewayError('Cloudflare WARP is not connected. Connect it under Routing → WARP.',503,'route_unavailable');
-      warpPort=target.port;response=await fetch(url,{...init,proxy:await socksBridge(target)});
-    }
+    else if(route.kind==='warp'){const result=await viaWarp(route,url,init,quiet);response=result.response;judged=result.judged;}
     else if(route.kind==='proxy'){
       // Only a chat request spends Free allowance; catalog, version and other reads are not limited, so they skip the slow shared proxies.
       // Only while Direct is on: switched off, nothing leaves from this computer's own address, not even a model list.
       if(route.id==='proxy-pool'&&settings.catalogDirect!==false&&directOn()&&isReadOnly(init))response=await fetch(url,init);
       else if(route.id==='proxy-pool')response=await viaPool(route,url,init);
-      else if(route.id===PSIPHON)response=await viaPsiphon(url,init);
+      else if(exitGroupOf(route.id))response=await viaGroup(exitGroupOf(route.id)!,url,init);
       else response=await fetch(url,{...init,proxy:await usableProxy(route.url||'')});
     }
     else response=await fetch(url,init);
@@ -500,22 +544,22 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
     finishAttempt(attempt,response);
     // A 429 with a Retry-After that counts down to the daily reset is probably this exit's allowance, but is confirmed first (judgeExhaustion); the gateway learns of it by request id.
     let exhausted=false;const rid=routeContext.getStore()?.requestId;
-    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'&&route.id!==PSIPHON){const seen=judged?judged.seen:await suspectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&ex===undefined)noteRefused(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(route.id.startsWith(PSIPHON+':')){if(!ex.refused)psiphonSpent(route.id.slice(PSIPHON.length+1),ex.until);}else if(route.id!=='proxy-pool'){routeExhausted(route,ex);if(!ex.refused)scheduleReroll(route);}}}
+    if(response.status===429&&!quiet&&!isCanary(rid)&&route.id!=='proxy-pool'&&!exitGroupOf(route.id)){const seen=judged?judged.seen:await suspectExhaustion(response);const ex=judged?judged.ex:seen&&await judgeExhaustion(route.id,route.kind==='relay',response,seen,rid);if(ex&&route.kind==='relay')markSpent(route.id,liveEgress.get(route.id),ex.until);if(seen&&ex===undefined)noteRefused(rid);if(seen&&ex===null)noteInconclusive(rid);if(ex){exhausted=true;noteExhaustion(routeContext.getStore()?.requestId,ex);if(route.id.startsWith('pool:'))poolExhausted(route.id.slice(5),ex);else if(exitOfVirtual(route.id)){const v=exitOfVirtual(route.id)!;if(!ex.refused)v.group.spent(v.region,ex.until);}else if(route.id!=='proxy-pool'&&route.kind!=='warp'){routeExhausted(route,ex);if(!ex.refused)scheduleReroll(route);}}}
     // Route health follows delivery, not the model's verdict: a 429 or 500 from the provider means the route worked.
-    if(quiet){/* diagnostic lookup: leave route health alone */}
+    if(quiet||isCanary(rid)){/* diagnostic lookup or confirmation: leave route health alone */}
     else if(route.id.startsWith('pool:')){/* virtual route: the pool keeps its own health */}
-    else if(route.id.startsWith(PSIPHON+':')){/* one Psiphon region: Psiphon keeps its own health */}
+    else if(exitOfVirtual(route.id)){/* one exit of a group: the group keeps its own health */}
     // The relay's own refusal of a wrong access token is not delivery: the relay answered, but nothing it is sent will ever get through.
     else if(route.kind==='relay'&&response.status===401&&await relayRejectedKey(response))routeFailed(route,'The relay rejected its access token (HTTP 401). Check the token on the Relays page.',true);
     else if(route.kind==='relay'&&(response.status===502||response.status===504))routeFailed(route,`HTTP ${response.status}`);
-    else if(!exhausted&&(response.status<500||route.kind==='direct')){if(route.kind==='relay'&&response.status<400)tallyRoute(route.id,'ok');routeSucceeded(route,now()-started);if(warpPort)warpSuccess(warpPort);}
+    else if(!exhausted&&(response.status<500||route.kind==='direct')){if(route.kind==='relay'&&response.status<400)tallyRoute(route.id,'ok');routeSucceeded(route,now()-started);}
     return response;
   }catch(e){
     finishAttempt(attempt,undefined,e);
+    if(e instanceof WarpFreeUnavailable)throw e;
     // Background reads (model lists, version and identity checks) carry no one's request, and a slow one times out now and then: they never
     // put an exit to rest. Only requests that send something (chat) count toward the breaker.
-    if(quiet||callerCancelled(init)||route.id.startsWith('pool:')||route.id.startsWith(PSIPHON+':')||isReadOnly(init))throw e;
-    if(warpPort)warpFailure(warpPort);
+    if(quiet||callerCancelled(init)||isCanary(routeContext.getStore()?.requestId)||route.id.startsWith('pool:')||!!exitOfVirtual(route.id)||isReadOnly(init))throw e;
     routeFailed(route,e instanceof GatewayError?e.message:String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');
     // A relay its platform switched off rests until it may be back, not the breaker's few minutes, when another exit can stand in.
     const restUntil=Number((e as any)?.restUntil)||0;if(restUntil&&route.cooldownUntil&&route.cooldownUntil>now()){route.cooldownUntil=Math.max(route.cooldownUntil,restUntil);persist();}
@@ -527,8 +571,9 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
 // chat 'ok' means the test model answered to the end; 'incomplete' means the request was accepted and the answer did not finish.
 // One model is asked (`model`), so a pass says the exit works for that provider, not that every model of it will answer.
 // until: when a check found the exit used up, the end of the wait the provider gave.
-export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string;model?:string;until?:number;regions?:PsiphonRegionTest[]};
-export type PsiphonRegionTest={region:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
+export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string;model?:string;until?:number;regions?:ExitTest[]};
+export type ExitTest={region:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
+export type PsiphonRegionTest=ExitTest;
 function testProvider(route:Route,providerId?:string):Provider|undefined{
   const enabled=settings.providers.filter(p=>p.enabled&&p.kind!=='zai');
   const chosen=providerId?enabled.find(p=>p.id===providerId):route.only?enabled.find(p=>p.kind===route.only):undefined;
@@ -553,29 +598,29 @@ async function chatCheck(route:Route,p:Provider):Promise<{chat:string;line:strin
 }
 // Every route test leaves its outcome in the Logs page: a test that passed and a chat that is then refused are easier to understand side by side.
 function tested<T extends {chat:string;summary:string;status?:number;latency?:number}>(route:Route,res:T):T{logEvent(res.chat==='ok'?'info':'warn','routes',res.summary,{route:route.id,chat:res.chat,status:res.status,ms:res.latency});return res;}
-// Psiphon is several exits behind one route: each connected region is checked through its own exit, at the same time, so a used-up answer
-// marks that exit alone and a passing one clears a stale mark. A check through the route itself would test one region and judge them all.
-async function testPsiphon(route:Route,providerId?:string):Promise<RouteTest>{
-  const ready=psiphonRegionsReady();
-  if(!route.enabled||!ready.length)throw new GatewayError(psiphonUnavailable(),503,'route_unavailable');
+// An exit group is several exits behind one route: each connected exit is checked through itself, at the same time, so a used-up answer
+// marks that exit alone and a passing one clears a stale mark. A check through the route itself would test one exit and judge them all.
+async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<RouteTest>{
+  const ready=g.regionsReady();
+  if(!route.enabled||!ready.length)throw new GatewayError(g.unavailable(),503,'route_unavailable');
   const kilo=settings.providers.find(p=>p.id===providerId)?.kind==='kilo';
-  const regions:PsiphonRegionTest[]=await Promise.all(ready.map(async({region,exitIp})=>{
-    try{const t=await regionTester(PSIPHON+':'+region,providerId);
-      if(t.chat==='used-up'&&!kilo)psiphonSpent(region,t.until||nextResetAt());else if(t.chat==='ok')psiphonClean(region);else if(t.chat==='limited'&&kilo)psiphonKiloLimited(region,now()+30*60000);
+  const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp})=>{
+    try{const t=await regionTester(g.id+':'+region,providerId);
+      if(t.chat==='used-up'&&!kilo)g.spent(region,t.until||nextResetAt());else if(t.chat==='ok')g.clean(region);else if(t.chat==='limited'&&kilo)g.kiloLimited(region,now()+30*60000);
       return {region,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
-    catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`Psiphon ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
+    catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
   }));
   const good=regions.filter(r=>r.ok);const times=regions.map(r=>r.latency).filter((n):n is number=>typeof n==='number').sort((a,b)=>a-b);
   route.latency=times.length?times[Math.floor(times.length/2)]:route.latency;route.status=good.length?'healthy':route.status;if(good.length){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
   const others=regions.filter(r=>!r.ok).map(r=>`${r.region} ${r.chat==='used-up'?'is used up':r.chat==='limited'?'reached Kilo\'s limit':r.chat==='refused'?'was refused':r.chat==='busy'?'was busy':'did not answer'}`);
-  const summary=`Psiphon: ${good.length} of ${regions.length} region${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
+  const summary=`${g.label}: ${good.length} of ${regions.length} ${g.unit}${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
   logEvent(good.length?'info':'warn','routes',summary,{route:route.id});
   return {ok:good.length>0,status:good.length?200:503,latency:route.latency,buffered:false,chat:good.length?'ok':regions[0]?.chat||'unknown',summary,provider:kilo?'Kilo Free':undefined,regions};
 }
-// Checks a Psiphon region's new address with the provider whose limit it had reached, through exactly that region's exit (backend/psiphon.ts):
+// Checks an exit's new address with the provider whose limit it had reached, through exactly that exit (Psiphon, Surfshark):
 // OpenCode Free with the same small request as a route test, Kilo with one small chat request to a Kilo model.
-setPsiphonChecker(async(region,scope)=>{
-  const route=psiphonVirtualRoute(region);if(!route)return {result:'unknown',note:'the region stopped'};
+for(const group of exitGroups())group.setChecker(async(region,scope)=>{
+  const route=group.virtualRoute(region);if(!route)return {result:'unknown',note:`the ${group.unit} stopped`};
   if(scope==='opencode'){const c=await checkChat(route);return c.chat==='ok'?{result:'ok'}:c.chat==='used-up'||c.chat==='refused'?{result:'used-up',until:c.until}:{result:'unknown',note:c.note};}
   const kilo=settings.providers.find(p=>p.kind==='kilo'&&p.enabled);if(scope!=='kilo'||!kilo)return {result:'unknown',note:'Kilo is not enabled'};
   const c=await chatCheck(route,kilo);return c.chat==='ok'?{result:'ok'}:c.chat==='limited'?{result:'used-up',until:now()+30*60000}:{result:'unknown',note:c.line};
@@ -586,8 +631,8 @@ let regionTester=(id:string,providerId?:string)=>testRoute(id,providerId);export
 export async function testRoute(id:string,providerId?:string):Promise<RouteTest>{const r=await testRouteOnce(id,providerId);stopIfCancelled();return r;}
 async function testRouteOnce(id:string,providerId?:string):Promise<RouteTest>{
   if(typeof id!=='string'||!id)throw new GatewayError('Say which route to test',400);
-  if(id===PSIPHON){const r=settings.routes.find(x=>x.id===PSIPHON);if(!r)throw new GatewayError('Route not found',404);return testPsiphon(r,providerId);}
-  const route=id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):id.startsWith(PSIPHON+':')?psiphonVirtualRoute(id.slice(PSIPHON.length+1)):settings.routes.find(r=>r.id===id);if(!route)throw new GatewayError('Route not found',404);
+  const group=exitGroupOf(id);if(group){const r=settings.routes.find(x=>x.id===id);if(!r)throw new GatewayError('Route not found',404);return testGroup(group,r,providerId);}
+  const route=id.startsWith('pool:')?virtualPoolRoute(id.slice(5)):exitOfVirtual(id)?virtualExit(id):settings.routes.find(r=>r.id===id);if(!route)throw new GatewayError('Route not found',404);
   const other=testProvider(route,providerId);
   const start=now();
   try{

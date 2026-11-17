@@ -11,6 +11,7 @@ import { freePort, traceVia } from './warp';
 import { logEvent } from './logbook';
 import { notify } from './notifications';
 import { requestSignal, stopIfCancelled, detached } from './cancel';
+import { __exitTest, scopeOfUrl, scopeOfKind, registerExitGroup, type ExitScope, type ExitCheck } from './exit-group';
 import type { PsiphonSettings, Route } from './types';
 
 const isWin = process.platform === 'win32';
@@ -53,11 +54,10 @@ type Instance = { region: string; port: number; proc?: ChildProcess; state: Stat
   failures: number; restarts: number; error: string; renewedAt: number[]; stopping?: boolean; output: string; checking?: PsiphonScope };
 // Which limits a request is subject to: OpenCode Free's daily allowance and Kilo's per-address limit belong to different services, so an exit
 // used up for one is still good for the other, and for every other provider.
-export type PsiphonScope = 'opencode' | 'kilo' | 'other';
-// Tests reach only local addresses, so they say which service a request stands for.
-export const __psiphonTest = { scope: '' as PsiphonScope | '' };
-export const scopeOfUrl = (url: string): PsiphonScope => { if (__psiphonTest.scope) return __psiphonTest.scope; try { const h = new URL(url).hostname; return h === 'opencode.ai' || h.endsWith('.opencode.ai') ? 'opencode' : h === 'kilo.ai' || h.endsWith('.kilo.ai') ? 'kilo' : 'other'; } catch { return 'other'; } };
-export const scopeOfKind = (kind?: string): PsiphonScope => kind === 'free' ? 'opencode' : kind === 'kilo' ? 'kilo' : 'other';
+// The scopes and the per-request service are shared with every exit group (backend/exit-group.ts); the old names stay for callers and tests.
+export type PsiphonScope = ExitScope;
+export const __psiphonTest = __exitTest;
+export { scopeOfUrl, scopeOfKind };
 const instances = new Map<string, Instance>();
 let rr = 0, monitor: ReturnType<typeof setInterval> | undefined, busy = '', lastError = '', updating = false, lastNotified = '';
 
@@ -165,7 +165,7 @@ function tryRenew(inst: Instance, scope: PsiphonScope) {
 }
 // The check is a request, so backend/transport.ts sends it and registers itself here: one small chat request to that provider through
 // exactly this region's exit. 'unknown' (the check could not be sent or read) lets real requests decide, as before the option existed.
-export type ExitCheck = { result: 'ok' | 'used-up' | 'unknown'; until?: number; note?: string };
+export type { ExitCheck };
 let checker: ((region: string, scope: PsiphonScope) => Promise<ExitCheck>) | undefined;
 export const setPsiphonChecker = (fn?: (region: string, scope: PsiphonScope) => Promise<ExitCheck>) => { checker = fn; };
 const scopeName = (scope: PsiphonScope) => scope === 'kilo' ? 'Kilo Free' : 'OpenCode Free';
@@ -415,6 +415,10 @@ export async function startPsiphon() {
   reconcilePsiphon();
 }
 export async function stopPsiphon() { if (monitor) clearInterval(monitor); monitor = undefined; await stopAll(); }
+// Psiphon is one exit group: the route machinery (backend/transport.ts) reaches it through these.
+registerExitGroup({ id: ROUTE_ID, label: 'Psiphon', unit: 'region', source: 'psiphon', pick: pickPsiphon, ready: psiphonReady, live: psiphonLive, unavailable: psiphonUnavailable,
+  virtualRoute: psiphonVirtualRoute, regionsReady: psiphonRegionsReady, spent: psiphonSpent, kiloLimited: psiphonKiloLimited, clean: psiphonClean,
+  failed: psiphonFailed, ok: psiphonOk, skips: psiphonSkips, setChecker: setPsiphonChecker });
 export const __instances = instances;
 export const __saveRegions = saveRegions;
 // Tests: what happens once a region has reconnected and its exit is known (the client says so in real use).

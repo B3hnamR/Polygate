@@ -3,8 +3,9 @@ import { test, expect, beforeAll, afterAll } from 'bun:test';
 process.env.POLYGATE_ADMIN_TOKEN = 'csp-secret';
 const { startGateway } = await import('../backend/main');
 let gateway: Awaited<ReturnType<typeof startGateway>>, base = '';
-beforeAll(async () => { gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`; });
-afterAll(async () => { await gateway?.close(); });
+let savedPath: string | undefined;
+beforeAll(async () => { savedPath = process.env.POLYGATE_DASHBOARD_PATH; delete process.env.POLYGATE_DASHBOARD_PATH; gateway = await startGateway(0); base = `http://127.0.0.1:${gateway.port}`; });
+afterAll(async () => { await gateway?.close(); if (savedPath === undefined) delete process.env.POLYGATE_DASHBOARD_PATH; else process.env.POLYGATE_DASHBOARD_PATH = savedPath; });
 
 test('the dashboard policy lets the page use its inline font (the stamp font is embedded as a data: URL)', async () => {
   const r = await fetch(base + '/'); await r.text();

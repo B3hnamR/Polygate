@@ -124,9 +124,10 @@ async function testOne(e: PoolEntry, deep: boolean) {
       if (!deep) { Object.assign(h, { status: poolConfig().deepTest ? 'reachable' : 'ready', error: '', deep: false }); return; }
     }
     const { rankedModels, providerChat, sessionFor } = await import('./providers'); const { collect } = await import('./protocols');
-    const provider = settings.providers.find(p => p.enabled && p.kind === 'free') || settings.providers.find(p => p.enabled);
+    // Testing public proxies is not authorization to send another provider's key or spend its paid quota.
+    const provider = settings.providers.find(p => p.enabled && p.kind === 'free');
     const model = rankedModels().find(m => m.providerId === provider?.id && m.state !== 'unavailable' && m.cooldownUntil <= Date.now());
-    if (!provider || !model) { Object.assign(h, { status: 'reachable', error: 'No model available for a deep test; refresh models or wait for cooldowns.', deep: false }); return; }
+    if (!provider || !model) { Object.assign(h, { status: 'reachable', error: 'No enabled OpenCode Free model is available for a deep test; other providers are not used.', deep: false }); return; }
     const t0 = Date.now(); const testId = 'pool-test-' + crypto.randomUUID(); const r = await providerChat(provider, model, { messages: [{ role: 'user', content: 'Reply with OK.' }], max_tokens: 8, stream: true }, AbortSignal.timeout(40000), route, sessionFor('pool-test', [{ role: 'user', content: e.url }], {}), testId);
     if (r.ok) { takeExhaustion(testId); await collect(r); Object.assign(h, { status: 'ready', error: '', deep: true, latency: Date.now() - t0, exhaustedUntil: 0, checkedAt: Date.now() }); }
     else {

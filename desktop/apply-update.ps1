@@ -61,7 +61,7 @@ try {
   }
   [IO.File]::WriteAllText($config.resultPath, (@{ ok=$true; version=$config.version; path=$final } | ConvertTo-Json -Compress))
   # The update is already in place; a launch that fails must not roll it back.
-  if (!$NoLaunch) { try { Start-Process -FilePath $final -WorkingDirectory $targetDir } catch { [Console]::Error.WriteLine('The update was installed but the app could not be started: ' + $_.Exception.Message) } }
+  if (!$NoLaunch) { try { Remove-Item Env:POLYGATE_RELOCATED -ErrorAction SilentlyContinue; Start-Process -FilePath $final -WorkingDirectory $targetDir } catch { [Console]::Error.WriteLine('The update was installed but the app could not be started: ' + $_.Exception.Message) } }
   Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
   foreach ($file in @($staged, $configFile, (Join-Path $stageDir 'ready'), (Join-Path $stageDir 'launcher-error.log'), $PSCommandPath)) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
   Remove-Item -LiteralPath $stageDir -ErrorAction SilentlyContinue
@@ -77,6 +77,6 @@ try {
   if ($config -and $config.resultPath) {
     try { [IO.File]::WriteAllText($config.resultPath, (@{ ok=$false; error=('The update could not finish: ' + $message); version=$config.version } | ConvertTo-Json -Compress)) } catch {}
   }
-  if (!$NoLaunch -and $config -and (Test-Path -LiteralPath $config.target)) { Start-Process -FilePath $config.target -WorkingDirectory ([IO.Path]::GetDirectoryName($config.target)) }
+  if (!$NoLaunch -and $config -and (Test-Path -LiteralPath $config.target)) { Remove-Item Env:POLYGATE_RELOCATED -ErrorAction SilentlyContinue; Start-Process -FilePath $config.target -WorkingDirectory ([IO.Path]::GetDirectoryName($config.target)) }
   exit 1
 }

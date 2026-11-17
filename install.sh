@@ -713,9 +713,27 @@ EXAMPLE
 }
 
 prune_releases() {
-  local d
-  # Keep the running release and the one before it (for rollback); older ones only take disk space.
-  ls -1dt /opt/polygate/releases/*/ 2>/dev/null | tail -n +3 | while read -r d; do case "$d" in /opt/polygate/releases/*) rm -rf -- "$d" ;; esac; done
+  local root=/opt/polygate/releases current previous=${old:-} d
+  # Do not prune through redirected roots or when current is not a direct release directory.
+  [ "$(readlink -e -- "$root")" = "$root" ] || return 0
+  current=$(readlink -e -- "/opt/polygate/current") || return 0
+  [ -d "$current" ] && [ "${current%/*}" = "$root" ] || return 0
+  if [ -n "$previous" ]; then
+    case "$previous" in /*) ;; *) previous="/opt/polygate/$previous" ;; esac
+    previous=$(readlink -e -- "$previous") || previous=
+    [ "${previous%/*}" = "$root" ] || previous=
+  fi
+  # Archive mtimes are not install order. Keep current and the target captured before activation.
+  for d in "$root"/*; do
+    [ ! -L "$d" ] && [ -d "$d" ] || continue
+    [[ "${d##*/}" =~ ^[0-9]{14}-[0-9]+$ ]] || continue
+    [ "$(readlink -e -- "$d")" = "$d" ] || continue
+    [ "$d" != "$current" ] && [ "$d" != "$previous" ] || continue
+    # Recognize existing installer releases without following a substituted ownership marker.
+    [ ! -L "$d/install" ] && [ -f "$d/install/polygate" ] && [ ! -L "$d/install/polygate" ] || continue
+    grep -q 'polygate-cli' "$d/install/polygate" || continue
+    rm -rf -- "$d"
+  done
 }
 
 finish() {

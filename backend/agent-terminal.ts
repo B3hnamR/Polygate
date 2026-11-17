@@ -1,14 +1,13 @@
 import {spawn,spawnSync,type ChildProcess} from 'node:child_process';
 import {StringDecoder} from 'node:string_decoder';
 import path from 'node:path';
-import {realpathSync} from 'node:fs';
+import {foldersOverlap} from './agent-paths';
 import {chooseShell} from './agent-engine';
 import {redactError} from './state';
 
 type Terminal={folder:string;command:string;output:string;running:boolean;started:number;ended?:number;exitCode?:number|null;truncated:boolean;process?:ChildProcess};
 const terminals=new Map<string,Terminal>();
-const canonical=(folder:string)=>{try{folder=realpathSync(folder);}catch{}return process.platform==='win32'?path.resolve(folder).toLowerCase():path.resolve(folder);};
-export const terminalInFolder=(folder:string)=>[...terminals.values()].some(t=>t.running&&canonical(t.folder)===canonical(folder));
+export const terminalInFolder=(folder:string)=>[...terminals.values()].some(t=>t.running&&foldersOverlap(t.folder,folder));
 export const terminalState=(id:string)=>{const t=terminals.get(id);if(!t)return null;const {process,...state}=t;return state;};
 export function startTerminal(id:string,folder:string,command:string){
   if(terminalInFolder(folder))throw new Error('This folder already has a running terminal command. Stop it or wait for it to finish.');

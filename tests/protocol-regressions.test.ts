@@ -36,8 +36,66 @@ test('Responses assistant output_text history survives alongside images and tool
   const messages = adapters.responsesInputToChatBody({ model: 'fixture', input }).messages;
   expect(messages.map((m: any) => m.role)).toEqual(['user', 'assistant', 'assistant', 'tool', 'user']);
   expect(messages[1].content).toEqual([{ type: 'text', text: 'Previous answer' }]);
-  expect(messages[0].content[1].type).toBe('image_url');
+  expect(messages[0].content[1]).toEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } });
   expect(messages[2].tool_calls[0].id).toBe(messages[3].tool_call_id);
+});
+
+test('Responses image detail and a single output limit survive conversion without mutating input', () => {
+  const body = { model: 'fixture', max_output_tokens: 32000, input: [{ role: 'user', content: [
+    { type: 'input_image', image_url: 'https://fixture.invalid/a.png', detail: 'low' },
+    { type: 'input_image', image_url: { url: 'data:image/png;base64,AA==', detail: 'high' } },
+  ] }] };
+  const original = JSON.stringify(body);
+  const chat = adapters.responsesInputToChatBody(body);
+  expect(chat.messages[0].content).toEqual([
+    { type: 'image_url', image_url: { url: 'https://fixture.invalid/a.png', detail: 'low' } },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==', detail: 'high' } },
+  ]);
+  expect(chat.max_completion_tokens).toBe(32000);
+  expect(chat.max_tokens).toBeUndefined(); expect(chat.max_output_tokens).toBeUndefined();
+  expect(JSON.stringify(body)).toBe(original);
+});
+
+test('Responses groups parallel calls across skipped reasoning but never across results or messages', () => {
+  const call = (id: string) => ({ type: 'function_call', call_id: id, name: 'read', arguments: JSON.stringify({ id }) });
+  const result = (id: string) => ({ type: 'function_call_output', call_id: id, output: id });
+  const messages = adapters.responsesInputToChatBody({ model: 'fixture', input: [call('a'), { type: 'reasoning' }, call('b'), result('a'), result('b'), call('c'), result('c'), { role: 'user', content: 'next' }, call('d')] }).messages;
+  expect(messages.map((m: any) => m.role)).toEqual(['assistant', 'tool', 'tool', 'assistant', 'tool', 'user', 'assistant']);
+  expect(messages[0].tool_calls.map((c: any) => c.id)).toEqual(['a', 'b']);
+  expect(messages[0].tool_calls[1].function.arguments).toBe('{"id":"b"}');
+  expect(messages.slice(1, 3).map((m: any) => m.tool_call_id)).toEqual(['a', 'b']);
+  expect(messages[3].tool_calls.map((c: any) => c.id)).toEqual(['c']);
+});
+
+for (const toolOnly of [false, true]) test(`Anthropic block lifecycles are unique and contiguous, toolOnly=${toolOnly}`, async () => {
+  const before = adapters.config.agentTools; adapters.config.agentTools = false;
+  try {
+    const tool = (index: number, args: string, name?: string) => ({ tool_calls: [{ index, ...(name ? { id: `call_${index}` } : {}), function: { ...(name ? { name } : {}), arguments: args } }] });
+    const deltas = toolOnly ? [tool(8, '{}', 'read')] : [
+      { reasoning_content: 'think' }, { content: 'answer' }, { reasoning_content: 'again' },
+      tool(8, '{"a":', 'read'), { content: 'between' }, tool(2, '{"b":', 'shell'),
+      tool(8, '1}'), { reasoning_content: 'later' }, tool(2, '2}'), { content: 'last' },
+    ];
+    const res = responseSink();
+    await adapters.relayAnthropicStream({}, res, adapters.sseChunks(sse(deltas.map(d => chatChunk(null, d)).join('') + chatChunk('tool_calls'))), 'fixture', 'fixture');
+    const events = res.output.split('\n').filter((line: string) => line.startsWith('data:') && line.trim() !== 'data: [DONE]').map((line: string) => JSON.parse(line.slice(5)));
+    const starts = events.filter((e: any) => e.type === 'content_block_start');
+    expect(starts.map((e: any) => e.index)).toEqual(starts.map((_: any, i: number) => i));
+    expect(starts.map((e: any) => e.content_block.type)).toEqual(toolOnly ? ['tool_use'] : ['thinking', 'text', 'thinking', 'tool_use', 'text', 'tool_use', 'thinking', 'text']);
+    let active: any; const stopped: number[] = [];
+    for (const e of events) {
+      if (e.type === 'content_block_start') { expect(active).toBeUndefined(); active = e; }
+      if (e.type === 'content_block_delta') {
+        expect(e.index).toBe(active?.index);
+        expect(e.delta.type).toBe(({ text: 'text_delta', thinking: 'thinking_delta', tool_use: 'input_json_delta' } as any)[active.content_block.type]);
+      }
+      if (e.type === 'content_block_stop') { expect(e.index).toBe(active?.index); stopped.push(e.index); active = undefined; }
+    }
+    expect(active).toBeUndefined(); expect(stopped).toEqual(starts.map((e: any) => e.index));
+    expect(starts.filter((e: any) => e.content_block.type === 'tool_use').map((e: any) => e.content_block.id)).toEqual(toolOnly ? ['call_8'] : ['call_8', 'call_2']);
+    expect(events.filter((e: any) => e.delta?.type === 'input_json_delta').map((e: any) => e.delta.partial_json)).toEqual(toolOnly ? ['{}'] : ['{"a":1}', '{"b":2}']);
+    expect(events.at(-1).type).toBe('message_stop');
+  } finally { adapters.config.agentTools = before; }
 });
 
 test('agentTools=false preserves native tool names and arguments; enabled mapping still works', () => {

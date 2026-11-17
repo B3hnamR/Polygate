@@ -277,11 +277,38 @@ async function embeddedConnect(fresh = false) {
 }
 async function stopTunnels() { epoch++; lifecycle.abort(); lifecycle = new AbortController(); const live = [...tunnels.values()]; tunnels.clear(); for (const t of live) stopProcess(t.proc); await Bun.sleep(150); }
 // --- public API ---
-export type WarpTarget = { host: string; port: number };
-export function warpTarget(): WarpTarget | null {
+export type WarpTarget = { host: string; port: number; generation: number; egress: string };
+const generations = new WeakMap<Tunnel, number>(); let generation = 0;
+const spentTunnels = new WeakMap<Tunnel, { egress: string; until: number }>();
+const pins = new Map<string, { routeId: string; target: WarpTarget }>();
+const generationOf = (t: Tunnel) => { let id = generations.get(t); if (!id) { id = ++generation; generations.set(t, id); } return id; };
+export function warpTargetActive(target: WarpTarget): boolean {
+  const t = tunnels.get(target.port);
+  return engineMode() !== 'disabled' && !!t && generationOf(t) === target.generation && (t.egressIp || t.egress?.ip || '') === target.egress;
+}
+export function warpTarget(kind?: string, peek = false, excluded: ReadonlySet<number> = new Set()): WarpTarget | null {
   if (engineMode() === 'disabled') return null;
-  const live = [...tunnels.values()].filter(t => t.cooldownUntil < Date.now()); const pool = live.length ? live : [...tunnels.values()];
-  if (!pool.length) return null; return { host: '127.0.0.1', port: pool[rr++ % pool.length].port };
+  const eligible = [...tunnels.values()].filter(t => { const spent = spentTunnels.get(t); return !excluded.has(t.port) && (kind !== 'free' || !spent || spent.until <= Date.now() || spent.egress !== (t.egressIp || t.egress?.ip || '')); });
+  const live = eligible.filter(t => t.cooldownUntil < Date.now()); const pool = live.length ? live : eligible;
+  if (!pool.length) return null; const t = pool[(peek ? rr : rr++) % pool.length];
+  return { host: '127.0.0.1', port: t.port, generation: generationOf(t), egress: t.egressIp || t.egress?.ip || '' };
+}
+// Only server-issued, short-lived tokens cross the provider's HTTP bridge, never a caller-supplied port.
+export function pinWarpTarget(routeId: string, target: WarpTarget): string | undefined {
+  if (!warpTargetActive(target)) return;
+  const id = 'warp-pin:' + crypto.randomUUID(); pins.set(id, { routeId, target }); return id;
+}
+export const releaseWarpPin = (id: string) => { pins.delete(id); };
+export function warpPinnedTarget(id: string): WarpTarget | undefined {
+  const pin = pins.get(id); if (!pin || !warpTargetActive(pin.target) || !settings.routes.some(r => r.id === pin.routeId && r.enabled && r.kind === 'warp')) return;
+  return pin.target;
+}
+export function warpVirtualRoute(id: string): Route | undefined {
+  if (!warpPinnedTarget(id)) return;
+  const route = settings.routes.find(r => r.id === pins.get(id)!.routeId)!; return { ...route, id };
+}
+export function warpSpent(target: WarpTarget, until: number) {
+  if (warpTargetActive(target)) spentTunnels.set(tunnels.get(target.port)!, { egress: target.egress, until });
 }
 export function warpFailure(port: number) { const t = tunnels.get(port); if (!t) return; if (++t.failures >= 3) { t.cooldownUntil = Date.now() + 30000; t.failures = 0; } }
 export function warpSuccess(port: number) { const t = tunnels.get(port); if (t) t.failures = 0; }

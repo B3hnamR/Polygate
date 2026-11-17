@@ -2,7 +2,7 @@ import net from 'node:net';
 import dns from 'node:dns/promises';
 // Bun's fetch can use an HTTP proxy but not SOCKS. This bridge exposes a local HTTP proxy (CONNECT and absolute-form requests)
 // whose upstream is a SOCKS4 or SOCKS5 server, so WARP and any socks4:// or socks5:// route work.
-export type SocksUpstream = { host: string; port: number; username?: string; password?: string; version?: 4 | 5 };
+export type SocksUpstream = { host: string; port: number; username?: string; password?: string; version?: 4 | 5; remoteDns?: boolean };
 const bridges = new Map<string, Promise<string>>();
 const servers = new Set<net.Server>();
 // Each distinct SOCKS upstream gets its own local listener. Pool tests and warm-up touch thousands of them over days, so the number is capped and
@@ -14,7 +14,7 @@ export const bridgeCount = () => meta.size;
 function dropBridge(b: Bridge) { b.server.close(); servers.delete(b.server); bridges.delete(b.key); meta.delete(b.key); }
 function sweep(idleFor: number) { const now = Date.now(); for (const b of [...meta.values()]) if (b.active === 0 && now - b.last >= idleFor) dropBridge(b); }
 const HEADER_LIMIT = 16 * 1024;
-const keyOf = (u: SocksUpstream) => `${u.version || 5}|${u.username || ''}:${u.password || ''}@${u.host}:${u.port}`;
+const keyOf = (u: SocksUpstream) => JSON.stringify([u.version || 5, u.remoteDns === true, u.username || '', u.password || '', u.host, u.port]);
 const socksReply = ['succeeded', 'general failure', 'connection not allowed', 'network unreachable', 'host unreachable', 'connection refused', 'TTL expired', 'command not supported', 'address type not supported'];
 // Opens a SOCKS5 tunnel to host:port through the upstream. The target is sent as a domain name so the proxy resolves it (no DNS leak).
 export function socksConnect(up: SocksUpstream, host: string, port: number, timeoutMs = 15000): Promise<net.Socket> {
@@ -54,14 +54,20 @@ export function socksConnect(up: SocksUpstream, host: string, port: number, time
     socket.once('error', fail); socket.once('close', () => fail(new Error('SOCKS5 connection closed during handshake')));
   });
 }
-// SOCKS4 only carries an IPv4 address, so the target is resolved here (the user id is the proxy's username, if any).
+// SOCKS4 resolves locally; SOCKS4a sends the hostname after the user id so only the proxy resolves it.
 async function socks4Connect(up: SocksUpstream, host: string, port: number, timeoutMs: number): Promise<net.Socket> {
-  const ip = net.isIPv4(host) ? host : (await dns.lookup(host, { family: 4 })).address;
+  if (!host || /[\x00-\x20\x7f]/.test(host) || /\x00/.test(up.username || '') || /\x00/.test(up.password || '') || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid SOCKS4 destination or user id');
+  if (net.isIPv6(host) || /[\[\]:]/.test(host)) throw new Error('SOCKS4 does not support IPv6 destinations');
+  if (up.remoteDns && (/^[\d.]+$/.test(host) && !net.isIPv4(host) || /^0\.0\.0\.[1-9]\d*$/.test(host))) throw new Error('Unsupported SOCKS4a IPv4 destination');
+  const remote = up.remoteDns === true && !net.isIPv4(host);
+  if (remote && (host.length > 253 || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.?$/i.test(host) || host.replace(/\.$/, '').split('.').some(label => !label || label.length > 63 || label.startsWith('-') || label.endsWith('-')))) throw new Error('Invalid SOCKS4a hostname');
+  const ip = remote ? '0.0.0.1' : net.isIPv4(host) ? host : (await dns.lookup(host, { family: 4 })).address;
+  const request = Buffer.concat([Buffer.from([0x04, 0x01, (port >> 8) & 0xff, port & 0xff]), Buffer.from(ip.split('.').map(Number)), Buffer.from(up.username || ''), Buffer.from([0x00]), ...(remote ? [Buffer.from(host), Buffer.from([0x00])] : [])]);
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: up.host, port: up.port }); socket.setNoDelay(true); let buffer = Buffer.alloc(0); let done = false;
     const fail = (error: Error) => { if (done) return; done = true; clearTimeout(timer); socket.destroy(); reject(error); };
     const timer = setTimeout(() => fail(new Error(`SOCKS4 ${up.host}:${up.port} timed out after ${timeoutMs}ms`)), timeoutMs);
-    socket.once('connect', () => socket.write(Buffer.concat([Buffer.from([0x04, 0x01, (port >> 8) & 0xff, port & 0xff]), Buffer.from(ip.split('.').map(Number)), Buffer.from(up.username || ''), Buffer.from([0x00])])));
+    socket.once('connect', () => socket.write(request));
     socket.on('data', (chunk: Buffer) => {
       if (done) return; buffer = Buffer.concat([buffer, chunk]); if (buffer.length < 8) return;
       if (buffer[1] !== 0x5a) return fail(new Error(`SOCKS4 connect to ${host}:${port} was refused (code ${buffer[1]})`));
@@ -123,5 +129,5 @@ export function socksBridge(up: SocksUpstream): Promise<string> {
 }
 export function closeSocksBridges() { for (const s of servers) s.close(); servers.clear(); bridges.clear(); meta.clear(); if (sweeper) { clearInterval(sweeper); sweeper = undefined; } }
 export function parseSocksUrl(raw: string): SocksUpstream | null {
-  try { const u = new URL(raw); if (!/^socks(4a?|5h?):$/.test(u.protocol)) return null; return { version: u.protocol.startsWith('socks4') ? 4 as const : 5 as const, host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 1080, username: decodeURIComponent(u.username) || undefined, password: decodeURIComponent(u.password) || undefined }; } catch { return null; }
+  try { const u = new URL(raw); if (!/^socks(4a?|5h?):$/.test(u.protocol)) return null; return { version: u.protocol.startsWith('socks4') ? 4 as const : 5 as const, remoteDns: u.protocol === 'socks4a:', host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 1080, username: decodeURIComponent(u.username) || undefined, password: decodeURIComponent(u.password) || undefined }; } catch { return null; }
 }

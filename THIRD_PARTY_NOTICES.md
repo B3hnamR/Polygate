@@ -25,6 +25,32 @@ Packages and downloads keep their own licenses and are not relicensed by Polygat
 - Psiphon's client, `psiphon-tunnel-core` (https://github.com/Psiphon-Labs/psiphon-tunnel-core), copyright Psiphon Inc., is licensed under the GNU General Public License v3, reproduced at resources/psiphon/LICENSE. The Windows app and the Linux x86-64 package carry Psiphon Inc.'s official unmodified builds from https://github.com/Psiphon-Labs/psiphon-tunnel-core-binaries at commit `c49818e8b2fe7b64657aea27b53f12d1374d21eb` (`windows/psiphon-tunnel-core-i686.exe`, `linux/psiphon-tunnel-core-x86_64`); their source is available from the repository above. The client runs as a separate process; no Psiphon code is linked into Polygate. SHA-256 of every Psiphon file is in resources/psiphon/sha256.txt.
 - npm build dependencies retain their own licenses. The notices above cover identified bundled dashboard components, not a complete inventory of every build dependency.
 
+# Surfshark Route Helper: wireproxy
+
+The Surfshark route uses **wireproxy v1.1.3**, an unmodified standalone WireGuard client from https://github.com/pufferffish/wireproxy/releases/tag/v1.1.3, under the ISC license reproduced below and at `resources/surfshark/LICENSE`. The helper runs as a separate process; no wireproxy code is linked into Polygate. The supplied helper files are `wireproxy-windows-amd64.exe`, `wireproxy-linux-amd64` and `wireproxy-linux-arm64`; their hashes are listed in `resources/surfshark/sha256.txt`. See `resources/surfshark/README.md` for their upstream archive provenance. This notice does not assert a reproducible build or inspection of the final public release packages.
+
+The integration requires the user's own Surfshark subscription and manual WireGuard key pair. No Surfshark accounts or keys are bundled. Polygate is not an official Surfshark app and is not affiliated with Surfshark.
+
+The helper executables are build inputs retrieved with checksum verification, not newly committed source files. The license and checksum manifest remain in the repository, and the appropriate executable is included in release packages.
+
+```text
+Copyright (c) 2026 Tsz Fung Wong <im@windtfw.com>
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+Adding this ISC notice does not resolve other components' redistribution requirements. In particular, the Psiphon source-repository link above is not verification that complete corresponding source and build materials for the exact shipped binaries have been supplied; that remains to be established. The Bun redistribution gaps below also remain open.
+
 # Bundled Dashboard Fonts
 
 `src/main.tsx` imports Barlow, Barlow Condensed and Doto from the locally installed Fontsource packages, each at version 5.3.0. Their complete copyright statements and SIL Open Font License 1.1 texts are copied unchanged from the corresponding installed `LICENSE` files:

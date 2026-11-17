@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
-import { deployRelay, inspectVercel, __zip, __timing } from '../backend/relay-deploy';
+import { deployRelay, inspectVercel, verifyRelay, __zip, __timing } from '../backend/relay-deploy';
+import { withRequestCancel } from '../backend/cancel';
+import { EventEmitter } from 'node:events';
 __timing.poll = 1; __timing.verify = 1;
 // The deployers talk to Vercel and Netlify. Each test replaces fetch with a recorder that answers like the platform.
 const realFetch = globalThis.fetch; afterEach(() => { globalThis.fetch = realFetch; });
@@ -124,4 +126,81 @@ test('a new relay never takes a name already in use: Vercel and Cloudflare refus
   const cloudflare = platform(c => c.url.endsWith('/workers/subdomain') ? ok({ result: { subdomain: 'acct' } }) : ok({ success: true }));
   await expect(deployRelay({ platform: 'cloudflare', token: API_TOKEN, name: 'my-relay', accountId: 'a'.repeat(32) })).rejects.toThrow('already exists');
   expect(cloudflare.some(c => c.method === 'PUT' || c.method === 'DELETE')).toBe(false); // the existing Worker was neither overwritten nor deleted
+});
+
+test('failed existence checks never authorize a new deployment or cleanup', async () => {
+  for (const service of ['vercel', 'cloudflare'] as const) for (const status of [401, 403, 429, 500, 503]) {
+    const calls: Call[] = [];
+    globalThis.fetch = (async (url: any, init: any = {}) => {
+      const c = { url: String(url), method: init.method || 'GET', headers: new Headers(init.headers), body: init.body }; calls.push(c);
+      if (c.url.endsWith('/workers/subdomain')) return ok({ result: { subdomain: 'fixture' } });
+      return Response.json({ error: 'lookup unavailable' }, { status });
+    }) as any;
+    await expect(deployRelay({ platform: service, token: API_TOKEN, name: 'existing-project', accountId: ACCOUNT })).rejects.toThrow('could not confirm');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.method === 'GET')).toBe(true);
+  }
+});
+
+test('an unsuccessful Worker upload does not delete a resource whose ownership is unknown', async () => {
+  const calls = platform(c => c.url.endsWith('/workers/subdomain') ? ok({ result: { subdomain: 'fixture' } })
+    : c.method === 'PUT' ? Response.json({ errors: [{ message: 'write failed' }] }, { status: 503 }) : ok({}));
+  await expect(deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT, name: 'uncertain' })).rejects.toThrow('write failed');
+  expect(calls.some(c => c.method === 'PUT')).toBe(true);
+  expect(calls.some(c => c.method === 'DELETE')).toBe(false);
+});
+
+test('relay verification stops when cancelled during a fetch or between attempts', async () => {
+  const previous = __timing.verify;
+  try {
+    __timing.verify = 30000;
+    for (const duringFetch of [true, false]) {
+      const res = Object.assign(new EventEmitter(), { writableEnded: false });
+      let count = 0, reached!: () => void;
+      const first = new Promise<void>(resolve => { reached = resolve; });
+      globalThis.fetch = (async (_url: any, init: any) => {
+        count++; reached();
+        if (!duringFetch) return new Response('', { status: 503 });
+        return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+      }) as any;
+      const pending = withRequestCancel(res as any, {} as any, () => verifyRelay('https://fixture.invalid', 'dummy'));
+      const settled = pending.then(() => undefined, error => error);
+      await first;
+      if (!duringFetch) await new Promise(resolve => setTimeout(resolve, 10));
+      res.emit('close');
+      expect(await settled).toMatchObject({ message: 'Cancelled.' });
+      expect(count).toBe(1);
+    }
+  } finally { __timing.verify = previous; }
+});
+
+test('cancelling Worker verification stops retries and cleans up the confirmed upload', async () => {
+  const res = Object.assign(new EventEmitter(), { writableEnded: false });
+  let pings = 0;
+  const calls = cfPlatform();
+  const platformFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any = {}) => {
+    if (!isApi(String(url))) { pings++; res.emit('close'); throw new Error('cancelled fixture request'); }
+    return platformFetch(url, init);
+  }) as any;
+  await expect(withRequestCancel(res as any, {} as any, () => deployRelay({ platform: 'cloudflare', token: API_TOKEN, accountId: ACCOUNT, name: 'cancelled-worker' }))).rejects.toThrow('Cancelled');
+  expect(pings).toBe(1);
+  expect(calls.filter(c => c.method === 'DELETE').map(c => c.url)).toEqual([`${CF}/workers/scripts/cancelled-worker`]);
+});
+
+test('cancellation before a deployment response is accepted never deletes an uncertain resource', async () => {
+  for (const service of ['vercel', 'cloudflare'] as const) {
+    const res = Object.assign(new EventEmitter(), { writableEnded: false });
+    const calls = platform(c => {
+      if (c.url.endsWith('/workers/subdomain')) return ok({ result: { subdomain: 'fixture' } });
+      if (c.method === 'POST' || c.method === 'PUT') {
+        res.emit('close');
+        throw new Error('upload response lost');
+      }
+      return ok({});
+    });
+    await expect(withRequestCancel(res as any, {} as any, () => deployRelay({ platform: service, token: API_TOKEN, accountId: ACCOUNT, name: 'uncertain-upload' }))).rejects.toThrow('Cancelled');
+    expect(calls.some(c => c.method === 'POST' || c.method === 'PUT')).toBe(true);
+    expect(calls.some(c => c.method === 'DELETE')).toBe(false);
+  }
 });

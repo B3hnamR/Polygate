@@ -129,6 +129,7 @@ test('observed streaming usage above reservation aborts and is reconciled, not s
     key.budget = estimate(body) + body.max_tokens;
     fetch(() => reply(delta('x'.repeat(400)), delta('', 'stop'), '[DONE]'));
     const sink = await send(); expect(sink.text).not.toContain('x'.repeat(400)); expect(key.used).toBe(estimate(body) + 100);
+    expect(sink.text).toContain('insufficient_quota'); expect(sink.text).toContain('reserved token allowance');
     expect(() => __captureKeyTestState()).not.toThrow();
   });
 });
@@ -221,6 +222,34 @@ for (const kind of ['openai', 'kilo'] as const) test(`${kind} internal retry can
     settings.providers[0].kind = kind; model.output = 0; const request = { ...body, max_tokens: 9000 }; key.budget = estimate(request) + 9000; let calls = 0;
     fetch(() => { calls++; return new Response(JSON.stringify({ error: { message: 'max_tokens maximum is 8192' }, usage: { prompt_tokens: key.budget, completion_tokens: 0 } }), { status: 400 }); });
     expect((await send(request)).statusCode).toBe(429); expect(calls).toBe(1); expect(key.used).toBe(key.budget); expect(() => __captureKeyTestState()).not.toThrow();
+  });
+});
+
+test('mixed output aliases retain smaller bounds while retry accounting charges both attempts', async () => {
+  await fixture(async ({ key, body, model, send, fetch }) => {
+    model.output = 0;
+    const request = { ...body, max_tokens: 1000, max_completion_tokens: 9000 }, input = estimate(request);
+    key.budget = 2 * input + 9000;
+    const sent: any[] = [];
+    fetch(init => {
+      sent.push(JSON.parse(init.body));
+      return sent.length === 1 ? Response.json({ error: { message: 'max_completion_tokens maximum is 8192' }, usage: { prompt_tokens: input + 3, completion_tokens: 2 } }, { status: 400 })
+        : reply(delta('ok'), { ...delta('', 'stop'), usage: { prompt_tokens: 2, completion_tokens: 3 } }, '[DONE]');
+    });
+    expect((await send(request)).statusCode).toBe(200);
+    expect(sent.map(b => [b.max_tokens, b.max_completion_tokens])).toEqual([[1000, 9000], [1000, 8192]]);
+    expect(key.used).toBe(input + 10); expect(() => __captureKeyTestState()).not.toThrow();
+  });
+});
+
+test('mixed output aliases do not dispatch a retry after refusal usage consumes the budget', async () => {
+  await fixture(async ({ key, body, model, send, fetch }) => {
+    model.output = 0;
+    const request = { ...body, max_tokens: 1000, max_completion_tokens: 9000 }; key.budget = estimate(request) + 9000;
+    let calls = 0;
+    fetch(() => { calls++; return Response.json({ error: { message: 'max_completion_tokens maximum is 8192' }, usage: { prompt_tokens: key.budget, completion_tokens: 0 } }, { status: 400 }); });
+    expect((await send(request)).statusCode).toBe(429); expect(calls).toBe(1);
+    expect(key.used).toBe(key.budget); expect(() => __captureKeyTestState()).not.toThrow();
   });
 });
 

@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -21,6 +21,7 @@ import {clearTerminal,startTerminal,stopAllTerminals,stopTerminal,terminalState,
 import {projectPreferences,projectSources,readProjectSource,saveProjectPreferences} from './agent-project';
 import {agentChains} from './agent-chains';
 import {agentLibrary,isBuiltinSkill,saveAgentLibrary,skillProblems,syncSkills} from './agent-library';
+import {folderKey,foldersOverlap} from './agent-paths';
 // The agent controller (docs/agent/PLAN.md, Phase 2a): the only part of Polygate that talks to the agent's engine. The Agent page uses it
 // through the desktop-only admin API (admin.ts); the engine's password never reaches the page. It keeps one event stream per working
 // folder open to the engine (opened again after an engine restart), hands each session's events to the page, and answers approvals:
@@ -30,7 +31,7 @@ import {agentLibrary,isBuiltinSkill,saveAgentLibrary,skillProblems,syncSkills} f
 const MAX_RETRIES = 3;
 type Mode = keyof typeof ENGINE_MODES;
 type Pending = { id: string; action: string; resources: string[]; note: string; input?: unknown };
-type Session = { id: string; folder: string; parent?:string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; toolNames: Map<string, string>; toolFiles:Map<string,Set<string>>; turns?: Turn[]; backup?: Backup; recording?: Promise<void>; recovering?: Promise<'committed'|'rolledback'|undefined>; undoing?: boolean; sending?: boolean; mode?: Mode; fullEngine?: string; unsafeTurn?:'busy'|'delegated'; turnMessage?:string };
+type Session = { id: string; folder: string; parent?:string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; toolNames: Map<string, string>; toolFiles:Map<string,Set<string>>; turns?: Turn[]; backup?: Backup; completions: PendingCompletion[]; pendingError?: string; pendingDirty?: boolean; executionEpoch: number; recording?: Promise<void>; recovering?: Promise<'committed'|'rolledback'|undefined>; undoing?: boolean; sending?: boolean; mode?: Mode; fullEngine?: string; unsafeTurn?:'busy'|'delegated'; turnMessage?:string };
 const sessions = new Map<string, Session>();
 const listeners = new Map<string, Set<ServerResponse>>();
 const eventEpoch = randomUUID();
@@ -39,9 +40,35 @@ const eventJournal = (sid: string) => { let journal = eventJournals.get(sid); if
 const streamStates = new Map<string, { connected: boolean; generation: number }>();
 const folders = new Map<string, { abort: AbortController; ready: Promise<void> }>();
 const parentChecked=new Set<string>();
-const folderKey=(p:string)=>{try{p=realpathSync(p);}catch{}return process.platform==='win32'?path.resolve(p).toLowerCase():path.resolve(p);};
 const sameFolder=(a:string,b:string)=>folderKey(a)===folderKey(b);
-const folderConflict=(s:Session)=>[...sessions.values()].some(other=>other.id!==s.id&&sameFolder(other.folder,s.folder)&&(other.busy||other.sending||other.undoing));
+const folderConflict=(s:Session)=>[...sessions.values()].some(other=>other.id!==s.id&&foldersOverlap(other.folder,s.folder)&&(other.busy||other.sending||other.undoing||other.recording));
+
+async function activeInFolder(folder: string) {
+  const epochs = new Map([...sessions.values()].map(s => [s.id, s.executionEpoch]));
+  const active = await engine('GET', '/api/session/active');
+  for (const s of sessions.values()) if (foldersOverlap(folder, s.folder) && epochs.get(s.id) === s.executionEpoch) s.busy = !!active?.[s.id];
+  const overlapping = new Set<string>();
+  for (const id of Object.keys(active || {}).filter(id => active[id])) {
+    const location = sessions.get(id)?.folder || (await engine('GET', `/api/session/${enc(id)}`))?.location?.directory;
+    if (location && foldersOverlap(folder, location)) {
+      const s = session(id, location);
+      if (epochs.get(id) === s.executionEpoch || !epochs.has(id) && s.executionEpoch === 0) s.busy = true;
+      overlapping.add(id);
+    }
+  }
+  // Include starts delivered during either the inventory request or location lookups.
+  for (const s of sessions.values()) if (s.busy && foldersOverlap(folder, s.folder)) overlapping.add(s.id);
+  return [...overlapping];
+}
+
+function invalidateOverlappingBackups(s: Session) {
+  for (const other of sessions.values()) {
+    if (other.id === s.id || !foldersOverlap(s.folder, other.folder) || !(other.busy || other.sending || other.backup)) continue;
+    s.unsafeTurn = s.unsafeTurn || 'busy';
+    other.unsafeTurn = other.unsafeTurn || 'busy';
+    persistPending(other);
+  }
+}
 
 // --- Engine calls ---
 async function engine(method: string, route: string, body?: unknown, envelope = false): Promise<any> {
@@ -115,7 +142,7 @@ function watchFolder(folder: string) {
       const state = streamStates.get(folder);
       if (state?.connected) {
         state.connected = false;
-        for (const s of sessions.values()) if (sameFolder(s.folder, folder)) publish(s.id, { type: 'agent.stream', data: { sessionID: s.id, ...state } });
+        for (const s of sessions.values()) if (sameFolder(s.folder, folder)) { s.executionEpoch++; publish(s.id, { type: 'agent.stream', data: { sessionID: s.id, ...state } }); }
       }
       if (!abort.signal.aborted) await Bun.sleep(500);
     }
@@ -125,8 +152,11 @@ function watchFolder(folder: string) {
 function session(id: string, folder = '') {
   let s = sessions.get(id);
   if (!s) {
-    s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0, stepFiles: new Set(), toolNames: new Map(), toolFiles:new Map(), paused: pausedAgents().find(s => s.id === id)?.paused };
-    try { s.backup = JSON.parse(readFileSync(pendingFile(id), 'utf8')); } catch {}
+    s = { id, folder, allowed: new Set(), pending: new Map(), retries: 0, stepFiles: new Set(), toolNames: new Map(), toolFiles:new Map(), completions: [], executionEpoch: 0, paused: pausedAgents().find(s => s.id === id)?.paused };
+    try {
+      const saved = decodePending(JSON.parse(readFileSync(pendingFile(id), 'utf8')));
+      s.backup = saved.backup; s.turnMessage = saved.turnMessage; s.unsafeTurn = saved.unsafeTurn; s.completions = saved.completions;
+    } catch (err: any) { if (err.code !== 'ENOENT') s.pendingError = 'The saved turn recording could not be read. It was left untouched.'; }
     sessions.set(id, s);
   }
   if (folder && !s.folder) s.folder = folder;
@@ -161,7 +191,7 @@ function onEvent(e: any, folder: string) {
   const captured=s;
   if(!parentChecked.has(sid)){parentChecked.add(sid);void engine('GET',`/api/session/${enc(sid)}`).then(info=>{if(info.parentID){captured.parent=info.parentID;const parent=session(info.parentID,folder);parent.unsafeTurn='delegated';for(const file of captured.stepFiles)parent.stepFiles.add(file);}}).catch(()=>parentChecked.delete(sid));}
   if(e.type==='session.created'&&d.parentID){s.parent=d.parentID;const parent=session(d.parentID,folder);parent.unsafeTurn='delegated';}
-  if(e.type==='session.inbox.delivered'){if(!s.turnMessage)s.turnMessage=d.inboxID;else if(s.turnMessage!==d.inboxID)s.unsafeTurn=s.unsafeTurn||'busy';}
+  if(e.type==='session.inbox.delivered'){s.executionEpoch++;if(!s.turnMessage)s.turnMessage=d.inboxID;else if(s.turnMessage!==d.inboxID)s.unsafeTurn=s.unsafeTurn||'busy';persistPending(s);}
   if (e.type === 'permission.asked') {
     const resources = Array.isArray(d.resources) ? d.resources.map(String) : []; const key = keyOf(d.action, resources);
     try { requireTrust(s.folder); }
@@ -190,7 +220,7 @@ function onEvent(e: any, folder: string) {
     const { save, ...rest } = d; publish(sid, { ...e, data: { ...rest, resources, note: pending.note, ...(pending.input !== undefined ? { input: pending.input } : {}) } }); return;
   }
   if (e.type === 'permission.replied') s.pending.delete(String(d.requestID));
-  if (e.type === 'session.execution.started') { s.retries = 0; s.paused = undefined; setAgentPause(s.id); s.busy = true; }
+  if (e.type === 'session.execution.started') { s.executionEpoch++; s.retries = 0; s.paused = undefined; setAgentPause(s.id); s.busy = true; invalidateOverlappingBackups(s); persistPending(s); }
   // OpenCode 2.2.5 reports step files only in Git projects. File tools still identify their targets in every folder.
   if (e.type === 'session.tool.input.started') s.toolNames.set(d.id, d.name);
   if(e.type==='session.tool.called'&&s.toolNames.get(d.id)==='subagent')s.unsafeTurn='delegated';
@@ -225,7 +255,9 @@ function onEvent(e: any, folder: string) {
     s.pending.clear();
     s.toolNames.clear();
     s.toolFiles.clear();
-    s.recording = recordTurn(s).catch(err => logEvent('warn', 'agent', `What the agent changed in this turn could not be recorded, so it cannot be undone from Polygate: ${err?.message || err}`)).finally(prune);
+    try { captureTurnCompletion(s); }
+    catch (err: any) { logEvent('warn', 'agent', `The completed turn could not be saved for recovery: ${err?.message || err}`); }
+    void recordTurn(s).catch(err => logEvent('warn', 'agent', `Turn recording is pending; reconnect to retry: ${err?.message || err}`));
   }
   publish(sid, e);
   // The engine retries a failing model request for a long time on its own; after a few tries the turn is stopped and the page told why,
@@ -249,13 +281,43 @@ function expireFull(s: Session) {
 // What each turn changed, kept per session in the agent's folder so it outlives a restart: the files the engine's steps reported, the
 // exact pre/post-turn bytes. Undo reverses turns in private scratch copies, merging non-overlapping user edits, then checks the working
 // files before writing. Engine snapshots are not used because their Git index can normalize working-tree content.
-type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after: string | null; before?: FileBackup };
+type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after?: string | null; hashOnly?: true; before?: FileBackup };
 // noBackup: no backup was taken before the turn, because folder backups were off or the message was queued while the agent was working.
-type Turn = { message: string; at: number; files: FileChange[]; noBackup?: 'off' | 'busy' | 'delegated' };
+type Turn = { message: string; at: number; files: FileChange[]; noBackup?: 'off' | 'busy' | 'delegated'; completionID?: string };
+type PendingCompletion = { id: string; at: number; message?: string; files: FileChange[]; noBackup?: Turn['noBackup'] };
+type PendingTurns = { version: 1; backup?: Backup; turnMessage?: string; unsafeTurn?: Session['unsafeTurn']; completions: PendingCompletion[] };
+// Only live, uninterrupted capture boundaries may use the engine's latest context/diff.
+const completionEpochs = new WeakMap<PendingCompletion, number>();
 const enc = encodeURIComponent;
 const turnsFile = (sid: string) => path.join(enginePaths().root, 'turns', `${sid.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
 const pendingFile = (sid: string) => turnsFile(sid) + '.pending';
 const journalFile=(sid:string)=>turnsFile(sid)+'.undo';
+function decodePending(value: any): PendingTurns {
+  const savedFile = (f: any) => f && /^[a-f0-9]{64}$/.test(f.hash) && Number.isInteger(f.mode);
+  const validBackup = (b: any) => b && b.files && typeof b.files === 'object' && !Array.isArray(b.files) && Object.values(b.files).every(savedFile) && Array.isArray(b.excluded) && b.excluded.every((x: any) => typeof x === 'string');
+  if (value && value.version === undefined && validBackup(value)) return { version: 1, backup: value, completions: [] };
+  if (!value || value.version !== 1 || value.backup !== undefined && !validBackup(value.backup) ||
+      value.turnMessage !== undefined && typeof value.turnMessage !== 'string' ||
+      value.unsafeTurn !== undefined && !['busy', 'delegated'].includes(value.unsafeTurn) ||
+      !Array.isArray(value.completions) || !value.completions.every((c: any) => c && typeof c.id === 'string' && c.id && Number.isFinite(c.at) &&
+        (c.message === undefined || typeof c.message === 'string') && (c.noBackup === undefined || ['off', 'busy', 'delegated'].includes(c.noBackup)) &&
+        Array.isArray(c.files) && c.files.every((f: any) => f && typeof f.file === 'string' && typeof f.status === 'string' && typeof f.patch === 'string' && Number.isFinite(f.additions) && Number.isFinite(f.deletions) &&
+          (f.hashOnly === undefined || f.hashOnly === true) && (f.after === undefined || f.after === null || typeof f.after === 'string' && /^[a-f0-9]{64}$/.test(f.after)) &&
+          (f.before === undefined || f.before === null || savedFile(f.before))))) throw new Error('Invalid pending turn record.');
+  return value;
+}
+function persistPending(s: Session, completions = s.completions) {
+  s.pendingDirty = true;
+  if (s.pendingError) throw new GatewayError(s.pendingError, 409, 'agent_recording_pending');
+  if (s.backup || s.turnMessage || s.unsafeTurn || completions.length) {
+    mkdirSync(path.dirname(pendingFile(s.id)), { recursive: true });
+    const saved: PendingTurns = { version: 1, backup: s.backup, turnMessage: s.turnMessage, unsafeTurn: s.unsafeTurn, completions };
+    writeFileAtomic(pendingFile(s.id), JSON.stringify(saved));
+  } else {
+    try { unlinkSync(pendingFile(s.id)); } catch (err: any) { if (err.code !== 'ENOENT') throw err; }
+  }
+  s.pendingDirty = false;
+}
 type UndoJournal={message:string;phase:'staged'|'restoring'|'committing';rollback:[string,FileBackup][];target:[string,FileBackup][];history:string[];remaining:Turn[]};
 function recoverUndo(s:Session, ownsUndo=false):Promise<'committed'|'rolledback'|undefined>{
   if(s.recovering)return s.recovering;
@@ -274,8 +336,8 @@ function recoverUndo(s:Session, ownsUndo=false):Promise<'committed'|'rolledback'
   const committed=!info.revert&&boundary>=0&&messages.length<journal.history.length&&messages.every((id,i)=>id===journal.history[i])&&messages.length<=boundary+1;
   const desired=committed?journal.target:journal.rollback;
   if(!committed&&(!unchanged||info.revert&&info.revert.messageID!==journal.message))throw new GatewayError('Undo outcome is uncertain. Files and history were left untouched; resolve the saved Undo transaction before continuing.',409,'agent_undo_recovery');
-  const [active,folderSessions]=await Promise.all([engine('GET','/api/session/active'),engine('GET',`/api/session${q(s.folder)}`)]);
-  if(s.busy||s.sending||terminalInFolder(s.folder)||folderConflict(s)||active?.[s.id]||(Array.isArray(folderSessions)&&folderSessions.some(x=>active?.[x.id])))throw new GatewayError('An agent or terminal in this folder is working. Stop it or wait until it is done before Undo recovery. Recovery information is saved.',409,'agent_busy');
+  const active = await activeInFolder(s.folder);
+  if(s.busy||s.sending||s.recording||terminalInFolder(s.folder)||folderConflict(s)||active.length)throw new GatewayError('An agent or terminal in this folder is working. Stop it or wait until it is done before Undo recovery. Recovery information is saved.',409,'agent_busy');
   // Never overwrite an edit made after the interrupted transaction.
   for(const [file]of desired){const hash=hashOf(s.folder,file);if(hash!==(new Map(journal.target).get(file)?.hash??null)&&hash!==(new Map(journal.rollback).get(file)?.hash??null))throw new GatewayError('A file changed during interrupted Undo recovery. Nothing was overwritten. Resolve the saved Undo transaction before continuing.',409,'agent_undo_recovery');}
   let uncertain=false;
@@ -283,7 +345,7 @@ function recoverUndo(s:Session, ownsUndo=false):Promise<'committed'|'rolledback'
   if(!committed&&info.revert){try{await engine('DELETE',`/api/session/${enc(s.id)}/revert`);}catch{uncertain=true;}}
   for(const [file,bytes]of desired){try{if(!matchesBackup(s.folder,file,bytes))uncertain=true;}catch{uncertain=true;}}
   if(uncertain)throw new GatewayError('Undo recovery could not restore and verify every file or cancel staged history. Recovery information is saved; resolve the saved Undo transaction before continuing.',409,'agent_undo_recovery');
-  if(committed){s.turns=journal.remaining;saveTurns(s);}
+  if(committed)saveTurns(s,journal.remaining);
   unlinkSync(journalFile(s.id));return committed?'committed' as const:'rolledback' as const;
   })().finally(()=>{s.recovering=undefined;s.undoing=undoing;});
   return s.recovering;
@@ -296,10 +358,19 @@ function referencedCopies(): Set<string> | null {
   for (const name of names.filter(n => n.endsWith('.json') || n.endsWith('.json.pending') || n.endsWith('.json.undo'))) {
     try {
       const v = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
-      if(name.endsWith('.undo')){for(const [,f]of [...v.rollback,...v.target])if(f?.hash)refs.add(f.hash);for(const t of v.remaining||[])for(const f of t.files||[]){if(f.before?.hash)refs.add(f.before.hash);if(f.after)refs.add(f.after);}}
-      else if (name.endsWith('.pending')) { for (const f of Object.values<any>(v?.files || {})) if (typeof f?.hash === 'string') refs.add(f.hash); }
-      else for (const t of Array.isArray(v) ? v : []) for (const f of t?.files || []) { if (typeof f?.before?.hash === 'string') refs.add(f.before.hash); if (typeof f?.after === 'string') refs.add(f.after); }
+      if(name.endsWith('.undo')){for(const [,f]of [...v.rollback,...v.target])if(f?.hash)refs.add(f.hash);for(const t of v.remaining||[])for(const f of t.files||[]){if(f.before?.hash)refs.add(f.before.hash);if(f.after&&!f.hashOnly)refs.add(f.after);}}
+      else if (name.endsWith('.pending')) {
+        const pending = decodePending(v);
+        for (const f of Object.values(pending.backup?.files || {})) refs.add(f.hash);
+        for (const c of pending.completions) for (const f of c.files) { if (f.before?.hash) refs.add(f.before.hash); if (f.after && !f.hashOnly) refs.add(f.after); }
+      }
+      else for (const t of Array.isArray(v) ? v : []) for (const f of t?.files || []) { if (typeof f?.before?.hash === 'string') refs.add(f.before.hash); if (typeof f?.after === 'string' && !f.hashOnly) refs.add(f.after); }
     } catch { return null; }
+  }
+  for (const s of sessions.values()) {
+    if (s.pendingError) return null;
+    for (const f of Object.values(s.backup?.files || {})) refs.add(f.hash);
+    for (const c of s.completions) for (const f of c.files) { if (f.before?.hash) refs.add(f.before.hash); if (f.after && !f.hashOnly) refs.add(f.after); }
   }
   return refs;
 }
@@ -311,8 +382,17 @@ export function pruneAgentBackups(now = false) {
   pruneBackups(referencedCopies(), Date.now(), settings.agentBackups === true).catch(err => logEvent('warn', 'agent', `Old agent backups could not be removed: ${err?.message || err}`));
 }
 const prune = () => pruneAgentBackups();
-function loadTurns(s: Session): Turn[] { if (!s.turns) { try { const v = JSON.parse(readFileSync(turnsFile(s.id), 'utf8')); s.turns = Array.isArray(v) ? v : []; } catch { s.turns = []; } } return s.turns!; }
-function saveTurns(s: Session) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(s.turns || [])); }
+function loadTurns(s: Session): Turn[] {
+  if (!s.turns) {
+    try {
+      const v = JSON.parse(readFileSync(turnsFile(s.id), 'utf8'));
+      if (!Array.isArray(v)) throw new Error('Invalid saved turn history.');
+      s.turns = v;
+    } catch (err: any) { if (err.code === 'ENOENT') s.turns = []; else throw err; }
+  }
+  return s.turns;
+}
+function saveTurns(s: Session, turns = loadTurns(s)) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(turns)); s.turns = turns; }
 const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch { return null; } };
 function matchesBackup(folder: string, file: string, saved: FileBackup) {
   const full = filePath(folder, file);
@@ -324,52 +404,105 @@ function matchesBackup(folder: string, file: string, saved: FileBackup) {
 // undoable: every file the turn changed has an exact copy from before it; when not, `why` says so in plain words.
 const NO_BACKUP = { off: 'Folder backups were off when this turn ran, so it cannot be undone from Polygate.', busy: 'This execution includes queued or steering messages without separate backup boundaries, so it cannot be safely undone from Polygate.', delegated:'This task includes delegated work with separate child history. Changes are shown, but combined parent/child Undo is unavailable.' };
 function publicTurn(t: Turn) {
-  const why = t.noBackup ? NO_BACKUP[t.noBackup] : t.files.some(f => f.before === undefined) ? 'Some of these files were not in the backup (the folder is bigger than one backup covers, or the file is left out of backups), so this turn cannot be undone from Polygate.' : '';
-  return { message: t.message, at: t.at, undoable: !why, ...(why ? { why } : {}), files: t.files.map(({ after, before, ...f }) => f) };
+  const why = t.noBackup ? NO_BACKUP[t.noBackup] : t.files.some(f => f.after === undefined) ? 'Some post-turn files could not be captured exactly, so this turn cannot be undone from Polygate.' : t.files.some(f => f.before === undefined || f.hashOnly) ? 'Some of these files were not in the backup (the folder is bigger than one backup covers, or the file is left out of backups), so this turn cannot be undone from Polygate.' : '';
+  return { message: t.message, at: t.at, undoable: !why, ...(why ? { why } : {}), files: t.files.map(({ after, before, hashOnly, ...f }) => f) };
 }
 // The engine's diff route answers for the latest turn that changed something, so a turn that changed nothing could be handed the previous
 // turn's files: which files a turn changed comes from its own steps, and only the patches from the diff.
-async function recordTurn(s: Session) {
-  const reported = [...s.stepFiles]; s.stepFiles.clear();
+function captureTurnCompletion(s: Session) {
+  s.executionEpoch++;
+  const reported = [...s.stepFiles];
   const backup = s.backup, noBackup = s.unsafeTurn || (s.parent?'delegated' as const:backup ? undefined : settings.agentBackups === true ? 'busy' as const : 'off' as const);
   const displayPaths = new Map(Object.keys(backup?.files || {}).map(file => [fileKey(file), file]));
   const changed = [...new Map(reported.map(file => [fileKey(file), displayPaths.get(fileKey(file)) || path.posix.normalize(file.replace(/\\/g, '/'))])).values()];
-  const turnMessage=s.turnMessage;s.turnMessage=undefined;
-  s.backup = undefined;
-  try { unlinkSync(pendingFile(s.id)); } catch {}
-  if (!changed.length) return;
-  const [diff, ctx] = await Promise.all([engine('GET', `/api/session/${enc(s.id)}/diff`), engine('GET', `/api/session/${enc(s.id)}/context`)]);
-  const message = turnMessage||[...(Array.isArray(ctx) ? ctx : [])].reverse().find((m: any) => m?.type === 'user')?.id; if (!message) return;
-  const byFile = new Map<string, any>((Array.isArray(diff) ? diff : []).filter((f: any) => f?.file).map((f: any) => [fileKey(String(f.file)), f]));
   const files: FileChange[] = changed.map(file => {
-    const f = byFile.get(fileKey(file)) || {}, before = beforeFile(backup, file);
-    const after = hashOf(s.folder, file);
-    let patch = { additions: Number(f.additions) || 0, deletions: Number(f.deletions) || 0, patch: String(f.patch || '').slice(0, 200000) };
-    if (before !== undefined) {
+    const before = beforeFile(backup, file);
+    const hashOnly = !!noBackup || before === undefined;
+    let after: string | null | undefined;
+    try {
+      const full = filePath(s.folder, file);
+      let content: Buffer | undefined;
       try {
-        const content = after === null ? Buffer.alloc(0) : readFileSync(filePath(s.folder, file));
-        if (content.length > 256 * 1024 * 1024 || after !== null && saveBytes(content) !== after) throw new Error('The changed file cannot be recorded safely.');
-        patch = byteDiff(file, before === null ? Buffer.alloc(0) : backupBytes(before), content);
+        const stat = statSync(full);
+        if (!stat.isFile() || stat.size > 256 * 1024 * 1024) throw new Error('The changed file cannot be captured safely.');
+        content = readFileSync(full);
+      } catch (err: any) { if (err.code === 'ENOENT') after = null; else throw err; }
+      if (content) {
+        if (content.length > 256 * 1024 * 1024) throw new Error('The changed file is too large.');
+        after = hashOnly ? createHash('sha256').update(content).digest('hex') : saveBytes(content);
       }
-      catch { return { file, status: String(f.status || 'modified'), ...patch, after }; }
-    }
-    return { file, status: before === null ? 'added' : before !== undefined && after === null ? 'deleted' : String(f.status || 'modified'), ...patch, after, ...(before !== undefined ? { before } : {}) };
+    } catch { /* An unavailable post-image is not a deletion and cannot authorize Undo. */ }
+    return { file, status: before === null ? 'added' : before !== undefined && after === null ? 'deleted' : 'modified', additions: 0, deletions: 0, patch: '', before, after, ...(hashOnly ? { hashOnly: true as const } : {}) };
   });
-  const actual=files.filter(f=>f.before===undefined||f.after!==(f.before?.hash??null));
-  if(!actual.length)return;
-  const turns = loadTurns(s); const known = turns.find(t => t.message === message);
-  // A message can take more than one run (sent again after a pause): its record keeps every file, with the newest state of each.
-  const turn: Turn = known ? Object.assign(known, { at: Date.now(), ...(noBackup && !known.noBackup ? { noBackup } : {}), files: [...known.files.filter(f => !actual.some(n => fileKey(n.file) === fileKey(f.file))), ...actual.map(f => { const old = known.files.find(x => fileKey(x.file) === fileKey(f.file)); return old ? { ...f, file: old.file, before: old.before } : f; })] }) : { message, at: Date.now(), files:actual, ...(noBackup ? { noBackup } : {}) };
-  if (!known) turns.push(turn);
-  saveTurns(s); publish(s.id, { type: 'agent.changes', data: { sessionID: s.id, turn: publicTurn(turn) } });
+  if (files.length) {
+    const completion: PendingCompletion = { id: randomUUID(), at: Date.now(), message: s.turnMessage, files, noBackup };
+    completionEpochs.set(completion, s.executionEpoch);
+    s.completions.push(completion);
+  }
+  s.stepFiles.clear(); s.backup = undefined; s.turnMessage = undefined; s.unsafeTurn = undefined;
+  persistPending(s);
+}
+function recordTurn(s: Session): Promise<void> {
+  if (s.recording) return s.recording;
+  const recording = Promise.resolve().then(async () => {
+    if (s.pendingError) throw new GatewayError(s.pendingError, 409, 'agent_recording_pending');
+    if (s.pendingDirty) persistPending(s);
+    while (s.completions.length) {
+      const completion = s.completions[0], turns = loadTurns(s);
+      const committed = turns.find(t => t.completionID === completion.id);
+      let turn = committed;
+      if (!committed) {
+        const unchangedBoundary = () => completionEpochs.has(completion) && completionEpochs.get(completion) === s.executionEpoch && !s.busy;
+        // Missing identity may only be resolved while this live execution is still the latest one.
+        if (!completion.message && completion.files.some(f => f.before === undefined || f.after === undefined || f.after !== (f.before?.hash ?? null)) && unchangedBoundary()) {
+          const ctx = await engine('GET', `/api/session/${enc(s.id)}/context`);
+          if (unchangedBoundary()) {
+            completion.message = [...(Array.isArray(ctx) ? ctx : [])].reverse().find((m: any) => m?.type === 'user')?.id;
+            persistPending(s);
+          }
+        }
+        const known = turns.find(t => t.message === completion.message);
+        let files = [...(known?.files.filter(f => !completion.files.some(n => fileKey(n.file) === fileKey(f.file))) || []), ...completion.files.map(f => {
+          const old = known?.files.find(x => fileKey(x.file) === fileKey(f.file));
+          const before = old ? old.before : f.before;
+          return { ...f, file: old?.file || f.file, before, status: before === null ? 'added' : before !== undefined && f.after === null ? 'deleted' : 'modified' };
+        })].filter(f => !!known || f.before === undefined || f.after === undefined || f.after !== (f.before?.hash ?? null));
+        if (files.length && !completion.message) throw new GatewayError('The completed turn has no confirmed message identity. Its captured files are saved; no later message was substituted.', 409, 'agent_recording_pending');
+        // The latest diff is optional display metadata, never a source of file identity or bytes.
+        let diff: any[] = [];
+        if (files.some(f => f.before === undefined || f.hashOnly) && unchangedBoundary()) {
+          const result = await engine('GET', `/api/session/${enc(s.id)}/diff`).catch(() => []);
+          if (unchangedBoundary() && Array.isArray(result)) diff = result;
+        }
+        files = files.map(f => {
+          if (!f.hashOnly && f.before !== undefined && f.after !== undefined) {
+            try { return { ...f, ...byteDiff(f.file, f.before === null ? Buffer.alloc(0) : backupBytes(f.before), f.after === null ? Buffer.alloc(0) : backupBytes({ hash: f.after, mode: 0o600 })) }; }
+            catch { return { ...f, after: undefined }; }
+          }
+          const metadata = diff.find(d => typeof d?.file === 'string' && fileKey(d.file) === fileKey(f.file));
+          return metadata ? { ...f, additions: Number(metadata.additions) || 0, deletions: Number(metadata.deletions) || 0, patch: String(metadata.patch || '').slice(0, 200000) } : f;
+        });
+        if (completion.message && (files.length || known)) {
+          turn = { message: completion.message, at: completion.at, files, noBackup: known?.noBackup || completion.noBackup, completionID: completion.id };
+          saveTurns(s, known ? turns.map(t => t === known ? turn! : t) : [...turns, turn]);
+        }
+      }
+      // Write the latest envelope: another run may have appended a completion during metadata awaits.
+      persistPending(s, s.completions.slice(1));
+      s.completions.shift();
+      if (turn) publish(s.id, { type: 'agent.changes', data: { sessionID: s.id, turn: publicTurn(turn) } });
+    }
+  }).finally(() => { if (s.recording === recording) s.recording = undefined; prune(); });
+  s.recording = recording;
+  return recording;
 }
 async function undoTurn(s: Session, message: string) {
-  if (s.busy || s.undoing || s.sending || terminalInFolder(s.folder)||folderConflict(s)) throw new GatewayError('An agent or terminal in this folder is working. Stop it or wait until it is done, then undo.', 409, 'agent_busy');
+  if (s.busy || s.undoing || s.sending || s.recording || terminalInFolder(s.folder)||folderConflict(s)) throw new GatewayError('An agent or terminal in this folder is working. Stop it or wait until it is done, then undo.', 409, 'agent_busy');
   s.undoing = true;
   try {
-  const [active,folderSessions]=await Promise.all([engine('GET','/api/session/active'),engine('GET',`/api/session${q(s.folder)}`)]);
-  if(Array.isArray(folderSessions)&&folderSessions.some(x=>active?.[x.id]))throw new GatewayError('An agent in this folder is still working. Stop it before Undo.',409,'agent_busy');
-  await s.recording;
+  const active = await activeInFolder(s.folder);
+  if(active.length||s.busy||s.sending||s.recording||terminalInFolder(s.folder)||folderConflict(s))throw new GatewayError('An agent in this folder is still working. Stop it before Undo.',409,'agent_busy');
+  await recordTurn(s);
   const turns = loadTurns(s); const from = turns.findIndex(t => t.message === message);
   if (from < 0) throw new GatewayError('Polygate has no recorded changes for that turn.', 404, 'agent_undo_unknown');
   // Undo goes back through every later turn too, so one of them without a backup stops it as well.
@@ -385,7 +518,7 @@ async function undoTurn(s: Session, message: string) {
       let current: Buffer | null = saved === null ? null : backupBytes(saved);
       for (const turn of turns.slice(from).reverse()) {
         const change = turn.files.find(f => fileKey(f.file) === fileKey(file)); if (!change) continue;
-        if (change.before === undefined) throw new Error('No exact backup exists for this file. Older turns cannot be safely undone.');
+        if (change.before === undefined || change.after === undefined || change.hashOnly) throw new Error('No exact backup exists for this file. Older turns cannot be safely undone.');
         const before = change.before === null ? null : backupBytes(change.before);
         const exact = change.after === (current === null ? null : saveBytes(current));
         const after = exact ? current : change.after === null ? null : backupBytes({ hash: change.after, mode: 0o600 });
@@ -431,7 +564,7 @@ async function undoTurn(s: Session, message: string) {
     }
     throw err;
   }
-  s.turns = turns.slice(0, from); saveTurns(s); prune();
+  saveTurns(s, turns.slice(0, from)); prune();
   try{unlinkSync(journalFile(s.id));}catch{}
   publish(s.id, { type: 'agent.undone', data: { sessionID: s.id, message, files } });
   logEvent('info', 'agent', `Agent turn undone: ${files.length} file(s) restored${merged ? ', non-overlapping edits preserved' : ''}`);
@@ -515,7 +648,13 @@ async function engineSkills(folder: string) {
 }
 const checkMode = (raw: unknown): Mode => { if (typeof raw === 'string' && raw in ENGINE_MODES) return raw as Mode; throw new GatewayError(`Unknown mode. Use one of: ${Object.keys(ENGINE_MODES).join(', ')}.`, 400, 'agent_mode'); };
 const modeOf = (agent: string) => (Object.entries(ENGINE_MODES).find(([, m]) => m.agent === agent)?.[0] || '') as Mode | '';
-const summary = (s: any) => ({ id: s.id, title: s.title, mode: modeOf(s.agent || ''), model: s.model?.id || '', effort: EFFORTS.includes(s.model?.variant) ? s.model.variant : '', folder: s.location?.directory || '', created: s.time?.created, tokens: s.tokens, cost: s.cost, outcome: s.outcome });
+// The engine names a session with a small model call, and a free model sometimes answers with a tag from its prompt
+// ("<project_instructions>") or nothing useful: such a title is cleaned, or replaced by the session's date.
+export function sessionTitle(raw: unknown, created?: number) {
+  const clean = String(raw ?? '').replace(/<\/?[A-Za-z_][\w.-]*[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return /[\p{L}\p{N}]/u.test(clean) ? clean : `Session ${created ? new Date(created).toLocaleString() : ''}`.trim();
+}
+const summary = (s: any) => ({ id: s.id, title: sessionTitle(s.title, s.time?.created), mode: modeOf(s.agent || ''), model: s.model?.id || '', effort: EFFORTS.includes(s.model?.variant) ? s.model.variant : '', folder: s.location?.directory || '', created: s.time?.created, tokens: s.tokens, cost: s.cost, outcome: s.outcome });
 // Rules OpenCode saved through "always" (never sent by Polygate) would allow commands without asking in every session of the project.
 async function clearSavedPermissions() {
   const found = await engine('GET', '/api/permission/saved'); const saved: any[] = Array.isArray(found) ? found : [];
@@ -560,28 +699,33 @@ async function requireEngineModel(folder: string, model: string) {
   throw new GatewayError('The agent engine does not have that model. Pick one from the list, or resync the models.', 400, 'agent_model');
 }
 // A session this process has not seen yet (Polygate restarted): its folder comes from the engine.
-async function known(id: unknown) {
+async function known(id: unknown, waitForRecording = true) {
   const sid = String(id || ''); if (!sid) throw new GatewayError('Which session?', 400);
   const info = await engine('GET', `/api/session/${encodeURIComponent(sid)}`);
   const folder = info?.location?.directory || ''; const out = session(sid, folder);out.parent=info.parentID;
   if(!out.mode)out.mode = modeOf(info?.agent || '') || 'ask';
   if (out.mode === 'full'&&out.fullEngine!==engineConnection()?.url) { out.mode = 'ask';out.fullEngine=undefined; await engine('POST', `/api/session/${enc(sid)}/agent`, { agent: ENGINE_MODES.ask.agent }); }
   if (folder) await watchFolder(folder);
+  const epochs = new Map([...sessions.values()].map(s => [s.id, s.executionEpoch]));
   const [active,pending]=await Promise.all([engine('GET','/api/session/active'),engine('GET',`/api/session/${enc(sid)}/permission`)]);
-  for(const other of sessions.values())if(sameFolder(other.folder,folder))other.busy=!!active?.[other.id];
-  out.busy=!!active?.[sid];
+  for(const other of sessions.values())if(sameFolder(other.folder,folder)&&epochs.get(other.id)===other.executionEpoch)other.busy=!!active?.[other.id];
   const waiting=Array.isArray(pending)?pending:[];out.pending=new Map(waiting.map((d:any)=>[d.id,{id:d.id,action:d.action,resources:d.resources||[],note:noteFor(d.action,d.resources||[]),input:d.metadata?.input}]));
-  if(out.recovering||(!out.busy&&!out.undoing))await recoverUndo(out);
+  // Reading/cancelling a session must remain possible when a completion needs manual reconciliation.
+  if(out.recording||out.completions.length||out.pendingDirty||out.pendingError) {
+    const recording = recordTurn(out).catch(err=>logEvent('warn','agent',`Turn recording is still pending: ${err?.message||err}`));
+    if(waitForRecording)await recording;
+  }
+  if(out.recovering||(!out.busy&&!out.undoing&&!out.recording&&!out.completions.length&&!out.pendingError))await recoverUndo(out);
   return out;
 }
 
 export async function agentApi(req: IncomingMessage, res: ServerResponse, pathname: string, readJson: (req: IncomingMessage, max?: number) => Promise<any>, json: (res: ServerResponse, status: number, body: unknown) => void) {
   const method = req.method; const url = new URL(req.url || '/', 'http://x');
   if(pathname==='/admin/agent/session/forms'&&method==='GET'){
-    const s=await known(url.searchParams.get('id'));return json(res,200,{forms:await engine('GET',`/api/session/${enc(s.id)}/form`)});
+    const s=await known(url.searchParams.get('id'),false);return json(res,200,{forms:await engine('GET',`/api/session/${enc(s.id)}/form`)});
   }
   if(pathname==='/admin/agent/session/form'&&method==='POST'){
-    const b=await readJson(req),s=await known(b.id);const form=String(b.form||'');
+    const b=await readJson(req),s=await known(b.id,false);const form=String(b.form||'');
     if(!/^frm_[A-Za-z0-9_-]+$/.test(form))throw new GatewayError('Choose a pending question.',400);
     if(b.cancel===true)await engine('DELETE',`/api/session/${enc(s.id)}/form/${enc(form)}`);
     else{requireTrust(s.folder);if(!b.answer||typeof b.answer!=='object'||Array.isArray(b.answer))throw new GatewayError('Answer the question fields.',400);await engine('POST',`/api/session/${enc(s.id)}/form/${enc(form)}/reply`,{answer:b.answer});}
@@ -599,17 +743,17 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     try { return json(res, 200, await inspectGit(s.folder, b.file)); }
     catch (e: any) { throw new GatewayError(e.message, 409, 'agent_git_inspection'); }
   }
-  if (pathname === '/admin/agent/session/terminal' && method === 'GET') { const s=await known(url.searchParams.get('id')); return json(res,200,{terminal:terminalState(s.id)}); }
+  if (pathname === '/admin/agent/session/terminal' && method === 'GET') { const s=await known(url.searchParams.get('id'),false); return json(res,200,{terminal:terminalState(s.id)}); }
   if (pathname.startsWith('/admin/agent/session/terminal/') && method === 'POST') {
-    const b=await readJson(req),s=await known(b.id);
+    const b=await readJson(req),s=await known(b.id,pathname.endsWith('/run'));
     if(pathname.endsWith('/stop'))return json(res,200,{terminal:stopTerminal(s.id)});
     if(pathname.endsWith('/clear')){clearTerminal(s.id);return json(res,200,{terminal:null});}
     if(!pathname.endsWith('/run'))throw new GatewayError('Endpoint not found',404);
     requireTrust(s.folder);
     if(b.confirm!==true)throw new GatewayError('Confirm this terminal command first. It runs with your account access, outside the Agent permission mode.',400,'agent_terminal_consent');
-    const active=await engine('GET','/api/session/active');
-    const list=await engine('GET',`/api/session${q(s.folder)}`);
-    if(s.busy||s.sending||s.undoing||folderConflict(s)||(Array.isArray(list)&&list.some(x=>active?.[x.id])))throw new GatewayError('Wait for agents in this folder to finish or stop them before running a terminal command.',409,'agent_busy');
+    const active=await activeInFolder(s.folder);
+    if(s.busy||s.sending||s.undoing||s.recording||s.completions.length||s.pendingError||folderConflict(s)||active.length)throw new GatewayError('Wait for agents in this folder to finish or stop them before running a terminal command.',409,'agent_busy');
+    for(const other of sessions.values())if(other.backup&&foldersOverlap(other.folder,s.folder)){other.unsafeTurn=other.unsafeTurn||'busy';persistPending(other);}
     try{return json(res,200,{terminal:startTerminal(s.id,s.folder,String(b.command||''))});}catch(e:any){throw new GatewayError(e.message,409,'agent_terminal');}
   }
   // The system prompt and skills for every folder, with the engine's own skills (only while it runs: they come from the engine).
@@ -655,7 +799,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/delete' && method === 'POST') {
     const s = await known((await readJson(req)).id);
     if(terminalState(s.id)?.running)throw new GatewayError('Stop the terminal before deleting this session.',409,'agent_terminal_busy');
-    if (s.busy || s.sending || s.undoing) throw new GatewayError('Stop the agent before deleting this session.', 409, 'agent_busy');
+    if (s.busy || s.sending || s.undoing || s.recording || s.completions.length || s.pendingError) throw new GatewayError('Stop the agent and finish recording before deleting this session.', 409, 'agent_busy');
     await engine('DELETE', `/api/session/${enc(s.id)}`);
     // Polygate's own records of it go too: its turns (and their undo), a waiting backup and a pause.
     sessions.delete(s.id); setAgentPause(s.id);
@@ -668,7 +812,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   }
   if (pathname === '/admin/agent/session/create' && method === 'POST') return json(res, 200, await createSession(await readJson(req)));
   if (pathname === '/admin/agent/session' && method === 'GET') {
-    const s = await known(url.searchParams.get('id'));
+    const s = await known(url.searchParams.get('id'),false);
     const before = eventJournal(s.id).seq, streamBefore = { ...streamStates.get(s.folder) };
     // inbox: messages the engine holds and has not handed to the agent yet (queued ones show above the message box). Only user messages.
     const [info, messages, inbox] = await Promise.all([engine('GET', `/api/session/${encodeURIComponent(s.id)}`), history(s.id), engine('GET', `/api/session/${enc(s.id)}/inbox`).catch(() => [])]);
@@ -680,7 +824,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   }
   // A message waiting in the queue: taken back (it never reaches the agent), or sent to the agent now as steering.
   if ((pathname === '/admin/agent/session/inbox/cancel' || pathname === '/admin/agent/session/inbox/steer') && method === 'POST') {
-    const b = await readJson(req); const s = await known(b.id); const inbox = String(b.inbox || '');
+    const b = await readJson(req); const s = await known(b.id,!pathname.endsWith('/cancel')); const inbox = String(b.inbox || '');
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(inbox)) throw new GatewayError('Name the queued message.', 400, 'agent_inbox');
     const route = `/api/session/${enc(s.id)}/inbox/${enc(inbox)}`;
     if (pathname.endsWith('/cancel')) await engine('DELETE', route);
@@ -688,7 +832,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     return json(res, 200, { ok: true });
   }
   if(pathname==='/admin/agent/session/children'&&method==='GET'){
-    const parent=await known(url.searchParams.get('id'));requireTrust(parent.folder);
+    const parent=await known(url.searchParams.get('id'),false);requireTrust(parent.folder);
     const active=await engine('GET','/api/session/active');
     const childID=url.searchParams.get('child');
     const verified=async(id:string)=>{const info=await engine('GET',`/api/session/${enc(id)}`);if(info.parentID!==parent.id||path.resolve(info.location?.directory||'')!==path.resolve(parent.folder))throw new GatewayError('That is not a child of this session in the same working folder.',403,'agent_child');return info;};
@@ -698,7 +842,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     return json(res,200,{children:list.filter((c:any)=>c.parentID===parent.id&&path.resolve(c.location?.directory||'')===path.resolve(parent.folder)).map((c:any)=>({...summary(c),parentID:parent.id,busy:!!active?.[c.id],pending:sessions.get(c.id)?.pending.size||0})),more:!!page?.cursor?.next});
   }
   if (pathname === '/admin/agent/session/project' && method === 'GET') {
-    const s=await known(url.searchParams.get('id'));requireTrust(s.folder);
+    const s=await known(url.searchParams.get('id'),false);requireTrust(s.folder);
     return json(res,200,{...projectPreferences(s.folder),sources:projectSources(s.folder)});
   }
   if (pathname === '/admin/agent/session/project/source' && method === 'POST') {
@@ -708,7 +852,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   if (pathname === '/admin/agent/session/project' && method === 'POST') {
     const b=await readJson(req,200000),s=await known(b.id);requireTrust(s.folder);
     if(b.confirm!==true)throw new GatewayError('Confirm changes to this folder’s Agent instructions and templates.',400,'agent_project_consent');
-    if(s.busy||s.sending||s.undoing||terminalInFolder(s.folder)||folderConflict(s))throw new GatewayError('Wait for this folder to be idle before saving project preferences.',409,'agent_busy');
+    if(s.busy||s.sending||s.undoing||s.recording||terminalInFolder(s.folder)||folderConflict(s))throw new GatewayError('Wait for this folder to be idle before saving project preferences.',409,'agent_busy');
     try{return json(res,200,{...saveProjectPreferences(s.folder,b),sources:projectSources(s.folder)});}catch(e:any){throw new GatewayError(e.message,409,'agent_project');}
   }
   if (pathname === '/admin/agent/session/prompt' && method === 'POST') {
@@ -725,10 +869,11 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     if (s.undoing || s.sending) throw new GatewayError('Wait for the current action to finish before sending another message.', 409, 'agent_busy');
     s.sending = true;
     try {
-    await s.recording;
+    await recordTurn(s);
     if(existsSync(journalFile(s.id)))throw new GatewayError('Resolve the interrupted Undo before sending more work. Reconnect when the engine is idle to recover it safely.',409,'agent_undo_recovery');
-    if([...sessions.values()].some(x=>x.id!==s.id&&sameFolder(x.folder,s.folder)&&(x.undoing||x.sending)))throw new GatewayError('Another session in this folder is changing a backup boundary. Wait for it to finish.',409,'agent_busy');
-    if(folderConflict(s)){s.unsafeTurn='busy';for(const other of sessions.values())if(other.id!==s.id&&sameFolder(other.folder,s.folder)&&other.busy)other.unsafeTurn='busy';}
+    if([...sessions.values()].some(x=>x.id!==s.id&&foldersOverlap(x.folder,s.folder)&&(x.undoing||x.sending||x.recording)))throw new GatewayError('Another session in this folder is changing a backup boundary. Wait for it to finish.',409,'agent_busy');
+    if(!s.busy)s.unsafeTurn=undefined;
+    invalidateOverlappingBackups(s);
     // A restarted engine may have captured an incomplete catalog. Restore this session's pin before enqueueing any work.
     const pinned = await engine('GET', `/api/session/${enc(s.id)}`);
     const pinnedId = pinned?.model?.modelID || pinned?.model?.id;
@@ -753,19 +898,23 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
       const entry = `/api/experimental/session/${enc(s.id)}/instructions/entries/${key}`;
       if (value.trim()) await engine('PUT', entry, { value: { text: value, source } }); else await engine('DELETE', entry);
     }
-    // Folder backups (for Undo) are off unless switched on: then nothing is copied, and turns are recorded without undo.
-    if(s.busy)s.unsafeTurn=s.unsafeTurn||'busy';else if(!folderConflict(s))s.unsafeTurn=undefined;
+    // Folder copies (for Undo) are opt-in; unbacked completions retain hashes, not raw file contents.
+    if(s.busy)s.unsafeTurn=s.unsafeTurn||'busy';
+    const boundary = s.executionEpoch;
+    let prepared: Backup | undefined;
     if (!s.busy && settings.agentBackups === true) {
-      s.backup = await captureBackup(s.folder);
-      mkdirSync(path.dirname(pendingFile(s.id)), { recursive: true });
-      writeFileAtomic(pendingFile(s.id), JSON.stringify(s.backup));
-    } else if (!s.busy) {
-      // A backup left from before (switched off since, or from before a restart) must not stand for this turn's starting point.
-      s.backup = undefined; try { unlinkSync(pendingFile(s.id)); } catch {}
+      prepared = await captureBackup(s.folder);
     }
-    s.retries = 0; s.paused = undefined; setAgentPause(s.id);
+    const overlapping = await activeInFolder(s.folder);
+    if(s.undoing||s.recording||s.completions.length||terminalInFolder(s.folder)||[...sessions.values()].some(x=>x.id!==s.id&&foldersOverlap(x.folder,s.folder)&&(x.undoing||x.sending||x.recording)))throw new GatewayError('Another action changed the backup boundary. Wait for it to finish before sending.',409,'agent_busy');
+    if(overlapping.some(id=>id!==s.id)||boundary!==s.executionEpoch)s.unsafeTurn=s.unsafeTurn||'busy';
+    invalidateOverlappingBackups(s);
     // limited: the folder is bigger than one backup covers, so the page says that some changes cannot be undone from Polygate.
     const attachments = engineFiles(files);
+    requireTrust(s.folder);
+    if (!s.busy && !overlapping.includes(s.id) && boundary === s.executionEpoch) s.backup = prepared;
+    persistPending(s);
+    s.retries = 0; s.paused = undefined; setAgentPause(s.id);
     return json(res, 200, { ok: true, message: await engine('POST', `/api/session/${encodeURIComponent(s.id)}/prompt`, { text, delivery, ...(attachments.length ? { files: attachments } : {}), ...(skills.length ? { skills } : {}) }), ...(s.backup?.limited ? { limited: true } : {}) });
     } finally { s.sending = false; }
   }
@@ -787,7 +936,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     }
     return json(res, 200, { ok: true });
   }
-  if (pathname === '/admin/agent/session/changes' && method === 'GET') { const s = await known(url.searchParams.get('id')); return json(res, 200, { turns: loadTurns(s).map(publicTurn) }); }
+  if (pathname === '/admin/agent/session/changes' && method === 'GET') { const s = await known(url.searchParams.get('id')); await recordTurn(s); return json(res, 200, { turns: loadTurns(s).map(publicTurn) }); }
   if (pathname === '/admin/agent/session/undo' && method === 'POST') {
     const b = await readJson(req); const s = await known(b.id); const out = await undoTurn(s, String(b.message || ''));
     if (out.conflicts) return json(res, 409, { error: { type: 'agent_undo_conflict', message: `Nothing was undone. ${out.conflicts.map(c => `${c.file}: ${c.reason}`).join(' ')} Undoing would overwrite that.` }, conflicts: out.conflicts });
@@ -809,7 +958,7 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     if (!title) throw new GatewayError('Give the session a name.', 400);
     await engine('PATCH', `/api/session/${enc(s.id)}`, { title }); return json(res, 200, { ok: true, title });
   }
-  if (pathname === '/admin/agent/session/cancel' && method === 'POST') { const s = await known((await readJson(req)).id); await engine('POST', `/api/session/${encodeURIComponent(s.id)}/interrupt`); return json(res, 200, { ok: true }); }
+  if (pathname === '/admin/agent/session/cancel' && method === 'POST') { const s = await known((await readJson(req)).id,false); await engine('POST', `/api/session/${encodeURIComponent(s.id)}/interrupt`); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/session/mode' && method === 'POST') {
     const b = await readJson(req); const mode = checkMode(b.mode); const s = await known(b.id);
     requireTrust(s.folder);
@@ -821,10 +970,10 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     publish(s.id, { type: 'agent.mode', data: { sessionID: s.id, mode } });
     return json(res, 200, { ok: true, mode });
   }
-  if (pathname === '/admin/agent/rules' && method === 'GET') { const s = await known(url.searchParams.get('id')); return json(res, 200, { rules: projectRules(s.folder), inspections: inspectionCommands() }); }
+  if (pathname === '/admin/agent/rules' && method === 'GET') { const s = await known(url.searchParams.get('id'),false); return json(res, 200, { rules: projectRules(s.folder), inspections: inspectionCommands() }); }
   if (pathname === '/admin/agent/rules/remove' && method === 'POST') { const b = await readJson(req), s = await known(b.id); removeProjectRule(s.folder, String(b.rule || '')); return json(res, 200, { ok: true }); }
   if (pathname === '/admin/agent/events' && method === 'GET') {
-    const s = await known(url.searchParams.get('id'));
+    const s = await known(url.searchParams.get('id'),false);
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
     const journal = eventJournal(s.id), last = String(req.headers['last-event-id'] || ''), split = last.lastIndexOf(':'), epoch = last.slice(0, split), seq = Number(last.slice(split + 1));
     const replay = !!last && epoch === eventEpoch && Number.isSafeInteger(seq) && seq >= 0 && seq <= journal.seq && seq >= (journal.entries[0]?.seq ?? journal.seq + 1) - 1;

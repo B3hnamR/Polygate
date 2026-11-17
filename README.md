@@ -36,7 +36,7 @@ Your tools keep one base URL and one key. Polygate picks the model, moves to ano
 | **Free providers, built in** | OpenCode Free and Kilo Free, with their current catalogs. Add a Z.ai (ZCode) account or any OpenAI-compatible API beside them. |
 | **One address for your tools** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages endpoints. |
 | **Automatic model selection** | Use `auto`, `auto:smart`, or `auto:fast`; Polygate can try another model when one is busy or rate-limited. Or name your own **chain** (`my-coding`: try model A, then B, then C). |
-| **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool (from public lists or your own list links), WARP, Psiphon, and deployable relays. |
+| **Control your connection** | Direct access, HTTP/SOCKS proxies, a verified proxy pool (from public lists or your own list links), WARP, Psiphon, Surfshark with your own subscription, and deployable relays. |
 | **One MCP address for your tools** | Add MCP servers once; every AI client gets all their tools from `/mcp` with its Polygate key, reached through your own routes. |
 | **A coding agent in the app** | The Windows app has an **Agent** workspace: sessions per folder, permission modes, each turn's changed files with Undo. It runs on the models your gateway already serves. |
 | **Limits that hold** | Client keys can carry a token budget, a per-minute limit, an expiry and a model list. A request that cannot fit is refused, not cut short. |
@@ -277,15 +277,21 @@ The page has ready-to-paste settings for Claude Code, Cursor, Codex, OpenCode, V
 
 A *route* is the path a request takes to the provider. Pick one on the Routing page, and give a provider its own route if it needs one.
 
-In the side menu, **Routing** opens a sub-menu: **Proxies**, **Relays**, **WARP** and **Psiphon**, each with its own settings. The Routing page itself lists every exit, the one in use, and the policy for exits that are used up or cannot connect.
+In the side menu, **Routing** opens a sub-menu: **Proxies**, **Relays**, **WARP**, **Psiphon** and **Surfshark**, each with its own settings. The Routing page itself lists every exit, the one in use, and the policy for exits that are used up or cannot connect.
 
-The Routing page has two views of the same settings. *List* shows the exits and switches one under another. *Map* shows providers and exits as nodes joined by lines: drag from a provider to an exit (or back) to join them, drag the dot near a line's end to move it to another exit, click a line to pause or remove it, and pause any node from its own button. A paused line keeps its place and is not used. Z.ai keeps one steady address: Direct, or one proxy of your own. Relays, the proxy pool, WARP and Psiphon change address between requests, so they are not offered for it. The map works from the keyboard through its side panel.
+The Routing page has two views of the same settings. *List* shows the exits and switches one under another. *Map* shows providers and exits as nodes joined by lines: drag from a provider to an exit (or back) to join them, drag the dot near a line's end to move it to another exit, click a line to pause or remove it, and pause any node from its own button. A paused line keeps its place and is not used. Z.ai keeps one steady address: Direct, or one proxy of your own. Relays, the proxy pool, WARP, Psiphon and Surfshark can change address between requests, so they are not offered for it. The map works from the keyboard through its side panel.
 
 - **Direct**: your own connection.
 - **HTTP / SOCKS proxy**: your own proxy, or the **verified proxy pool**: Polygate downloads public lists, tests them with real model requests, and keeps the ones that work. Under **My proxies and lists** you can paste proxies and links to lists (plain `ip:port`, `socks5://…`, `user:pass@ip:port`, `ip:port:user:pass`, web-page tables, JSON), or save list links that every search downloads before (or instead of) the public lists.
 - **Cloudflare WARP**: a built-in MASQUE tunnel over HTTP/2, using a bundled helper built from usque (MIT). It changes nothing on the machine: no network interface, route, DNS or firewall rule, only a local SOCKS port on `127.0.0.1` that Polygate's own requests use. If another program already uses that port (Cloudflare's own `warp-cli` and some xray setups use 40000), Polygate picks the next free one and never touches the other program. It needs outbound TCP 443 and normal DNS access, and splits the first part of the TLS handshake on networks that reset it (names inside the tunnel are looked up through `8.8.8.8` and `9.9.9.9`, not Cloudflare's own resolver; the helper program can be changed only in the Windows app, or on a server with the admin token), so it works where WireGuard/UDP is blocked. Cloudflare's WARP exit addresses are shared, so a service can still rate-limit an exit while the tunnel itself is healthy.
 - **Psiphon**: tick the regions you want under **Routing → Psiphon** and press **Connect**. Polygate runs Psiphon's own client (bundled, GPL-3.0, from Psiphon Inc.'s official builds) once per region, each on its own local SOCKS port, and together they are one route named **Psiphon**. Choose **Take turns** (each request uses the next connected region) or **Stay on one region**. When OpenCode Free or Kilo says a region's exit is used up, the request goes on through the next region, and the region reconnects for a new address that is checked with that same provider before it carries that provider's requests again (at most three new addresses an hour per region). Other providers keep using the region meanwhile. **Test** checks every connected region through its own exit. **Update servers** connects once to fetch Psiphon's current servers and regions. Each request line in Logs names the region it went through (`via Psiphon NL`), and a line under Logs → Psiphon says when a request moved from one region to another and why. Like WARP it changes nothing on the machine. It runs on Windows and Linux x86-64; Psiphon publishes no Linux arm64 client.
 - **Relays**: one click on the Relays page deploys a small forwarding function to your own Vercel, Netlify or Cloudflare account. The platform token is used for the deploy and is kept only if you tick **Remember this token** (encrypted with your other settings, never shown again; the dialog can forget it). On Vercel you can tick several regions and deploy them one after another. A relay Polygate deployed can be **updated** to the current relay code from its row, and deleting it can remove its project, site or Worker from the platform as well. A table on the Relays page shows how each relay has done (worked, refused, redirected, failed), so a region that never works can be replaced.
+
+**Surfshark (new in 0.6.6).** Use your existing Surfshark subscription and a WireGuard key pair from your account's **VPN → Manual setup → Desktop or mobile → WireGuard** page. Under **Routing → Surfshark**, save the key pair, press **Update servers**, choose and **Save locations**, then **Connect**. Choose **Make it the route in use**, or assign the route to a supported provider on the Routing page. No Surfshark account or key is bundled with Polygate.
+
+Each chosen location runs its own wireproxy tunnel; together they form one **Surfshark** route. Choose **Take turns** or **Stay on one location**. Used-up exits can be skipped per provider, and reconnecting can try for a different address, but shared exits may already be rate-limited and a new address is not guaranteed. The helper is wireproxy 1.1.3 (ISC), available on Windows x64 and Linux amd64/arm64. It needs DNS, HTTPS access for the server list, and **outbound UDP 51820** to Surfshark; it will not connect where that WireGuard traffic is blocked.
+
+These are gateway-only tunnels, not a system VPN: they add no system network adapter and change no system routes, DNS or firewall rules. Other applications are not routed through them, and Polygate's routing policy still controls fallback. Polygate is not an official Surfshark app and is not affiliated with Surfshark.
 
 Press **Test** on a route to send one small request through it with the provider you pick. The result names the model that was asked and passes only when the answer finished; another model can still be refused.
 
@@ -350,6 +356,8 @@ The dashboard checks for a newer **published stable release** when you open it, 
 > Update notices and Windows one-click updates are included from **v0.2.1**. If you use the v0.2.0 Windows app, download and open v0.2.1 once; future updates can then be installed from the app. Linux users can run `sudo polygate update` to get the new dashboard notices.
 
 Checks contact GitHub directly and are cached. Downloads only begin when you click the Windows update button. A failed download or checksum check leaves the current app running.
+
+**0.6.6 is a recommended update** for safer Windows portable cleanup and Linux release retention, alongside routing, Agent and dashboard fixes. See the [0.6.6 release notes](docs/releases/0.6.6.md). Back up your settings before replacing the application and keep the existing data directory. The Windows app remains unsigned.
 
 ## Managing a server
 
@@ -427,18 +435,20 @@ Most things are changed in the dashboard. A server reads these environment varia
 | Kilo: *stopped answering from this network address* | Kilo's anonymous limit for the address. All Kilo models rest for 30 minutes and then try again. You can save an optional Kilo key on its provider row; whether it lifts this limit has not been verified here. |
 | WARP: *Could not start a WARP tunnel* | the message says what was tried and what most likely happened. *Your network reset the connection* means the network blocks Cloudflare's MASQUE servers; *did not answer in time* means the traffic is dropped or very slow. If a VPN or proxy program is running on this computer, turn it off first (WARP runs its own tunnel, and a VPN in between often breaks it). WARP tries a plain handshake first and splits it only if the network resets that (**Handshake splitting** in the WARP settings forces either way). You can also set a different MASQUE endpoint (the default tries `162.159.198.183`, then `162.159.198.2`), try another network, or use a proxy or relay route instead. |
 | WARP is connected but a service still refuses the exit | WARP exit addresses are shared and can be rate-limited. Ask for a **New identity**, or use a proxy or relay route for that service. |
+| Surfshark: the WireGuard handshake never completes | Check outbound UDP 51820 and DNS access, and confirm that the manual WireGuard key pair is still valid in your Surfshark account. A connected tunnel does not guarantee provider allowance. |
 | HTTPS fails at the certificate step | check that the domain points at the server, that ports 80 and 443 reach it (also in your hosting provider's firewall), and that nothing else uses them. Run `sudo polygate https status` for the exact reason. |
 | The Linux installer stops with *problems to fix* | it lists them and changed nothing. Fix them and run it again, or use `--check` to look first. |
 | Nothing works after an update | `polygate doctor`, then `polygate logs`. A failed update puts the previous release back by itself. |
 
 ## Development
 
-With Node.js, npm, and Bun installed (release builds use Bun 1.4.4):
+With Node.js, npm, Bun and Python 3 installed (release builds use Bun 1.4.4):
 
 ```bash
 git clone https://github.com/B3hnamR/Polygate.git
 cd Polygate
 npm install
+python scripts/fetch-wireproxy.py all  # verified Surfshark helpers for resource checks
 bun run check        # type check
 bun test tests       # the test suite
 bun run dev          # dashboard + gateway with live reload
@@ -446,7 +456,9 @@ bun run dev          # dashboard + gateway with live reload
 
 `backend/` is the gateway (Bun, no framework), `src/` the dashboard (React), `desktop/` the Windows app (Electron), `relays/` the relay templates,
 `install.sh` and `install/` the Linux installer and the `polygate` command, `vendor/` code reused from other open projects (see below).
-Releases are built on the maintainer's machine with the commands below and published with their `.sha256` files; the workflows in `.github/` describe the same steps but are not run for releases.
+The release workflow validates the release commit, builds Windows and Linux artifacts, and prepares a draft for review. The commands below also build locally; they do not publish a release. Each published package has a `.sha256` file.
+
+Surfshark helper binaries are not committed to Git. `scripts/fetch-wireproxy.py` retrieves the pinned upstream archives and verifies their SHA-256 and extracted helper hashes; Windows and Linux package builds call it automatically for their target. Before source tests that check bundled resources, fetch all helpers as above (`python3` on systems where that is the Python command). `--offline` uses only already available, verified files or cache entries and fails if they are missing or do not match. Runtime credentials and local state are not build inputs.
 
 To build the portable Windows app in PowerShell, with Python available:
 

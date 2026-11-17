@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { stateDir, settings, models, saveModel, removeModel, usagePenalties, redactError } from './state';
 import { cancellable } from './cancel';
 import { networkFetch, routeContext, routeForProvider, providerRoutes } from './transport';
@@ -15,7 +15,7 @@ process.env.ZEN_PROXY_CONFIG=stateDir+'/unused-protocol-settings.json';
 const bridge=require('../vendor/bridge/server.js');
 const proxy=require('../vendor/bridge/proxy.js');
 proxy.netFetch=(url:any,init:any)=>networkFetch(url,init);
-let bridgeUrl=''; let bridgeServer:ReturnType<typeof serve>|undefined; let discovery:Promise<void>|undefined;
+let bridgeUrl='', bridgeSecret=''; let bridgeServer:ReturnType<typeof serve>|undefined; let discovery:Promise<void>|undefined;
 export const identityState=()=>bridge.identity.getState();
 // The OpenCode version the bridge presents to OpenCode Free (its identity recipe); the agent's engine must run the same one. Tests set it.
 let presentedOverride:string|undefined;
@@ -24,10 +24,18 @@ export const __setPresentedVersion=(v?:string)=>{presentedOverride=v;};
 export async function syncIdentity(){return await bridge.identity.refresh({force:true});}
 export async function initBridge(){
   if(bridgeUrl)return;
-  bridgeServer=serve((req,res)=>routeContext.run({routeId:String(req.headers['x-polygate-route']||settings.routeId),requestId:String(req.headers['x-polygate-request']||'')||undefined},()=>bridge.handleRequest(req,res)),0);
+  const secret=randomBytes(32).toString('hex');
+  bridgeServer=serve((req,res)=>{
+    const supplied=req.headers['x-polygate-bridge'];
+    if(bridgeSecret!==secret||typeof supplied!=='string'||!/^[a-f0-9]{64}$/.test(supplied)||!timingSafeEqual(Buffer.from(supplied),Buffer.from(secret))){res.writeHead(401,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({error:{message:'Internal bridge authentication required',type:'authentication_error'}}));return;}
+    if(req.method!=='POST'||req.url!=='/v1/chat/completions'){res.writeHead(404);res.end();return;}
+    delete req.headers['x-polygate-bridge'];
+    return routeContext.run({routeId:String(req.headers['x-polygate-route']||settings.routeId),requestId:String(req.headers['x-polygate-request']||'')||undefined},()=>bridge.handleRequest(req,res));
+  },0);
+  bridgeSecret=secret;
   bridgeUrl=`http://127.0.0.1:${bridgeServer.port}`;
 }
-export function stopBridge(){bridgeServer?.stop(true);}
+export function stopBridge(){const server=bridgeServer;bridgeServer=undefined;bridgeUrl='';bridgeSecret='';server?.stop(true);}
 export function codingScore(id:string){let score=50;if(/coder|code|deepseek|qwen|glm/i.test(id))score+=15;if(/reason|thinking/i.test(id))score+=8;if(/flash|mini|light/i.test(id))score-=4;const n=Number(id.match(/(\d+)b(?:\b|-)/i)?.[1]);if(n>=70)score+=10;return score;}
 export function rankedModels(){const penalty=usagePenalties();return [...models.values()].filter(m=>settings.providers.some(p=>p.id===m.providerId&&p.enabled)).sort((a,b)=>{const ca=a.cooldownUntil>Date.now()?1:0,cb=b.cooldownUntil>Date.now()?1:0;return ca-cb||a.priority-b.priority||(b.score-(penalty.get(b.id)||0))-(a.score-(penalty.get(a.id)||0))||(a.latency||1e9)-(b.latency||1e9);});}
 const ABSENT='Absent from latest provider catalog';
@@ -85,7 +93,10 @@ const catalogRoute=(p:Provider)=>{try{return routeForProvider(p,'').id;}catch{re
 // preserves usage from a consumed refusal before the adapter changes/retries its payload.
 export type GenerationAccounting={before:(chat:any)=>void;failed:(usage?:unknown)=>void};
 export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId='',accounting?:GenerationAccounting):Promise<Response>{
-  if(p.kind==='free')return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
+  if(p.kind==='free'){
+    if(!bridgeUrl||!bridgeSecret)throw new GatewayError('The internal Free bridge is not running',503,'provider_unavailable');
+    return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',redirect:'error',headers:{'content-type':'application/json','x-polygate-bridge':bridgeSecret,'x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
+  }
   if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined},()=>realOpenCode(p,model,body,signal,routeId));
   if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined},()=>kiloChat(p,model,body,signal,routeId,accounting));
   // Z.ai chooses its own exit (zai.ts): Direct or the one proxy set for it, whatever the route's failover would pick.
@@ -100,17 +111,19 @@ const refusesOutput=(text:string)=>/max_(?:completion_|output_)?tokens|max.?toke
 // A request asking for more output than the model allows is refused with 400. It is asked once more with the limit the refusal names
 // (or 8k when it names none), and the limit that worked is kept on the model, so later requests are sent within it from the start.
 export async function withOutputLimit(m:Model,body:any,send:(b:any)=>Promise<Response>,accounting?:GenerationAccounting){
-  const key=OUTPUT_KEYS.find(k=>typeof body[k]==='number');
-  const first=key&&m.output>0&&body[key]>m.output?{...body,[key]:m.output}:body;
+  const keys=OUTPUT_KEYS.filter(k=>typeof body[k]==='number'&&Number.isFinite(body[k]));
+  const clamp=(value:any,limit:number)=>Object.fromEntries(keys.map(k=>[k,Math.min(value[k],limit)]));
+  const first=keys.length&&m.output>0&&keys.some(k=>body[k]>m.output)?{...body,...clamp(body,m.output)}:body;
   const r=await send(first);
-  if(r.status!==400||!key)return r;
+  if(r.status!==400||!keys.length)return r;
   const text=await r.text().catch(()=>'');const again=()=>new Response(text,{status:400,headers:{'content-type':r.headers.get('content-type')||'application/json'}});
   if(accounting){let usage;try{usage=JSON.parse(text)?.usage;}catch{}accounting.failed(usage);}
   if(!refusesOutput(text))return again();
-  const named=namedOutputLimit(text),next=named>0&&named<first[key]?named:Math.min(8192,first[key]-1);
-  if(next<256||next>=first[key])return again();
-  const retry=await send({...first,[key]:next});
-  if(retry.ok){m.output=next;saveModel(m);logEvent('info','models',`${m.id} refused ${first[key]} output tokens; it was asked again with ${next}, and Polygate keeps that limit for it`,{model:m.id});}
+  const requested=Math.max(...keys.map(k=>first[k]));
+  const named=namedOutputLimit(text),next=named>0&&named<requested?named:Math.min(8192,requested-1);
+  if(next<256||next>=requested)return again();
+  const retry=await send({...first,...clamp(first,next)});
+  if(retry.ok){m.output=next;saveModel(m);logEvent('info','models',`${m.id} refused ${requested} output tokens; it was asked again with ${next}, and Polygate keeps that limit for it`,{model:m.id});}
   return retry;
 }
 async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,routeId:string){

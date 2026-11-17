@@ -1,6 +1,7 @@
-import { expect, test, afterAll } from 'bun:test';
+import { expect, test, afterAll, spyOn } from 'bun:test';
 import { preserveTestState } from './setup';
 import net from 'node:net';
+import dns from 'node:dns/promises';
 // The state folder comes from tests/setup.ts (shared by every test file and removed after the run).
 const engine = await import('../backend/proxy-engine');
 const restore = preserveTestState();
@@ -71,7 +72,7 @@ test('Proxies that passed are saved fastest first, can be removed, and a check j
 });
 test('SOCKS4 and SOCKS5 proxy URLs are both understood by the bridge', async () => {
   const { parseSocksUrl } = await import('../backend/socks-bridge');
-  expect(parseSocksUrl('socks4://1.2.3.4:1081')).toMatchObject({ version: 4, host: '1.2.3.4', port: 1081 }); expect(parseSocksUrl('socks4a://u@1.2.3.4')).toMatchObject({ version: 4, port: 1080, username: 'u' });
+  expect(parseSocksUrl('socks4://1.2.3.4:1081')).toMatchObject({ version: 4, host: '1.2.3.4', port: 1081, remoteDns: false }); expect(parseSocksUrl('socks4a://u@1.2.3.4')).toMatchObject({ version: 4, port: 1080, username: 'u', remoteDns: true });
   expect(parseSocksUrl('socks5h://u:p@1.2.3.4:1')).toMatchObject({ version: 5, username: 'u', password: 'p' }); expect(parseSocksUrl('http://1.2.3.4:80')).toBeNull();
 });
 test('Lists in any format are read: logins in either place, small ranges, web-page tables and JSON records', () => {
@@ -96,4 +97,20 @@ test('Downloaded lists keep only IP addresses, so a host name cannot point the s
   const text = ['8.8.4.4:3128', 'proxy.example.com:8080', 'socks5://evil.example.net:1080', '[2606:4700::1111]:3128'].join('\n');
   expect(engine.parseProxyText(text, 'http', true).map(c => c.host)).toEqual(['8.8.4.4', '[2606:4700::1111]']);
   expect(engine.parseProxyText(text, 'http').map(c => c.host)).toEqual(['8.8.4.4', 'proxy.example.com', 'evil.example.net', '[2606:4700::1111]']);
+});
+
+test('SOCKS4a sends the hostname and user id to the proxy, without resolving the destination locally', async () => {
+  const { socksConnect, parseSocksUrl } = await import('../backend/socks-bridge');
+  const host = 'never-resolve-this.invalid'; let received = Buffer.alloc(0);
+  const proxy = await listen(c => c.on('data', (d: Buffer) => {
+    received = Buffer.concat([received, d]);
+    if (received.length >= 8 + Buffer.byteLength('fixture') + 1 + Buffer.byteLength(host) + 1) c.write(Buffer.from([0, 0x5a, 0, 0, 0, 0, 0, 0]));
+  }));
+  const lookup = spyOn(dns, 'lookup').mockImplementation(async () => { throw new Error('SOCKS4a must not resolve the target locally'); });
+  let tunnel: net.Socket | undefined;
+  try {
+    tunnel = await socksConnect(parseSocksUrl(`socks4a://fixture@127.0.0.1:${port(proxy)}`)!, host, 443, 1000);
+    expect(received).toEqual(Buffer.concat([Buffer.from([4, 1, 1, 187, 0, 0, 0, 1]), Buffer.from(`fixture\0${host}\0`)]));
+    expect(lookup).not.toHaveBeenCalled();
+  } finally { lookup.mockRestore(); tunnel?.destroy(); proxy.close(); }
 });

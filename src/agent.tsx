@@ -9,7 +9,7 @@ import {Dialog} from './mcp';
 import {Markdown} from './markdown';
 import {plainError} from '../backend/plain-error';
 import {AgentDiff as Diff} from './agent-diff';
-import {AgentWorkspace} from './agent-workspace';
+import {AgentWorkspace,type WorkspaceTab} from './agent-workspace';
 import {AgentForms} from './agent-forms';
 import {AgentLibrarySettings} from './agent-library';
 import {SkillChips,SkillMenu} from './agent-skills';
@@ -23,7 +23,7 @@ type Models={models:AgentModel[];modes:Record<string,string>};
 type RouteUsage={requests:number;errors:number;input:number;output:number;last:number;routes:{route:string;requests:number}[]};
 type SessionInfo={id:string;title:string;mode:Mode|'';model:string;effort:string;folder:string;created?:number;tokens?:{input:number;output:number;reasoning?:number;cache?:{read:number;write:number}}};
 type FolderInfo={folder:string;trusted:boolean};
-// What a new session hands to its first view: a message that could not be sent, or a note about its backup.
+// What a new session hands to its first view: unsent draft edits, a send error, or a note about its backup.
 type Opening={draft?:string;files?:AgentFile[];skills?:SkillPick[];error?:string;notice?:string};
 const cap=(s:string)=>s.charAt(0).toUpperCase()+s.slice(1);
 const sameFolder=(a:string,b:string)=>a.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase()===b.replace(/\\/g,'/').replace(/\/$/,'').toLowerCase();
@@ -47,7 +47,8 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const resync=async()=>{const r=await api('/admin/agent/models/sync',{});reloadModels();return Number(r.models)||0;};
   const {data:folderList,reload:reloadFolders}=usePoll<{folders:FolderInfo[];scratch?:string}>('/admin/agent/folders',15000);
   const [open,setOpen]=useState(()=>stored('polygate-agent-open'));const [fresh,setFresh]=useState<{info:SessionInfo;opening:Opening}|null>(null);
-  const [settings,setSettings]=useState(false);const [problem,setProblem]=useState('');
+  const [settings,setSettings]=useState<SettingsSection|null>(null);const [problem,setProblem]=useState('');
+  useEffect(()=>{const open=(e:Event)=>setSettings(((e as CustomEvent).detail as SettingsSection)||'general');window.addEventListener('polygate-agent-settings',open);return()=>window.removeEventListener('polygate-agent-settings',open);},[]);
   // The Agent's font, remembered on this computer (Agent settings → Appearance).
   const [font,setFont]=useState(()=>stored('polygate-agent-font')||'default');const pickFont=(id:string)=>{setFont(id);store('polygate-agent-font',id);};
   const [busy,setBusy]=useState('');
@@ -101,14 +102,14 @@ export function AgentApp({onBack}:{onBack:()=>void}){
       <div className="ag-side-foot">
         <span className={`ag-dot ${engineTone(engine?.state||'')}`}/><span className="truncate">{engine?`Engine ${(ENGINE_LABEL[engine.state]||engine.state).toLowerCase()}`:'Engine'}</span>
         <span className="toolbar-spacer"/>
-        <button className="icon-button" aria-label="Agent settings" title="Agent settings" onClick={()=>setSettings(true)}><Settings2 size={17}/></button>
+        <button className="icon-button" aria-label="Agent settings" title="Agent settings" onClick={()=>setSettings('general')}><Settings2 size={17}/></button>
       </div>
     </aside>
     <main className="ag-main">
       {problem&&<div className="pg-error ag-problem" role="alert"><span>{problem}</span><button className="icon-button" aria-label="Dismiss" onClick={()=>setProblem('')}><X size={14}/></button></div>}
       {main}
     </main>
-    {settings&&<AgentSettings font={font} onFont={pickFont} engine={engine||null} busy={busy} act={act} folders={folderList?.folders||[]} reloadEngine={reloadEngine} reloadFolders={reloadFolders} onClose={()=>setSettings(false)}/>}
+    {settings&&<AgentSettings section={settings} font={font} onFont={pickFont} engine={engine||null} busy={busy} act={act} folders={folderList?.folders||[]} reloadEngine={reloadEngine} reloadFolders={reloadFolders} onClose={()=>setSettings(null)}/>}
     {dialog}
   </div>;
 }
@@ -136,34 +137,62 @@ function EngineCard({engine,busy,act}:{engine:Engine;busy:string;act:(path:strin
   </div>;
 }
 
-// Settings that belong to the agent alone: its engine, folder backups for undo, and the folders it may work in.
-function AgentSettings({font,onFont,engine,busy,act,folders,reloadEngine,reloadFolders,onClose}:{font:string;onFont:(id:string)=>void;engine:Engine|null;busy:string;act:(path:string,label:string)=>void;folders:FolderInfo[];reloadEngine:()=>void;reloadFolders:()=>void;onClose:()=>void}){
+// Agent settings, laid out like a desktop app's settings: the sections on the left (with a search that narrows them), the chosen
+// section on the right as rows, each a name and a sentence on the left and its control on the right.
+export type SettingsSection='general'|'appearance'|'instructions'|'skills'|'mcp'|'folders';
+const SECTIONS:{id:SettingsSection;label:string;icon:typeof Brain;words:string}[]=[
+  {id:'general',label:'General',icon:Settings2,words:'engine opencode start stop install version undo backup backups restore'},
+  {id:'appearance',label:'Appearance',icon:Pencil,words:'font typeface text look persian'},
+  {id:'instructions',label:'Instructions',icon:ScrollText,words:'system prompt rules language style always'},
+  {id:'skills',label:'Skills',icon:BookOpen,words:'skill skills slash templates SKILL.md import built-in'},
+  {id:'mcp',label:'MCP tools',icon:Workflow,words:'mcp tools servers sharing hub'},
+  {id:'folders',label:'Folders',icon:Folder,words:'working folders trust revoke allowed'},
+];
+// Anything in the Agent can open settings at a section (the skill list's "Manage skills", for one).
+export const openAgentSettings=(section:SettingsSection='general')=>window.dispatchEvent(new CustomEvent('polygate-agent-settings',{detail:section}));
+function AgentSettings({section:first,font,onFont,engine,busy,act,folders,reloadEngine,reloadFolders,onClose}:{section:SettingsSection;font:string;onFont:(id:string)=>void;engine:Engine|null;busy:string;act:(path:string,label:string)=>void;folders:FolderInfo[];reloadEngine:()=>void;reloadFolders:()=>void;onClose:()=>void}){
   const [error,setError]=useState('');const [backups,setBackups]=useState<boolean|null>(null);const {confirm,dialog}=useConfirm();
+  const [section,setSection]=useState<SettingsSection>(first);useEffect(()=>setSection(first),[first]);
+  const [query,setQuery]=useState('');
+  const words=query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const shown=SECTIONS.filter(s=>words.every(w=>`${s.label} ${s.words}`.toLowerCase().includes(w)));
+  const current=shown.some(s=>s.id===section)?section:shown[0]?.id;
   const on=backups??!!engine?.backups;
   const switchBackups=async(next:boolean)=>{setBackups(next);setError('');try{await api('/admin/settings',{agentBackups:next});reloadEngine();}catch(e:any){setBackups(null);setError(e.message);}};
   const revoke=async(folder:string)=>{
     if(!await confirm(<>Stop running turns in <code>{folder}</code> and require consent again before another message there? Saved project rules remain stored.</>,{title:'Revoke folder trust',confirm:'Revoke and stop',icon:<ShieldAlert size={18}/>}))return;
     setError('');try{await api('/admin/agent/trust/revoke',{folder});reloadFolders();}catch(e:any){setError(e.message);}
   };
-  return <Dialog title="Agent settings" icon={<Settings2 size={18}/>} onClose={onClose} wide>
-    <section className="ag-set"><h3>Engine</h3>{engine?<EngineCard engine={engine} busy={busy} act={act}/>:<p className="subtle">Checking the agent engine…</p>}</section>
-    <section className="ag-set"><h3>Appearance</h3>
-      <p className="subtle">The font for the whole Agent view: the conversation, the message box and the menus. Persian text keeps Vazirmatn. Remembered on this computer.</p>
-      <div className="ag-fonts" role="radiogroup" aria-label="Agent font">{AGENT_FONTS.map(f=><button type="button" key={f.id} role="radio" aria-checked={font===f.id} className={`ag-font${font===f.id?' chosen':''}`} style={f.family?{fontFamily:`'Agent Persian','${f.family}',sans-serif`}:undefined} onClick={()=>onFont(f.id)}>
-        <span className="ag-font-name">{f.label}{font===f.id&&<Check size={14}/>}</span><span className="ag-font-sample">The agent edited 3 files. سلام، کار انجام شد.</span><small>{f.note}</small>
-      </button>)}</div>
-    </section>
-    <section className="ag-set"><h3>Undo</h3>
-      <Toggle checked={on} onChange={switchBackups} label="Back up the working folder before each message"
-        detail="Lets you undo what the agent changed in a turn. Before each message Polygate copies the folder's files it has not copied yet: up to 20,000 files and 256 MB, files up to 8 MB each. Off: nothing is copied, and new turns cannot be undone from Polygate. Switching it off removes the copies only it kept; turns already recorded keep their undo."/>
-    </section>
-    <AgentLibrarySettings busy={!!busy}/>
-    <AgentMcpSettings running={!engine||['running','starting','restarting','stopping'].includes(engine.state)} busy={!!busy}/>
-    <section className="ag-set"><h3>Working folders</h3>
-      {folders.length?<ul className="ag-folders">{folders.map(f=><li key={f.folder}><Folder size={15}/><div><code title={f.folder}>{f.folder}</code><small className={f.trusted?'green':'amber'}>{f.trusted?'Allowed':'Needs review before the next message'}</small></div>{f.trusted&&<Button onClick={()=>revoke(f.folder)}>Revoke</Button>}</li>)}</ul>
-        :<p className="subtle">No folders yet. A folder is added when you allow the agent to work in it.</p>}
-    </section>
-    {error&&<div className="pg-error">{error}</div>}
+  const title=SECTIONS.find(s=>s.id===current)?.label||'Settings';
+  return <Dialog title="Agent settings" icon={<Settings2 size={18}/>} onClose={onClose} variant="settings">
+    <nav className="ag-settings-nav" aria-label="Settings sections">
+      <label className="ag-settings-search"><Search size={14}/><input type="search" aria-label="Search settings" placeholder="Search" value={query} onChange={e=>setQuery(e.target.value)}/></label>
+      {shown.map(s=>{const Icon=s.icon;return <button type="button" key={s.id} aria-current={current===s.id?'page':undefined} className={current===s.id?'active':undefined} onClick={()=>setSection(s.id)}><Icon size={15}/>{s.label}</button>;})}
+      {!shown.length&&<p className="subtle">Nothing matches “{query}”.</p>}
+    </nav>
+    <div className="ag-settings-pane">
+      {current&&<h3 className="ag-settings-title">{title}</h3>}
+      {current==='general'&&<>
+        <div className="ag-row ag-row-engine">{engine?<EngineCard engine={engine} busy={busy} act={act}/>:<p className="subtle">Checking the agent engine…</p>}</div>
+        <div className="ag-row"><div><strong>Back up before each message</strong><small>Lets you undo what the agent changed in a turn. Polygate copies files it has not copied yet: up to 20,000 files and 256 MB, 8 MB each. Off: new turns cannot be undone; switching it off removes only the copies it kept.</small></div>
+          <label className="ag-switch"><input type="checkbox" role="switch" aria-label="Back up the working folder before each message" checked={on} onChange={e=>switchBackups(e.target.checked)}/><span/></label></div>
+      </>}
+      {current==='appearance'&&<>
+        <p className="ag-settings-lead">The font for the whole Agent view: the conversation, the message box and the menus. Persian text keeps Vazirmatn. Remembered on this computer.</p>
+        <div className="ag-fonts" role="radiogroup" aria-label="Agent font">{AGENT_FONTS.map(f=><button type="button" key={f.id} role="radio" aria-checked={font===f.id} className={`ag-font${font===f.id?' chosen':''}`} style={f.family?{fontFamily:`'Agent Persian','${f.family}',sans-serif`}:undefined} onClick={()=>onFont(f.id)}>
+          <span className="ag-font-name">{f.label}{font===f.id&&<Check size={14}/>}</span><span className="ag-font-sample">The agent edited 3 files. سلام، کار انجام شد.</span><small>{f.note}</small>
+        </button>)}</div>
+      </>}
+      {/* One instance for both parts, kept while the window is open, so unsaved edits survive moving between sections. */}
+      <AgentLibrarySettings busy={!!busy} part={current==='instructions'?'prompt':current==='skills'?'skills':null}/>
+      {current==='mcp'&&<AgentMcpSettings running={!engine||['running','starting','restarting','stopping'].includes(engine.state)} busy={!!busy}/>}
+      {current==='folders'&&<>
+        <p className="ag-settings-lead">Folders you allowed the agent to work in. Revoking stops its turns there and asks again before the next message.</p>
+        {folders.length?<ul className="ag-folders">{folders.map(f=><li key={f.folder} className="ag-row"><div><code title={f.folder}>{f.folder}</code><small className={f.trusted?'green':'amber'}>{f.trusted?'Allowed':'Needs review before the next message'}</small></div>{f.trusted&&<Button onClick={()=>revoke(f.folder)}>Revoke</Button>}</li>)}</ul>
+          :<p className="subtle">No folders yet. A folder is added when you allow the agent to work in it.</p>}
+      </>}
+      {error&&<div className="pg-error">{error}</div>}
+    </div>
     {dialog}
   </Dialog>;
 }
@@ -382,13 +411,19 @@ function Attachments({files,remove}:{files:AgentFile[];remove?:(index:number)=>v
 // A new session: a folder, a model, a mode and the first message. Sending creates the session and sends the message to it.
 function NewSession({startFolder,models,folders,reloadFolders,onResync,onCreated}:{startFolder?:string|null;models:Models|null;folders:FolderInfo[];reloadFolders:()=>void;onResync:()=>Promise<number>;onCreated:(s:SessionInfo,opening:Opening)=>void}){
   const {confirm,dialog}=useConfirm();
+  const lifetime=useRef({active:false});
+  useEffect(()=>{const current={active:true};lifetime.current=current;return()=>{current.active=false;};},[]);
   // Full access is confirmed when it is picked, and never remembered as the mode the next session starts in.
-  const pickMode=async(m:Mode)=>{if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;setMode(m);};
+  const pickMode=async(m:Mode)=>{const current=lifetime.current;if(m==='full'&&!await confirm(FULL_WARNING,{title:'Start with Full access',confirm:'Use Full access',icon:<ShieldAlert size={18}/>}))return;if(current.active)setMode(m);};
   // "New session" starts with No folder (""); a folder's own + starts in that folder.
   const [folder,setFolder]=useState<string|null>(()=>startFolder!==undefined&&startFolder!==null?startFolder:'');
   const [model,setModel]=useState(()=>stored('polygate-agent-model'));const [effort,setEffort]=useState(()=>stored('polygate-agent-effort'));
   const [mode,setMode]=useState<Mode>(()=>{const m=stored('polygate-agent-mode');return MODES.some(x=>x.id===m&&x.id!=='full')?m as Mode:'ask';});
   const [text,setText]=useState('');const [files,setFiles]=useState<AgentFile[]>([]);const [skills,setSkills]=useState<SkillPick[]>([]);const [busy,setBusy]=useState(false);const [error,setError]=useState('');
+  const draft=useRef({text,files,skills}),draftRevision=useRef({text:0,files:0,skills:0}),starting=useRef(false);
+  const editText=(value:string)=>{draft.current.text=value;draftRevision.current.text++;setText(value);};
+  const editFiles=(value:AgentFile[])=>{draft.current.files=value;draftRevision.current.files++;setFiles(value);};
+  const editSkills=(value:SkillPick[])=>{draft.current.skills=value;draftRevision.current.skills++;setSkills(value);};
   const all=models?.models||[];const usable=all.filter(m=>m.usable);const current=usable.find(m=>m.id===model)||usable[0];
   const [trust,setTrust]=useState<{requested:string;report:TrustReport}|null>(null),[trustError,setTrustError]=useState(''),[trustReload,setTrustReload]=useState(0);const trustRequest=useRef(0);
   useEffect(()=>{
@@ -401,14 +436,22 @@ function NewSession({startFolder,models,folders,reloadFolders,onResync,onCreated
   // A folder picked from disk joins the recent folders at once.
   const pickFolder=(f:string)=>{++trustRequest.current;setTrust(null);setTrustError('');setFolder(f);reloadTrust();setError('');if(f)reloadFolders();};
   const start=async()=>{
-    const t=text.trim();if((!t&&!files.length&&!skills.length)||!current||!trusted)return;setBusy(true);setError('');
+    const currentLifetime=lifetime.current;if(!currentLifetime.active)return;
+    const submitted={...draft.current},revision={...draftRevision.current};const t=submitted.text.trim();
+    if(starting.current||(!t&&!submitted.files.length&&!submitted.skills.length)||!current||!trusted)return;starting.current=true;setBusy(true);setError('');
     const chosen=current.efforts.includes(effort)?effort:'';
     let s:SessionInfo;
-    try{s=await api('/admin/agent/session/create',{...(canonical?{folder:canonical}:{noFolder:true}),model:current.id,mode,confirmFull:mode==='full',effort:chosen,title:(t||skills[0]?.name||files[0]?.name||'Attachment').split('\n')[0].slice(0,80)});}catch(e:any){setError(e.message);setBusy(false);return;}
+    try{s=await api('/admin/agent/session/create',{...(canonical?{folder:canonical}:{noFolder:true}),model:current.id,mode,confirmFull:mode==='full',effort:chosen,title:(t||submitted.skills[0]?.name||submitted.files[0]?.name||'Attachment').split('\n')[0].slice(0,80)});}catch(e:any){if(currentLifetime.active){setError(e.message);starting.current=false;setBusy(false);}return;}
+    // Leaving this composer abandons preparation, but does not cancel an already posted prompt.
+    if(!currentLifetime.active)return;
     store('polygate-agent-model',current.id);store('polygate-agent-effort',chosen);if(mode!=='full')store('polygate-agent-mode',mode);
     // The session exists from here on: if the message cannot be sent, it opens with the message still in its box and the reason.
     let opening:Opening={};
-    try{const r=await api('/admin/agent/session/prompt',{id:s.id,text:t,files,skills:skills.map(k=>k.id)});if(r.limited)opening={notice:LIMITED};}catch(e:any){opening={draft:t,files,skills,error:e.message};}
+    try{const r=await api('/admin/agent/session/prompt',{id:s.id,text:t,files:submitted.files,skills:submitted.skills.map(k=>k.id)});
+      opening={draft:clearSubmitted(draft.current.text,submitted.text,'',draftRevision.current.text,revision.text),files:clearSubmitted(draft.current.files,submitted.files,[],draftRevision.current.files,revision.files),skills:clearSubmitted(draft.current.skills,submitted.skills,[],draftRevision.current.skills,revision.skills),...(r.limited?{notice:LIMITED}:{})};
+    }catch(e:any){opening={draft:draft.current.text,files:draft.current.files,skills:draft.current.skills,error:e.message};}
+    if(!currentLifetime.active)return;
+    // Keep the synchronous start guard until this view is replaced by the created session.
     setBusy(false);onCreated(s,opening);
   };
   const placeholder=!current?'No model can run the agent yet…':!trusted?'Trust this folder first…':'Describe a task or ask a question';
@@ -418,7 +461,7 @@ function NewSession({startFolder,models,folders,reloadFolders,onResync,onCreated
       {folder&&report&&!report.trusted&&<FolderTrust folder={report.folder} report={report} error={trustError} reload={()=>{reloadTrust();reloadFolders();}}/>}
       {folder&&!report&&trustError&&<div className="pg-error">{trustError}</div>}
       {models&&!usable.length&&<p className="agent-warn"><TriangleAlert size={15}/>No model can run the agent yet: it needs one that can call tools, from a provider that is switched on.</p>}
-      <Composer value={text} onChange={setText} files={files} onFiles={setFiles} skills={skills} onSkills={setSkills} folder={canonical||''} onSend={start} canSend={!!current&&trusted} sending={busy} placeholder={placeholder} autoFocus
+      <Composer value={text} onChange={editText} files={files} onFiles={editFiles} skills={skills} onSkills={editSkills} folder={canonical||''} onSend={start} canSend={!!current&&trusted} sending={busy} placeholder={placeholder} autoFocus
         left={<FolderChip folder={canonical} folders={folders} onPick={pickFolder}/>}
         right={<><ModeChip mode={mode} modes={models?.modes||{}} onPick={pickMode}/><ModelChip models={all} value={current?.id||''} effort={current?.efforts.includes(effort)?effort:''} onResync={onResync} onPick={(id,e)=>{setModel(id);setEffort(e);}}/></>}/>
       {error&&<div className="pg-error">{error}</div>}
@@ -437,8 +480,10 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   const editText=(value:string|((current:string)=>string))=>{draftRevision.current.text++;setText(value);};
   const editFiles=(value:AgentFile[])=>{draftRevision.current.files++;setFiles(value);};
   const editSkills=(value:SkillPick[])=>{draftRevision.current.skills++;setSkills(value);};
-  const [rules,setRules]=useState(false);
-  const [workspace,setWorkspace]=useState(false);const [workspaceTab,setWorkspaceTab]=useState<'changes'|'plan'>('changes');
+
+  const [workspace,setWorkspace]=useState(false);const [workspaceTab,setWorkspaceTab]=useState<WorkspaceTab>('changes');
+  // The header's buttons open the workspace at their tab, and close it when it already shows that tab.
+  const showTab=(t:WorkspaceTab)=>{if(workspace&&workspaceTab===t)setWorkspace(false);else{setWorkspaceTab(t);setWorkspace(true);}};
   const thread=useRef<HTMLDivElement>(null);const changed=useRef(onChanged);changed.current=onChanged;const deleted=useRef(onDeleted);deleted.current=onDeleted;
   const follow=useRef(true);const [away,setAway]=useState(false);
   const {data:trust,error:trustError,reload:reloadTrust}=usePoll<TrustReport>('/admin/agent/trust?folder='+encodeURIComponent(folder),10000,!!folder);
@@ -546,12 +591,10 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
       {tokens>0&&<span className="pg-stat" title="Tokens this session has used, as the engine counts them">{compact(tokens)} tokens</span>}
       {requests&&requests.requests>0&&<span className={`pg-stat${requests.errors?' warn':''}`} title={`Model requests this session made through Polygate, by route:\n${requests.routes.map(r=>`${r.route||'-'}: ${r.requests}`).join('\n')}`}>
         {requests.requests} request{requests.requests===1?'':'s'}{requests.errors?`, ${requests.errors} failed`:''}</span>}
-      <button className={`ag-chip${rules?' open':''}`} aria-expanded={rules} onClick={()=>setRules(r=>!r)} title="Saved approvals for this folder"><ListChecks size={14}/>Project rules</button>
-      <button type="button" className={`ag-chip${workspace&&workspaceTab==='changes'?' open':''}`} aria-expanded={workspace&&workspaceTab==='changes'} aria-controls="agent-workspace" onClick={()=>{setWorkspaceTab('changes');setWorkspace(w=>workspaceTab!=='changes'||!w);}} title="Recorded file changes and Git inspection"><Files size={14}/>Changes{fileCount>0?` (${fileCount})`:''}</button>
-      <button type="button" className={`ag-chip${workspace&&workspaceTab==='plan'?' open':''}`} aria-expanded={workspace&&workspaceTab==='plan'} aria-controls="agent-workspace" onClick={()=>{setWorkspaceTab('plan');setWorkspace(true);}}><ListChecks size={14}/>Plan{todos.length?` (${todos.filter(t=>t.status==='completed').length}/${todos.length})`:''}</button>
+      {([['changes',Files,'Changes'+(fileCount>0?` (${fileCount})`:''),'Recorded file changes and Git inspection'],['plan',ListChecks,'Plan'+(todos.length?` (${todos.filter(t=>t.status==='completed').length}/${todos.length})`:''),'The agent’s task list'],['rules',ShieldCheck,'Rules','Saved approvals for this folder']] as const).map(([t,Icon,label,tip])=>
+        <button type="button" key={t} className={`ag-chip${workspace&&workspaceTab===t?' open':''}`} aria-expanded={workspace&&workspaceTab===t} aria-controls="agent-workspace" title={tip} onClick={()=>showTab(t)}><Icon size={14}/>{label}</button>)}
        <span className={`agent-live ${live}`} role="status" title={live==='recovering'?'Some streamed text may already be in history. Waiting for complete output or a quiet snapshot to reconcile it.':undefined}>{live==='live'?'Live':live==='lost'?'Reconnecting…':live==='recovering'?'Reconciling output…':live==='syncing'?'Syncing history…':'Connecting…'}</span>
     </header>
-    {rules&&<ProjectRules id={id} mode={mode}/>}
     <div className="ag-workspace-layout"><div className="ag-conversation">
     <div className="ag-thread-wrap"><div className="ag-thread" ref={thread} aria-live="polite"><div className="ag-column">
       {untrusted&&<FolderTrust folder={folder} report={untrusted} error={trustError} reload={reloadTrust}/>}
@@ -574,7 +617,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
         right={<><ModeChip mode={mode} modes={modelData?.modes||{}} disabled={busy||pending.length>0} onPick={changeMode}/><ModelChip models={models} value={info.model} effort={info.effort} disabled={busy} onResync={onResync} onPick={switchModel}/></>}/>
     </div></div>
     </div>
-    {workspace&&<AgentWorkspace id={id} turns={turns} todos={todos} initialTab={workspaceTab} busy={busy} blocked={blocked} onUndo={undo} onClose={()=>setWorkspace(false)} onInsert={template=>{editText(t=>t+(t?'\n\n':'')+template);setWorkspace(false);}}/>}
+    {workspace&&<AgentWorkspace id={id} turns={turns} todos={todos} tab={workspaceTab} onTab={setWorkspaceTab} rules={<ProjectRules id={id} mode={mode}/>} busy={busy} blocked={blocked} onUndo={undo} onClose={()=>setWorkspace(false)} onInsert={template=>{editText(t=>t+(t?'\n\n':'')+template);setWorkspace(false);}}/>}
     </div>
     {dialog}
   </>;
@@ -586,10 +629,9 @@ function Row({block,folder,busy,blocked,onUndo}:{block:Block;folder:string;busy:
   if(block.kind==='changes')return <ChangesLine files={block.files} busy={busy} blocked={blocked} undo={()=>onUndo(block.message)}/>;
   if(block.kind==='user')return <div className="ag-message ag-message-user">{!!block.skills?.length&&<SkillChips skills={block.skills}/>}{!!block.files?.length&&<Attachments files={block.files}/>} {!!block.text&&<><div className="ag-msg-user"><pre dir="auto">{block.text}</pre></div><MessageCopy text={block.text} who="your message"/></>}</div>;
   if(block.kind==='text')return block.text?<div className="ag-message ag-msg-agent"><Markdown text={block.text}/><MessageCopy text={block.text} who="agent message"/></div>:null;
-  if(block.kind==='reasoning')return <details className="ag-line ag-kind-think"><summary>{block.done?<><Brain size={14} className="ag-kind-icon"/>Thought</>:<><Loader2 size={13} className="spin ag-kind-icon"/>Thinking</>}<ChevronRight size={13} className="ag-line-chevron"/></summary><pre dir="auto" className="ag-thought">{block.text}</pre></details>;
   if(block.kind==='queued')return null;
   if(block.kind==='note')return <div className={`agent-note ${block.tone}`}>{block.text}</div>;
-  return <Steps tools={block.tools} folder={folder}/>;
+  return <Steps block={block} folder={folder}/>;
 }
 function MessageCopy({text,who}:{text:string;who:string}){
   const [state,setState]=useState<'idle'|'copied'|'error'>('idle');
@@ -603,11 +645,14 @@ function MessageCopy({text,who}:{text:string;who:string}){
 }
 // Each kind of work has its own icon and colour (styles.css .ag-kind-*), so a long turn reads at a glance.
 const KIND_ICONS:Record<StepKind,typeof Brain>={run:SquareTerminal,read:FileText,edit:Pencil,search:Search,web:Globe,agent:Hammer,todo:ListChecks,other:Wrench};
-function Steps({tools,folder}:{tools:Tool[];folder:string}){
-  const working=tools.some(t=>t.status==='running'||t.status==='preparing');
+function Steps({block,folder}:{block:Extract<Block,{kind:'steps'}>;folder:string}){
+  const {tools,thoughts,items}=block;
+  const thinking=thoughts.some(t=>!t.done);const working=thinking||tools.some(t=>t.status==='running'||t.status==='preparing');
   const parts=stepsParts(tools);
-  return <details className="ag-line"><summary>{working&&<Loader2 size={13} className="spin"/>}<span className="ag-kinds">{parts.map((p,i)=>{const Icon=KIND_ICONS[p.kind];return <span key={i} className={'ag-kind ag-kind-'+p.kind}><Icon size={14} className="ag-kind-icon"/>{p.text.charAt(0).toUpperCase()+p.text.slice(1)}</span>;})}{failedNote(tools)&&<span className="ag-kind-failed">{failedNote(tools).trim()}</span>}</span><ChevronRight size={13} className="ag-line-chevron"/></summary>
-    <div className="ag-steps">{tools.map(t=><Step key={t.key} tool={t} folder={folder}/>)}</div>
+  return <details className="ag-line"><summary>{working&&<Loader2 size={12} className="spin"/>}<span className="ag-kinds">
+      {thoughts.length>0&&<span className="ag-kind ag-kind-think">{!thinking&&<Brain size={13} className="ag-kind-icon"/>}{thinking?'Thinking':'Thought'}</span>}
+      {parts.map((p,i)=>{const Icon=KIND_ICONS[p.kind];return <span key={i} className={'ag-kind ag-kind-'+p.kind}><Icon size={13} className="ag-kind-icon"/>{p.text.charAt(0).toUpperCase()+p.text.slice(1)}</span>;})}{failedNote(tools)&&<span className="ag-kind-failed">{failedNote(tools).trim()}</span>}</span><ChevronRight size={12} className="ag-line-chevron"/></summary>
+    <div className="ag-steps">{items.map(t=>t.kind==='reasoning'?<pre key={t.key} dir="auto" className="ag-thought">{t.text||'…'}</pre>:<Step key={t.key} tool={t} folder={folder}/>)}</div>
   </details>;
 }
 function Step({tool:t,folder}:{tool:Tool;folder:string}){
@@ -677,10 +722,18 @@ function ProjectRules({id,mode}:{id:string;mode:Mode}){
   const load=useCallback(async()=>{try{setData(await api('/admin/agent/rules?id='+encodeURIComponent(id)));setError('');}catch(e:any){setError(e.message);}},[id]);
   useEffect(()=>{void load();},[load]);
   const remove=async(rule:string)=>{try{await api('/admin/agent/rules/remove',{id,rule});await load();}catch(e:any){setError(e.message);}};
+  // Saved approvals for this folder, as a list of rules with what each allows or blocks, and a short word on how they apply.
   return <div className="agent-project-rules">
-    <p className="subtle">Saved by Polygate for this working folder. Only the exact action and targets match; Plan still blocks commands and edits. Full access bypasses these rules for its current turn.</p>
+    <div className="ag-rules-head"><strong>Saved approvals</strong>{data&&<span className="subtle">{data.rules.length}</span>}</div>
+    <p className="subtle">When the agent asks for approval, “Save project rule” keeps the exact request here; it is then allowed (or blocked) without asking, in every session in this folder.</p>
     {error&&<p className="pg-error">{error}</p>}
-    {!data&&!error?<p className="subtle">Loading…</p>:data?.rules.length?<ul>{data.rules.map(r=><li key={r.id}><div><strong>{r.effect==='allow'?'Allow':'Deny'} {r.action}</strong>{r.resources.map((x,i)=><code key={i} className="agent-approval-target">{x}</code>)}</div><Button onClick={()=>remove(r.id)}>Remove</Button></li>)}</ul>:<p className="subtle">No saved rules. Save one from an approval card.</p>}
-    {mode==='rules'&&data&&<><p className="subtle">Only these exact hardened inspections are automatically approved. Ordinary git commands, scripts and unrecognized arguments still ask.</p>{data.inspections.map(x=><code className="agent-approval-target" key={x}>{x}</code>)}</>}
+    {!data&&!error?<p className="subtle">Loading…</p>:data?.rules.length?<ul className="ag-rules">{data.rules.map(r=><li key={r.id}>
+        <span className={`ag-rule-effect ${r.effect==='allow'?'allow':'deny'}`}>{r.effect==='allow'?'Allow':'Block'}</span>
+        <div><strong>{r.action}</strong>{r.resources.map((x,i)=><code key={i} title={x}>{x}</code>)}</div>
+        <button type="button" className="icon-button danger" aria-label={`Remove rule ${r.action}`} title="Remove rule" onClick={()=>remove(r.id)}><Trash2 size={14}/></button>
+      </li>)}</ul>
+      :<div className="ag-empty"><ShieldCheck size={18}/><p>No saved approvals yet. They appear here when you press “Save project rule” on an approval card.</p></div>}
+    <details className="ag-rules-how"><summary>How rules apply</summary><p className="subtle">Only the exact action and targets match, never a broader command. Plan mode still blocks commands and edits. Full access does not ask at all, so rules do not come into play in its turns.</p></details>
+    {mode==='rules'&&data&&<><div className="ag-rules-head"><strong>Approved inspections</strong></div><p className="subtle">In this mode only these exact read-only inspections run without asking. Ordinary git commands, scripts and other arguments still ask.</p><div className="ag-rules-inspections">{data.inspections.map(x=><code key={x}>{x}</code>)}</div></>}
   </div>;
 }

@@ -42,6 +42,8 @@ const skillsOf = (list: unknown) => { const skills = Array.isArray(list) ? list.
 const textOf = (content: unknown) => Array.isArray(content) ? content.map((c: any) => typeof c?.text === 'string' ? c.text : '').join('') : typeof content === 'string' ? content : '';
 const filesOf = (value: unknown) => { const files = fromEngineFiles(value); return files.length ? { files } : {}; };
 
+// A failed turn says why when the engine kept the reason with it.
+const failedText = (error: any) => { const why = typeof error === 'string' ? error : error?.message || error?.data?.message; return why ? `This turn failed: ${plainError(String(why))}` : 'This turn failed.'; };
 export function fromHistory(messages: any[]): Item[] {
   const out: Item[] = [];
   for (const m of messages || []) {
@@ -59,7 +61,7 @@ export function fromHistory(messages: any[]): Item[] {
         }
       });
     }
-    else if (m?.type === 'idle' && (m.outcome === 'failed' || m.outcome === 'interrupted')) out.push({ kind: 'note', key: m.id, tone: m.outcome === 'failed' ? 'bad' : 'info', text: m.outcome === 'failed' ? 'This turn failed.' : 'Stopped.' });
+    else if (m?.type === 'idle' && (m.outcome === 'failed' || m.outcome === 'interrupted')) out.push({ kind: 'note', key: m.id, tone: m.outcome === 'failed' ? 'bad' : 'info', text: m.outcome === 'failed' ? failedText(m.error) : 'Stopped.' });
     else if (m?.type === 'agent-switched' && AGENT_MODES[m.agent] && AGENT_MODES[m.agent] !== 'full') out.push({ kind: 'note', key: m.id, tone: 'info', text: `Mode: ${modeLabel(AGENT_MODES[m.agent])}` });
   }
   return out;
@@ -299,15 +301,19 @@ export function matchModels<T extends PickModel>(models: T[], provider: string, 
 // A folder's last part, for the session list's group headings (the full path is shown on hover).
 export const folderName = (folder: string) => folder.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || folder;
 
-// The transcript as the page draws it: runs of tool calls fold into one line of steps, like a chat app's "Ran 2 commands, read a.ts".
+// The transcript as the page draws it: a run of thinking and tool calls folds into one quiet line, like a chat app's
+// "Thought · Ran 2 commands, read a.ts", which opens to show each thought and step in the order they happened.
 export type Tool = Extract<Item, { kind: 'tool' }>;
-export type Block = Exclude<Item, Tool> | { kind: 'steps'; key: string; tools: Tool[] };
+export type Thought = Extract<Item, { kind: 'reasoning' }>;
+export type Block = Exclude<Item, Tool | Thought> | { kind: 'steps'; key: string; tools: Tool[]; thoughts: Thought[]; items: (Tool | Thought)[] };
 export function blocks(items: Item[]): Block[] {
   const out: Block[] = [];
   for (const i of items) {
-    if (i.kind !== 'tool') { out.push(i); continue; }
+    if (i.kind !== 'tool' && i.kind !== 'reasoning') { out.push(i); continue; }
+    if (i.kind === 'reasoning' && i.done && !i.text.trim()) continue; // a model that thinks without saying anything
     const last = out[out.length - 1];
-    if (last?.kind === 'steps') last.tools.push(i); else out.push({ kind: 'steps', key: `steps:${i.key}`, tools: [i] });
+    const group = last?.kind === 'steps' ? last : (out.push({ kind: 'steps', key: `steps:${i.key}`, tools: [], thoughts: [], items: [] }), out[out.length - 1] as Extract<Block, { kind: 'steps' }>);
+    group.items.push(i); if (i.kind === 'tool') group.tools.push(i); else group.thoughts.push(i);
   }
   return out;
 }

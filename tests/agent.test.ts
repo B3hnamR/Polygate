@@ -216,9 +216,13 @@ test('the system prompt applies to every message and skills from the library can
   const global=[...c].reverse().find((x:any)=>x.method==='PUT'&&x.path.endsWith('/instructions/entries/polygate-global'));expect(global!.body.value.text).toBe(next.instructions);
   await emit('session.execution.succeeded',{sessionID:a});await until(async()=>!(await admin('/admin/agent/session?id='+a)).body.busy);
   // Cleared, the system prompt is removed from the next message rather than left behind.
-  await admin('/admin/agent/library',{revision:saved.body.revision,instructions:'',skills:[],confirm:true});
-  await admin('/admin/agent/session/prompt',{id:a,text:'again'});
-  expect((await calls()).at(-2)).toMatchObject({method:'DELETE'});expect((await calls()).some((x:any)=>x.method==='DELETE'&&x.path.endsWith('/polygate-global'))).toBe(true);
+  expect((await admin('/admin/agent/library',{revision:saved.body.revision,instructions:'',skills:[],confirm:true})).status).toBe(200);
+  const beforePrompt=(await calls()).length;
+  expect((await admin('/admin/agent/session/prompt',{id:a,text:'again'})).status).toBe(200);
+  const sent=(await calls()).slice(beforePrompt);
+  const removed=sent.findIndex(x=>x.method==='DELETE'&&x.path===`/api/experimental/session/${a}/instructions/entries/polygate-global`);
+  const submitted=sent.findIndex(x=>x.method==='POST'&&x.path===`/api/session/${a}/prompt`&&x.body.text==='again');
+  expect(removed).toBeGreaterThanOrEqual(0);expect(submitted).toBeGreaterThan(removed);
   expect(readdirSync(path.join(process.env.POLYGATE_AGENT_DIR!,'skills'))).toEqual([]);
 });
 
@@ -352,6 +356,7 @@ test('allow for this session also answers the same request already waiting besid
   await until(() => ui.events.filter(e => e.type === 'permission.asked').length === 2);
   expect((await admin('/admin/agent/session/approve', { id: a, request: 'per_p1', decision: 'session' })).status).toBe(200);
   expect([await replies('per_p1'), await replies('per_p2')]).toEqual([['once'], ['once']]);
+  await until(() => ui.events.some(e => e.type === 'agent.approval.auto' && e.data.requestID === 'per_p2'));
   expect(ui.events.some(e => e.type === 'agent.approval.auto' && e.data.requestID === 'per_p2')).toBe(true);
   expect((await admin('/admin/agent/session/approve', { id: a, request: 'per_p2', decision: 'deny' })).status).toBe(404);
   ui.stop();
@@ -851,4 +856,14 @@ test('a session can switch to another usable model (with its effort), and can be
 test('the agent routes answer in the desktop app only', async () => {
   delete process.env.POLYGATE_DESKTOP;
   try { expect((await admin('/admin/agent/models')).status).toBe(404); } finally { process.env.POLYGATE_DESKTOP = '1'; }
+});
+
+test("a session the engine named with a tag from its prompt, or with nothing, shows a readable title", async () => {
+  const { sessionTitle } = await import('../backend/agent');
+  expect(sessionTitle('Fix the login bug')).toBe('Fix the login bug');
+  expect(sessionTitle('<project_instructions>', Date.UTC(2026, 10, 16))).toStartWith('Session ');
+  expect(sessionTitle('<title>Refactor routes</title>')).toBe('Refactor routes');
+  expect(sessionTitle('   ')).toBe('Session');
+  expect(sessionTitle('بررسی پروژه')).toBe('بررسی پروژه');
+  expect(sessionTitle('a < b and c > d')).toBe('a < b and c > d');
 });

@@ -14,30 +14,44 @@ function Question({session,form,onDone}:{session:string;form:Form;onDone:()=>voi
  const [values,setValues]=useState<Record<string,any>>(()=>Object.fromEntries(form.fields.filter(f=>f.default!==undefined).map(f=>[f.key,f.default]))),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const [step,setStep]=useState(0),[other,setOther]=useState<Record<string,string>>({}),[otherOn,setOtherOn]=useState<Record<string,boolean>>({});
  const shown=form.fields.filter(f=>formActive(f,values)&&!f.hidden);const at=Math.min(step,Math.max(0,shown.length-1));const field=shown[at];const last=at>=shown.length-1;
- const card=useRef<HTMLFormElement>(null);
- const set=(key:string,value:any)=>setValues(v=>({...v,[key]:value}));
- const next=()=>setStep(s=>Math.min(s+1,shown.length-1));
- const send=async(cancel=false)=>{setBusy(true);setError('');try{await api('/admin/agent/session/form',{id:session,form:form.id,...(cancel?{cancel:true}:{answer:formAnswer(form.fields,values)})});onDone();}catch(e:any){setError(e.message);}finally{setBusy(false);}};
+  const card=useRef<HTMLFormElement>(null);
+  const latest=useRef({session,form,values,step});latest.current={session,form,values,step};
+  const advance=useRef<ReturnType<typeof setTimeout>|null>(null),sending=useRef(false);
+  const cancelAdvance=()=>{if(advance.current!==null)clearTimeout(advance.current);advance.current=null;};
+  const set=(key:string,value:any)=>{cancelAdvance();const next={...latest.current.values,[key]:value};latest.current.values=next;setValues(next);};
+  const navigate=(to:number)=>{cancelAdvance();latest.current.step=to;setStep(to);};
+  const next=()=>{const now=latest.current;const fields=now.form.fields.filter(f=>formActive(f,now.values)&&!f.hidden);navigate(Math.max(0,Math.min(now.step+1,fields.length-1)));};
+  const chosen=()=>{
+    cancelAdvance();if(sending.current)return;
+    const key=field?.key,from=step;
+    advance.current=setTimeout(()=>{
+      advance.current=null;const now=latest.current;
+      const fields=now.form.fields.filter(f=>formActive(f,now.values)&&!f.hidden),index=Math.min(now.step,Math.max(0,fields.length-1));
+      if(!sending.current&&now.session===session&&now.form.id===form.id&&now.step===from&&fields[index]?.key===key)navigate(Math.min(index+1,fields.length-1));
+    },160);
+  };
+  const send=async(cancel=false)=>{cancelAdvance();if(sending.current)return;sending.current=true;setBusy(true);setError('');try{await api('/admin/agent/session/form',{id:session,form:form.id,...(cancel?{cancel:true}:{answer:formAnswer(latest.current.form.fields,latest.current.values)})});onDone();}catch(e:any){setError(e.message);}finally{sending.current=false;setBusy(false);}};
  const external=form.fields.some(f=>formActive(f,values)&&f.type==='external');const ready=formReady(form.fields,values)&&!external;
- useEffect(()=>{card.current?.querySelector<HTMLElement>('.ag-q-option[aria-checked="true"],.ag-q-option,input,textarea')?.focus({preventScroll:true});},[at]);
+  useEffect(()=>{card.current?.querySelector<HTMLElement>('.ag-q-option[aria-checked="true"],.ag-q-option,input,textarea')?.focus({preventScroll:true});},[at]);
+  useEffect(()=>cancelAdvance,[session,form.id,field?.key,at]);
  if(!field)return null;
  const answered=(f:FormField)=>{const v=values[f.key];return Array.isArray(v)?v.length>0:v!==undefined&&v!=='';};
  // 1-9 picks a choice, unless a text box has the keyboard.
  const keys=(e:KeyboardEvent)=>{if(/^(INPUT|TEXTAREA)$/.test((e.target as HTMLElement).tagName)||e.ctrlKey||e.metaKey||e.altKey)return;const n=Number(e.key);if(n>=1&&n<=9){const b=card.current?.querySelectorAll<HTMLButtonElement>('.ag-q-options > .ag-q-option')[n-1];if(b){e.preventDefault();b.click();}}};
- return <form ref={card} className="ag-q" aria-label="Question from the agent" onKeyDown={keys} onSubmit={e=>{e.preventDefault();if(last){if(ready)void send();}else next();}}>
+  return <form ref={card} className="ag-q" aria-label="Question from the agent" onKeyDown={keys} onSubmit={e=>{e.preventDefault();cancelAdvance();if(sending.current)return;if(last){if(ready)void send();}else next();}}>
   <header className="ag-q-head"><MessageCircleQuestion size={16}/><span>{shown.length>1?`The agent has ${shown.length} questions`:'The agent is asking'}</span>
    <button type="button" className="icon-button" aria-label="Dismiss question" title="Dismiss: the agent is told you did not answer" disabled={busy} onClick={()=>send(true)}><X size={14}/></button></header>
-  {shown.length>1&&<nav className="ag-q-tabs" aria-label="Questions">{shown.map((f,i)=><button type="button" key={f.key} aria-current={i===at?'step':undefined} className={answered(f)?'done':undefined} onClick={()=>setStep(i)}>{answered(f)&&<Check size={12}/>}<span dir="auto">{f.title||`Question ${i+1}`}</span></button>)}</nav>}
+   {shown.length>1&&<nav className="ag-q-tabs" aria-label="Questions">{shown.map((f,i)=><button type="button" key={f.key} aria-current={i===at?'step':undefined} className={answered(f)?'done':undefined} onClick={()=>navigate(i)}>{answered(f)&&<Check size={12}/>}<span dir="auto">{f.title||`Question ${i+1}`}</span></button>)}</nav>}
   <div className="ag-q-body">
    {shown.length<=1&&field.title&&<span className="ag-q-chip" dir="auto">{field.title}</span>}
    <p className="ag-q-text" dir="auto">{field.description||field.title||'Answer the question'}{field.required&&<em> (required)</em>}</p>
    <Answer key={field.key} field={field} value={values[field.key]} set={v=>set(field.key,v)} other={other[field.key]||''} otherOn={!!otherOn[field.key]}
-     setOther={t=>{setOther(o=>({...o,[field.key]:t}));}} setOtherOn={on=>setOtherOn(o=>({...o,[field.key]:on}))} onChosen={()=>{if(!last)setTimeout(next,160);}}/>
+      setOther={t=>{cancelAdvance();setOther(o=>({...o,[field.key]:t}));}} setOtherOn={on=>{cancelAdvance();setOtherOn(o=>({...o,[field.key]:on}));}} onChosen={chosen}/>
   </div>
   <footer className="ag-q-foot">
    {shown.length>1&&<span className="ag-q-count">{at+1} of {shown.length}</span>}
    <span className="toolbar-spacer"/>
-   {at>0&&<button type="button" className="button" disabled={busy} onClick={()=>setStep(at-1)}><ArrowLeft size={14}/>Back</button>}
+    {at>0&&<button type="button" className="button" disabled={busy} onClick={()=>navigate(at-1)}><ArrowLeft size={14}/>Back</button>}
    {!last&&<button type="submit" className="button" disabled={busy}>{answered(field)?'Next':'Skip'}<ArrowRight size={14}/></button>}
    {last&&<button type="submit" className="button primary" disabled={busy||!ready} title={ready?undefined:external?'This question needs your trusted client':'Answer the required questions first'}><Send size={14}/>{busy?'Sending…':'Send answers'}</button>}
   </footer>

@@ -1,5 +1,5 @@
 import {useEffect,useState} from 'react';
-import {BookOpen,FileText,Loader2,X} from 'lucide-react';
+import {BookOpen,FileText,Loader2,Settings2,X} from 'lucide-react';
 import {api} from './api';
 import {menuEntries,type MenuChoice,type MenuEntry,type SkillOffer,type SkillPick} from './agent-logic';
 
@@ -15,10 +15,12 @@ export function SkillMenu({folder,query,picked,active,onActive,onEntries,onPick,
     {!offer&&!error&&<p className="subtle"><Loader2 size={13} className="spin"/> Loading…</p>}
     {error&&<p className="pg-error">{error}</p>}
     {offer&&!offer.running&&<p className="subtle">Skills are listed once the agent engine runs.</p>}
-    {offer&&!entries.length&&<p className="subtle">{query?`Nothing matches “${query}”.`:'No skills yet. Add them in Agent settings → Skills, or folder templates in this session’s Project tab.'}</p>}
+    {offer&&!entries.length&&<p className="subtle">{query?`Nothing matches “${query}”.`:'No skills yet. Make one with Manage skills below, or add folder templates in this session’s Project tab.'}</p>}
     {entries.map((e,i)=><button type="button" role="option" aria-selected={i===active} key={e.key} className={i===active?'active':undefined} onMouseEnter={()=>onActive(i)} onMouseDown={ev=>ev.preventDefault()} onClick={()=>onPick(e.choice)}>
       {e.choice.kind==='skill'?<BookOpen size={14}/>:<FileText size={14}/>}<span><strong dir="auto">{e.title}</strong>{e.detail&&<small dir="auto">{e.detail}</small>}</span><em>{e.tag}</em>
     </button>)}
+    {/* Opens Agent settings at Skills (AgentApp listens for this event). */}
+    <button type="button" className="ag-skill-menu-foot" onMouseDown={ev=>ev.preventDefault()} onClick={()=>{onClose();window.dispatchEvent(new CustomEvent('polygate-agent-settings',{detail:'skills'}));}}><Settings2 size={13}/>Manage skills</button>
   </div>;
 }
 export function SkillChips({skills,remove}:{skills:SkillPick[];remove?:(id:string)=>void}){

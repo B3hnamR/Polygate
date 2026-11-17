@@ -22,6 +22,19 @@ export function needsOf(chat: any): Needs {
   // About four characters to a token; images are left out of the count, so a large picture does not look like a huge prompt.
   return { tools, images, tokens: Math.ceil(chars / 4) };
 }
+// A model that cannot see images still gets the conversation: each image becomes a short note in its place, so a picture sent earlier (or to the
+// wrong model) does not make every later message of the conversation fail. `count` is how many were replaced.
+export const IMAGE_NOTE = '[An image was attached here, but the model answering cannot see images.]';
+export function withoutImages(chat: any): { chat: any; count: number } {
+  let count = 0;
+  const messages = (Array.isArray(chat?.messages) ? chat.messages : []).map((m: any) => {
+    if (!Array.isArray(m?.content) || !m.content.some((p: any) => IMAGE_PART.has(p?.type))) return m;
+    return { ...m, content: m.content.map((p: any) => IMAGE_PART.has(p?.type) ? (count++, { type: 'text', text: IMAGE_NOTE }) : p) };
+  });
+  return { chat: count ? { ...chat, messages } : chat, count };
+}
+// A provider's way of saying the model takes no images (OpenRouter-style routing, OpenAI-compatible servers, and plain wording).
+export const refusesImages = (status: number, message: string) => status >= 400 && status < 500 && /no endpoints? found that supports? image|does not support (image|vision)|images? (input )?(is |are )?not supported|image_url.{0,40}not supported|not a multimodal model|model does not accept images|unsupported content type.{0,40}image/i.test(message);
 const k = (n: number) => n >= 10000 ? Math.round(n / 1000).toLocaleString() + 'k' : n.toLocaleString();
 export function lacks(m: Model, n: Needs): { short: string; long: string } | undefined {
   if (n.tools && m.tools === false) return { short: 'no tool support', long: 'the request needs tool support and this model is listed without it' };

@@ -17,7 +17,7 @@ const make = (name: string) => {
   return { cert: readFileSync(crt, 'utf8'), key: readFileSync(key, 'utf8') };
 };
 const A = make('a'), B = make('b');
-const settled = async () => { for (let i = 0; i < 100; i++) { if (!(await https.httpsStatus() as any).job?.running) return; await Bun.sleep(30); } };
+const settled = async () => { for (let i = 0; i < 100; i++) { if (!(await https.httpsStatus() as any).job?.running) return; await Bun.sleep(30); } throw new Error('HTTPS job did not settle'); };
 const pem = () => ({ cert: readFileSync(path.join(stateDir, 'tls', 'custom-fullchain.pem'), 'utf8'), key: readFileSync(path.join(stateDir, 'tls', 'custom-privkey.pem'), 'utf8') });
 
 test.skipIf(!A || !B)('a certificate change whose listener cannot be installed leaves the previous certificate files in place', async () => {

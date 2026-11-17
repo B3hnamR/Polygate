@@ -972,8 +972,10 @@ function responsesInputToMessages(input) {
   if (typeof input === "string") return input ? [{ role: "user", content: input }] : []
   if (!Array.isArray(input)) return input == null ? [] : [{ role: "user", content: textOf(input) }]
   const messages = []
+  let calls = null
   for (const item of input) {
     if (item?.type === "message" || (item?.type == null && (item?.role ?? item?.content))) {
+      calls = null
       const role = item?.role ?? "user"
       const content = item?.content
       if (typeof content === "string") {
@@ -983,27 +985,29 @@ function responsesInputToMessages(input) {
         for (const p of content) {
           if (typeof p === "string") { if (p) parts.push({ type: "text", text: p }) }
           else if ((p?.type === "input_text" || p?.type === "output_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
-          else if (p?.type === "input_image" && (p.image_url ?? p.url)) parts.push({ type: "image_url", image_url: p.image_url ?? p.url })
+          else if (p?.type === "input_image" && (p.image_url ?? p.url)) {
+            const image = p.image_url ?? p.url
+            parts.push({ type: "image_url", image_url: { ...(typeof image === "string" ? { url: image } : image), ...(p.detail != null ? { detail: p.detail } : {}) } })
+          }
         }
         if (parts.length) messages.push({ role, content: parts })
       }
       continue
     }
     if (item?.type === "function_call") {
-      messages.push({
-        role: "assistant",
-        content: "",
-        tool_calls: [
-          {
-            id: item?.call_id ?? item?.id ?? "call_0",
-            type: "function",
-            function: { name: item?.name ?? "unknown", arguments: typeof item?.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}) },
-          },
-        ],
+      if (!calls) {
+        calls = []
+        messages.push({ role: "assistant", content: "", tool_calls: calls })
+      }
+      calls.push({
+        id: item?.call_id ?? item?.id ?? "call_0",
+        type: "function",
+        function: { name: item?.name ?? "unknown", arguments: typeof item?.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}) },
       })
       continue
     }
     if (item?.type === "function_call_output") {
+      calls = null
       messages.push({ role: "tool", tool_call_id: item?.call_id ?? item?.id ?? "call_0", content: item?.output ?? " " })
       continue
     }
@@ -1026,7 +1030,7 @@ function responsesInputItemArray(input) {
 // A Responses request body -> the chat-shaped body the request loop already
 // understands. Only the fields that have a chat counterpart travel;
 // `instructions` becomes the system message, Responses tools (flat) become
-// chat tools (nested), `max_output_tokens` maps onto both token keys.
+// chat tools (nested), `max_output_tokens` maps onto one chat token key.
 function responsesInputToChatBody(body) {
   const chat = { model: body?.model }
   const messages = responsesInputToMessages(body.input)
@@ -1037,7 +1041,6 @@ function responsesInputToChatBody(body) {
   if (body.top_p != null) chat.top_p = body.top_p
   const mt = Number(body.max_output_tokens ?? body.max_tokens)
   if (Number.isFinite(mt) && mt > 0) {
-    chat.max_tokens = Math.floor(mt)
     chat.max_completion_tokens = Math.floor(mt)
   }
   if (body.parallel_tool_calls != null) chat.parallel_tool_calls = body.parallel_tool_calls
@@ -1798,10 +1801,9 @@ async function handleChat(req, res, responsesRoute = false) {
   )
 }
 
-// A client that disconnected has nothing left to be told. A gateway deadline (the abort reason carries HTTP 504) is different: the client is still
-// reading, so it must be told the reply failed instead of seeing a stream that simply stops.
+// Only 499 means the client left. Quota and deadline aborts still need an in-band error.
 function clientGone(req) {
-  return !!req.signal?.aborted && req.signal.reason?.status !== 504
+  return !!req.signal?.aborted && req.signal.reason?.status === 499
 }
 function cutMessage(req, stalled, fallback = "upstream stream ended mid-reply") {
   if (stalled) return "upstream stalled past the relay wall"
@@ -1811,27 +1813,138 @@ function cutMessage(req, stalled, fallback = "upstream stream ended mid-reply") 
 
 // Turns a Response body into an async iterable of raw SSE text blocks, so the
 // Anthropic relay can read chat and Responses streams through one code path.
-async function* sseChunks(upstreamRes) {
+function sseChunks(upstreamRes) {
   const reader = upstreamRes.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ""
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      let i
-      while ((i = buf.indexOf("\n\n")) !== -1) {
-        yield buf.slice(0, i + 2)
-        buf = buf.slice(i + 2)
-      }
-    }
-    if (buf.trim()) yield buf
-  } finally {
-    // cancel() returns a promise that rejects with the abort reason when the stream was cut short; left alone it is an unhandled rejection.
+  let cancelled = false
+  const cancel = () => { if (cancelled) return; cancelled = true; try { reader.cancel().catch(() => {}) } catch {} }
+  const chunks = (async function* () {
+    const decoder = new TextDecoder()
+    let buf = ""
     try {
-      reader.cancel().catch(() => {})
-    } catch {}
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let i
+        while ((i = buf.indexOf("\n\n")) !== -1) {
+          yield buf.slice(0, i + 2)
+          buf = buf.slice(i + 2)
+        }
+      }
+      buf += decoder.decode()
+      if (buf.trim()) yield buf
+    } finally {
+      cancel()
+    }
+  })()
+  // Unlike generator.return(), this interrupts an outstanding reader.read().
+  chunks.cancel = cancel
+  return chunks
+}
+
+// One pump owns all writes. Event callbacks only cancel; they never emit concurrently.
+function relayFlow(req, res, cancel, options = {}) {
+  const ctrl = new AbortController()
+  let closed = false, cancelled = false
+  const cancelSource = () => {
+    if (cancelled) return
+    cancelled = true
+    try { Promise.resolve(cancel()).catch(() => {}) } catch {}
+  }
+  const stop = (reason) => {
+    if (!ctrl.signal.aborted) ctrl.abort(reason)
+    cancelSource()
+  }
+  const onClose = () => { closed = true; stop(Object.assign(new Error("Client disconnected"), { status: 499 })) }
+  const onError = (error) => { closed = true; stop(error) }
+  const onAbort = () => stop(req.signal.reason ?? new Error("Request aborted"))
+  res.on("close", onClose)
+  res.on("finish", onClose)
+  res.on("error", onError)
+  req.signal?.addEventListener("abort", onAbort)
+  if (res.destroyed || res.writableEnded) onClose()
+  else if (req.signal?.aborted) onAbort()
+  const write = (chunk, terminal = false) => new Promise((resolve, reject) => {
+    let settled = false, drained = false, writing = true, waiting = false, timer
+    const finish = (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      res.removeListener("drain", drain)
+      res.removeListener("close", gone)
+      res.removeListener("finish", gone)
+      res.removeListener("error", fail)
+      ctrl.signal.removeEventListener("abort", aborted)
+      req.signal?.removeEventListener("abort", requestAborted)
+      if (waiting) options.onBackpressure?.(false)
+      if (error) reject(error); else resolve()
+    }
+    const drain = () => { drained = true; if (!writing) finish() }
+    const gone = () => finish(new Error("Response closed"))
+    const fail = (error) => finish(error)
+    const aborted = () => finish(ctrl.signal.reason)
+    const requestAborted = () => { if (clientGone(req)) gone() }
+    res.on("drain", drain)
+    res.on("close", gone)
+    res.on("finish", gone)
+    res.on("error", fail)
+    if (!terminal) ctrl.signal.addEventListener("abort", aborted)
+    else req.signal?.addEventListener("abort", requestAborted)
+    if (closed || res.destroyed || res.writableEnded || clientGone(req)) { gone(); return }
+    if (!terminal && ctrl.signal.aborted) { aborted(); return }
+    try {
+      const accepted = res.write(chunk)
+      writing = false
+      if (settled) return
+      if (accepted !== false || drained) { finish(); return }
+      waiting = true
+      options.onBackpressure?.(true)
+      if (settled) return
+      timer = setTimeout(() => {
+        const error = new Error(terminal ? "Error response could not drain" : "Downstream stopped reading")
+        finish(error)
+        if (!terminal) stop(error)
+      }, terminal ? 1000 : config.timeoutMs)
+    } catch (error) { finish(error) }
+  })
+  return {
+    write,
+    async read(next) {
+      if (ctrl.signal.aborted) throw ctrl.signal.reason
+      let timer, aborted
+      try {
+        const result = await Promise.race([
+          new Promise((_, reject) => {
+            aborted = () => reject(ctrl.signal.reason)
+            ctrl.signal.addEventListener("abort", aborted, { once: true })
+            timer = setTimeout(() => stop(new Error("upstream stalled past the relay wall")), config.timeoutMs)
+          }),
+          Promise.resolve().then(() => { if (ctrl.signal.aborted) throw ctrl.signal.reason; return next() }),
+        ])
+        if (ctrl.signal.aborted) throw ctrl.signal.reason
+        return result
+      } finally {
+        clearTimeout(timer)
+        ctrl.signal.removeEventListener("abort", aborted)
+      }
+    },
+    error(err, type = "api_error") {
+      const reason = req.signal?.aborted ? req.signal.reason : err
+      return { type: reason?.type ?? type, message: reason?.message ?? "upstream stream ended mid-reply" }
+    },
+    async fail(chunk) {
+      cancelSource()
+      try { await write(chunk, true) }
+      catch { if (!res.destroyed) res.destroy?.() }
+      finally { if (!res.destroyed && !res.writableEnded) res.end() }
+    },
+    dispose() {
+      res.removeListener("close", onClose)
+      res.removeListener("finish", onClose)
+      res.removeListener("error", onError)
+      req.signal?.removeEventListener("abort", onAbort)
+      cancelSource()
+    },
   }
 }
 
@@ -2048,17 +2161,16 @@ function chatBlockTerminal(block) {
   return false
 }
 
-// The real failure text travels as `data: {"error": ...}` blocks; remember it
-// so the relay's closing event says why, not just that something went wrong.
+// Detect failure before forwarding any later completion frames, retaining its payload.
 function chatBlockError(block) {
-  const b = block.trim()
-  if (!b.startsWith("data: ") || !b.includes('"error"')) return null
-  try {
-    const d = JSON.parse(b.slice(6))
-    return d?.error ? String(d.error.message ?? "upstream stream error") : null
-  } catch {
-    return null
+  for (const line of block.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    try {
+      const d = JSON.parse(line.slice(5).trim())
+      if (d?.error) return d.error
+    } catch {}
   }
+  return null
 }
 
 // Stream relays need walls that no runtime disagrees with. req.signal is
@@ -2083,7 +2195,7 @@ function headersWall(timeoutMs = config.timeoutMs) {
   return { signal: ctrl.signal, release() { clearTimeout(timer) } }
 }
 
-function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null, options = {}) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2093,56 +2205,39 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
     ...(servedBy && servedBy !== requested ? { "x-zen-served-by": servedBy, "x-zen-fallback": "true" } : {}),
   })
   const id = `msg_${randomBytes(12).toString("hex")}`
-  const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
-
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 1 }
-  emit("message_start", {
-    message: {
-      id,
-      type: "message",
-      role: "assistant",
-      model: requested,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    },
-  })
-
-  const closeText = () => {
-    if (st.textOpen) {
-      emit("content_block_stop", { index: 0 })
-      st.textOpen = false
+  const iterator = chunks[Symbol.asyncIterator]()
+  const flow = relayFlow(req, res, () => { chunks.cancel?.(); return iterator.return?.() }, options)
+  const emit = (type, data) => flow.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
+  const st = { active: null, blocks: new Map(), pending: [], finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 0 }
+  const closeText = async () => {
+    if (st.active) {
+      await emit("content_block_stop", { index: st.active.index })
+      st.active = null
     }
   }
-  const closeThink = () => {
-    if (st.thinkOpen) {
-      emit("content_block_stop", { index: 0 })
-      st.thinkOpen = false
+  const text = async (type, value) => {
+    // Tool arguments may resume after text or another call. Buffer from the first tool
+    // onward so every Anthropic block stays contiguous without prematurely closing it.
+    if (st.pending.length) {
+      const last = st.pending.at(-1)
+      if (last.type === type) last.value += value
+      else st.pending.push({ type, value, index: st.nextBlock++ })
+      return
     }
+    if (st.active?.type !== type) {
+      await closeText()
+      st.active = { type, index: st.nextBlock++ }
+      await emit("content_block_start", { index: st.active.index, content_block: type === "text" ? { type, text: "" } : { type, thinking: "", signature: "" } })
+    }
+    await emit("content_block_delta", { index: st.active.index, delta: type === "text" ? { type: "text_delta", text: value } : { type: "thinking_delta", thinking: value } })
   }
-
-  const ctrl = new AbortController()
-  let stalled = false
-  // Canceling the chunks generator makes the loop below end cleanly and reach
-  // the same mid-reply handling, where the stall is named for what it is.
-  ctrl.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
-  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
-  let timer
-  const rearm = () => {
-    clearTimeout(timer)
-    timer = setTimeout(() => {
-      stalled = true
-      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-    }, config.timeoutMs)
-  }
-  rearm()
-  const cleanup = () => clearTimeout(timer)
 
   const pump = async () => {
     try {
-      for await (const chunkText of chunks) {
-        rearm()
+      await emit("message_start", { message: { id, type: "message", role: "assistant", model: requested, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })
+      for (;;) {
+        const { done, value: chunkText } = await flow.read(() => iterator.next())
+        if (done) break
         if (chatBlockTerminal(chunkText)) st.finished = true
         {
           for (const line of chunkText.split("\n")) {
@@ -2159,7 +2254,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
             // Upstream declares the reply failed with an explicit error chunk;
             // dropping it (the old behavior) presented a truncated stream as a
             // clean end_turn. Reaching the catch emits the real `error` event.
-            if (d.error) throw new Error(d.error.message ?? "upstream stream error")
+            if (d.error) throw Object.assign(new Error(d.error.message ?? "upstream stream error"), { type: d.error.type })
             if (d.usage) st.usage = d.usage
             const choice = d.choices?.[0]
             const delta = choice?.delta ?? {}
@@ -2167,23 +2262,12 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
             // offered none must never see a call to one (see stripToolCalls).
             if (choice?.finish_reason) st.finish = strip && choice.finish_reason === "tool_calls" ? "stop" : choice.finish_reason
             if (typeof delta.content === "string" && delta.content) {
-              closeThink()
-              if (!st.textOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
-                st.textOpen = true
-              }
-              emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: delta.content } })
+              await text("text", delta.content)
             }
             if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-              if (!st.textOpen && !st.thinkOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "", signature: "" } })
-                st.thinkOpen = true
-              }
-              emit("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
+              await text("thinking", delta.reasoning_content)
             }
             for (const tc of strip ? [] : delta.tool_calls ?? []) {
-              closeThink()
-              closeText()
               const tIndex = tc.index ?? 0
               // A call's name arrives in its first chunk; argument chunks for it
               // follow under the same index with `name: null`. So the keep/drop
@@ -2209,50 +2293,38 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               } else if (st.dropped.has(tIndex)) {
                 continue
               }
-              // Renumbered blocks only when filtering — the plain path keeps the
-              // upstream index so a caller never sees a numbering change.
-              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : pin ? st.nextBlock++ : tIndex + 1
               if (!st.blocks.has(tIndex)) {
+                await closeText()
                 const rawName = tc.function?.name ?? "unknown"
                 const mapped = remapAgentTool(rawName, "{}")
-                st.blocks.set(tIndex, {
-                  index: blockIndex,
+                const block = {
+                  type: "tool_use",
+                  index: st.nextBlock++,
                   id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
                   raw: rawName,
                   name: mapped ? mapped.name : rawName,
                   args: "",
-                })
-                emit("content_block_start", {
-                  index: blockIndex,
-                  content_block: { type: "tool_use", id: st.blocks.get(tIndex).id, name: st.blocks.get(tIndex).name, input: {} },
-                })
+                }
+                st.blocks.set(tIndex, block)
+                st.pending.push(block)
               }
               if (tc.function?.arguments) st.blocks.get(tIndex).args += tc.function.arguments
             }
           }
         }
       }
-      if (!st.finished) {
-        // The upstream stream closed without a finish chunk or [DONE]: claiming
-        // message_stop would present a truncated reply as a completed turn
-        // (measured: hostile mid-cut). Anthropic carries mid-stream failure as
-        // an `error` event — emit it, close nothing further, stop. A wall abort
-        // cancelled the generator into done — name the stall for what it is.
-        closeThink()
-        closeText()
-        emit("error", { error: { type: "api_error", message: cutMessage(req, stalled) } })
-        res.end()
-        return
-      }
-      closeThink()
-      closeText()
-      for (const t of st.blocks.values()) {
-        // Rename the caller's argument keys here too — streamed arguments are
-        // accumulated and only emitted at the end of the block.
-        const mapped = remapAgentTool(t.raw, t.args || "{}")
-        const json = mapped ? mapped.args : t.args || "{}"
-        emit("content_block_delta", { index: t.index, delta: { type: "input_json_delta", partial_json: json } })
-        emit("content_block_stop", { index: t.index })
+      if (!st.finished) throw new Error("upstream stream ended mid-reply")
+      await closeText()
+      for (const t of st.pending) {
+        if (t.type === "tool_use") {
+          const mapped = remapAgentTool(t.raw, t.args || "{}")
+          await emit("content_block_start", { index: t.index, content_block: { type: "tool_use", id: t.id, name: t.name, input: {} } })
+          await emit("content_block_delta", { index: t.index, delta: { type: "input_json_delta", partial_json: mapped ? mapped.args : t.args || "{}" } })
+        } else {
+          await emit("content_block_start", { index: t.index, content_block: t.type === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "", signature: "" } })
+          await emit("content_block_delta", { index: t.index, delta: t.type === "text" ? { type: "text_delta", text: t.value } : { type: "thinking_delta", thinking: t.value } })
+        }
+        await emit("content_block_stop", { index: t.index })
       }
       const u = st.usage ?? {}
       // The model claimed a tool call but every call got filtered away: the
@@ -2261,24 +2333,17 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
       // call in a stub-riding turn was the dropped stub) must not survive.
       const claimed = pin ? st.kept : keepable ? st.callKept : true
       const finish = st.finish === "tool_calls" && !claimed ? "stop" : st.finish
-      emit("message_delta", {
+      await emit("message_delta", {
         delta: { stop_reason: STOP_REASON[finish] ?? "end_turn", stop_sequence: null },
         usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
       })
-      emit("message_stop", {})
-      res.write("data: [DONE]\n\n")
+      await emit("message_stop", {})
+      await flow.write("data: [DONE]\n\n")
       res.end()
     } catch (err) {
-      if (!clientGone(req) && !res.writableEnded) {
-        closeThink()
-        closeText()
-        // The 200 is already on the wire; Anthropic's mid-stream failure event
-        // is the only way left to tell the caller the turn collapsed.
-        emit("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
-      }
-      res.end()
+      await flow.fail(`event: error\ndata: ${JSON.stringify({ type: "error", error: flow.error(err) })}\n\n`)
     } finally {
-      cleanup()
+      flow.dispose()
     }
   }
   return pump()
@@ -2385,7 +2450,7 @@ function filterPinnedDelta(parsed, pinState) {
   }
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null, expectChoices = 1) {
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null, expectChoices = 1, options = {}) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
@@ -2401,45 +2466,27 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   let sawFinish = false
   const finish = chatFinishTracker(expectChoices)
   let upstreamErr = null
-  const ctrl = new AbortController()
-  let stalled = false
-  ctrl.signal.addEventListener("abort", () => {
-    reader.cancel().catch(() => {})
-  })
-  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
-  let timer
-  const rearm = () => {
-    clearTimeout(timer)
-    timer = setTimeout(() => {
-      stalled = true
-      ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-    }, config.timeoutMs)
-  }
-  rearm()
-  const cleanup = () => clearTimeout(timer)
-  const midReplyError = (message) => {
-    // The 200 line is already on the wire — an in-band error chunk plus the
-    // [DONE] sentinel is the only honest ending left. SDKs raise on error
-    // chunks instead of returning a silent half-turn.
-    if (!clientGone(req) && !res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message } })}\n\n`)
-      res.write("data: [DONE]\n\n")
-    }
-    res.end()
-  }
+  const flow = relayFlow(req, res, () => reader.cancel(), options)
   const pump = async () => {
     try {
       for (;;) {
-        const { done, value } = await reader.read()
-        if (!done) rearm()
+        const { done, value } = await flow.read(() => reader.read())
         if (done) {
-          if (buffer.trim()) res.write(buffer)
+          buffer += decoder.decode()
+          if (buffer.trim()) {
+            upstreamErr = chatBlockError(buffer)
+            if (upstreamErr) throw upstreamErr
+            finish.feed(buffer)
+            sawFinish = finish.terminal
+            const out = rewriteSSE(buffer, requested, strip, pinned)
+            if (out) await flow.write(out)
+          }
           // Upstream closed without delivering a finish chunk or [DONE]: the
           // reply died in flight, and a silent end reads like a successful
           // empty turn (measured against a hostile mid-cut). A wall abort
           // cancels the reader into done — name the stall for what it is.
-          if (!sawFinish) midReplyError(upstreamErr ?? (cutMessage(req, stalled)))
-          else res.end()
+          if (!sawFinish) throw new Error("upstream stream ended mid-reply")
+          res.end()
           return
         }
         buffer += decoder.decode(value, { stream: true })
@@ -2447,9 +2494,10 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
-          if (!upstreamErr) upstreamErr = chatBlockError(block)
+          upstreamErr = chatBlockError(block)
+          if (upstreamErr) throw upstreamErr
           const out = rewriteSSE(block, requested, strip, pinned)
-          if (out) res.write(out)
+          if (out) await flow.write(out)
           finish.feed(block)
           sawFinish = finish.terminal
         }
@@ -2457,9 +2505,9 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
     } catch (err) {
       // The reader died (cut, reset, abort). Nothing more can come upstream;
       // surface it in-band before ending.
-      midReplyError(upstreamErr ?? err?.message ?? "upstream stream ended mid-reply")
+      await flow.fail(`data: ${JSON.stringify({ error: upstreamErr ?? flow.error(err, "upstream_error") })}\n\ndata: [DONE]\n\n`)
     } finally {
-      cleanup()
+      flow.dispose()
     }
   }
   return pump()
@@ -2723,7 +2771,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
 // gateway itself emits for native /responses traffic, emitted live — the
 // callers here are agents, and buffering the stream would throw the latency
 // away.
-function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null) {
+function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, keepable = null, options = {}) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2731,8 +2779,9 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
   })
   const id = `resp_${randomBytes(12).toString("hex")}`
   const created = Math.floor(Date.now() / 1000)
-  const evt = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
-  evt("response.created", { response: { id, object: "response", created_at: created, status: "in_progress", model: requested, output: [] } })
+  const chunksIter = sseChunks(upstreamRes)
+  const flow = relayFlow(req, res, () => { chunksIter.cancel(); return chunksIter.return() }, options)
+  const evt = (type, data) => flow.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
   // Output items are created lazily at their first delta, so a reply with no
   // text or no calls produces no empty items. Reasoning deltas are delivered
@@ -2748,29 +2797,12 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
     dropped: new Set(), // pinned-filter: chat indices that name a stray call
   }
 
-  // Same relay wall as the pumps that hold their own reader: unlike them this
-  // one had NO timer, so a dead upstream stalled the stream forever. Cancelling
-  // the generator ends the loop cleanly into the mid-reply handling below.
-  const chunksIter = sseChunks(upstreamRes)
-  const wall = new AbortController()
-  let stalled = false
-  wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
-  // An idle wall: it measures silence, so every chunk from the upstream starts it again. A long reply that keeps streaming is never cut.
-  let wallTimer
-  const rearm = () => {
-    clearTimeout(wallTimer)
-    wallTimer = setTimeout(() => {
-      stalled = true
-      wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-    }, config.timeoutMs)
-  }
-  rearm()
-  const cleanup = () => clearTimeout(wallTimer)
-
   const pump = async () => {
     try {
-      for await (const chunk of chunksIter) {
-        rearm()
+      await evt("response.created", { response: { id, object: "response", created_at: created, status: "in_progress", model: requested, output: [] } })
+      for (;;) {
+        const { done, value: chunk } = await flow.read(() => chunksIter.next())
+        if (done) break
         if (chatBlockTerminal(chunk)) st.finished = true
         let raw = ""
         for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
@@ -2781,14 +2813,14 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         } catch {
           continue
         }
-        if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+        if (d?.error) throw Object.assign(new Error(d.error.message ?? "upstream stream error"), { type: d.error.type })
         if (d?.usage) st.usage = d.usage
         const choice = d?.choices?.[0]
         if (!choice) continue
         if (choice.finish_reason != null) st.finishReason = choice.finish_reason
         const delta = choice.delta ?? {}
         if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-          evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
+          await evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
         }
         if (typeof delta.content === "string" && delta.content) {
           if (!st.message) {
@@ -2796,11 +2828,11 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
             const item = { type: "message", role: "assistant", content: [] }
             items.push(item)
             st.message = { index, text: "" }
-            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
-            evt("response.content_part.added", { output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })
+            await evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+            await evt("response.content_part.added", { output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })
           }
           st.message.text += delta.content
-          evt("response.output_text.delta", { output_index: st.message.index, content_index: 0, delta: delta.content })
+          await evt("response.output_text.delta", { output_index: st.message.index, content_index: 0, delta: delta.content })
         }
         // Responses replies put tool calls after the message as sibling output
         // items, not interleaved into the message's content parts — so each
@@ -2827,25 +2859,17 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
             const entry = { index, item, args: "" }
             st.calls.set(tIndex, entry)
             items.push(item)
-            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+            await evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
           }
           const entry = st.calls.get(tIndex)
           if (tc.function?.arguments) {
             entry.args += tc.function.arguments
-            evt("response.function_call_arguments.delta", { item_id: entry.item.id, output_index: entry.index, delta: tc.function.arguments })
+            await evt("response.function_call_arguments.delta", { item_id: entry.item.id, output_index: entry.index, delta: tc.function.arguments })
           }
         }
       }
       // Stream complete: close what was opened in output order, then report its status.
-      if (!st.finished) {
-        // The chat-chunk stream never reached a finish chunk (measured: hostile
-        // mid-cut): emitting response.completed would tell the caller a turn
-        // ended that upstream never finished. The Responses dialect carries
-        // mid-stream failure as an `error` event.
-        if (!clientGone(req) && !res.writableEnded) evt("error", { error: { type: "api_error", message: cutMessage(req, stalled) } })
-        res.end()
-        return
-      }
+      if (!st.finished) throw new Error("upstream stream ended mid-reply")
       const incompleteReason = st.finishReason === "length" ? "max_output_tokens" : st.finishReason === "content_filter" ? "content_filter" : null
       const status = incompleteReason ? "incomplete" : "completed"
       const output = items.map((item) => {
@@ -2861,14 +2885,14 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         }
         return item
       })
-      if (st.message) evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
+      if (st.message) await evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
       for (const entry of st.calls.values()) {
-        evt("response.function_call_arguments.done", { item_id: entry.item.id, output_index: entry.index, arguments: entry.args })
+        await evt("response.function_call_arguments.done", { item_id: entry.item.id, output_index: entry.index, arguments: entry.args })
       }
-      items.forEach((item, i) => {
-        evt("response.output_item.done", { output_index: i, item })
-      })
-      evt(incompleteReason ? "response.incomplete" : "response.completed", {
+      for (const [i, item] of items.entries()) {
+        await evt("response.output_item.done", { output_index: i, item })
+      }
+      await evt(incompleteReason ? "response.incomplete" : "response.completed", {
         response: {
           id,
           object: "response",
@@ -2887,10 +2911,9 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
       res.end()
     } catch (err) {
       // The 200 is on the wire already: announce the collapse in-band.
-      if (!clientGone(req)) evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
-      res.end()
+      await flow.fail(`event: error\ndata: ${JSON.stringify({ type: "error", error: flow.error(err) })}\n\n`)
     } finally {
-      cleanup()
+      flow.dispose()
     }
   }
   return pump()

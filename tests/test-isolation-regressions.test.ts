@@ -15,6 +15,13 @@ const entry = (n: number, latencyMs = n * 10): PoolEntry => ({ url: `http://127.
 const route = { id: 'proxy-pool', name: 'Fixture', kind: 'proxy' as const, url: 'pool://verified', enabled: true, models: [] };
 const activity = () => ['models', 'requests', 'usage_daily', 'usage_keys_daily', 'route_outcomes', 'events'].map(table => db.query(`SELECT * FROM ${table} ORDER BY rowid`).all());
 
+test('setup does not sweep shared temporary directories by name or age', () => {
+  // Inspect source instead of re-running a preload that patches globals and opens shared state.
+  const source = readFileSync(new URL('./setup.ts', import.meta.url), 'utf8');
+  expect(source).not.toMatch(/\b(?:readdir|opendir|glob)(?:Sync)?\s*\(/);
+  expect(source).not.toMatch(/\bmtime(?:Ms|Ns)?\b/);
+});
+
 test('sequential file-like scopes restore settings, model memory and disk, activity, environment and key windows', () => {
   const outer = preserveTestState();
   try {

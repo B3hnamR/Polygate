@@ -39,6 +39,7 @@ export function RouteTestDialog({route,providers,onClose,onDone}:{route:Route;pr
       <div className="dialog-body">
         <p className="subtle">Pick the provider to send through this route. Each provider has its own limits, so a route can pass for one and fail for another.</p>
         {route.id==='psiphon'&&<div className="dialog-note info"><Check size={16}/><p>Every connected Psiphon region is tested at the same time, each through its own exit. A region found used up is skipped from then on; one that answers is cleared.</p></div>}
+        {route.id==='surfshark'&&<div className="dialog-note info"><Check size={16}/><p>Every connected Surfshark location is tested at the same time, each through its own exit. A location found used up is skipped from then on; one that answers is cleared.</p></div>}
         {route.only&&<div className="dialog-note info"><Check size={16}/><p>This relay carries {route.only==='kilo'?'Kilo':route.only} only, so other providers cannot be tested through it.</p></div>}
         <fieldset className="choices" disabled={busy}>
           {enabled.length?enabled.map(p=>{const ok=carries(route,p);return <label key={p.id} className={'choice'+(chosen===p.id?' selected':'')+(ok?'':' disabled')}>

@@ -33,11 +33,11 @@ function dialogHarness() {
   let effects: (() => void | (() => void))[] = [];
   const document: any = { activeElement: null, addEventListener: (name: string, fn: any) => (listeners[name] ||= new Set()).add(fn), removeEventListener: (name: string, fn: any) => listeners[name]?.delete(fn) };
   const dispatch = (name: string, event: any) => { for (const fn of [...(listeners[name] || [])]) fn(event); };
-  const element = (name: string, parent?: any, extra: Record<string, unknown> = {}) => ({ name, parent, isConnected: true, tabIndex: 0, hidden: false, disabled: false, visibility: 'visible', autofocus: false,
+  const element = (name: string, parent?: any, extra: Record<string, unknown> = {}) => ({ name, tag: ['input', 'button', 'summary', 'dialog'].includes(name) ? name : 'button', parent, isConnected: true, tabIndex: 0, explicitTabIndex: false, hidden: false, disabled: false, visibility: 'visible', autofocus: false,
     focus() { document.activeElement = this; dispatch('focusin', { target: this }); },
-    matches(selector: string) { return selector === ':disabled' ? this.disabled : selector.includes('input') && name === 'input'; },
+    matches(selector: string): boolean { return selector.split(',').some(s => s === ':disabled' ? this.disabled : s === '[tabindex]' ? this.explicitTabIndex : s === this.tag); },
     closest() { return this.hidden; }, getClientRects() { return [1]; }, hasAttribute() { return this.autofocus; }, ...extra });
-  const makeBox = () => { const box: any = element('dialog', undefined, { parentElement: { style: {} }, children: [] }); box.contains = (el: any): boolean => el === box || !!el && box.contains(el.parent); box.querySelectorAll = () => box.children; return box; };
+  const makeBox = () => { const box: any = element('dialog', undefined, { parentElement: { style: {} }, children: [] }); box.contains = (el: any): boolean => el === box || !!el && box.contains(el.parent); box.querySelectorAll = (selector: string) => box.children.filter((el: any) => el.matches(selector)); return box; };
   const code = between(source('mcp.tsx'), 'const dialogs:', 'function Pairs(').replace('export function Dialog', 'function Dialog') + '\nreturn Dialog;';
   const Dialog = evaluate(code, { createElement, X: () => null, document, getComputedStyle: (el: any) => ({ visibility: el.visibility }), useRef: (value: unknown) => ({ current: value === null ? currentBox : value }), useEffect: (effect: any) => effects.push(effect) });
   return { document, element, makeBox, dispatch,
@@ -73,6 +73,23 @@ test('removing an underlying dialog first still restores the original connected 
   const a = h.mount(lower, () => {}), upper = h.makeBox(), b = h.mount(upper, () => {});
   a.unmount(); input.isConnected = false; b.unmount(); expect(h.document.activeElement).toBe(opener);
   const relay = source('relay-manage.tsx'); expect(relay).toContain("import {Dialog} from './mcp'"); expect(relay).not.toContain("addEventListener('keydown'");
+});
+
+test('native summary without tabindex participates in the dialog trap, but invisible controls do not', () => {
+  const h = dialogHarness(), box = h.makeBox();
+  const first = h.element('button', box), summary = h.element('summary', box);
+  box.children = [first, summary, h.element('summary', box, { visibility: 'hidden' }), h.element('summary', box, { getClientRects: () => [] }), h.element('summary', box, { hidden: true }), h.element('summary', box, { tabIndex: -1 })];
+  const dialog = h.mount(box, () => {});
+  expect(h.document.activeElement).toBe(first);
+  h.key('Tab', true); expect(h.document.activeElement).toBe(summary);
+  h.key('Tab'); expect(h.document.activeElement).toBe(first);
+  const expandedControl = h.element('input', box); box.children.push(expandedControl);
+  summary.focus(); expect(h.key('Tab').defaultPrevented).toBe(false);
+  // The fake DOM does not implement native tab order: assert the trap lets the browser advance.
+  expandedControl.focus(); h.key('Tab'); expect(h.document.activeElement).toBe(first);
+  summary.focus(); const inner = h.mount(h.makeBox(), () => {});
+  inner.unmount(); expect(h.document.activeElement).toBe(summary);
+  dialog.unmount();
 });
 
 function logsHarness() {
