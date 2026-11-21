@@ -51,6 +51,8 @@ function buildDesktop() {
   for (const dir of ['release', 'build', 'dist']) if (existsSync(path.join(root, dir)) && lstatSync(path.join(root, dir)).isSymbolicLink()) throw new Error(`Untrusted build directory: ${dir}`);
   const helper = Bun.spawnSync(['python', 'scripts/fetch-wireproxy.py', 'windows-amd64'], { cwd: root, stdio: ['inherit', 'inherit', 'inherit'] });
   if (helper.exitCode !== 0) throw new Error('Verified wireproxy provisioning failed; Python 3 must be available on PATH.');
+  const helperAwg = Bun.spawnSync(['python', 'scripts/fetch-wireproxy-awg.py', 'windows-amd64'], { cwd: root, stdio: ['inherit', 'inherit', 'inherit'] });
+  if (helperAwg.exitCode !== 0) throw new Error('Verified wireproxy-awg provisioning failed; Python 3 must be available on PATH.');
   mkdirSync(output, { recursive: true });
   const runtime = path.join(root, 'build/runtime/1.4.4/windows-x64/bun.exe');
   const env = { ...process.env, ...(existsSync(runtime) && !process.env.POLYGATE_BUN_RUNTIME ? { POLYGATE_BUN_RUNTIME: runtime } : {}) };

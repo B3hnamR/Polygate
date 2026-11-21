@@ -1,7 +1,7 @@
 import { test, expect, afterEach } from 'bun:test';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
 const { settings } = await import('../backend/state');
-const { plainRouteError, routeFailed } = await import('../backend/transport');
+const { plainRouteError, routeFailed, networkFailure, networkFetch, routeContext } = await import('../backend/transport');
 const { explainError, largeRequestNote } = await import('../backend/explain');
 const { queryEvents } = await import('../backend/logbook');
 
@@ -28,6 +28,49 @@ test('a failed route shows the plain reason and the log keeps the raw one', () =
   expect(route.status).toContain('Connection reset'); expect(route.status).not.toContain('TypeError');
   const entry = queryEvents({ q: 'Test relay is paused' }).entries[0]; expect(entry).toBeTruthy();
   expect(JSON.stringify(entry)).toContain('ECONNRESET');
+});
+
+test('a route that never answered names the route, the cause and the next step', () => {
+  const route: any = { id: 'nf-1', name: 'Vercel fra1', kind: 'relay', url: 'https://relay.example/', enabled: true, models: [] };
+  const reset = networkFailure(route, new Error('TypeError: ECONNRESET: The socket connection was closed unexpectedly.'), new URL('https://api.opencode.ai/v1/chat/completions'));
+  expect(reset.status).toBe(502); expect(reset.type).toBe('route_unreachable');
+  expect(reset.message).toContain('Could not reach api.opencode.ai');
+  expect(reset.message).toContain('the relay "Vercel fra1"');
+  expect(reset.message).toContain('Connection reset');
+  expect(reset.message).toContain('network may be blocking the site');
+  expect(reset.message).not.toContain('ECONNRESET');
+
+  const dns = networkFailure({ ...route, name: 'Home proxy', kind: 'proxy' }, new Error('getaddrinfo ENOTFOUND missing.example'), new URL('https://api.openai.com/v1'));
+  expect(dns.message).toContain('the route "Home proxy"');
+  expect(dns.message).toContain('Name not found');
+  expect(dns.message).toContain("check the address and this computer's DNS");
+
+  const refused = networkFailure({ ...route, name: 'Direct', kind: 'direct' }, new Error('ConnectionRefused: Unable to connect'), new URL('https://x.example/'));
+  expect(refused.message).toContain('nothing is listening');
+});
+
+test('networkFetch turns a raw connection failure into a plain route error', async () => {
+  const nativeFetch = globalThis.fetch;
+  const route: any = { id: 'nf-direct', name: 'Direct', kind: 'direct', url: '', enabled: true, models: [] };
+  const savedRoutes = settings.routes.slice();
+  try {
+    settings.routes.length = 0; settings.routes.push(route);
+    globalThis.fetch = (async () => { throw new TypeError('ECONNRESET: The socket connection was closed unexpectedly.'); }) as unknown as typeof fetch;
+    const rid = crypto.randomUUID();
+    await expect(routeContext.run({ routeId: route.id, requestId: rid }, () => networkFetch('https://api.opencode.ai/v1/chat/completions', { method: 'POST', body: '{}' }))).rejects.toMatchObject({ status: 502, type: 'route_unreachable' });
+  } finally { settings.routes.length = 0; settings.routes.push(...savedRoutes); globalThis.fetch = nativeFetch; }
+});
+
+test('a request that ran out of time says so and points at the deadline setting', () => {
+  const base = { model: 'opencode/x', route: 'Vercel fra1', switches: 0, cooldownsEnabled: true };
+  const timed = explainError({ ...base, status: 504, type: 'timeout', message: 'Gateway request deadline exceeded', switches: 2 })!;
+  expect(timed.code).toBe('gateway_timeout');
+  expect(timed.message).toContain('No answer arrived');
+  expect(timed.message).toContain('2 other network exits');
+  expect(timed.message).toContain('Deadline');
+  const stalled = explainError({ ...base, status: 504, type: 'timeout', message: 'The upstream stopped sending data' })!;
+  expect(stalled.code).toBe('stream_stalled');
+  expect(stalled.message).toContain('started but then stopped arriving');
 });
 
 test('a very large request is named as such in the used-up message, a small one is not', () => {

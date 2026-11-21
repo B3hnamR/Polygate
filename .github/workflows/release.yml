@@ -34,7 +34,7 @@ jobs:
           bun-version: '1.4.4'
       - run: npm ci --ignore-scripts
       - name: Provision pinned wireproxy helpers before tests and packaging
-        run: python3 scripts/fetch-wireproxy.py all
+        run: python3 scripts/fetch-wireproxy.py all && python3 scripts/fetch-wireproxy-awg.py all
       - run: npm run check && bun test tests
       - run: bash scripts/build-linux.sh ${{ matrix.arch }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -66,8 +66,8 @@ jobs:
         with:
           bun-version: '1.4.4'
       - run: npm ci --ignore-scripts
-      - name: Provision the pinned Windows wireproxy helper
-        run: python scripts/fetch-wireproxy.py windows-amd64
+      - name: Provision the pinned Windows wireproxy helpers
+        run: python scripts/fetch-wireproxy.py windows-amd64 && python scripts/fetch-wireproxy-awg.py windows-amd64
       - name: Prepare the Electron packaging runtime
         run: node node_modules/electron/install.js
       - name: Fetch the Bun runtime and verify its release checksum

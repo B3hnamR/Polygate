@@ -28,7 +28,7 @@ const reconstructedCalls = (text: string) => {
 
 // Exercise the real HTTP handler with in-memory request/response streams. No
 // listener or model is contacted; every upstream call is intercepted below.
-async function request(lane: 'chat' | 'responses', stream: boolean, wire: string | string[], extra: any = {}, options: { gateRetry?: boolean; fullCollision?: boolean; holdOpen?: boolean } = {}) {
+async function request(lane: 'chat' | 'responses', stream: boolean, wire: string | string[], extra: any = {}, options: { gateRetry?: boolean; fullCollision?: boolean; holdOpen?: boolean; upstreamError?: Error } = {}) {
   const payloads: any[] = [];
   let cancelled = false;
   const ensure = spyOn(bridge.identity, 'ensureFresh').mockImplementation(() => ({}));
@@ -45,6 +45,7 @@ async function request(lane: 'chat' | 'responses', stream: boolean, wire: string
   });
   const upstream = spyOn(proxy, 'netFetch').mockImplementation(async (_url: any, init: any) => {
     payloads.push(JSON.parse(init.body));
+    if (options.upstreamError) throw options.upstreamError;
     if (options.gateRetry && payloads.length === 1) return Response.json({ error: { type: 'FreeTierError', message: 'Fixture gate rejection' } }, { status: 403 });
     const pieces = typeof wire === 'string' ? [wire] : wire;
     let i = 0;
@@ -86,10 +87,13 @@ async function request(lane: 'chat' | 'responses', stream: boolean, wire: string
 
 for (const lane of ['chat', 'responses'] as const) for (const stream of [false, true]) {
   const wireCall = lane === 'chat' ? chatCall : responseCall;
-  for (const contract of ['absent', 'none', 'object-none', 'placeholder', 'unknown'] as const) {
+  // Only a client that actually constrained tools has a strict contract. An auto request with tools must let the client handle a name the
+  // model invented: OpenCode aliases bash to shell and returns a recoverable tool error for other unknown names; aborting the whole stream
+  // here is what produced upstream_tool_error 502 for 0.6.6 clients.
+  for (const contract of ['absent', 'none', 'object-none'] as const) {
     test(`${lane} ${stream ? 'stream' : 'collected'} rejects ${contract} tool calls without exposing arguments`, async () => {
-      const extra = contract === 'absent' ? {} : { tools: [tool('read')], ...(contract === 'none' ? { tool_choice: 'none' } : contract === 'object-none' ? { tool_choice: { type: 'none' } } : {}) };
-      const name = contract === 'none' || contract === 'object-none' ? 'read_client' : contract === 'unknown' ? 'unoffered' : 'read';
+      const extra = contract === 'absent' ? {} : { tools: [tool('read')], ...(contract === 'none' ? { tool_choice: 'none' } : { tool_choice: { type: 'none' } }) };
+      const name = contract === 'none' || contract === 'object-none' ? 'read_client' : 'read';
       const r = await request(lane, stream, wireCall(name), extra);
       expect(r.status).toBe(502);
       expect(JSON.parse(r.text).error.type).toBe('upstream_tool_error');
@@ -146,6 +150,31 @@ for (const lane of ['chat', 'responses'] as const) for (const stream of [false, 
   });
 }
 
+test('a tool name the client would handle itself is forwarded, not fatal', async () => {
+  const tools = [
+    { type: 'function', function: { name: 'read', ...bridge.identity.DEFAULT_TOOLS.read } },
+    { type: 'function', function: { name: 'shell', ...bridge.identity.DEFAULT_TOOLS.shell } },
+  ];
+  for (const lane of ['chat', 'responses'] as const) for (const stream of [false, true]) {
+    const wire = lane === 'chat' ? chatCall('bash') : responseCall('bash');
+    const r = await request(lane, stream, wire, { tools });
+    expect(r.status).toBe(200);
+    expect(r.text).not.toContain('upstream_tool_error');
+    const calls = stream ? events(r.text).flatMap(e => e.choices?.flatMap((c: any) => c.delta?.tool_calls || []) || []) : JSON.parse(r.text).choices[0].message.tool_calls;
+    expect(calls.map((c: any) => c.function?.name)).toContain('bash');
+  }
+});
+
+test('a route that never answered keeps its status and plain message through the bridge', async () => {
+  const failure: any = new Error('Could not reach api.opencode.ai through the relay "Vercel fra1": Connection reset: the network or the relay host closed it. Another relay or exit may work.');
+  failure.status = 502; failure.type = 'route_unreachable';
+  const r = await request('chat', false, '', {}, { upstreamError: failure });
+  expect(r.status).toBe(502);
+  expect(JSON.parse(r.text).error).toMatchObject({ type: 'route_unreachable', code: 502 });
+  expect(r.text).toContain('Connection reset');
+  expect(r.text).not.toContain('Internal server error');
+});
+
 test('chat buffers split names, preserves parallel call IDs and does not alias twice', async () => {
   const wire = sse(chunk({ tool_calls: [call('read_', '{"value":', 0), call('read_client', '{"value":"other"}', 1)] })) +
     sse(chunk({ tool_calls: [{ index: 0, function: { name: 'client2', arguments: '"fixture"}' } }] })) + sse(chunk({}, 'tool_calls')) + sse('[DONE]');
@@ -159,14 +188,15 @@ test('chat buffers split names, preserves parallel call IDs and does not alias t
   }
 });
 
-test('chat refuses an allowed prefix extended into an unoffered tool', async () => {
+test('chat forwards a completed name that extends an offered prefix', async () => {
   const wire = sse(chunk({ tool_calls: [call('lookup', '{"value":"private"}')] })) +
     sse(chunk({ tool_calls: [{ index: 0, function: { name: '_unoffered' } }] })) + sse(chunk({}, 'tool_calls'));
   for (const stream of [false, true]) {
     const r = await request('chat', stream, wire, { tools: [tool('lookup')] });
-    expect(r.status).toBe(502);
-    expect(r.text).not.toContain('private');
-    expect(r.text).not.toContain('call-fixture');
+    expect(r.status).toBe(200);
+    const calls = stream ? events(r.text).flatMap(e => e.choices?.flatMap((c: any) => c.delta?.tool_calls || []) || []) : JSON.parse(r.text).choices[0].message.tool_calls;
+    expect(calls.find((c: any) => c.function?.name)?.function.name).toBe('lookup_unoffered');
+    expect(r.text).toContain('private');
   }
 });
 
@@ -195,7 +225,7 @@ test('chat genuine DONE can finish a held valid call, but EOF cannot', async () 
   }
 });
 
-test('Responses rejects orphan argument deltas and unoffered calls in terminal output', async () => {
+test('Responses rejects function calls with no matching announcement event', async () => {
   for (const stream of [false, true]) for (const ev of [
     { type: 'response.function_call_arguments.delta', item_id: 'unknown', delta: '{"command":"private"}' },
     { type: 'response.completed', response: { status: 'completed', output: [{ type: 'function_call', name: 'shell', arguments: '{"command":"private"}' }] } },
@@ -212,7 +242,7 @@ test('chat checks every choice and refuses legacy function calls', async () => {
     sse({ choices: [{ index: 0, delta: {}, finish_reason: null }, { index: 1, delta: { tool_calls: [call('shell')] }, finish_reason: 'tool_calls' }] }),
     sse(chunk({ function_call: { name: 'shell', arguments: '{"command":"private"}' } }, 'function_call')),
   ]) {
-    const r = await request('chat', stream, wire, { tools: [tool('lookup')] });
+    const r = await request('chat', stream, wire, {});
     expect(r.status).toBe(502);
     expect(r.text).not.toContain('private');
     expect(r.text).not.toContain('call-fixture');
