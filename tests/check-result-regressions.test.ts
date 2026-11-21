@@ -45,10 +45,15 @@ test('cached tools keep the release they came from; the presented version is not
     expect(identity.getState().tools).toMatchObject({ source: 'source', version: '2.2.6', ref: 'ref-226' });
     expect(identity.getState().recipe.version).toBe(before.recipe.version);
     // A cache written before the release was stored does not say: the label is unknown, never the default version.
-    const file = join(dir, 'source-recipe.json'); const old = JSON.parse(readFileSync(file, 'utf8')); delete old.version; writeFileSync(file, JSON.stringify(old));
+    const file = join(dir, 'source-recipe.json'); const current = JSON.parse(readFileSync(file, 'utf8')); const old = { ...current }; delete old.version; writeFileSync(file, JSON.stringify(old));
     const legacy = identity.readCachedSource(); expect(legacy.version).toBeUndefined();
     identity.applyRecipe(legacy.extracted, null, { toolsVersion: null, toolsRef: legacy.ref });
     expect(identity.getState().tools.version).toBeNull();
+    // A cache written by an older extractor describes the release with a
+    // profile that can disagree with the client; it is ignored and refetched.
+    const stale = { ...current }; delete stale.cacheVersion; writeFileSync(file, JSON.stringify(stale));
+    expect(identity.readCachedSource()).toBeNull();
+    writeFileSync(file, JSON.stringify(current));
     // A release applied together with its own source labels the tools with that release, as before.
     identity.applyRecipe({ tools });
     expect(identity.getState().tools.version).toBe(before.recipe.version);
