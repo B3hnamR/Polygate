@@ -56,6 +56,8 @@ function fixture(options: { exe?: string; inherited?: boolean; failCopy?: boolea
     put(win.join(folder, 'Polygate.exe'), 'inert exe');
     put(win.join(folder, 'resources', 'app.asar'), 'asar');
     put(win.join(folder, 'resources', 'gateway.js'), 'gateway');
+    put(win.join(folder, 'resources', 'bin', 'bun.exe'), 'bun');
+    put(win.join(folder, 'resources', 'ui', 'index.html'), 'ui');
     put(win.join(folder, '.polygate-copy'), `${name} 4 7 1234`);
     return folder;
   };
@@ -63,6 +65,8 @@ function fixture(options: { exe?: string; inherited?: boolean; failCopy?: boolea
   put(exe, 'inert exe');
   put(win.join(win.dirname(exe), 'resources', 'app.asar'), 'asar');
   put(win.join(win.dirname(exe), 'resources', 'gateway.js'), 'gateway');
+  put(win.join(win.dirname(exe), 'resources', 'bin', 'bun.exe'), 'bun');
+  put(win.join(win.dirname(exe), 'resources', 'ui', 'index.html'), 'ui');
   const env: Record<string, string> = { LOCALAPPDATA: 'C:\\Local', PORTABLE_EXECUTABLE_DIR: 'C:\\Downloads', PORTABLE_EXECUTABLE_FILE: 'C:\\Downloads\\Portable.exe' };
   if (options.inherited !== false) env.POLYGATE_RELOCATED = '1';
   const app = {
@@ -70,22 +74,25 @@ function fixture(options: { exe?: string; inherited?: boolean; failCopy?: boolea
     requestSingleInstanceLock: () => true, releaseSingleInstanceLock() {}, exit() {}, quit() {}, on() {},
     whenReady: () => ({ then() {} }),
   };
+  let now = Date.now();
   const context: any = {
+    Date: { now: () => now }, setTimeout: (fn: () => void, ms: number) => { now += ms; fn(); },
     process: { platform: options.platform || 'win32', execPath: exe, resourcesPath: win.join(win.dirname(exe), 'resources'), env, argv: ['Polygate.exe'], pid: 123 },
     __dirname: 'C:\\app\\desktop', console: { error: (...args: unknown[]) => errors.push(args.join(' ')) },
     require: (name: string) => {
       if (name === 'electron') return { app };
-      if (name === './updater.cjs' || name === './window-mode.cjs') return {};
+      if (name === './updater.cjs') return { portableTarget: (target: string) => target };
+      if (name === './window-mode.cjs') return {};
       if (name === 'original-fs') return ofs;
-      if (name === 'node:fs') return { writeSync() {} };
+      if (name === 'node:fs') return { ...ofs, unlinkSync: ofs.rmSync, writeSync() {} };
       if (name === 'node:path') return win;
       if (name === 'node:crypto') return { randomBytes: () => Buffer.from('inert token') };
       if (name === 'node:child_process') return { spawn: (...args: unknown[]) => { launches.push(args); return { unref() {} }; } };
       throw new Error('Unexpected module: ' + name);
     },
   };
-  const start = () => runInNewContext(mainSource + '\nglobalThis.prune = pruneCopies;', context);
-  return { put, copy, entries, key, ofs, env, removed, launches, errors, start, prune: () => context.prune(0) };
+  const start = () => runInNewContext(mainSource, context);
+  return { put, copy, entries, key, ofs, env, removed, launches, errors, start, prune: () => context.pruneCopies(0), confirm: (window: unknown, result: string) => context.confirmDashboardStartup(window, result) };
 }
 
 describe('portable cache ownership', () => {
@@ -110,6 +117,29 @@ describe('portable cache ownership', () => {
     expect(f.errors).toEqual([]); expect(f.removed).toEqual([]);
     expect(f.launches).toHaveLength(1);
     expect(f.launches[0][0]).toBe(win.join(base, version, 'Polygate.exe'));
+  });
+
+  for (const asset of ['resources\\bin\\bun.exe', 'resources\\ui\\index.html']) test(`a cache missing ${asset} is rebuilt before startup`, () => {
+    const f = fixture(), folder = f.copy(version), file = win.join(folder, asset);
+    f.entries.delete(f.key(file));
+    f.start();
+    expect(f.removed).toEqual([folder]);
+    expect(f.ofs.existsSync(file)).toBe(true);
+    expect(f.launches[0][0]).toBe(win.join(folder, 'Polygate.exe'));
+  });
+
+  test('a new copy lists every file it holds, and a copy that lost one listed file is made again', () => {
+    const first = fixture(); first.start();
+    const folder = win.join(base, version); const list = JSON.parse(String(first.ofs.readFileSync(win.join(folder, '.polygate-files'))));
+    // (The stand-in file system keeps names in lower case.)
+    expect(list.map(([rel]: [string]) => rel.toLowerCase())).toEqual(expect.arrayContaining(['polygate.exe', 'resources\\app.asar', 'resources\\bin\\bun.exe', 'resources\\ui\\index.html']));
+    // A file outside the old fixed checks (here the gateway's WARP helper would do as well): gone from the copy, so the copy is not trusted.
+    const f = fixture(), copy = f.copy(version), extra = win.join(copy, 'resources', 'ui', 'assets', 'index.js');
+    f.ofs.writeFileSync(extra, 'js'); f.ofs.writeFileSync(win.join(copy, '.polygate-files'), JSON.stringify(f.ofs.readdirSync(copy).length ? [['resources\\ui\\assets\\index.js', 2], ['Polygate.exe', f.ofs.statSync(win.join(copy, 'Polygate.exe')).size]] : []));
+    f.entries.delete(f.key(extra));
+    f.start();
+    expect(f.removed).toEqual([copy]);
+    expect(f.launches[0][0]).toBe(win.join(copy, 'Polygate.exe'));
   });
 
   test('verified current cache skips relocation even without the flag; pruning deletes only owned old versions', () => {
@@ -189,6 +219,37 @@ describe('portable cache ownership', () => {
     relative.start(); relative.prune();
     expect(relative.launches).toEqual([]); expect(relative.removed).toEqual([]);
   });
+});
+
+test('the update acknowledgement requires a rendered workspace and a session that can read this desktop version', async () => {
+  const result = 'C:\\Profile\\update-result.json', ack = 'C:\\Profile\\update-started.json';
+  for (const [view, status, mode, gatewayVersion, ready] of [
+    ['.loading', 200, 'desktop', version, false], ['.login', 200, 'desktop', version, false],
+    ['.page-content', 401, 'desktop', version, false], ['.mini', 503, 'desktop', version, false],
+    ['.page-content', 200, 'server', version, false], ['.page-content', 200, 'desktop', '0.6.5', false],
+    ['.page-content', 200, 'desktop', version, true], ['.mini', 200, 'desktop', version, true],
+  ] as const) {
+    const f = fixture(); f.start();
+    const folder = f.env.PORTABLE_EXECUTABLE_DIR, suffix = 'a'.repeat(32) + '.exe';
+    const backup = (stamp: string) => win.join(folder, '.polygate-backup-' + stamp + suffix);
+    const fresh = backup(Date.now() + '-'), stale = backup((Date.now() - 8 * 86400000) + '-'), legacy = backup('');
+    for (const file of [fresh, stale, legacy]) f.put(file, 'old exe'); // All mtimes predate this update.
+    let calls = 0;
+    const renderer = {
+      document: { querySelector: (selectors: string) => selectors.split(', ').includes('#root ' + view) }, AbortSignal,
+      fetch: async (url: string, init: RequestInit) => {
+        if (url !== '/admin/state' || init.credentials !== 'same-origin' || init.headers) throw new Error('Not the dashboard session');
+        calls++;
+        return Response.json({ server: { mode }, version: gatewayVersion }, { status });
+      },
+    };
+    await f.confirm({ isDestroyed: () => false, webContents: { executeJavaScript: (probe: string) => runInNewContext(probe, renderer) } }, result);
+    expect(f.ofs.existsSync(ack)).toBe(ready);
+    expect(calls > 0).toBe(!['.loading', '.login'].includes(view));
+    if (ready) expect(JSON.parse(f.ofs.readFileSync(ack)!)).toMatchObject({ version, exe: f.env.PORTABLE_EXECUTABLE_FILE });
+    expect(f.ofs.existsSync(fresh)).toBe(true); expect(f.ofs.existsSync(legacy)).toBe(true);
+    expect(f.ofs.existsSync(stale)).toBe(!ready);
+  }
 });
 
 const windowsTest = process.platform === 'win32' ? test : test.skip;

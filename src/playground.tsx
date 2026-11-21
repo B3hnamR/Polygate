@@ -151,8 +151,9 @@ export function Playground({ data, apiKey, model, setModel, refresh, notice }: {
     }));
     refresh();
   }
-  function send() { const prompt = draft.trim(); if (!prompt || busy) return; setDraft(''); void start(turns.map(list => [...list, { role: 'user' as const, content: prompt }])); }
-  function regenerate() { const next = turns.map(list => { const l = [...list]; while (l.length && l[l.length - 1].role === 'assistant') l.pop(); return l; }); if (next[0].length && !busy) void start(next); }
+  // Only the panes in use get the message: a prompt sent with one pane must not reach the second model later, when Compare is turned on.
+  function send() { const prompt = draft.trim(); if (!prompt || busy) return; setDraft(''); void start(turns.map((list, k) => k < slots ? [...list, { role: 'user' as const, content: prompt }] : list)); }
+  function regenerate() { const next = turns.map((list, k) => { if (k >= slots) return list; const l = [...list]; while (l.length && l[l.length - 1].role === 'assistant') l.pop(); return l; }); if (next[0].length && !busy) void start(next); }
   function clear() { const ctl = controller.current; controller.current = null; ctl?.abort(); setTurns([[], []]); setRunning([false, false]); }
   function savePrompt() { const name = prompt('Name this prompt', draft.trim().slice(0, 40)); if (!name?.trim() || (!draft.trim() && !system.trim())) return; const list = [...prompts.filter(p => p.name !== name.trim()), { name: name.trim(), system, prompt: draft }]; setPrompts(list); keep(PROMPTS, { list }); setPicked(name.trim()); notice('Prompt saved'); }
   function removePrompt() { const list = prompts.filter(p => p.name !== picked); setPrompts(list); keep(PROMPTS, { list }); setPicked(''); }

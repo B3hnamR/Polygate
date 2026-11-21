@@ -13,42 +13,55 @@ export function failureText(raw: string) {
   return text.replace(/\s+/g, ' ').slice(0, 160);
 }
 // The most common failures in the period; numbers are left out when comparing, so the same failure counts as one. A client that hung up (499) is not a failure of anything.
-function topFailures(since: number) {
+function topFailures(since: number, until: number) {
   const seen = new Map<string, { message: string; status: number; count: number; lastAt: number; model: string }>();
-  for (const r of rows('SELECT status, error, model, time FROM requests WHERE time>? AND status>=400 AND status<>499 ORDER BY time DESC LIMIT 5000', since)) {
+  for (const r of rows('SELECT status, error, model, time FROM requests WHERE time>? AND time<=? AND status>=400 AND status<>499 ORDER BY time DESC LIMIT 5000', since, until)) {
     const message = failureText(String(r.error || '')) || `HTTP ${r.status}`; const key = `${r.status}:${message.replace(/\d+/g, '#')}`;
     const had = seen.get(key); if (had) had.count++; else seen.set(key, { message, status: Number(r.status), count: 1, lastAt: Number(r.time), model: String(r.model || '') });
   }
   return [...seen.values()].sort((a, b) => b.count - a.count).slice(0, 5);
 }
-// Everything the dashboard charts come from the request log, so the numbers survive restarts and match the Requests page.
-export function metrics() {
-  const now = Date.now(); const day = now - 86400000; const minute = now - 60000;
-  const total = one('SELECT COUNT(*) n, SUM(CASE WHEN status<400 THEN 1 ELSE 0 END) ok, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output, COALESCE(AVG(ms),0) avg FROM requests WHERE time>?', day);
-  const latencies = rows('SELECT ms FROM requests WHERE time>? AND status<400 ORDER BY ms', day).map(r => Number(r.ms)); const live = one('SELECT COUNT(*) n, COALESCE(SUM(input+output),0) tokens FROM requests WHERE time>?', minute);
-  const speed = one('SELECT COALESCE(SUM(output),0) out, COALESCE(SUM(ms),0) ms FROM requests WHERE time>? AND status<400 AND output>0', day);
-  const hourly = rows('SELECT (time/3600000) h, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY h ORDER BY h', now - 24 * 3600000);
-  const byModel = rows('SELECT model, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY model ORDER BY n DESC LIMIT 12', day);
-  const byRoute = rows("SELECT CASE WHEN route='' THEN '-' ELSE route END route, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY route ORDER BY n DESC LIMIT 12", day);
-  const byStatus = rows('SELECT status, COUNT(*) n FROM requests WHERE time>? GROUP BY status ORDER BY n DESC LIMIT 8', day);
+const hourMs = 3600000;
+// A rollup survives log pruning but cannot be split at a timestamp. Count only retained detail for
+// historical partial hours; if some is gone this is a lower bound, not an estimate from the entire hour.
+function windowHours(since: number, until: number, live = false) {
+  // (since, until] in integer milliseconds; the middle contains precisely the complete buckets.
+  const first = Math.ceil((since + 1) / hourMs);
+  let end = Math.floor((until + 1) / hourMs);
+  // Ordinarily the live bucket only contains traffic through now. Keep its rollup too unless the
+  // clock moved backwards. For a historical cutoff, never assume missing detail was on either side.
+  if (live && (until + 1) % hourMs !== 0 && !one('SELECT 1 n FROM requests WHERE time>? AND time<? LIMIT 1', until, (end + 1) * hourMs).n) end++;
+  return db.query(`SELECT hour h, requests n, errors, input, output, ms FROM usage_hourly WHERE hour>=? AND hour<?
+    UNION ALL SELECT time/3600000 h, COUNT(*), SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END), COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(ms),0)
+    FROM requests WHERE (time>? AND time<?) OR (time>=? AND time<=?) GROUP BY time/3600000 ORDER BY h`).all(first, end, since, first * hourMs, end * hourMs, until) as {h: number, n: number, errors: number, input: number, output: number, ms: number}[];
+}
+export function metrics(now = Date.now()) {
+  const day = now - 86400000; const minute = now - 60000;
+  const hourly = windowHours(day, now, true);
+  const sum = (key: 'n' | 'errors' | 'input' | 'output' | 'ms') => hourly.reduce((s, r) => s + r[key], 0);
+  const n = sum('n'), errors = sum('errors');
+  const latencies = rows('SELECT ms FROM requests WHERE time>? AND time<=? AND status<400 ORDER BY ms', day, now).map(r => Number(r.ms)); const live = one('SELECT COUNT(*) n, COALESCE(SUM(input+output),0) tokens FROM requests WHERE time>? AND time<=?', minute, now);
+  const speed = one('SELECT COALESCE(SUM(output),0) out, COALESCE(SUM(ms),0) ms FROM requests WHERE time>? AND time<=? AND status<400 AND output>0', day, now);
+  const byModel = rows('SELECT model, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? AND time<=? GROUP BY model ORDER BY n DESC LIMIT 12', day, now);
+  const byRoute = rows("SELECT CASE WHEN route='' THEN '-' ELSE route END route, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? AND time<=? GROUP BY route ORDER BY n DESC LIMIT 12", day, now);
+  const byStatus = rows('SELECT status, COUNT(*) n FROM requests WHERE time>? AND time<=? GROUP BY status ORDER BY n DESC LIMIT 8', day, now);
   // Where the requests went and came from, and what failed: the Overview's summary and the Routing map's line weights.
-  const byProvider = rows('SELECT provider, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? GROUP BY provider ORDER BY n DESC LIMIT 60', day);
-  const byLink = rows("SELECT provider, route, COUNT(*) n FROM requests WHERE time>? AND route<>'' GROUP BY provider, route LIMIT 500", day);
-  const byKey = rows('SELECT keyId, COUNT(*) n, COALESCE(SUM(input+output),0) tokens FROM requests WHERE time>? GROUP BY keyId ORDER BY n DESC LIMIT 8', day);
-  const before = one('SELECT COUNT(*) n FROM requests WHERE time>? AND time<=?', now - 2 * 86400000, day);
-  const n = Number(total.n) || 0;
+  const byProvider = rows('SELECT provider, COUNT(*) n, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors, COALESCE(SUM(input+output),0) tokens, COALESCE(AVG(ms),0) avg FROM requests WHERE time>? AND time<=? GROUP BY provider ORDER BY n DESC LIMIT 60', day, now);
+  const byLink = rows("SELECT provider, route, COUNT(*) n FROM requests WHERE time>? AND time<=? AND route<>'' GROUP BY provider, route LIMIT 500", day, now);
+  const byKey = rows('SELECT keyId, COUNT(*) n, COALESCE(SUM(input+output),0) tokens FROM requests WHERE time>? AND time<=? GROUP BY keyId ORDER BY n DESC LIMIT 8', day, now);
+  const before = windowHours(day - 86400000, day);
   return {
-    uptimeSeconds: Math.round(process.uptime()), requests: n, successRate: n ? Math.round(Number(total.ok) / n * 1000) / 10 : null, errors: n - Number(total.ok || 0),
-    inputTokens: Number(total.input), outputTokens: Number(total.output), avgMs: Math.round(Number(total.avg)), p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), p99: percentile(latencies, 0.99),
+    uptimeSeconds: Math.round(process.uptime()), requests: n, successRate: n ? Math.round((n - errors) / n * 1000) / 10 : null, errors,
+    inputTokens: sum('input'), outputTokens: sum('output'), avgMs: n ? Math.round(sum('ms') / n) : 0, p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), p99: percentile(latencies, 0.99),
     rpm: Number(live.n), tpm: Number(live.tokens), tokensPerSecond: Number(speed.ms) ? Math.round(Number(speed.out) / (Number(speed.ms) / 1000) * 10) / 10 : 0,
-    hourly: hourly.map(r => ({ hour: Number(r.h) * 3600000, requests: Number(r.n), errors: Number(r.errors), tokens: Number(r.tokens), avgMs: Math.round(Number(r.avg)) })),
+    hourly: hourly.map(r => ({ hour: r.h * hourMs, requests: r.n, errors: r.errors, tokens: r.input + r.output, avgMs: r.n ? Math.round(r.ms / r.n) : 0 })),
     byModel: byModel.map(r => ({ model: r.model, requests: Number(r.n), errors: Number(r.errors), tokens: Number(r.tokens), avgMs: Math.round(Number(r.avg)) })),
     byRoute: byRoute.map(r => ({ route: r.route, requests: Number(r.n), errors: Number(r.errors), avgMs: Math.round(Number(r.avg)) })),
     byStatus: byStatus.map(r => ({ status: Number(r.status), requests: Number(r.n) })),
     byProvider: byProvider.map(r => ({ provider: String(r.provider), requests: Number(r.n), errors: Number(r.errors), tokens: Number(r.tokens), avgMs: Math.round(Number(r.avg)) })),
     byLink: byLink.map(r => ({ provider: String(r.provider), route: String(r.route), requests: Number(r.n) })),
     byKey: byKey.map(r => ({ name: keyName(String(r.keyId || '')), requests: Number(r.n), tokens: Number(r.tokens) })),
-    previousRequests: Number(before.n) || 0, failures: topFailures(day),
+    previousRequests: before.reduce((s, r) => s + r.n, 0), failures: topFailures(day, now),
     keys: settings.keys.map(k => ({ id: k.id, name: k.name, requests: k.requests || 0, tokens: k.used || 0, budget: k.budget || 0, lastUsed: k.lastUsed || 0 })),
   };
 }

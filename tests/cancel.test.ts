@@ -1,7 +1,6 @@
 import { test, expect } from 'bun:test';
 import './setup';
-import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { serve } from '../backend/serve';
 const { withRequestCancel, cancellable, isCancelled, afterCancel, requestSignal } = await import('../backend/cancel');
 
 // A server that accepts a request and never answers: work waiting on it only ends by its timeout or a cancel.
@@ -11,29 +10,26 @@ function hanging(): Promise<{ url: string; close: () => void }> {
     resolve({ url: `http://127.0.0.1:${s.port}/`, close: () => s.stop(true) });
   });
 }
-function listen(handler: Parameters<typeof createServer>[1]): Promise<{ server: Server; url: string }> {
-  return new Promise(resolve => { const server = createServer(handler); server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/` })); });
-}
 
 test('a dashboard request that is dropped cancels the work it started, at once', async () => {
   const slow = await hanging();
   let outcome = ''; let took = 0; let cleanedUpWithSignal: boolean | undefined;
-  const done = new Promise<void>(r => {
-    void listen((req, res) => {
-      const start = Date.now();
-      void withRequestCancel(res, req, async () => {
-        try { await fetch(slow.url, { signal: cancellable(20000) }); outcome = 'answered'; }
-        catch { outcome = isCancelled() ? 'cancelled' : 'failed'; took = Date.now() - start; cleanedUpWithSignal = await afterCancel(async () => !!requestSignal()); }
-        r();
-      });
-    }).then(({ server, url }) => {
-      const c = new AbortController();
-      fetch(url, { method: 'POST', signal: c.signal }).catch(() => {});
-      setTimeout(() => c.abort(), 300);
-      void done.then(() => server.close());
+  const c = new AbortController();
+  let ready!: () => void, finish!: () => void;
+  const started = new Promise<void>(r => { ready = r; }), done = new Promise<void>(r => { finish = r; });
+  const server = serve((req, res) => {
+    const start = Date.now();
+    return withRequestCancel(res, req, async () => {
+      ready();
+      try { await fetch(slow.url, { signal: cancellable(20000) }); outcome = 'answered'; }
+      catch { outcome = isCancelled() ? 'cancelled' : 'failed'; took = Date.now() - start; cleanedUpWithSignal = await afterCancel(async () => !!requestSignal()); }
+      finish();
     });
-  });
-  await done; slow.close();
+  }, 0);
+  try {
+    void fetch(`http://127.0.0.1:${server.port}/`, { method: 'POST', signal: c.signal }).catch(() => {});
+    await started; c.abort(); await done;
+  } finally { server.stop(true); slow.close(); }
   expect(outcome).toBe('cancelled');
   expect(took).toBeLessThan(3000); // not the 20 s timeout
   expect(cleanedUpWithSignal).toBe(false); // clean-up runs outside the cancelled request
@@ -41,15 +37,17 @@ test('a dashboard request that is dropped cancels the work it started, at once',
 
 test('a request that is answered normally is not taken for a cancel', async () => {
   let after: boolean | undefined;
-  const { server, url } = await listen((req, res) => {
+  const server = serve((req, res) => {
     void withRequestCancel(res, req, async () => {
       const signal = requestSignal()!;
       res.end('ok');
       await new Promise(r => setTimeout(r, 200)); after = signal.aborted;
     });
-  });
-  expect(await (await fetch(url)).text()).toBe('ok');
-  await new Promise(r => setTimeout(r, 400)); server.close();
+  }, 0);
+  try {
+    expect(await (await fetch(`http://127.0.0.1:${server.port}/`)).text()).toBe('ok');
+    await new Promise(r => setTimeout(r, 400));
+  } finally { server.stop(true); }
   expect(after).toBe(false);
 });
 

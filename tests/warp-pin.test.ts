@@ -68,7 +68,7 @@ test('all exhausted tunnels stop after one confirmation per tunnel without retir
     expect(route).toMatchObject(health);
   }
   expect(routeAfter({ kind: 'free' } as any, route)?.id).toBe('backup');
-  const paid = { id: 'paid', kind: 'openai', routes: { ids: ['warp'] }, baseUrl: 'https://paid.example.test/v1' } as any;
+  const paid = { id: 'paid', kind: 'openai', routes: { ids: ['warp'] }, baseUrl: 'https://opencode.ai/zen/v1', apiKey: 'fixture-paid' } as any;
   expect(routeForProvider(paid, 'test')).toBe(route);
   const target = warpTarget('openai', true)!; let port = 0;
   globalThis.fetch = (async (_url: any, init: any) => { port = Number(new URL(init.proxy).port); return new Response('paid OK'); }) as typeof fetch;

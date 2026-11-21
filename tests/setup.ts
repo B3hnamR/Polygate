@@ -87,7 +87,7 @@ export function preserveTestState() {
   const settings = structuredClone(state.settings);
   const models = structuredClone([...state.models]);
   const env = { ...process.env };
-  const tables = ['models', 'requests', 'usage_daily', 'usage_keys_daily', 'route_outcomes', 'events'] as const;
+  const tables = ['models', 'requests', 'usage_daily', 'usage_keys_daily', 'usage_hourly', 'route_outcomes', 'events'] as const;
   const rows = tables.map(table => ({ table, rows: state.db.query(`SELECT * FROM ${table}`).all() as Record<string, any>[] }));
   const eventSequence = state.db.query("SELECT seq FROM sqlite_sequence WHERE name='events'").get() as { seq: number } | null;
   return () => {

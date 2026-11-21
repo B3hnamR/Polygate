@@ -20,6 +20,12 @@ const deferred = () => { let resolve!: (value: any) => void, reject!: (reason: E
 const settle = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 const server = (disabledTools: string[] = []) => ({ id: 'one', name: 'one', enabled: true, disabledTools, status: { state: 'ready', tools: ['a', 'b'].map(name => ({ name, disabled: disabledTools.includes(name) })) } });
 
+const mcpSource = source('mcp.tsx');
+const createPage = evaluate(between(mcpSource, 'let settingsQueue', 'export function McpPage') + `
+  return ({ api, notice, hub, useRef, useCallback, useEffect, setHub, setError }) => {
+    ${between(mcpSource, '  const generation =', '  if (!hub)')}
+    return { load, changed, settingsChange };
+  };`);
 function mcpHarness() {
   const pending: { path: string; body: unknown; request: ReturnType<typeof deferred> }[] = [];
   const state: any = { hub: { enabled: true, builtin: true, builtinKeys: [], builtinTools: [{ name: 'status' }], canAddLocal: true, mode: 'desktop', servers: [server()] }, error: '', busy: '', notices: [] };
@@ -27,7 +33,7 @@ function mcpHarness() {
   const setter = (key: string) => (value: any) => { state[key] = typeof value === 'function' ? value(state[key]) : value; };
   const api = (path: string, body?: unknown) => { const request = deferred(); pending.push({ path, body, request }); return request.promise; };
   const notice = (...args: unknown[]) => state.notices.push(args);
-  const page = evaluate(between(source('mcp.tsx'), '  const generation =', '  if (!hub)') + '\nreturn { load, changed, settingsChange };', {
+  const page = createPage({
     api, notice, hub: state.hub, useRef: (current: unknown) => ({ current }), useCallback: (fn: unknown) => fn, useEffect: (effect: () => void | (() => void)) => effects.push(effect), setHub: setter('hub'), setError: setter('error'),
   });
   const act = () => evaluate(between(source('mcp.tsx'), '  const act = async', '  const st =') + '\nreturn act;', { api, notice, s: state.hub.servers[0], setBusy: setter('busy'), onChanged: page.changed });
@@ -148,16 +154,29 @@ test('opposite settings toggles cannot dispatch or apply out of order', async ()
   expect(h.state.hub.enabled).toBe(true);
 });
 
-test('unmount invalidates GETs, ignores late mutations and drops queued settings work', async () => {
+test('accepted settings POSTs finish in order after unmount, before a reopened page reads them', async () => {
   const h = mcpHarness(), initial = h.state.hub, unmount = h.mount();
   const settings = h.settingsChange({ enabled: false }, 'Off'), queued = h.settingsChange({ builtin: false }, 'Builtin off');
   await settle(); expect(h.pending).toHaveLength(2);
+  expect(h.pending[1]).toMatchObject({ path: '/admin/mcp/settings', body: { enabled: false } });
   unmount();
+  const reopened = mcpHarness(), close = reopened.mount();
+  await h.settingsChange({ enabled: true }, 'Too late');
+  await settle(); expect(reopened.pending).toHaveLength(0);
   h.pending[0].request.resolve({ servers: [] });
-  h.pending[1].request.resolve({ ...initial, enabled: false });
-  await settings; await queued;
+  const persisted = { ...initial };
+  h.pending[1].request.resolve(Object.assign(persisted, h.pending[1].body));
+  await settings; await settle();
+  expect(h.pending[2]).toMatchObject({ path: '/admin/mcp/settings', body: { builtin: false } });
+  expect(reopened.pending).toHaveLength(0);
+  h.pending[2].request.resolve(Object.assign(persisted, h.pending[2].body));
+  await queued; await settle();
   await h.changed(null, 'one'); await h.load();
-  expect(h.pending).toHaveLength(2); expect(h.state.hub).toBe(initial); expect(h.state.notices).toEqual([]);
+  expect(h.pending).toHaveLength(3); expect(h.state.hub).toBe(initial); expect(h.state.notices).toEqual([]);
+  expect(reopened.pending).toHaveLength(1); expect(reopened.pending[0].path).toBe('/admin/mcp');
+  reopened.pending[0].request.resolve(persisted); await settle();
+  expect(reopened.state.hub).toMatchObject({ enabled: false, builtin: false });
+  close();
 });
 
 test('Button forwards native aria, form, data and event props while preserving defaults and styling', () => {

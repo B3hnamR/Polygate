@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as engine from '../backend/agent-engine';
@@ -199,6 +199,35 @@ test('restore failure after replacement still enrolls that file and attempts all
   expect((await changes()).body.turns).toHaveLength(1);
   expect(readFileSync(path.join(folder, 'c.txt'), 'utf8')).toBe('after c.txt');
   expect(existsSync(journalPath())).toBe(false);
+});
+
+for (const phase of ['recovery', 'rollback'] as const) test(`Undo ${phase} restores the saved mode when the bytes already match`, async () => {
+  const [change] = seedTurn(['a.txt']);
+  const full = path.join(folder, change.file);
+  chmodSync(full, 0o444);
+  const mode = statSync(full).mode & 0o777;
+  try {
+    if (phase === 'recovery') {
+      revert = { messageID: message() };
+      writeFileSync(journalPath(), JSON.stringify({ message: message(), phase: 'restoring',
+        rollback: [[change.file, { hash: change.after, mode }]], target: [[change.file, change.before]],
+        history: messages.map(m => m.id), remaining: [] }));
+      chmodSync(full, 0o666);
+      expect((await changes()).status).toBe(200);
+    } else {
+      restoreSpy = spyOn(backup, 'restoreFile').mockImplementation((dir, file, saved, bytes) => {
+        if (saved?.hash === change.before.hash) {
+          chmodSync(full, 0o666);
+          throw new Error('synthetic failure after mode change');
+        }
+        originalRestore(dir, file, saved, bytes);
+      });
+      await expect(undo()).rejects.toThrow('synthetic failure after mode change');
+    }
+    expect(statSync(full).mode & 0o777).toBe(mode);
+    expect(readFileSync(full, 'utf8')).toBe('after a.txt');
+    expect(existsSync(journalPath())).toBe(false);
+  } finally { chmodSync(full, 0o666); }
 });
 
 test('a silently incomplete rollback fails verification and retains recovery state', async () => {

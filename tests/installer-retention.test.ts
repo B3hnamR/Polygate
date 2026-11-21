@@ -11,8 +11,21 @@ if (!prune) throw new Error('Cannot locate the actual installer pruning function
 const shellTest = test.skipIf(process.platform !== 'linux' || !existsSync('/bin/bash'));
 const names = ['20261117000100-100', '20261117000200-200', '20261117000300-300'];
 const archiveTime = new Date('2026-01-01T00:00:00Z');
+// This is the exact v0.6.5 cleanup rule. It is kept here as a regression fixture,
+// not as a supported implementation: an installed v0.6.5 updater cannot be patched
+// by changing this checkout.
+const legacyPrune = `prune_releases() {
+  local d
+  ls -1dt /opt/polygate/releases/*/ 2>/dev/null | tail -n +3 | while read -r d; do case "$d" in /opt/polygate/releases/*) rm -rf -- "$d" ;; esac; done
+}`;
 
-function fixture(run: (f: { root: string; releases: string; release: (name: string, time?: Date) => string; prune: (old?: string) => void }) => void) {
+function fixture(run: (f: {
+  root: string;
+  releases: string;
+  release: (name: string, time?: Date) => string;
+  prune: (old?: string) => void;
+  pruneLegacy: (old?: string) => void;
+}) => void) {
   const scratch = mkdtempSync(path.join(tmpdir(), 'polygate-retention-'));
   const root = path.join(scratch, "install path 'quoted' $literal [glob]");
   const releases = path.join(root, 'releases');
@@ -31,6 +44,18 @@ function fixture(run: (f: { root: string; releases: string; release: (name: stri
       prune(old) {
         // Execute only the real function, relocating every install path to this test's scratch.
         const script = 'set -Eeuo pipefail\n' + prune!.replaceAll('/opt/polygate', '${FIXTURE_ROOT}')
+          + '\nif [ "$#" -gt 0 ]; then old=$1; fi\nprune_releases\n';
+        expect(script).not.toContain('/opt/polygate');
+        const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script, 'retention-test', ...(old === undefined ? [] : [old])], {
+          cwd: scratch, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', FIXTURE_ROOT: root }, encoding: 'utf8', timeout: 10000,
+        });
+        expect({ status: result.status, signal: result.signal, error: result.error?.message, stderr: result.stderr })
+          .toEqual({ status: 0, signal: null, error: undefined, stderr: '' });
+      },
+      pruneLegacy(old) {
+        // Quote the scratch root because this fixture also exercises paths with
+        // spaces; the installed /opt/polygate path itself has no spaces.
+        const script = 'set -Eeuo pipefail\n' + legacyPrune.replaceAll('/opt/polygate', '"${FIXTURE_ROOT}"')
           + '\nif [ "$#" -gt 0 ]; then old=$1; fi\nprune_releases\n';
         expect(script).not.toContain('/opt/polygate');
         const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script, 'retention-test', ...(old === undefined ? [] : [old])], {
@@ -65,6 +90,21 @@ shellTest('retains a downgrade with the oldest archive mtime rather than the two
     f.prune(previous);
     expect(readdirSync(f.releases).sort()).toEqual(names.slice(1));
     expect(existsSync(path.join(f.root, 'current', 'sentinel'))).toBe(true);
+  });
+});
+
+shellTest('the v0.6.5 layout demonstrates why the new installer must be run locally', () => {
+  fixture(f => {
+    const rollback = f.release(names[0], new Date('2026-01-01T00:00:00Z'));
+    f.release(names[1], new Date('2026-11-02T00:00:00Z'));
+    const incoming = f.release(names[2], new Date('2026-11-03T00:00:00Z'));
+    symlinkSync(incoming, path.join(f.root, 'current'));
+
+    // The stock updater keeps the two newest directories and can remove the
+    // active rollback target when an unrelated historical release is newer.
+    f.pruneLegacy(rollback);
+    expect(readdirSync(f.releases).sort()).toEqual(names.slice(1));
+    expect(existsSync(rollback)).toBe(false);
   });
 });
 

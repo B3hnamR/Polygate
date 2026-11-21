@@ -38,6 +38,8 @@ test('images are recognised and replaced by a note; the refusals are recognised,
   expect(refusesImages(404, 'No endpoints found that support image input')).toBe(true);
   expect(refusesImages(400, 'This model does not support image input')).toBe(true);
   expect(refusesImages(400, 'Image input is not supported for this model')).toBe(true);
+  expect(refusesImages(400, 'Unsupported content type: image/tiff')).toBe(false);
+  expect(refusesImages(400, 'This model does not support image format TIFF')).toBe(false);
   expect(refusesImages(429, 'rate limited')).toBe(false); expect(refusesImages(500, 'does not support images')).toBe(false); expect(refusesImages(404, 'model not found')).toBe(false);
 });
 

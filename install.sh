@@ -42,6 +42,8 @@ POLYGATE_DASHBOARD_PATH (default /polygate; empty for the root), POLYGATE_SKIP_D
 HELP
 }
 
+# Kept for handing an update to the new release's own installer (fetch_release).
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -139,7 +141,10 @@ confirm() { # confirm "Question" y|n  -> true/false. Without a terminal the defa
 # -------------------------------------------------------------------------------------------------------------- facts about the machine
 LOG=/var/log/polygate-install.log
 work=
-cleanup() { case "$work" in /tmp/polygate-install.*) rm -rf -- "$work" ;; esac; }
+cleanup() {
+  case "$work" in /tmp/polygate-install.*) rm -rf -- "$work" ;; esac
+  case "${POLYGATE_HANDED_OVER:-}" in /tmp/polygate-handover.*) rm -rf -- "$POLYGATE_HANDED_OVER" ;; esac
+}
 trap cleanup EXIT
 log_line() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
 
@@ -181,6 +186,20 @@ pick_port() { # a random free port in 20000-49999
 ours_unit() { [ -f /etc/systemd/system/polygate.service ] && grep -q '^Description=Polygate model gateway' /etc/systemd/system/polygate.service; }
 ours_cli() { [ -f /usr/local/bin/polygate ] && grep -q 'polygate-cli' /usr/local/bin/polygate; }
 dir_busy() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
+# /opt/polygate holds only what this installer makes: releases/ with <timestamp>-<pid> release folders, and the current link. A folder that merely
+# contains a releases/ directory is not enough.
+opt_ours() {
+  local e
+  for e in /opt/polygate/* /opt/polygate/.[!.]*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    case "${e##*/}" in releases|current|.current-new|.current-old) ;; *) return 1 ;; esac
+  done
+  [ -d /opt/polygate/releases ] && [ ! -L /opt/polygate/releases ] || return 1
+  for e in /opt/polygate/releases/* /opt/polygate/releases/.[!.]*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    [ ! -L "$e" ] && [ -d "$e" ] && [[ "${e##*/}" =~ ^[0-9]{14}-[0-9]+$ ]] && [ -f "$e/release.json" ] || return 1
+  done
+}
 
 OS_NAME=unknown; OS_ID=unknown; ARCH=; PUBLIC_IP=; OWNER80=; OWNER443=; FW=; INSTALLED=0; INSTALLED_VERSION=; MISSING_CMDS=; PKGS=; PM=
 
@@ -294,7 +313,7 @@ preflight() {
     # Names this installer will create must not belong to something else.
     if [ -e /etc/systemd/system/polygate.service ] && ! ours_unit; then bad 'A different service named polygate.service already exists. Nothing was changed.'; fi
     if [ -e /usr/local/bin/polygate ] && ! ours_cli; then bad "/usr/local/bin/polygate already exists and is not Polygate's command. Nothing was changed."; fi
-    if dir_busy /opt/polygate && [ ! -d /opt/polygate/releases ]; then bad '/opt/polygate already exists and is not a Polygate installation.'; fi
+    if dir_busy /opt/polygate && ! opt_ours; then bad '/opt/polygate already exists and is not a Polygate installation.'; fi
     if dir_busy /etc/polygate && [ ! -f /etc/polygate/polygate.env ]; then bad '/etc/polygate already exists and is not a Polygate installation.'; fi
     if dir_busy /var/lib/polygate && [ ! -f /var/lib/polygate/settings.vault ]; then bad "/var/lib/polygate already holds data that is not Polygate's."; fi
     if id polygate >/dev/null 2>&1; then
@@ -534,6 +553,16 @@ fetch_release() {
   chmod 0755 "$work/polygate/bin/bun"
   "$work/polygate/bin/bun" --version >>"$LOG" 2>&1 || die "The bundled runtime does not start on this machine (details: $LOG). Usual causes: a CPU without AVX2, or a very old kernel or C library. Use the Docker image instead. Nothing was installed."
   ok 'Downloaded and verified the release'
+  # An update is finished by the new release's own installer, with its own release pruning and rollback, not by the one installed before
+  # it (that is the script "polygate update" starts). It gets the archive already verified here, and is told it took over.
+  if [ "$UPDATE" = 1 ] && [ -z "${POLYGATE_HANDED_OVER:-}" ] && [ -f "$work/polygate/install.sh" ] && ! cmp -s "$work/polygate/install.sh" "${BASH_SOURCE[0]}"; then
+    local hand
+    hand=$(mktemp -d /tmp/polygate-handover.XXXXXXXX); chmod 0700 "$hand"
+    cp -- "$work/$asset" "$hand/$asset" && cp -- "$work/$asset.sha256" "$hand/$asset.sha256" && cp -- "$work/polygate/install.sh" "$hand/install.sh" || die 'Could not prepare the new installer. Nothing was installed.'
+    log_line 'handing the update to the new release installer'
+    cleanup
+    exec env POLYGATE_HANDED_OVER="$hand" POLYGATE_ARCHIVE="$hand/$asset" POLYGATE_CHECKSUM="$hand/$asset.sha256" bash "$hand/install.sh" "${ORIG_ARGS[@]}"
+  fi
 }
 
 install_release() {
@@ -550,7 +579,7 @@ install_release() {
   chmod -R a+rX "$release"; chmod 0755 "$release/bin/bun" "$release/install/polygate"
   # A package unpacked on a filesystem without execute bits (or built on Windows) would leave the WARP helper unrunnable.
   chmod 0755 "$release"/warp/usque-* 2>/dev/null || true
-  old=$(readlink /opt/polygate/current || true)
+  if [ "$UPDATE" = 0 ]; then old=$(readlink /opt/polygate/current || true); fi
   ln -sfnT "$release" /opt/polygate/.current-new; mv -Tf /opt/polygate/.current-new /opt/polygate/current
   BUNX="$release/bin/bun"
 }
@@ -597,17 +626,67 @@ configure_service() {
   ok 'Installed Polygate'
 }
 
+# The files an update replaces besides the release link, saved first so a failed update can put all of them back.
+SNAP=; UPDATE_PENDING=0
+MANAGED_FILES=(/etc/polygate/polygate.env /etc/systemd/system/polygate.service /usr/local/bin/polygate)
+snapshot_managed() {
+  local f resolved
+  [ "$UPDATE" = 1 ] || return 0
+  old=$(readlink /opt/polygate/current) && resolved=$(readlink -e /opt/polygate/current) &&
+    [ "${resolved%/*}" = /opt/polygate/releases ] && [ -d "$resolved" ] || die 'The current link does not point to a managed release. Nothing was changed.'
+  SNAP=$(mktemp -d /etc/polygate/.before-update-XXXXXX) || die 'Could not save the current settings before updating. Nothing was changed.'
+  chmod 0700 "$SNAP"
+  printf '%s\n' "$old" >"$SNAP/current-target"
+  for f in "${MANAGED_FILES[@]}"; do
+    if [ -L "$f" ] || [ -f "$f" ]; then cp -aT -- "$f" "$SNAP/${f##*/}"
+    elif [ -e "$f" ]; then die "Cannot save $f: not a managed file. Nothing was changed."
+    else touch "$SNAP/${f##*/}.absent"; fi
+  done
+  UPDATE_PENDING=1
+}
+restore_managed() {
+  local f saved stage failed=0
+  for f in "${MANAGED_FILES[@]}"; do
+    saved="$SNAP/${f##*/}"
+    if [ -f "$saved.absent" ]; then rm -f -- "$f" || failed=1
+    else
+      stage=$(mktemp -d -- "${f%/*}/.polygate-restore-XXXXXX") || { failed=1; continue; }
+      cp -aT -- "$saved" "$stage/file" && mv -Tf -- "$stage/file" "$f" || failed=1
+      rm -rf -- "$stage" || failed=1
+    fi
+  done
+  return "$failed"
+}
+drop_snapshot() { [ -z "$SNAP" ] || rm -rf -- "$SNAP" || return 1; SNAP=; }
+
+rollback_update() {
+  local failed=0 current
+  # Before activation no managed file has been touched. Do not rewrite a running installation.
+  current=$(readlink /opt/polygate/current) || current=
+  if [ -n "$release" ] && [ "$current" = "$release" ]; then
+    ln -sfnT -- "$old" /opt/polygate/.current-old && mv -Tf /opt/polygate/.current-old /opt/polygate/current || failed=1
+    restore_managed || failed=1
+  elif [ "$current" != "$old" ]; then
+    printf '  Current changed independently; not overwriting it. Recovery files: %s\n' "$SNAP" >&2; return 1
+  fi
+  if [ "$failed" = 1 ]; then printf '  Rollback was incomplete. Recovery files: %s\n' "$SNAP" >&2; return 1; fi
+  if [ "$STARTED" = 1 ]; then
+    if systemctl daemon-reload && systemctl restart polygate && wait_healthy; then
+      printf '  The previous release and its settings were put back. It is running again.\n' >&2
+    else
+      printf '  The previous files were restored, but service recovery was not confirmed. Recovery files: %s\n' "$SNAP" >&2; return 1
+    fi
+  fi
+  drop_snapshot
+}
+
 wait_healthy() { local i; for i in $(seq 1 45); do if "$CLI" health >/dev/null 2>&1; then return 0; fi; sleep 1; done; return 1; }
 
 start_polygate() { systemctl daemon-reload && systemctl enable polygate && systemctl restart polygate && wait_healthy; }
 start_service() {
   STARTED=1
-  if RUN_SILENT=1 run 'Starting Polygate' start_polygate; then ok 'Polygate is running'; return 0; fi
+  if RUN_SILENT=1 run 'Starting Polygate' start_polygate; then UPDATE_PENDING=0; drop_snapshot; ok 'Polygate is running'; return 0; fi
   say ''; say '  The service log says:'; journalctl -u polygate -n 25 --no-pager 2>/dev/null | sed 's/^/        /' || true
-  if [[ "$old" = /opt/polygate/releases/* ]] && [ -d "$old" ]; then
-    ln -sfnT "$old" /opt/polygate/.current-old; mv -Tf /opt/polygate/.current-old /opt/polygate/current; systemctl restart polygate || true
-    die 'The new release did not start, so the previous release was put back.'
-  fi
   die 'The gateway did not start. Read the log above or run: journalctl -u polygate -n 100'
 }
 
@@ -774,10 +853,16 @@ finish() {
 
 on_exit() {
   local s=$?
-  spin_stop; cleanup
-  if [ "$s" -ne 0 ] && [ "$CHECK" = 0 ] && [ "$STARTED" = 1 ]; then
+  spin_stop || true
+  if [ "$s" -ne 0 ] && [ "$UPDATE_PENDING" = 1 ]; then
+    rollback_update || true
+    printf '  Update failed. Details are in %s\n' "$LOG" >&2
+  elif [ "$s" -ne 0 ] && [ "$UPDATE" = 1 ]; then
+    drop_snapshot || true  # An incomplete snapshot was never armed.
+  elif [ "$s" -ne 0 ] && [ "$CHECK" = 0 ] && [ "$STARTED" = 1 ]; then
     printf '\n  The installer stopped early. Details are in %s\n  To remove what was installed:  sudo polygate uninstall --yes\n\n' "$LOG" >&2
   fi
+  cleanup || true
 }
 
 show_issues() { # the warnings and problems collected while the checks ran quietly
@@ -834,6 +919,12 @@ main() {
   if [ "$UPDATE" = 1 ]; then
     [ "$INSTALLED" = 1 ] || die 'There is no Polygate installation here to update. Run without --update.'
     PORT=$(sed -n 's/^POLYGATE_PORT=//p' /etc/polygate/polygate.env | tail -n 1); PORT=${PORT:-$(pick_port)}
+    # The service can write only /var/lib/polygate (ReadWritePaths in its unit), and the installer rewrites the data path to it. A data folder
+    # set elsewhere by hand would be switched silently, and the service would then run on other keys and settings, so the update stops first.
+    STATE_SET=$(sed -n 's/^[[:space:]]*POLYGATE_STATE[[:space:]]*=[[:space:]]*//p' /etc/polygate/polygate.env | tail -n 1 | tr -d "\"'")
+    if [ -n "$STATE_SET" ] && [ "${STATE_SET%/}" != /var/lib/polygate ]; then
+      die "This installation keeps its data in $STATE_SET, but the installer manages only /var/lib/polygate. Move the data there and remove the POLYGATE_STATE line from /etc/polygate/polygate.env, then update again. Nothing was changed."
+    fi
     MODE=; FW_PORTS=
   else
     choose_mode; collect_details
@@ -848,6 +939,7 @@ main() {
         grep -Fq 'https-disable-offline' "$work/polygate/build/manage.js" || die 'This release does not support safe offline HTTPS reconciliation. Choose a newer release; the existing installation was not changed.' ;;
     esac
   fi
+  snapshot_managed
   install_release
   configure_service
   if [ "$UPDATE" = 0 ]; then

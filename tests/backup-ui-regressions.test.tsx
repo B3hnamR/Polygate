@@ -78,8 +78,15 @@ test('restore completion never clears a newer file and retains the restart warni
   h.requests[1].pending.resolve(restored);await flush();h.render();expect(h.field('Backup file').props.ref.current.value).toBe('');expect(h.restore().props.disabled).toBe(true);
 });
 
-test('an old restore failure does not overwrite the new file read error',async()=>{
+test('a failed restore identifies the submitted file and leaves the newer file ready for confirmation',async()=>{
+  const h=harness(),a=file('A.pgbackup'),b=file('B.pgbackup');h.select(a);a.pending.resolve('A');await flush();h.render();h.change('Passphrase','secret',1);h.confirm();h.submit();h.render();
+  h.select(b);b.pending.resolve('B');await flush();h.requests[0].pending.reject(new Error('wrong passphrase'));await flush();h.render();
+  expect(h.content()).toContain('Could not restore A.pgbackup: wrong passphrase');expect(h.sure().props.checked).toBe(false);expect(h.field('Passphrase',1).props.value).toBe('');
+  h.change('Passphrase','new secret',1);h.confirm();h.submit();h.render();expect(h.requests[1].body.content).toBe('B');expect(h.content()).not.toContain('wrong passphrase');
+});
+
+test('a restore failure and the new file read error are both visible',async()=>{
   const h=harness(),a=file('A'),b=file('B');h.select(a);a.pending.resolve('A');await flush();h.render();h.change('Passphrase','secret',1);h.confirm();h.submit();h.render();
   h.select(b);b.pending.reject(new Error('new read failed'));await flush();h.requests[0].pending.reject(new Error('old restore failed'));await flush();h.render();
-  expect(h.content()).toContain('new read failed');expect(h.content()).not.toContain('old restore failed');
+  expect(h.content()).toContain('new read failed');expect(h.content()).toContain('Could not restore A: old restore failed');
 });

@@ -193,16 +193,18 @@ test('testing the route while nothing is connected says so', async () => {
   P.__instances.clear();
   await expect(testRoute('psiphon')).rejects.toThrow(/not connected/);
 });
-test('the route is on only while Psiphon runs; when it stops while in use, requests go back to the route before it', () => {
+test('idle reconciliation keeps the selection; explicit disconnect gives the previous route back', async () => {
   settings.routes = settings.routes.filter(r => r.id !== 'r-prev').concat({ id: 'r-prev', name: 'Previous relay', kind: 'relay', url: 'https://relay.test', enabled: true, models: [] } as any);
   settings.routeId = 'psiphon'; settings.previousRouteId = 'r-prev';
   P.reconcilePsiphon(); expect(settings.routes.find(r => r.id === 'psiphon')!.enabled).toBe(true);
   P.__instances.clear(); P.reconcilePsiphon();
   expect(settings.routes.find(r => r.id === 'psiphon')!.enabled).toBe(false);
+  expect(settings.routeId).toBe('psiphon');
+  await P.psiphonDisconnect();
   expect(settings.routeId).toBe('r-prev');
   // A remembered route that is switched off is passed over.
   settings.routes.find(r => r.id === 'psiphon')!.enabled = true; settings.routeId = 'psiphon'; settings.routes.find(r => r.id === 'r-prev')!.enabled = false;
-  P.reconcilePsiphon(); expect(settings.routeId).toBe('direct');
+  await P.psiphonDisconnect(); expect(settings.routeId).toBe('direct');
 });
 test('a new address is only for a running region', async () => {
   P.__instances.delete('FR');

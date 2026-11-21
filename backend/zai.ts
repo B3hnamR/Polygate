@@ -13,10 +13,11 @@ import { LIMIT_SCOPE, type Model, type Provider, type ZaiAccount } from './types
 // proxy the user chose for Z.ai (steadyExit in transport.ts), and nothing here changes that exit.
 export { ZAI_ID, ZAI_BASE };
 // Model and billing requests leave the same way. Quiet: Z.ai's answers say nothing about the route's own health or any exit's Free allowance.
-const zaiFetch = (url: string, init: RequestInit) => {
+const zaiFetch = (url: string, init: RequestInit, before?: (routeName: string) => void) => {
   const p = settings.providers.find(x => x.id === ZAI_ID);
   if (!p) throw new GatewayError('Z.ai provider is missing', 503, 'route_unavailable');
   const route = routeForProvider(p, '');
+  before?.(route.name);
   return networkFetch(url, { ...init, polygateQuiet: true }, route.id);
 };
 export const ZAI_MODELS = ['GLM-5.3', 'GLM-5.3-Flash'];
@@ -136,6 +137,13 @@ export function zaiBody(chat: any, model: string, deviceMid: string, sessionId: 
 }
 
 // --- Answer ---
+// Cached input counts as prompt usage; absent counters are not reported zeroes.
+function zaiUsage(usage: any) {
+  const n = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+  const cache = n(usage?.cache_read_input_tokens) ?? 0, input = n(usage?.input_tokens), completion = n(usage?.output_tokens);
+  const prompt = input === undefined ? undefined : input + cache + (n(usage?.cache_creation_input_tokens) ?? 0);
+  if (prompt !== undefined || completion !== undefined) return { ...(prompt !== undefined ? { prompt_tokens: prompt, prompt_tokens_details: { cached_tokens: cache } } : {}), ...(completion !== undefined ? { completion_tokens: completion } : {}), ...(prompt !== undefined && completion !== undefined ? { total_tokens: prompt + completion } : {}) };
+}
 // The plan's Anthropic-style stream as OpenAI chunks (zcode_protocol.OpenAITranslator). A stream that ends before message_stop is an error.
 export function toOpenAI(upstream: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array> {
   const enc = new TextEncoder(), dec = new TextDecoder(); let buf = '', stopped = false; const tools = new Map<number, number>(), empty = new Set<number>(); const usage: any = {};
@@ -166,8 +174,9 @@ export function toOpenAI(upstream: ReadableStream<Uint8Array>, model: string): R
         break;
       }
       case 'message_stop': {
-        stopped = true; const cache = Number(usage.cache_read_input_tokens || 0), prompt = Number(usage.input_tokens || 0) + cache + Number(usage.cache_creation_input_tokens || 0), completion = Number(usage.output_tokens || 0);
-        out({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion, prompt_tokens_details: { cached_tokens: cache } } });
+        stopped = true;
+        const counters = zaiUsage(usage);
+        if (counters) out({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: counters });
         break;
       }
       case 'error': throw new Error(`Z.ai: ${e.error?.message || 'the stream reported an error'}${e.error?.code ? ` (code ${e.error.code})` : ''}`);
@@ -230,13 +239,16 @@ export async function zaiChat(p: Provider, m: Model, chat: any, signal: AbortSig
   if (until > Date.now()) return quotaFail(a, model, until);
   let body: any; try { body = zaiBody(chat, model, a.deviceMid, randomUUID()); } catch (e: any) { return fail(400, e.message); }
   const url = (p.baseUrl || ZAI_BASE).replace(/\/$/, '') + MESSAGES;
+  // The model sees the translated conversation, ZCode context and tool definitions, not the device/session envelope.
+  const { system, messages, tools, tool_choice } = body;
+  const input = accounting ? Math.ceil(JSON.stringify({ system, messages, tools, tool_choice }).length / 4) : 0;
   for (let attempt = 1; ; attempt++) {
-    accounting?.before({ ...chat, max_tokens: body.max_tokens });
-    const r = await zaiFetch(url, { method: 'POST', headers: clientHeaders(a.token, a.deviceMid, false), body: JSON.stringify(body), signal });
+    const r = await zaiFetch(url, { method: 'POST', headers: clientHeaders(a.token, a.deviceMid, false), body: JSON.stringify(body), signal },
+      routeName => accounting?.before({ ...chat, max_tokens: body.max_tokens }, input, routeName));
     const json = (r.headers.get('content-type') || '').includes('application/json');
     if (r.ok && !json && r.body) return new Response(toOpenAI(r.body, m.upstreamId), { status: 200, headers: { 'content-type': 'text/event-stream' } });
     const text = await r.text().catch(() => '');
-    if (accounting) { let usage; try { usage = JSON.parse(text)?.usage; } catch {} accounting.failed(usage); }
+    if (accounting) { let usage; try { usage = JSON.parse(text)?.usage; } catch {} accounting.failed(zaiUsage(usage) ?? usage); }
     const { code, message } = parseError(r.status, text);
     // A 200 that carries a JSON error envelope is a refusal: quota codes are quota, anything else is a server problem.
     const status = r.ok ? (isQuota(0, code) ? 402 : 502) : r.status;

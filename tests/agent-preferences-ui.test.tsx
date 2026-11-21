@@ -72,9 +72,24 @@ test('library canonical IDs preserve newer row edits, additions, deletions and e
   expect(h.find(n=>n.props['aria-label']==='Skill 1 name').props.value).toBe('Second');expect(h.content()).not.toContain('Renamed');
 });
 
-test('library delayed import is retained across a save and hidden section switches',async()=>{
-  const h=await loaded('library',library());h.edit('Agent system prompt','submitted');const saving=h.click('Save');h.confirmations[0].resolve(true);await flush();
-  h.render({part:'skills'});const read=deferred();h.find(n=>n.props['aria-label']==='Choose SKILL.md files').props.onChange({target:{files:[{name:'guide.md',size:20,text:()=>read.promise}],value:'file'}});
+test('library drops cannot replace existing skills before load or change the draft during save',async()=>{
+  const h=harness('library');h.render({part:'skills'});
+  let reads=0;const file={name:'Guide.md',size:10,text:async()=>{reads++;return 'Guide body';}};
+  const drop=()=>h.find(n=>n.props.onDrop).props.onDrop({preventDefault(){},dataTransfer:{files:[file]}});
+  drop();await flush();expect(reads).toBe(0);
+  const existing=skill('existing','Existing skill');h.requests[0].pending.resolve(library('base',[existing]));await flush();h.render();
+  expect(h.content()).toContain('Existing skill');expect(h.content()).not.toContain('Unsaved changes');
+  drop();await flush();h.render();const saving=h.click('Save');drop();h.confirmations[0].resolve(true);await flush();h.render();
+  expect(h.requests[1].body.skills).toEqual([existing,expect.objectContaining({text:'Guide body'})]);
+  expect(h.button('Import').props.disabled).toBe(true);drop();await flush();expect(reads).toBe(1);
+  h.requests[1].pending.resolve(library('base',h.requests[1].body.skills,'r2'));await saving;h.render();expect(h.content()).not.toContain('Unsaved changes');
+});
+
+test('library delayed import blocks reload and is retained across a save and hidden section switches',async()=>{
+  const h=await loaded('library',library());h.render({part:'skills'});const read=deferred();h.find(n=>n.props['aria-label']==='Choose SKILL.md files').props.onChange({target:{files:[{name:'guide.md',size:20,text:()=>read.promise}],value:'file'}});
+  h.render();expect(h.button('Reload').props.disabled).toBe(true);h.click('Reload');expect(h.requests).toHaveLength(1);
+  h.render({part:'prompt'});h.edit('Agent system prompt','submitted');expect(h.button('Discard').props.disabled).toBe(true);
+  const saving=h.click('Save');h.confirmations[0].resolve(true);await flush();
   read.resolve('---\nname: Guide\ndescription: Use this guide\n---\nFollow these steps');await flush();h.render({part:null});h.requests[1].pending.resolve({instructions:'submitted',skills:[],revision:'r2'});await saving;h.render({part:'skills'});
   expect(h.content()).toContain('Guide');expect(h.content()).toContain('Unsaved changes');expect(h.content()).toContain('Built in skill');
   h.render({part:'prompt'});expect(h.find(n=>n.props['aria-label']==='Agent system prompt').props.value).toBe('submitted');

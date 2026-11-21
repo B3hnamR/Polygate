@@ -667,14 +667,48 @@ function readStringLiteral(raw) {
   return unescapeLiteral(text);
 }
 
+function readArrowExpression(source, start) {
+  let i = start;
+  while (/\s/.test(source[i] || '')) i++;
+  const begin = i;
+  let depth = 0, quote = null;
+  for (; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    else if (ch === '\n' && depth === 0 && /^\s*(?:export\s+)?(?:const|let|var|function|class|type|interface)\b/.test(source.slice(i + 1))) return source.slice(begin, i).trim();
+  }
+  return source.slice(begin).trim();
+}
+
+function expandSchemaHelper(name, argsText, source, vars) {
+  const corpus = typeof schemaCorpus === 'string' ? schemaCorpus : source;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = corpus.match(new RegExp(`const\\s+${escaped}\\s*=\\s*\\(([^)]*)\\)\\s*=>`));
+  if (!match) return null;
+  const body = readArrowExpression(corpus, match.index + match[0].length);
+  if (!body || body.startsWith('{')) return null;
+  const names = splitTopLevel(match[1]).map(part => (part.match(/^([A-Za-z_$][\w$]*)/) || [])[1]).filter(Boolean);
+  const args = splitTopLevel(argsText), bound = { ...(vars || {}) };
+  names.forEach((name, i) => { const arg = (args[i] || '').trim(); const value = /^\d[\d_]*$/.test(arg) ? Number(arg.replace(/_/g, '')) : bound[arg]; if (value !== undefined) bound[name] = value; });
+  return { body, vars: bound };
+}
+
 /**
  * Evaluate one field's schema expression into a JSON Schema fragment plus its
  * requiredness. This understands the constructors upstream uses and nothing
  * else; anything unrecognised degrades to `{ type: "string" }`.
  */
-function parseFieldSchema(expr, source) {
+function parseFieldSchema(expr, source, vars = schemaVars, depth = 0) {
   let required = true;
   let schema = {};
+
+  if (depth < 3) {
+    const helper = expr.trim().match(/^([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)$/);
+    if (helper) { const expanded = expandSchemaHelper(helper[1], helper[2], source, vars); if (expanded) return parseFieldSchema(expanded.body, source, expanded.vars, depth + 1); }
+  }
 
   // Unwrap modifiers, outermost first.
   let working = expr.trim();
@@ -696,7 +730,7 @@ function parseFieldSchema(expr, source) {
   const annotate = working.match(/\.annotate\(\{\s*description:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/s);
   if (annotate) {
     description = readStringLiteral(annotate[1]);
-    if (description && schemaVars) description = interpolateTemplate(description, schemaVars);
+    if (description && vars) description = interpolateTemplate(description, vars);
     // Where the annotation sits relative to `.pipe(...)` decides whether it
     // reaches the wire: `Schema.X.annotate({...}).pipe(...)` keeps it (webfetch's
     // `format`), while `Schema.X.pipe(...).annotate({...})` does not (question's
@@ -775,7 +809,9 @@ function parseFieldSchema(expr, source) {
     schema = { ...schema, type: "integer", exclusiveMinimum: 0 };
   } else if (/\bNonNegativeInt\b/.test(core)) {
     schema = { ...schema, type: "integer", minimum: 0 };
-  } else if (/Schema\.(?:Int|Number|Finite)\b/.test(core)) {
+  } else if (/Schema\.Int\b/.test(core)) {
+    schema = { ...schema, type: "integer" };
+  } else if (/Schema\.(?:Number|Finite)\b/.test(core)) {
     schema = { ...schema, type: "number" };
   } else if (/\bSession[A-Za-z]*\.ID\b/.test(core) || /\bSessionID\b/.test(core)) {
     schema = { ...schema, type: "string", pattern: "^ses" };
@@ -1031,10 +1067,31 @@ function extractToolFromSource(source, fallbackName) {
   if (!description || description.length < 20) {
     const addBlock0 = source.match(/editor\.add\(\{([\s\S]*?)\binput\s*:/);
     if (addBlock0) {
+      const block = addBlock0[1];
+      const start = /\bdescription\s*:\s*(?=\[)/.exec(block);
+      const at = start ? start.index + start[0].length : -1;
+      const array = at >= 0 && readBalanced(block, at);
+      const join = array && /^\s*\.join\(\s*(["'])(.*?)\1\s*\)/.exec(block.slice(at + array.length));
+      if (join) {
+        const parts = [];
+        for (const part of splitTopLevel(array.slice(1, -1))) {
+          const literal = readStringLiteral(part);
+          if (literal !== null) parts.push(interpolateTemplate(literal, vars));
+          else {
+            // The default (non-code-mode) client sends the second array. A colon inside a quoted description is not a branch delimiter.
+            const spread = /^\.\.\.\(\s*codeMode\s*\?\s*/.exec(part);
+            const first = spread && readBalanced(part, spread[0].length);
+            const second = first && part.slice(spread[0].length + first.length).match(/^\s*:\s*\[([\s\S]*)\]\s*\)$/);
+            if (!second) { parts.length = 0; break; }
+            for (const item of splitTopLevel(second[1])) { const text = readStringLiteral(item); if (text !== null) parts.push(interpolateTemplate(text, vars)); }
+          }
+        }
+        if (parts.length) description = parts.join(unescapeLiteral(join[2]));
+      }
       const descMatch0 = addBlock0[1].match(
         /description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)/
       );
-      if (descMatch0) {
+      if (!description && descMatch0) {
         description =
           descMatch0[1] !== undefined
             ? unescapeLiteral(descMatch0[1])
@@ -1127,6 +1184,7 @@ function writeCachedCatalog(json) {
   }
 }
 
+const SOURCE_CACHE_VERSION = 1;
 function readCachedSource(expectedRef = null) {
   try {
     const file = getSourceCacheFile();
@@ -1137,7 +1195,7 @@ function readCachedSource(expectedRef = null) {
     if (
       parsed &&
       typeof parsed === "object" &&
-      typeof parsed.ref === "string" &&
+      parsed.cacheVersion === SOURCE_CACHE_VERSION && typeof parsed.ref === "string" &&
       parsed.extracted &&
       typeof parsed.extracted === "object"
     ) {
@@ -1164,7 +1222,7 @@ function writeCachedSource(ref, extracted, version = null) {
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
     const release = typeof version === "string" && /^\d+\.\d+\.\d+$/.test(version) ? version : null;
-    fs.writeFileSync(tmp, JSON.stringify({ ref, ...(release ? { version: release } : {}), extracted, savedAt: Date.now() }));
+    fs.writeFileSync(tmp, JSON.stringify({ cacheVersion: SOURCE_CACHE_VERSION, ref, ...(release ? { version: release } : {}), extracted, savedAt: Date.now() }));
     fs.renameSync(tmp, file);
   } catch {}
 }
@@ -1951,6 +2009,7 @@ async function refresh({ force = false, recheck = false } = {}) {
         // `../read-filesystem.ts`. Fetch the local modules each plugin imports so
         // the field's real optionality/type can be resolved instead of guessed.
         const refFiles = new Map();
+        let referencesComplete = true;
         for (const [key, source] of Object.entries(fetchedFiles)) {
           if (!key.startsWith("tool:") || typeof source !== "string") continue;
           // Relative imports: `../read-filesystem.js` → packages/core/src/read-filesystem.ts
@@ -1977,6 +2036,7 @@ async function refresh({ force = false, recheck = false } = {}) {
           );
           for (const item of refSettled) {
             if (item.status === "fulfilled") fetchedFiles[item.value[0]] = item.value[1];
+            else referencesComplete = false;
           }
         }
 
@@ -2001,7 +2061,7 @@ async function refresh({ force = false, recheck = false } = {}) {
             })
           );
           for (const item of txtSettled) {
-            if (item.status !== "fulfilled") continue;
+            if (item.status !== "fulfilled") { referencesComplete = false; continue; }
             const [t, text] = item.value;
             const src = fetchedFiles[t.key];
             if (typeof src !== "string") continue;
@@ -2021,7 +2081,7 @@ async function refresh({ force = false, recheck = false } = {}) {
             (k) => typeof fetchedFiles[k] === "string" && fetchedFiles[k].length > 0
           );
           const allSettledOk = settled.every((item) => item.status === "fulfilled");
-          if (allCoreFetched && allSettledOk) {
+          if (allCoreFetched && allSettledOk && referencesComplete) {
             lastSyncedSource = { ref, extracted, fetchRef: global.fetch };
             if (extracted.tools && Object.keys(extracted.tools).length > 0) {
               writeCachedSource(ref, extracted, latest);

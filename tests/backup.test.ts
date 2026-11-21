@@ -47,6 +47,33 @@ test('restoring replaces the settings, keeps the current dashboard password and 
   expect(readdirSync(stateDir).some(f => f.startsWith('settings.vault.before-restore-'))).toBe(true);
 });
 
+test('restoring a selected Surfshark onto an idle gateway fails closed before and after restart', async () => {
+  const { surfsharkConfig, startSurfshark, surfsharkStatus } = await import('../backend/surfshark');
+  const { routeFor } = await import('../backend/transport');
+  const { persist } = await import('../backend/state');
+  const saved = { routes: settings.routes, routeId: settings.routeId, rotate: settings.rotate, allowDirect: settings.allowDirect,
+    managedChoice: settings.managedChoice, previousRouteId: settings.previousRouteId, surfshark: settings.surfshark, psiphon: settings.psiphon };
+  try {
+    expect(surfsharkStatus().running).toBe(false);
+    settings.routes = [{ id: 'direct', name: 'Direct', kind: 'direct', url: '', enabled: true, models: [] },
+      { id: 'surfshark', name: 'Surfshark', kind: 'proxy', url: 'surfshark://local', enabled: true, models: [], managed: true }];
+    settings.rotate = false; settings.allowDirect = false; settings.routeId = 'surfshark'; settings.previousRouteId = 'direct'; delete settings.managedChoice;
+    // Missing keys force startup to stop before a tunnel can launch, even with the client installed.
+    settings.surfshark = { ...surfsharkConfig(), enabled: true, autoStart: false, regions: ['de-fra'], privateKey: undefined };
+    const passphrase = 'restore selected route'; const { content } = createBackup(passphrase);
+    settings.routeId = 'direct'; settings.routes = settings.routes.filter(r => r.id === 'direct');
+    expect((await call('/admin/backup/restore', { content, passphrase })).status).toBe(200);
+    const checkUnavailable = () => {
+      expect(settings.routeId).toBe('surfshark'); expect(surfsharkStatus().route.enabled).toBe(false);
+      expect(() => routeFor()).toThrow('disabled or missing');
+    };
+    checkUnavailable();
+    await startSurfshark();
+    expect(surfsharkStatus().lastError).toMatch(/key pair|WireGuard client/i); // selection requested a start even though autoStart is false
+    checkUnavailable();
+  } finally { Object.assign(settings, saved); persist(); }
+});
+
 test('a restore from a session that cannot manage this machine does not bring in local programs', async () => {
   settings.mcp = { enabled: true, builtin: true, servers: [{ id: 'planted', name: 'planted', enabled: true, transport: 'stdio', command: 'calc' }, { id: 'remote', name: 'remote', enabled: true, transport: 'http', url: 'https://mcp.example.com' }] } as any;
   const fromBackup = createBackup('a long passphrase');

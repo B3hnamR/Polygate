@@ -11,13 +11,14 @@ import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanSta
 import { exitGroupOf, exitGroups, exitOfVirtual, scopeOfUrl, scopeOfKind, type ExitGroup } from './exit-group';
 // Loaded here so their exit groups are registered before the first request (backend/exit-group.ts).
 import './psiphon';
-import './surfshark';
+import { clearSurfsharkKiloLimit } from './surfshark';
 import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, noteInconclusive, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
 const exec = promisify(execFile);
 // requestId ties outbound calls to the gateway request that caused them, so their shape can be logged with it.
-export const routeContext = new AsyncLocalStorage<{routeId: string; requestId?: string}>();
+export const routeContext = new AsyncLocalStorage<{routeId: string; requestId?: string; providerKind?: Provider['kind']}>();
+const requestScope=(url:string)=>{const kind=routeContext.getStore()?.providerKind;return kind?scopeOfKind(kind):scopeOfUrl(url);};
 let cursor=0;
 const now=()=>Date.now();
 // A route is out of play while it cools down after connection failures, or while its exit address has used up its daily Free allowance.
@@ -170,13 +171,20 @@ export const findRoute=(id:string):Route|undefined=>id.startsWith('warp-pin:')?w
 // peek: only ask which route would be chosen. The rotation does not move on, so a readiness check never changes where real requests go.
 export function routeFor(model='', explicit='', kind?: string, peek=false): Route {
   const selected=explicit||settings.routeId;
-  let current=findRoute(selected);
+  const current=findRoute(selected);
   const rotating=settings.rotate&&!explicit;
-  if(!rotating&&current&&!carries(current,kind))throw new GatewayError('Selected network route cannot carry this provider',503,'route_unavailable');
-  // Rotation off (or a route asked for by name): a selected route whose exit has used up its daily allowance is replaced by a clean backup until
-  // the allowance resets. With rotation on, the rotation below already leaves used-up routes out, so it keeps spreading requests over the healthy ones.
-  if(!rotating&&current&&spentFor(current,kind)){const alt=exhaustedAlternative(current,[],kind);if(alt&&carries(alt,kind))return alt;}
-  if(!rotating){if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');return current;}
+  if(!rotating){
+    if(!current)throw new GatewayError('Selected network route is disabled or missing',503,'route_unavailable');
+    if(!carries(current,kind))throw new GatewayError('Selected network route cannot carry this provider',503,'route_unavailable');
+    // A transport cooldown applies to every provider. Follow connection failover, not the allowance policy, and never silently switch a named route.
+    if(current.cooldownUntil && current.cooldownUntil>now()){
+      const alt=!explicit && settings.failover!==false ? failoverRoutes(current,kind)[0] : undefined;
+      if(alt)return alt;
+      throw new GatewayError(whyNot(current.id,kind),503,'route_unavailable');
+    }
+    if(spentFor(current,kind)){const alt=exhaustedAlternative(current,[],kind);if(alt&&carries(alt,kind))return alt;}
+    return current;
+  }
   // Direct is left out of the spread unless the user includes it.
   const pool=spreadRoutes().filter(r=>carries(r,kind)&&!publicPool(r,kind)&&(!r.models.length||r.models.some(x=>model===x||model.endsWith('/'+x)))&&!coolingDownFor(r,kind)&&groupCan(r,kind));
   if(!pool.length){
@@ -244,11 +252,12 @@ export function routeForProvider(p: Provider, model: string, peek=false): Route 
 }
 // The route to move to after a connection failure: the next one in the provider's list, never one outside it. A provider that follows the route
 // in use uses the global fallback order.
-export function routeAfter(p: Provider, current: Route): Route | undefined {
+// `tried` are the exits this request already used: with A, B and C in the list, a failure on B moves on to C, not back to A.
+export function routeAfter(p: Provider, current: Route, tried: readonly string[] = []): Route | undefined {
   if (p.kind === 'zai') return;
   const set = providerRoutes(p);
-  if (!set) return failoverRoutes(current, p.kind)[0];
-  return set.ids.map(id => findRoute(id)).find((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id);
+  const next = set ? set.ids.map(id => findRoute(id)).filter((r): r is Route => routeUsable(r, p.kind) && r.id !== current.id) : failoverRoutes(current, p.kind);
+  return next.find(r => !tried.includes(r.id)) || next[0];
 }
 // The route to move to when the one in use has used up the allowance of its address (OpenCode Free's, or Kilo's). `tried` are the exits this
 // request already went through, so an exit whose mark did not stick is not tried twice.
@@ -394,6 +403,21 @@ const callerCancelled=(init:any)=>{const s=init?.signal as AbortSignal|undefined
 const LOOPBACK=['127.0.0.1','localhost','[::1]'];
 // What a relay can reach: public HTTPS hosts. A provider on a local address or plain http is reached directly, whichever route is in use.
 export const relayReaches=(u:URL)=>{const h=u.hostname.toLowerCase();return u.protocol==='https:'&&!(/^[\d.]+$/.test(h)||h.includes(':')||h==='localhost'||/\.(localhost|local|internal|lan)$/.test(h));};
+const directOff=()=>settings.routes.find(r=>r.id==='direct')?.enabled===false;
+// A host on this machine or the local network: loopback, private and link-local addresses, single-label names and local-only suffixes.
+export function privateHost(raw:string){
+  const h=raw.toLowerCase().replace(/^\[|\]$/g,'').replace(/\.$/,'');
+  if(h==='localhost'||/\.(localhost|local|internal|lan|home\.arpa)$/.test(h)||(!h.includes('.')&&!h.includes(':')))return true;
+  // URL.hostname serializes a mapped IPv4 address as two hex words, even when the URL used dotted decimal.
+  const mapped=/^::ffff:([\da-f]{1,4}):([\da-f]{1,4})$/.exec(h);
+  const v4=h.replace(/^::ffff:/,'').split('.');
+  if(mapped || (v4.length===4 && v4.every(o=>/^\d{1,3}$/.test(o)&&Number(o)<=255))){
+    const hi=mapped?parseInt(mapped[1],16):Number(v4[0])*256+Number(v4[1]),a=hi>>8,b=hi&255;
+    return a===10||a===127||a===0||(a===172&&b>=16&&b<=31)||(a===192&&b===168)||(a===169&&b===254)||(a===100&&b>=64&&b<=127);
+  }
+  if(h.includes(':'))return h==='::1'||/^f[cd][0-9a-f]{2}:/.test(h)||/^fe[89ab][0-9a-f]:/.test(h);
+  return false;
+}
 // Turns any proxy URL into one Bun's fetch can use: HTTP(S) proxies pass through, SOCKS5 goes through the native bridge, SOCKS4 and SOCKS5 through the local bridge (backend/socks-bridge.ts).
 export async function usableProxy(proxy:string):Promise<string>{
   const socks=parseSocksUrl(proxy);if(socks)return socksBridge(socks);
@@ -425,7 +449,7 @@ const exitRegions=new Map<string,string>();
 export const takeExitRegion=(rid:string|undefined)=>{if(!rid)return;const r=exitRegions.get(rid);exitRegions.delete(rid);return r;};
 export const takePsiphonRegion=takeExitRegion;
 async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
-  const rid=routeContext.getStore()?.requestId;const scope=scopeOfUrl(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
+  const rid=routeContext.getStore()?.requestId;const scope=requestScope(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
   // A request refused through a region whose small check passed: OpenCode's limits are not all per address and per day (one model can be
   // limited on an exit where another still answers), so it goes on to another region, at most twice, before the refusal is returned.
   let refused:Response|undefined;let refusedAt='';let refusals=0;
@@ -462,7 +486,7 @@ class WarpFreeUnavailable extends GatewayError {
 }
 async function viaWarp(route:Route,url:string,init:any,quiet:boolean){
   const rid=routeContext.getStore()?.requestId;
-  const check=!quiet&&!isCanary(rid)&&!isReadOnly(init)&&scopeOfUrl(url)==='opencode';
+  const check=!quiet&&!isCanary(rid)&&!isReadOnly(init)&&requestScope(url)==='opencode';
   const tried=new Set<number>();
   for(let i=0;i<4;i++){
     const target=route.id.startsWith('warp-pin:')?warpPinnedTarget(route.id):warpTarget(check?'free':undefined,false,tried);
@@ -496,7 +520,12 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   const id=explicit||routeContext.getStore()?.routeId||settings.routeId;
   const route=findRoute(id);
   if(!route)throw new GatewayError('Network route is disabled or missing',503,'route_unavailable');
-  if(route.kind==='relay'&&!relayReaches(local))return fetch(url,init);
+  if(route.kind==='relay'&&!relayReaches(local)){
+    // A relay cannot carry this destination, so it would leave from this computer's own address. That is allowed for a local or private
+    // address, but not for a public one once Direct is switched off ("Never use my own address").
+    if(directOff()&&!privateHost(local.hostname))throw new GatewayError(`${local.protocol==='http:'?'This plain-http address':'This address'} (${local.host}) cannot go through a relay, and Direct is switched off, so it was not sent. Use an HTTPS host name, or another exit.`,503,'route_unavailable');
+    return fetch(url,init);
+  }
   const started=now();let judged:{seen?:Exhaustion;ex?:Exhaustion|null}|undefined;
   // Diagnostic lookups (egress identity) must not move a route's health or open its breaker.
   const quiet=!!init?.polygateQuiet;if(quiet){init={...init};delete init.polygateQuiet;}
@@ -603,10 +632,14 @@ function tested<T extends {chat:string;summary:string;status?:number;latency?:nu
 async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<RouteTest>{
   const ready=g.regionsReady();
   if(!route.enabled||!ready.length)throw new GatewayError(g.unavailable(),503,'route_unavailable');
-  const kilo=settings.providers.find(p=>p.id===providerId)?.kind==='kilo';
+  const scope=providerId?scopeOfKind(settings.providers.find(p=>p.id===providerId)?.kind):'opencode';
+  const kilo=scope==='kilo';
   const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp})=>{
     try{const t=await regionTester(g.id+':'+region,providerId);
-      if(t.chat==='used-up'&&!kilo)g.spent(region,t.until||nextResetAt());else if(t.chat==='ok')g.clean(region);else if(t.chat==='limited'&&kilo)g.kiloLimited(region,now()+30*60000);
+      if(scope==='opencode'&&t.chat==='used-up')g.spent(region,t.until||nextResetAt());
+      else if(scope==='opencode'&&t.chat==='ok')g.clean(region);
+      else if(kilo&&t.chat==='limited')g.kiloLimited(region,now()+30*60000);
+      else if(kilo&&t.chat==='ok'&&g.id==='surfshark')clearSurfsharkKiloLimit(exitIp);
       return {region,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
     catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
   }));

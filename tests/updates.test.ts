@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSy
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { API_URL, createReleaseChecker, isNewer, releaseInfo } from '../desktop/releases.cjs';
 import { createPortableUpdater, downloadRelease, fetchAsset, portableTarget, startHelper } from '../desktop/updater.cjs';
 
@@ -147,6 +147,7 @@ describe('Windows portable downloads', () => {
 });
 
 const windowsTest = process.platform === 'win32' ? test : test.skip;
+const rollbackName = /^\.polygate-backup-\d{13}-[0-9a-f]{32}\.exe$/;
 describe('real Windows replacement helper', () => {
   for (const badHash of [false, true]) windowsTest(badHash ? 'rejects tampered bytes while preserving the original' : 'atomically replaces an executable with spaces and apostrophes in its path', () => {
     const directory = temporary('polygate-update-target-'), staging = temporary('polygate-update-');
@@ -161,7 +162,12 @@ describe('real Windows replacement helper', () => {
       expect(run.status, run.stdout + run.stderr).toBe(badHash ? 1 : 0);
       expect(readFileSync(target)).toEqual(badHash ? Buffer.from('old executable') : bytes);
       expect(JSON.parse(readFileSync(resultPath, 'utf8')).ok).toBe(!badHash);
-      if (!badHash) { expect(existsSync(staging)).toBe(false); expect(readdirSync(directory).sort()).toEqual([path.basename(target), 'result.json'].sort()); }
+      if (!badHash) {
+        expect(existsSync(staging)).toBe(false);
+        const backups = readdirSync(directory).filter(f => rollbackName.test(f));
+        expect(backups).toHaveLength(1); // No launch means no acknowledgement.
+        expect(readFileSync(path.join(directory, backups[0]), 'utf8')).toBe('old executable');
+      }
     } finally { cleanup(directory); if (existsSync(staging)) cleanup(staging); }
   // The first PowerShell start on a fresh CI machine can take longer than the default 5 s.
   }, 30000);
@@ -177,7 +183,7 @@ windowsTest('a portable executable named after its version is renamed to the new
     try {
       const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-ConfigPath', configPath, '-NoLaunch'], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
       expect(r.status, r.stdout + r.stderr).toBe(0);
-      return { files: readdirSync(directory).filter(f => f !== 'result.json').sort(), result: JSON.parse(readFileSync(resultPath, 'utf8')), directory, content: (f: string) => readFileSync(path.join(directory, f)) };
+      return { files: readdirSync(directory).filter(f => f !== 'result.json' && !rollbackName.test(f)).sort(), result: JSON.parse(readFileSync(resultPath, 'utf8')), directory, content: (f: string) => readFileSync(path.join(directory, f)) };
     } finally { if (existsSync(staging)) cleanup(staging); }
   };
   const renamed = run('Polygate-0.5.0-Windows-x64.exe', '0.5.2');
@@ -195,12 +201,21 @@ restartTest('one click downloads, verifies, closes the old process, replaces the
   const target = path.join(directory, 'Portable app.exe'), replacement = path.join(directory, 'replacement.exe');
   const marker = path.join(directory, 'launched.txt'), source = path.join(directory, 'Fixture.cs'), resultPath = path.join(directory, 'result.json');
   // A tiny windowless .NET fixture writes a marker and exits; no user app or installed gateway is involved.
-  writeFileSync(source, 'using System; using System.IO; class Fixture { static void Main() { File.WriteAllText(Environment.GetEnvironmentVariable("POLYGATE_UPDATE_TEST_MARKER"), "replacement launched\\n" + System.Diagnostics.Process.GetCurrentProcess().Id); } }');
-  const compiled = spawnSync(csc, ['/nologo', '/target:winexe', '/out:' + replacement, source], { encoding: 'utf8', windowsHide: true });
+  // Like the real app, the replacement confirms it started (update-started.json beside the result), so the helper then removes the backup.
+  writeFileSync(source, `using System; using System.IO; using System.Diagnostics; using System.Web.Script.Serialization;
+    class Fixture { static void Main() {
+      var marker = Environment.GetEnvironmentVariable("POLYGATE_UPDATE_TEST_MARKER");
+      var process = Process.GetCurrentProcess();
+      var ack = new JavaScriptSerializer().Serialize(new { version = "0.3.0", exe = process.MainModule.FileName });
+      File.WriteAllText(Path.Combine(Path.GetDirectoryName(marker), "update-started.json"), ack);
+      File.WriteAllText(marker, "replacement launched\\n" + process.Id);
+    } }`);
+  const compiled = spawnSync(csc, ['/nologo', '/target:winexe', '/reference:System.Web.Extensions.dll', '/out:' + replacement, source], { encoding: 'utf8', windowsHide: true });
   expect(compiled.status, compiled.stdout + compiled.stderr).toBe(0);
   const executable = readFileSync(replacement), expectedHash = createHash('sha256').update(executable).digest('hex');
   writeFileSync(target, 'old fixture executable');
-  const oldProcess = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore', windowsHide: true });
+  // EOF on our pipe is the quit request; the fixture cannot exit early just because setup was slow.
+  const oldProcess = Bun.spawn([process.execPath, '-e', 'process.stdin.resume()'], { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore', windowsHide: true });
   const previousMarker = process.env.POLYGATE_UPDATE_TEST_MARKER;
   process.env.POLYGATE_UPDATE_TEST_MARKER = marker;
   let staging = '', ready = false;
@@ -219,13 +234,14 @@ restartTest('one click downloads, verifies, closes the old process, replaces the
         await startHelper(script, configPath, stageDir);
         expect(readFileSync(target, 'utf8')).toBe('old fixture executable');
       },
-      onReady: () => { ready = true; oldProcess.kill(); },
+      onReady: () => { expect(oldProcess.exitCode).toBeNull(); ready = true; oldProcess.stdin.end(); },
     });
     const update = await updater.install();
     expect(update.status, update.error).toBe('installing'); expect(ready).toBe(true);
     const deadline = Date.now() + 20000;
     while ((!existsSync(marker) || existsSync(staging)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
-    expect(existsSync(marker),JSON.stringify({oldExit:oldProcess.exitCode,oldSignal:oldProcess.signalCode,result:existsSync(resultPath)?readFileSync(resultPath,'utf8'):null,staging:existsSync(staging)?readdirSync(staging):[]})).toBe(true);
+    expect(oldProcess.exitCode, 'old fixture did not exit cleanly after the quit request').toBe(0);
+    expect(existsSync(marker), existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : 'helper did not write an update result').toBe(true);
     const [message, fixturePid] = readFileSync(marker, 'utf8').trim().split('\n');
     expect(message).toBe('replacement launched');
     expect(Number(fixturePid)).toBeGreaterThan(0);
@@ -237,8 +253,10 @@ restartTest('one click downloads, verifies, closes the old process, replaces the
     expect(readFileSync(target)).toEqual(executable);
     expect(JSON.parse(readFileSync(resultPath, 'utf8')).ok).toBe(true);
     expect(existsSync(staging)).toBe(false);
+    expect(readdirSync(directory).filter(f => rollbackName.test(f))).toEqual([]);
   } finally {
-    oldProcess.kill();
+    if (oldProcess.exitCode === null) oldProcess.kill();
+    await oldProcess.exited;
     if (previousMarker === undefined) delete process.env.POLYGATE_UPDATE_TEST_MARKER; else process.env.POLYGATE_UPDATE_TEST_MARKER = previousMarker;
     cleanup(directory); if (staging && existsSync(staging)) cleanup(staging);
   }
@@ -246,17 +264,29 @@ restartTest('one click downloads, verifies, closes the old process, replaces the
 
 // The old app quits as soon as the helper says it is ready, so it can vanish between the helper's checks. That used to fail the update with
 // "Cannot find a process"; a process that is already gone now counts as closed, and one that stays open is still a failure.
-windowsTest('the helper waits for the old app without failing when it has already gone', () => {
+windowsTest('the helper waits for the old app without failing when it has already gone', async () => {
   const script = readFileSync(path.join(import.meta.dir, '..', 'desktop', 'apply-update.ps1'), 'utf8').replace(/\r\n/g, '\n'); // the script may be checked out with Windows line endings
   const fn = script.match(/function Wait-ForOldApp[\s\S]*?\n}\n/)![0];
   const run = (code: string) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', fn + '\n$ErrorActionPreference = "Stop"\n' + code], { encoding: 'utf8', timeout: 60000 });
-  const gone = spawnSync('cmd.exe', ['/c', 'exit', '0']).pid!;
-  const missing = run(`Wait-ForOldApp ${gone} 5; 'finished'`); expect(missing.stdout).toContain('finished'); expect(missing.status).toBe(0);
   expect(run(`Wait-ForOldApp 0 5; 'finished'`).stdout).toContain('finished');
-  // A Bun child starts in milliseconds; a PowerShell one can take many seconds on a loaded machine and made this wait time out.
-  const brief = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 800)'], { stdio: 'ignore' });
-  const closes = run(`Wait-ForOldApp ${brief.pid} 60; 'finished'`); expect(closes.stdout).toContain('finished');
-  const stays = spawn('powershell.exe', ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
-  try { const result = run(`Wait-ForOldApp ${stays.pid} 1; 'finished'`); expect(result.stdout).not.toContain('finished'); expect(result.stderr + result.stdout).toContain('did not close in time'); }
-  finally { stays.kill(); brief.kill(); }
+  const child = Bun.spawn([process.execPath, '-e', 'process.stdin.resume()'], { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore', windowsHide: true });
+  try {
+    const wait = `Wait-ForOldApp ${child.pid} 1; 'finished'`;
+    const live = run(wait);
+    expect(live.status).toBe(1); expect(live.stderr).toContain('did not close in time');
+    expect(child.exitCode).toBeNull(); // The helper must not terminate a process that timed out.
+    child.stdin.end(); expect(await child.exited).toBe(0);
+    const gone = run(wait);
+    expect(gone.status, gone.stderr).toBe(0); expect(gone.stdout).toContain('finished');
+  } finally {
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+  }
 }, 60000);
+
+test('the helper requires acknowledgement from the exact version and executable', () => {
+  const helper = readFileSync(path.join(import.meta.dir, '..', 'desktop', 'apply-update.ps1'), 'utf8');
+  expect(helper).toContain('$started.version -eq $config.version -and $started.exe');
+  expect(helper).toContain('-eq [IO.Path]::GetFullPath($final)');
+  expect(helper).toContain('if ($confirmed) { Remove-Item -LiteralPath $backup');
+});

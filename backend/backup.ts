@@ -2,7 +2,7 @@ import { scryptSync, randomBytes, createCipheriv, createDecipheriv } from 'node:
 import { copyFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { GatewayError } from './queue';
-import { settings, persist, stateDir, initialSettings, withBuiltIns } from './state';
+import { settings, writeVault, stateDir, initialSettings, withBuiltIns } from './state';
 import { version } from './version';
 import type { Settings } from './types';
 // A backup is the settings (providers and their keys, routes and relay tokens, client keys, chains, MCP servers, preferences) in one file,
@@ -53,11 +53,16 @@ export function restoreBackup(raw: unknown, passphrase: unknown, canRunLocal: bo
   // The WARP helper is a program the gateway starts: only a session that manages this machine may change which one (see checkHelperPath).
   if (!canRunLocal && next.warp) next.warp = { ...next.warp, helperPath: settings.warp?.helperPath || '' };
   if (!canRunLocal && next.mcp) next.mcp = { ...next.mcp, servers: [...next.mcp.servers.filter(s => s.transport !== 'stdio'), ...(settings.mcp?.servers || []).filter(s => s.transport === 'stdio')] };
+  // This machine's HTTPS listener stays as it is: its certificates are not in the backup, so the source's HTTPS settings would point at
+  // files that do not exist here (or remove a listener this machine has). Moving HTTPS is a separate step on the HTTPS page.
+  if (settings.https) next.https = settings.https; else delete next.https;
+  const keep = settings.admin; if (keep) next.admin = keep; else delete next.admin;
   const before = path.join(stateDir, 'settings.vault.before-restore-' + Date.now());
   const vault = path.join(stateDir, 'settings.vault'); if (existsSync(vault)) copyFileSync(vault, before);
-  const keep = settings.admin;
+  // The candidate is written to disk first. Only once it is saved does it replace the running settings, so a failed write changes nothing:
+  // requests keep the settings they had, and no later save can make a half-applied restore permanent.
+  writeVault(next);
   for (const k of Object.keys(settings)) delete (settings as any)[k];
-  Object.assign(settings, next); if (keep) settings.admin = keep; else delete settings.admin;
-  persist();
+  Object.assign(settings, next);
   return { providers: settings.providers.length, routes: settings.routes.length, keys: settings.keys.length, kept: path.basename(before) };
 }

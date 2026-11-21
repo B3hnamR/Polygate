@@ -34,7 +34,12 @@ export function withoutImages(chat: any): { chat: any; count: number } {
   return { chat: count ? { ...chat, messages } : chat, count };
 }
 // A provider's way of saying the model takes no images (OpenRouter-style routing, OpenAI-compatible servers, and plain wording).
-export const refusesImages = (status: number, message: string) => status >= 400 && status < 500 && /no endpoints? found that supports? image|does not support (image|vision)|images? (input )?(is |are )?not supported|image_url.{0,40}not supported|not a multimodal model|model does not accept images|unsupported content type.{0,40}image/i.test(message);
+export function refusesImages(status: number, message: string) {
+  if (status < 400 || status >= 500) return false;
+  // A refusal for this file is not a model capability: the result is cached for future conversations.
+  if (/\bimage\/[\w.+-]+|\b(?:file|image|mime) (?:type|format)s?\b/i.test(message)) return false;
+  return /no endpoints? found that supports? image input\b|does not support (?:images\b|image input\b|vision\b)|images? (?:input )?(?:is |are )?not supported\b|image_url (?:is )?not supported\b|not a multimodal model\b|model does not accept images\b/i.test(message);
+}
 const k = (n: number) => n >= 10000 ? Math.round(n / 1000).toLocaleString() + 'k' : n.toLocaleString();
 export function lacks(m: Model, n: Needs): { short: string; long: string } | undefined {
   if (n.tools && m.tools === false) return { short: 'no tool support', long: 'the request needs tool support and this model is listed without it' };

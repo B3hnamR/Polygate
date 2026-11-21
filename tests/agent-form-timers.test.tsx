@@ -2,6 +2,7 @@ import {expect,test} from 'bun:test';
 import {readFileSync} from 'node:fs';
 import {createElement,Fragment} from 'react';
 import {clearSubmitted,formActive,formAnswer,formChoice,formReady,splitRecommended,type FormField} from '../src/agent-logic';
+import * as agentLogic from '../src/agent-logic';
 
 // Execute the actual components and their returned event handlers without a DOM,
 // global module mocks, network requests, or a new renderer dependency.
@@ -44,6 +45,28 @@ function newSession(onCreated?:(...args:any[])=>void){
   return {...requests,created,stored,render,tree:()=>tree,unmount:state.unmount,staleWrites:state.staleWrites};
 }
 const session={id:'session',title:'First',folder:'/scratch',model:'model',mode:'ask',effort:''};
+
+test('session history and stream replay survive unavailable file changes; only core history can confirm deletion',async()=>{
+  const state=hooks(),requests=apiQueue();let stream:any,deleted=0;
+  const controls=Object.fromEntries('Pencil Folder Files ListChecks ShieldCheck TriangleAlert AgentForms Composer ModeChip ModelChip Row'.split(' ').map(k=>[k,k]));
+  const SessionView=component('agent.tsx','SessionView','// One piece of the conversation',{...state,...requests,...agentLogic,...controls,createElement,Fragment,
+    useMemo:(fn:()=>unknown)=>fn(),useConfirm:()=>({}),usePoll:()=>({}),at:(path:string)=>path,EventSource:class{constructor(){stream=this;}close(){}}});
+  const render=()=>nodes(state.render(()=>SessionView({start:session,opening:{error:'Prompt failed'},scratch:'',onDeleted:()=>deleted++})));
+  const flush=async()=>{for(let i=0;i<5;i++)await Promise.resolve();};
+  const history={session,messages:[{id:'u',type:'user',text:'Saved message'}],reconnect:{epoch:'e',before:0,after:0,connected:true}};
+  const missing=Object.assign(new Error('Not found'),{status:404});
+  render();stream.onopen();stream.onmessage({data:JSON.stringify({type:'session.text.ended',controller:{epoch:'e',seq:1},data:{assistantMessageID:'a',ordinal:0,text:'Live reply'}})});
+  requests.calls[1].request.reject(Object.assign(new Error('Recording pending'),{status:409}));requests.calls[0].request.resolve(history);await flush();
+  let view=render();expect(view.filter(n=>n.type==='Row').map(n=>n.props.block.text)).toEqual(['Saved message','Live reply']);
+  expect(view.some(n=>n.props.children==='Live')).toBe(true);expect(view.some(n=>n.props.children==='Prompt failed')).toBe(true);
+  expect(view.find(n=>n.props.className==='agent-warn')?.props.children).toContain('Recorded file changes are unavailable. Recording pending');
+  stream.onopen();stream.onerror();requests.calls[2].request.resolve({...history,messages:[]});requests.calls[3].request.resolve({turns:[]});await flush();
+  view=render();expect(view.some(n=>n.props.className==='agent-warn')).toBe(true);expect(view.some(n=>n.props.children==='Reconnecting…')).toBe(true);
+  stream.onopen();requests.calls[4].request.resolve(history);requests.calls[5].request.resolve({turns:[{message:'u',files:[]}]});await flush();
+  view=render();expect(view.some(n=>n.props.className==='agent-warn')).toBe(false);expect(view.some(n=>n.props.block?.kind==='changes')).toBe(true);
+  stream.onopen();requests.calls[7].request.reject(missing);await flush();expect(deleted).toBe(0);
+  requests.calls[6].request.reject(missing);await flush();expect(deleted).toBe(1);state.unmount();
+});
 
 test('new-session handlers capture originals synchronously and hand off edits made during create AND prompt',async()=>{
   const h=newSession(),c=h.render(),originalFiles=[file('first.txt')],originalSkills=[skill('first')];

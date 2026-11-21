@@ -36,15 +36,29 @@ function plainCopyPath(ofs,file,allowMissing=false){
     if(path.dirname(current)===current)return true;
   }
 }
-function ownedCopy(ofs,base,version){
+// Every file of the extraction with its size, written beside the copy: a copy that lost any of them (a dashboard script, a WARP or Psiphon
+// helper, one of Electron's own files) is made again instead of being chosen on every start. A copy from before this list keeps the check below.
+const FILE_LIST='.polygate-files';
+function listFiles(ofs,root,dir=root,out=[]){for(const name of ofs.readdirSync(dir)){const file=path.join(dir,name),st=ofs.lstatSync(file);if(st.isDirectory())listFiles(ofs,root,file,out);else if(st.isFile())out.push([path.relative(root,file),st.size]);}return out;}
+function listedFilesPresent(ofs,folder){
+  const list=path.join(folder,FILE_LIST);if(!ofs.existsSync(list))return true;
+  const files=JSON.parse(ofs.readFileSync(list,'utf8'));if(!Array.isArray(files)||!files.length)return false;
+  return files.every(([rel,size])=>{if(typeof rel!=='string'||path.isAbsolute(rel)||rel.split(/[\\/]/).includes('..'))return false;const file=path.join(folder,rel);return ofs.existsSync(file)&&ofs.lstatSync(file).isFile()&&ofs.lstatSync(file).size===size;});
+}
+// complete=false proves only that Polygate made the folder (to replace or prune it); true also that it has everything a start needs.
+function ownedCopy(ofs,base,version,complete=true){
   if(!COPY_VERSION.test(version))return false;
   const folder=path.join(base,version),marker=path.join(folder,'.polygate-copy');
   try{
     if(!plainCopyPath(ofs,folder)||!ofs.lstatSync(folder).isDirectory())return false;
-    for(const file of [marker,path.join(folder,'Polygate.exe'),path.join(folder,'resources','app.asar'),path.join(folder,'resources','gateway.js')]){
+    // Ownership (the marker) and what a start needs: the app, the gateway, its Bun runtime and the dashboard. A copy missing any of them is
+    // made again instead of being chosen on every start.
+    const needed=complete?[path.join(folder,'resources','bin','bun.exe'),path.join(folder,'resources','ui','index.html')]:[];
+    for(const file of [marker,path.join(folder,'Polygate.exe'),path.join(folder,'resources','app.asar'),path.join(folder,'resources','gateway.js'),...needed]){
       if(!plainCopyPath(ofs,file)||!ofs.lstatSync(file).isFile())return false;
     }
     if(ofs.statSync(marker).size>256)return false;
+    if(complete&&!listedFilesPresent(ofs,folder))return false;
     const stamp=ofs.readFileSync(marker,'utf8').split(' ');
     // cpSync does not preserve mtimes; the marker's timestamp describes the source, not the cached gateway.
     return stamp.length===4&&stamp[0]===version&&stamp.slice(1).every(n=>/^\d+$/.test(n))&&
@@ -71,16 +85,17 @@ function relocate(){
     const asar=ofs.statSync(path.join(process.resourcesPath,'app.asar')),gw=ofs.statSync(path.join(process.resourcesPath,'gateway.js'));
     const stamp=`${version} ${asar.size} ${gw.size} ${Math.round(gw.mtimeMs)}`;
     if(!plainCopyPath(ofs,target,true))throw new Error('Unsafe portable copy path');
-    const exists=ofs.existsSync(target),owned=ownedCopy(ofs,base,version);
+    const exists=ofs.existsSync(target),owned=ownedCopy(ofs,base,version,false);
     if(exists&&!owned)throw new Error('The portable cache folder is not an owned copy');
-    const ready=owned&&ofs.readFileSync(marker,'utf8')===stamp;
+    // An owned copy that lost a file it needs (the runtime, the dashboard) is made again rather than chosen on every start.
+    const ready=owned&&ofs.readFileSync(marker,'utf8')===stamp&&ownedCopy(ofs,base,version);
     if(!ready){
       ofs.mkdirSync(base,{recursive:true});
       if(!plainCopyPath(ofs,base))throw new Error('Unsafe portable cache path');
       staging=ofs.mkdtempSync(path.join(base,`${version}.copy-`));
-      ofs.cpSync(source,staging,{recursive:true});ofs.writeFileSync(path.join(staging,'.polygate-copy'),stamp);
+      ofs.cpSync(source,staging,{recursive:true});ofs.writeFileSync(path.join(staging,FILE_LIST),JSON.stringify(listFiles(ofs,source)));ofs.writeFileSync(path.join(staging,'.polygate-copy'),stamp);
       if(exists){
-        if(!ownedCopy(ofs,base,version))throw new Error('The portable copy changed during relocation');
+        if(!ownedCopy(ofs,base,version,false))throw new Error('The portable copy changed during relocation');
         ofs.rmSync(target,{recursive:true,force:true});
       }
       ofs.renameSync(staging,target);staging='';
@@ -93,12 +108,42 @@ function relocate(){
     console.error('[desktop] running from the unpacked files; the copy failed:',e.message);return '';
   }
 }
+// Told to the update helper once the gateway answers and the dashboard has drawn itself: it names this version and this executable, so the
+// helper removes only the previous executable it kept for this very update (apply-update.ps1). Backups are otherwise left alone: another copy
+// in the same folder may be waiting on its own. Only one left over for over a week (its update never confirmed) is cleared here.
+const STALE_BACKUP=7*86400000;
+function confirmStarted(resultPath){
+  try{fs.writeFileSync(path.join(path.dirname(resultPath),'update-started.json'),JSON.stringify({version:app.getVersion(),exe:process.env.PORTABLE_EXECUTABLE_FILE||'',at:Date.now()}));}catch{/* no update is waiting */}
+  const target=portableTarget(process.env.PORTABLE_EXECUTABLE_FILE,app.isPackaged);if(!target)return;
+  // Older helpers did not record backup age. Never infer it from the executable's inherited timestamps.
+  try{for(const name of fs.readdirSync(path.dirname(target))){
+    const stamp=/^\.polygate-backup-(\d{13})-[0-9a-f]{32}\.exe$/i.exec(name);
+    if(stamp&&Date.now()-Number(stamp[1])>STALE_BACKUP)try{fs.unlinkSync(path.join(path.dirname(target),name));}catch{/* in use */}
+  }}catch{/* folder unreadable */}
+}
+// These views mount only after App receives a snapshot; a login, spinner or empty shell never qualifies.
+async function confirmDashboardStartup(win,resultPath){
+  if(!portableTarget(process.env.PORTABLE_EXECUTABLE_FILE,app.isPackaged))return;
+  const probe=`(async()=>{
+    const view=()=>document.querySelector('#root .page-content, #root .mini, #root .ag-app');
+    if(!view())return false;
+    const state=await fetch('/admin/state',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(2000)});
+    if(!state.ok)return false;
+    const snapshot=await state.json();
+    return snapshot?.server?.mode==='desktop'&&snapshot.version===${JSON.stringify(app.getVersion())}&&!!view();
+  })()`;
+  for(const end=Date.now()+20000;Date.now()<end;){
+    if(quitting||win.isDestroyed())return;
+    try{if(await win.webContents.executeJavaScript(probe)){if(!quitting&&!win.isDestroyed())confirmStarted(resultPath);return;}}catch{/* session or gateway not ready */}
+    await new Promise(r=>setTimeout(r,250));
+  }
+}
 // Copies made for other versions are no longer needed. One that is still in use is left for the next start.
 function pruneCopies(log){
   if(!app.isPackaged||process.platform!=='win32'||!process.env.PORTABLE_EXECUTABLE_DIR)return;
   const ofs=require('original-fs'),base=copyBase();
   if(!runningCopy(ofs))return;
-  try{for(const name of ofs.readdirSync(base))if(!samePath(path.join(base,name),path.dirname(process.execPath))&&ownedCopy(ofs,base,name))try{ofs.rmSync(path.join(base,name),{recursive:true,force:true});}catch{/* in use */}}catch{/* nothing to prune */}
+  try{for(const name of ofs.readdirSync(base))if(!samePath(path.join(base,name),path.dirname(process.execPath))&&ownedCopy(ofs,base,name,false))try{ofs.rmSync(path.join(base,name),{recursive:true,force:true});}catch{/* in use */}}catch{/* nothing to prune */}
   try{fs.writeSync(log,`[desktop] running from ${path.dirname(process.execPath)}\n`);}catch{/* logging never blocks the start */}
 }
 // The running-app check comes first: when Polygate already runs, this start only brings it forward and never touches the copy it runs
@@ -192,6 +237,8 @@ app.whenReady().then(async()=>{
     win.webContents.on('render-process-gone',(_,d)=>{fs.writeSync(log,`[desktop] renderer gone: ${d.reason} (${d.exitCode})\n`);if(quitting||d.reason==='clean-exit')return;const soon=lastGone&&Date.now()-lastGone<120000;lastGone=Date.now();if(soon){dialog.showErrorBox('Polygate window crashed',`The window crashed twice in a row. Reopen Polygate. Details are in ${path.join(logDir,'gateway.log')}.`);app.quit();}else win.loadURL(home);});
     initView();
     await win.loadURL(home);if(process.env.POLYGATE_DESKTOP_SMOKE!=='1')win.show();
+    // Do not hold up startup or gateway exit handling while waiting for the renderer.
+    void confirmDashboardStartup(win,resultPath);
     if(fs.existsSync(resultPath)){try{const result=JSON.parse(fs.readFileSync(resultPath,'utf8'));fs.unlinkSync(resultPath);if(!result.ok)dialog.showErrorBox('Update could not finish',String(result.error||'Your previous app was kept. Download the latest release to try again.'));}catch{/* An interrupted result file must not prevent startup. */}}
     if(process.env.POLYGATE_DESKTOP_SMOKE==='1'){
       // The dashboard exchanges the launch token for a session cookie and then forgets it; the smoke check uses that cookie, like the UI.

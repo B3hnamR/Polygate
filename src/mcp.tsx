@@ -256,14 +256,16 @@ function ServerCard({ s, data, hub, onEdit, onChanged, onTry, notice }: { s: Ser
     {open && <ToolRows server={s} tools={st.tools} busy={!!busy} onTry={onTry} onToggle={(tool, on) => void act('tools', '/admin/mcp/servers/tools', { id: s.id, disabledTools: on ? (s.disabledTools || []).filter(t => t !== tool) : [...(s.disabledTools || []), tool] })} />}
   </article>;
 }
+// Accepted writes outlive their page. A new mount reads after those writes finish.
+let settingsQueue: Promise<void> = Promise.resolve();
 export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: string) => void; notice: (m: string, kind?: 'ok' | 'error') => void }) {
   const [hub, setHub] = useState<HubState | null>(null); const [error, setError] = useState('');
   const [editing, setEditing] = useState<Draft | null>(null); const [importing, setImporting] = useState(false);
   const [trying, setTrying] = useState<{ server: { id: string; name: string }; tool: ToolInfo } | null>(null); const [builtinOpen, setBuiltinOpen] = useState(false);
   const generation = useRef(0);
-  const mounted = useRef(true), settingsQueue = useRef<Promise<void>>(Promise.resolve());
+  const mounted = useRef(true);
   const load = useCallback(async () => { if (!mounted.current) return; const seq = ++generation.current; try { const next = await api('/admin/mcp'); if (seq !== generation.current || !mounted.current) return; setHub(next); setError(''); } catch (e: any) { if (seq === generation.current && mounted.current) setError(e?.message || 'Could not read the MCP settings'); } }, []);
-  useEffect(() => { mounted.current = true; void load(); return () => { mounted.current = false; generation.current++; }; }, [load]);
+  useEffect(() => { mounted.current = true; void settingsQueue.then(load); return () => { mounted.current = false; generation.current++; }; }, [load]);
   // A successful mutation is authoritative even if its follow-up read fails. Older polls cannot undo it.
   const changed = async (server: ServerView | null, id: string) => {
     if (!mounted.current) return;
@@ -276,8 +278,8 @@ export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: stri
   // Serialize settings writes so opposite toggles reach the server in order. Their full-state
   // responses own only the submitted settings, never servers or unrelated capability metadata.
   const settingsChange = (patch: Partial<Pick<HubState, 'enabled' | 'builtin' | 'builtinKeys'>>, done: string) => {
-    const pending = settingsQueue.current.then(async () => {
-      if (!mounted.current) return;
+    if (!mounted.current) return;
+    const pending = settingsQueue.then(async () => {
       try {
         const next: HubState = await api('/admin/mcp/settings', patch);
         if (!mounted.current) return;
@@ -287,7 +289,7 @@ export function McpPage({ data, copy, notice }: { data: Snapshot; copy: (s: stri
         await load();
       } catch (e: any) { if (mounted.current) notice(e?.message || 'Not saved', 'error'); }
     });
-    settingsQueue.current = pending;
+    settingsQueue = pending;
     return pending;
   };
   if (!hub) return error ? <section className="section-block"><Empty icon={Plug} title="MCP is unavailable" action={<Button onClick={() => void load()}>Try again</Button>}>{error}</Empty></section> : <section className="section-block"><div className="logs-loading"><Loader2 size={18} className="spin" />Loading MCP…</div></section>;

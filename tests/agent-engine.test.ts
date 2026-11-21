@@ -210,14 +210,12 @@ test('a started engine passes its self-test on a loopback port with a fresh pass
   await engine.stopEngine(); await until(() => !alive(second.pid));
 });
 
-test('an engine that reads a project\'s configuration, offers another provider, loosens the rules or is another version is stopped, with the reason', async () => {
-  const reasons: Record<string, RegExp> = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/, 'missing-agent': /polygate-plan agent/, 'foreign-skill': /planted/ };
+const rejectionReasons = { 'project-config': /cloned-repo/, 'other-provider': /evil/, 'loose-rules': /permission rules/, 'old-version': /1\.19\.5/, 'missing-agent': /polygate-plan agent/, 'foreign-skill': /planted/ };
+for (const [mode, reason] of Object.entries(rejectionReasons)) test(`engine self-test stops ${mode} and reports the reason`, async () => {
   try {
-    for (const [mode, reason] of Object.entries(reasons)) {
-      process.env.FAKE_OPENCODE_MODE = mode;
-      await expect(engine.startEngine({ command: FAKE })).rejects.toThrow(reason);
-      const s = engine.engineStatus(); expect(s.state).toBe('failed'); expect(s.problems.join(' ')).toMatch(reason);
-    }
+    process.env.FAKE_OPENCODE_MODE = mode;
+    await expect(engine.startEngine({ command: FAKE })).rejects.toThrow(reason);
+    const s = engine.engineStatus(); expect(s.state).toBe('failed'); expect(s.problems.join(' ')).toMatch(reason);
   } finally { delete process.env.FAKE_OPENCODE_MODE; }
   expect(engine.engineConnection()).toBeUndefined();
 });

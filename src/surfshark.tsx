@@ -52,6 +52,7 @@ export function SurfsharkPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   const [tone,label]=!s.installed?['neutral','Not available']:!s.keys.saved?['neutral','Key pair needed']:!c.enabled?['neutral','Off']:s.live?['healthy',`${s.live} of ${c.regions.length} connected`]:s.running?['cooldown','Connecting']:['neutral','Not running'];
   const down=s.regions.filter(r=>r.state==='stopped'||r.state==='failed').length;const connectLabel=!s.running?'Connect':down?`Restart ${down} stopped location${down>1?'s':''}`:'Connected';
   const toggle=(id:string)=>{setDirty(true);setPicked(p=>p.includes(id)?p.filter(x=>x!==id):[...p,id]);};
+  const retired=picked.filter(id=>!s.servers.some(server=>server.id===id));
   const applyRegions=async()=>{if(await save({regions:picked},picked.length?`Surfshark locations: ${picked.length} chosen`:'No Surfshark location chosen'))setDirty(false);};
   const nameOf=(id:string)=>{const v=s.servers.find(x=>x.id===id);return v?place(v):id;};
   return <section className="section-block form-section psiphon-panel surfshark-panel">
@@ -65,6 +66,7 @@ export function SurfsharkPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
         <div className="token-row"><Button disabled={working} onClick={()=>run('update','/admin/surfshark/update',{},'Surfshark servers updated')} title="Reads Surfshark's public list of servers: each location's address and WireGuard key">{busy==='update'||s.busy==='updating servers'?<Loader2 size={15} className="spin"/>:<RefreshCw size={15}/>}Update servers</Button>{busy==='update'&&<Button onClick={cancel}><X size={15}/>Cancel</Button>}</div>
       </div>
       {s.servers.length>0&&<>
+        {retired.length>0&&<div className="psi-apply" role="status"><span>No longer in Surfshark's server list: {retired.join(', ')}. Remove these and choose an available location before saving.</span><Button disabled={working} onClick={()=>{setDirty(true);setPicked(p=>p.filter(id=>!retired.includes(id)));}}>Remove unavailable locations</Button></div>}
         <div className="guide-search ss-search"><Search size={16}/><input type="search" aria-label="Search Surfshark locations" placeholder="Search a country or city…" value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<button className="icon-button" aria-label="Clear search" onClick={()=>setQuery('')}><X size={15}/></button>}<span className="subtle">{picked.length} chosen</span></div>
         {/* One flowing grid of every location, alphabetical: the country on top, the city and how busy it is below (a country with one
             location used to take a whole row of its own, which made a long single column). */}

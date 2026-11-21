@@ -271,17 +271,18 @@ export function psiphonVirtualRoute(region: string): Route | undefined {
 export const psiphonRegionsReady = () => [...instances.values()].filter(i => i.state === 'ready').map(i => ({ region: i.region, exitIp: i.exitIp }));
 
 // --- the managed route ---
-// The route is on exactly while Psiphon runs. When it goes off while it is the route in use, requests go back to the route used before it
-// (or Direct, or the first route that is on), never to a route that is switched off.
+// An explicit stop hands requests back to the previous route (or Direct, or the first route that is on).
 function fallbackRoute(): string {
   const on = (id?: string) => !!id && id !== ROUTE_ID && settings.routes.some(r => r.id === id && r.enabled);
   return on(settings.previousRouteId) ? settings.previousRouteId! : on('direct') ? 'direct' : settings.routes.find(r => r.enabled && r.id !== ROUTE_ID)?.id || settings.routeId;
 }
-function ensureRoute(enabled: boolean) {
+function ensureRoute(enabled: boolean, explicitStop = false) {
   let route = settings.routes.find(r => r.id === ROUTE_ID);
   if (!route) { if (!enabled) return; route = { id: ROUTE_ID, name: 'Psiphon', kind: 'proxy', url: 'psiphon://local', enabled: true, models: [], managed: true } satisfies Route; settings.routes.push(route); persist(); return; }
   if (route.enabled !== enabled) { route.enabled = enabled; if (enabled) { route.cooldownUntil = 0; route.failures = 0; route.opened = 0; } }
-  if (!enabled && settings.routeId === ROUTE_ID) { const to = fallbackRoute(); if (to !== ROUTE_ID) { settings.routeId = to; logEvent('info', 'psiphon', `Psiphon stopped; requests now use ${settings.routes.find(r => r.id === to)?.name || to}`, { route: to }); } }
+  // Observing an idle tunnel after restore or restart is not a request to use the fallback.
+  if (enabled && settings.managedChoice === ROUTE_ID) { settings.routeId = ROUTE_ID; settings.managedChoice = undefined; }
+  if (!enabled && explicitStop && settings.routeId === ROUTE_ID) { const to = fallbackRoute(); if (to !== ROUTE_ID) { settings.managedChoice = ROUTE_ID; settings.routeId = to; logEvent('info', 'psiphon', `Psiphon stopped; requests now use ${settings.routes.find(r => r.id === to)?.name || to}`, { route: to }); } }
   persist();
 }
 // Makes the route match what is running: on while a client runs, off when none does (after a restart, or a restored backup).
@@ -307,7 +308,7 @@ export function psiphonConnect() {
   });
 }
 export function psiphonDisconnect() {
-  return guard('disconnecting', async () => { await stopAll(); ensureRoute(false); return psiphonStatus(); });
+  return guard('disconnecting', async () => { await stopAll(); ensureRoute(false, true); return psiphonStatus(); });
 }
 // Reconnects one region on a fresh connection: usually another server of the same region, so another exit address.
 export async function renewRegion(region: string, auto = false) {
@@ -366,11 +367,11 @@ export async function setPsiphonSettings(patch: Partial<PsiphonSettings>) {
   if (patch.pinned !== undefined) { const p = String(patch.pinned || '').toUpperCase(); if (p && !REGION.test(p)) throw new GatewayError(`"${p}" is not a region code`, 400); next.pinned = p; }
   if (next.mode === 'single' && !next.regions.includes(next.pinned)) next.pinned = next.regions[0] || '';
   settings.psiphon = next; persist();
-  if (!next.enabled) { await stopAll(); ensureRoute(false); }
+  if (!next.enabled) await stopAll();
   // Running clients follow the chosen regions at once: removed ones stop, added ones start.
   else if (instances.size) { for (const [region, inst] of [...instances]) if (!next.regions.includes(region)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(region); } for (const r of next.regions) if (!instances.has(r)) await startInstance(r).catch(() => {}); }
   // With no region left running (all removed), the route goes off with them.
-  reconcilePsiphon();
+  ensureRoute(instances.size > 0 && psiphonConfig().enabled, patch.enabled === false || patch.regions?.length === 0);
   return psiphonStatus();
 }
 async function stopAll() {
@@ -410,9 +411,9 @@ export function psiphonStatus() {
 // Otherwise the route is switched off to match, so nothing is sent into a Psiphon that is not running.
 export async function startPsiphon() {
   const c = psiphonConfig(); pruneSpent();
-  const wanted = c.enabled && c.regions.length > 0 && !!findPsiphon() && (c.autoStart || settings.routeId === ROUTE_ID);
-  if (wanted) await psiphonConnect().catch(e => console.warn('[psiphon] start:', redactError(String(e.message || e))));
   reconcilePsiphon();
+  const wanted = c.enabled && (c.autoStart || settings.routeId === ROUTE_ID);
+  if (wanted) await psiphonConnect().catch(e => console.warn('[psiphon] start:', redactError(String(e.message || e))));
 }
 export async function stopPsiphon() { if (monitor) clearInterval(monitor); monitor = undefined; await stopAll(); }
 // Psiphon is one exit group: the route machinery (backend/transport.ts) reaches it through these.

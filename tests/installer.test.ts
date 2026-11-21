@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 // The Linux installer cannot be run on every machine that runs the tests, but its promises can be checked: it is valid shell, it needs no Python,
 // and it never changes a firewall. (The real behaviour was exercised in clean Linux containers: busy ports, a foreign service, update, uninstall.)
@@ -96,3 +96,68 @@ test('polygate password refuses before it stops anything when the password is se
   const fn = command.slice(command.indexOf('cmd_password()')); const guard = fn.indexOf('POLYGATE_ADMIN_PASSWORD');
   expect(guard).toBeGreaterThan(0); expect(guard).toBeLessThan(fn.indexOf('systemctl stop polygate'));
 });
+
+// Run only the transaction, in a private Linux scratch tree. No installer entry point,
+// package manager, release executable, service manager or network operation is invoked.
+for (const stop of ['snapshot', 'before-switch', 'configure', 'health', 'recovery', 'after-health', 'fresh'] as const) {
+  test.skipIf(process.platform !== 'linux')(`installer transaction: ${stop}`, () => {
+    const scratch = mkdtempSync('/tmp/polygate-txn-');
+    try {
+      const steps = installer.slice(installer.indexOf('\ninstall_release()'), installer.indexOf('\nfirewall_hint()'))
+        + installer.slice(installer.indexOf('\non_exit()'), installer.indexOf('\nshow_issues()'));
+      const script = `set -Eeuo pipefail
+umask 077
+${steps.replace(/\/(opt|etc|usr\/local|var\/lib)\//g, `${scratch}/$1/`)}
+UPDATE=1; CHECK=0; STARTED=0; old=; release=; REPO=fixture; PORT=12345; LOG=/dev/null
+work=$PWD/work; app=$PWD/opt/polygate; state=$PWD/var/lib/polygate
+envfile=$PWD/etc/polygate/polygate.env; unit=$PWD/etc/systemd/system/polygate.service; cli=$PWD/usr/local/bin/polygate
+mkdir -p "$app/releases/previous" "$work/polygate"/{bin,install} "$state" "$PWD/etc/polygate" "$PWD/etc/systemd/system" "$PWD/usr/local/bin"
+touch "$state/settings.vault" "$work/polygate/bin/bun"
+printf new-unit >"$work/polygate/install/polygate.service"; printf new-cli >"$work/polygate/install/polygate"
+printf 'POLYGATE_PORT=10\\n' >"$envfile"; chmod 0640 "$envfile"
+printf old-unit >"$PWD/etc/systemd/system/custom-unit"; ln -s custom-unit "$unit"
+if [ "$STOP" = fresh ]; then UPDATE=0; MODE=local; DASHBOARD_PATH=; else ln -s releases/previous "$app/current"; fi
+if [ "$STOP" = snapshot ]; then mkdir "$cli"; fi
+id() { return 0; }; chown() { [ "$STOP" != before-switch ] || return 72; }
+install() { if [ "$1" != -d ]; then command install "$@"; fi; }
+systemctl() { printf '%s:%s\\n' "$*" "$(readlink "$app/current")" >>calls; }
+wait_healthy() { [ "$STOP" != recovery ] && { [ "$STOP" != health ] || [ "$(readlink "$app/current")" = releases/previous ]; }; }
+run() { shift; "$@"; }; journalctl() { :; }; cleanup() { :; }; spin_stop() { :; }
+say() { :; }; note() { :; }; die() { exit 1; }
+ok() { if [ "$1" = 'Installed Polygate' ] && { [ "$STOP" = configure ] || [ "$STOP" = fresh ]; }; then return 73; fi; }
+trap on_exit EXIT
+snapshot_managed
+install_release
+configure_service
+start_service
+exit 74`;
+      const r = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
+        cwd: scratch, env: { HOME: scratch, PATH: '/usr/bin:/bin', LC_ALL: 'C', STOP: stop }, encoding: 'utf8', timeout: 5000,
+      });
+      expect({ error: r.error?.message, status: r.status }).toEqual({ error: undefined,
+        status: { snapshot: 1, 'before-switch': 72, configure: 73, health: 1, recovery: 1, 'after-health': 74, fresh: 73 }[stop] });
+      const committed = stop === 'after-health' || stop === 'fresh';
+      const link = readlinkSync(`${scratch}/opt/polygate/current`);
+      if (committed) expect(link).toStartWith(`${scratch}/opt/polygate/releases/`);
+      else expect(link).toBe('releases/previous');
+      const envfile = `${scratch}/etc/polygate/polygate.env`, unit = `${scratch}/etc/systemd/system/polygate.service`;
+      if (committed) {
+        expect(readFileSync(envfile, 'utf8')).toContain('POLYGATE_PORT=12345');
+        expect(readFileSync(unit, 'utf8')).toBe('new-unit');
+        expect(readFileSync(`${scratch}/usr/local/bin/polygate`, 'utf8')).toBe('new-cli');
+      } else {
+        expect(readFileSync(envfile, 'utf8')).toBe('POLYGATE_PORT=10\n');
+        expect(statSync(envfile).mode & 0o777).toBe(0o640);
+        expect(readlinkSync(unit)).toBe('custom-unit');
+        expect(readFileSync(unit, 'utf8')).toBe('old-unit');
+        expect(existsSync(`${scratch}/usr/local/bin/polygate`)).toBe(stop === 'snapshot');
+      }
+      const snapshots = readdirSync(`${scratch}/etc/polygate`).filter(f => f.startsWith('.before-update-'));
+      expect(snapshots.length).toBe(stop === 'recovery' ? 1 : 0);
+      if (stop === 'recovery') expect(r.stderr).toContain(snapshots[0]);
+      const calls = existsSync(`${scratch}/calls`) ? readFileSync(`${scratch}/calls`, 'utf8') : '';
+      if (stop === 'health' || stop === 'recovery') expect(calls).toEndWith('daemon-reload:releases/previous\nrestart polygate:releases/previous\n');
+      else if (stop !== 'after-health') expect(calls).toBe('');
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+}

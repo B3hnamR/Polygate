@@ -131,8 +131,30 @@ sudo bash install.sh --yes --https domain --domain panel.example.com --email you
 sudo bash install.sh --yes --https ip
 sudo bash install.sh --yes --https proxy --domain panel.example.com
 sudo bash install.sh --yes --https custom --cert fullchain.pem --key privkey.pem --https-port 8443
-sudo bash install.sh --update      # newer release, keeps your data, settings and certificates
 ```
+
+For a Linux installation that still runs the stock v0.6.5 updater, do not run
+`sudo polygate update` first: that command executes the old installer from the
+active release, whose mtime-based cleanup can delete the rollback release. Use a
+new, locally extracted installer after verifying the release checksum:
+
+```bash
+set -euo pipefail
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+base=https://github.com/B3hnamR/Polygate/releases/latest/download
+curl -fL "$base/polygate-linux-amd64.tar.gz" -o "$tmp/polygate-linux-amd64.tar.gz"
+curl -fL "$base/polygate-linux-amd64.tar.gz.sha256" -o "$tmp/polygate-linux-amd64.tar.gz.sha256"
+  (cd "$tmp" && sha256sum -c polygate-linux-amd64.tar.gz.sha256)
+tar -xzf "$tmp/polygate-linux-amd64.tar.gz" -C "$tmp"
+sudo env POLYGATE_ARCHIVE="$tmp/polygate-linux-amd64.tar.gz" POLYGATE_CHECKSUM="$tmp/polygate-linux-amd64.tar.gz.sha256" \
+  bash "$tmp/polygate/install.sh" --update
+```
+
+The new installer verifies the local archive again, keeps the active release and
+the captured rollback target, and preserves data, settings and certificates. Do
+not delete the temporary files until the update finishes. After this transition,
+`sudo polygate update` uses the new updater safely.
 
 `bash install.sh --help` lists every option. The dashboard is served at `/polygate/` (set `POLYGATE_DASHBOARD_PATH` to another path, or to an empty value for the root), so on a shared domain only that one path belongs to Polygate. The password is shown once at the end and kept in `/var/lib/polygate/admin-password.txt`.
 
@@ -148,7 +170,7 @@ The API stays at `http://127.0.0.1:4317/v1` from one launch to the next (if anot
 
 **Compact view.** Press **Compact view** in the header (or Ctrl+Shift+M, or the tray menu) to shrink the app into a small portrait window you can keep beside your work. It shows whether the gateway is online, the route, the success rate and speed, and your latest requests, with buttons to pause it and copy the base URL or API key. It stays on top of other windows (turn that off with the pin), and the app remembers where each view was.
 
-The app is currently unsigned, so Windows may show SmartScreen. Download from this repository’s release page and verify the executable against the supplied `.sha256` file. App data is kept in `%LOCALAPPDATA%\Polygate`.
+The app is currently unsigned, so Windows may show SmartScreen. Download from this repository’s release page and verify the executable against the supplied `.sha256` file. Your settings, keys and history are kept in `%APPDATA%\Polygate` (the `state` folder holds the vault and its key); back up that folder. `%LOCALAPPDATA%\Polygatepp` only holds replaceable copies of the program, made from the downloaded `.exe`, and is not your data.
 
 ### Docker
 
@@ -348,7 +370,7 @@ The dashboard checks for a newer **published stable release** when you open it, 
 | Where you run Polygate | How to update |
 |---|---|
 | **Windows portable app** | Click **Update & restart**. The app downloads the official Windows executable, verifies its SHA-256, closes, replaces its portable executable, and reopens. Settings and keys are kept. Finish active requests first. |
-| **Linux service** | Connect to your VPS over SSH and run `sudo polygate update`, or open `sudo polygate` and choose **8 · Update Polygate**. The dashboard shows the command; it does not run server commands for you. |
+| **Linux service** | On v0.6.6 or later, connect to your VPS over SSH and run `sudo polygate update`. For stock v0.6.5, first use the locally verified installer procedure above; the dashboard does not run server commands for you. |
 | **Docker** | In your checkout, run `git pull --ff-only`, then `docker compose up -d --build`. Keep your existing volume and Compose options. |
 | **Source / standalone package** | Update using your original deployment method, then restart the gateway. |
 
@@ -399,7 +421,7 @@ Most things are changed in the dashboard. A server reads these environment varia
 | `POLYGATE_PORT` | dashboard and API port | `4317` (the installer picks a free random one) |
 | `POLYGATE_HOST` | address to listen on | `127.0.0.1` |
 | `POLYGATE_DASHBOARD_PATH` | serve the dashboard and the API under this path, e.g. `/polygate`, so a reverse proxy can forward just that path (the root only redirects to it) | empty (the root); the Linux installer sets `/polygate` |
-| `POLYGATE_STATE` | where data is kept | per user (`%LOCALAPPDATA%\Polygate\state`, `~/.local/state/polygate`) |
+| `POLYGATE_STATE` | where data is kept | the Windows app: `%APPDATA%\Polygate\state`; run from source: `%LOCALAPPDATA%\Polygate\state` or `~/.local/state/polygate`; the Linux installer: `/var/lib/polygate` |
 | `POLYGATE_ADMIN_PASSWORD` | dashboard password, 12 or more characters (when set, controls the password instead of the dashboard) | a random one is generated |
 | `POLYGATE_ALLOWED_HOSTS` | names the dashboard answers to, comma separated (`*` for any) | loopback names and the certificate’s name; public listeners accept any hostname |
 | `POLYGATE_TRUST_PROXY` | how many reverse proxies sit in front (reads the client address from `X-Forwarded-For`) | `0` |

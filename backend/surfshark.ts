@@ -62,7 +62,7 @@ export async function setSurfsharkKeys(input: { privateKey?: unknown; publicKey?
   return surfsharkStatus();
 }
 export async function clearSurfsharkKeys() {
-  await stopAll(); ensureRoute(false);
+  await stopAll(); ensureRoute(false, true);
   const { privateKey: _p, publicKey: _q, ...rest } = surfsharkConfig(); settings.surfshark = rest; persist();
   logEvent('info', 'surfshark', 'Surfshark key pair removed');
   return surfsharkStatus();
@@ -102,7 +102,15 @@ export function surfsharkUpdateServers() {
         const r = await fetch(url, { signal: cancellable(30000) });
         if (!r.ok) { last = `HTTP ${r.status}`; await r.body?.cancel().catch(() => {}); continue; }
         const list = parseServers(await r.json());
-        if (list.length) { save({ servers: list, updatedAt: Date.now() }); logEvent('info', 'surfshark', `Surfshark servers updated: ${list.length} locations in ${new Set(list.map(s => s.countryCode)).size} countries`); return surfsharkStatus(); }
+        if (list.length) {
+          // A location Surfshark no longer lists leaves the chosen ones too: it is not shown any more, so it could not be unticked, and
+          // Connect would refuse every time because of it.
+          const c = surfsharkConfig(); const offered = new Set(list.map(s => s.id)); const gone = c.regions.filter(r => !offered.has(r));
+          const regions = c.regions.filter(r => offered.has(r)); const pinned = offered.has(c.pinned) ? c.pinned : regions[0] || '';
+          save({ servers: list, updatedAt: Date.now(), ...(gone.length ? { regions, pinned } : {}) });
+          logEvent('info', 'surfshark', `Surfshark servers updated: ${list.length} locations in ${new Set(list.map(s => s.countryCode)).size} countries${gone.length ? `; no longer offered, so removed from your locations: ${gone.join(', ')}` : ''}`);
+          return surfsharkStatus();
+        }
         last = 'the list was empty';
       } catch (e: any) { if (isCancelled()) throw cancelledError(); last = redactError(String(e?.message || e)).slice(0, 120); }
     }
@@ -236,6 +244,7 @@ function onExit(inst: Instance, code: number | null) {
 export function spentUntil(ip: string): number { const until = (ip && surfsharkConfig().spent?.[ip]) || 0; return until > Date.now() ? until : 0; }
 const kiloLimits = new Map<string, number>();
 export const kiloUntil = (ip: string) => { const until = (ip && kiloLimits.get(ip)) || 0; return until > Date.now() ? until : 0; };
+export const clearSurfsharkKiloLimit = (ip: string) => kiloLimits.delete(ip);
 function pruneSpent() {
   const c = surfsharkConfig(); const now = Date.now(); const spent = Object.fromEntries(Object.entries(c.spent || {}).filter(([, until]) => until > now));
   if (Object.keys(spent).length !== Object.keys(c.spent || {}).length) save({ spent });
@@ -297,11 +306,13 @@ function fallbackRoute(): string {
   const on = (id?: string) => !!id && id !== ROUTE_ID && settings.routes.some(r => r.id === id && r.enabled);
   return on(settings.previousRouteId) ? settings.previousRouteId! : on('direct') ? 'direct' : settings.routes.find(r => r.enabled && r.id !== ROUTE_ID)?.id || settings.routeId;
 }
-function ensureRoute(enabled: boolean) {
+function ensureRoute(enabled: boolean, explicitStop = false) {
   let route = settings.routes.find(r => r.id === ROUTE_ID);
   if (!route) { if (!enabled) return; route = { id: ROUTE_ID, name: 'Surfshark', kind: 'proxy', url: 'surfshark://local', enabled: true, models: [], managed: true } satisfies Route; settings.routes.push(route); persist(); return; }
   if (route.enabled !== enabled) { route.enabled = enabled; if (enabled) { route.cooldownUntil = 0; route.failures = 0; route.opened = 0; } }
-  if (!enabled && settings.routeId === ROUTE_ID) { const to = fallbackRoute(); if (to !== ROUTE_ID) { settings.routeId = to; logEvent('info', 'surfshark', `Surfshark stopped; requests now use ${settings.routes.find(r => r.id === to)?.name || to}`, { route: to }); } }
+  // Only an explicit stop hands traffic back. An idle restored selection stays selected but unavailable until it starts.
+  if (enabled && settings.managedChoice === ROUTE_ID) { settings.routeId = ROUTE_ID; settings.managedChoice = undefined; }
+  if (!enabled && explicitStop && settings.routeId === ROUTE_ID) { const to = fallbackRoute(); if (to !== ROUTE_ID) { settings.managedChoice = ROUTE_ID; settings.routeId = to; logEvent('info', 'surfshark', `Surfshark stopped; requests now use ${settings.routes.find(r => r.id === to)?.name || to}`, { route: to }); } }
   persist();
 }
 export function reconcileSurfshark() { ensureRoute(instances.size > 0 && surfsharkConfig().enabled); }
@@ -327,7 +338,7 @@ export function surfsharkConnect() {
     return surfsharkStatus();
   });
 }
-export function surfsharkDisconnect() { return guard('disconnecting', async () => { await stopAll(); ensureRoute(false); return surfsharkStatus(); }); }
+export function surfsharkDisconnect() { return guard('disconnecting', async () => { await stopAll(); ensureRoute(false, true); return surfsharkStatus(); }); }
 // Reconnects one location: its hostname is looked up again, which can land on another server, so another exit address.
 export async function renewSurfshark(region: string, auto = false) {
   const c = surfsharkConfig(); if (!c.regions.includes(region)) throw new GatewayError(`${region} is not one of the chosen locations`, 400);
@@ -354,9 +365,9 @@ export async function setSurfsharkSettings(patch: Partial<SurfsharkSettings>) {
   if (patch.pinned !== undefined) { const p = String(patch.pinned || '').toLowerCase(); if (p && !ID.test(p)) throw new GatewayError(`"${p}" is not a Surfshark location`, 400); next.pinned = p; }
   if (next.mode === 'single' && !next.regions.includes(next.pinned)) next.pinned = next.regions[0] || '';
   settings.surfshark = next; persist();
-  if (!next.enabled) { await stopAll(); ensureRoute(false); }
+  if (!next.enabled) await stopAll();
   else if (instances.size) { for (const [region, inst] of [...instances]) if (!next.regions.includes(region)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(region); dropConf(region); } for (const r of next.regions) if (!instances.has(r) && serverOf(r)) await startInstance(r).catch(() => {}); }
-  reconcileSurfshark();
+  ensureRoute(instances.size > 0 && surfsharkConfig().enabled, patch.enabled === false || patch.regions?.length === 0);
   return surfsharkStatus();
 }
 async function stopAll() {
@@ -393,9 +404,9 @@ export function surfsharkStatus() {
 }
 export async function startSurfshark() {
   const c = surfsharkConfig(); pruneSpent();
-  const wanted = c.enabled && c.regions.length > 0 && !!c.privateKey && !!findWireproxy() && (c.autoStart || settings.routeId === ROUTE_ID);
-  if (wanted) await surfsharkConnect().catch(e => console.warn('[surfshark] start:', redactError(String(e.message || e))));
   reconcileSurfshark();
+  const wanted = c.enabled && (c.autoStart || settings.routeId === ROUTE_ID);
+  if (wanted) await surfsharkConnect().catch(e => console.warn('[surfshark] start:', redactError(String(e.message || e))));
 }
 export async function stopSurfshark() { if (monitor) clearInterval(monitor); monitor = undefined; await stopAll(); }
 // Surfshark is one exit group: the route machinery (backend/transport.ts) reaches it through these.
