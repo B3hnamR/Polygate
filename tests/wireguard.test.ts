@@ -38,7 +38,7 @@ H1 = 1234
 H2 = 1235-1300
 H3 = 1301
 H4 = 1400-1500
-RandomTrailers = off`;
+RandomTrailers = true`;
 
 // Stand-in exits: a SOCKS5 server that forwards to a local target, so a request really travels the group's route.
 function socksTo(targetPort: number) {
@@ -66,13 +66,13 @@ const IDS = ['wg-home', 'wg-work', 'wg-travel'] as const;
 const targets = Object.fromEntries(IDS.map(id => [id, target(id)])) as Record<string, ReturnType<typeof target>>;
 const socks: Record<string, { port: number; close: () => void }> = {}; for (const id of IDS) socks[id] = await socksTo(targets[id].port as number);
 const exits: Record<string, string> = { 'wg-home': '198.51.100.21', 'wg-work': '198.51.100.22', 'wg-travel': '198.51.100.23' };
-const instance = (id: string, state = 'ready') => ({ id, name: id, port: socks[id].port, state, exitIp: exits[id], location: '', startedAt: Date.now(), readyAt: Date.now(), failures: 0, restarts: 0, error: '', renewedAt: [], output: '', handshake: true }) as any;
+const instance = (id: string, state = 'ready') => ({ id, name: id, port: socks[id].port, state, exitIp: exits[id], location: '', startedAt: Date.now(), readyAt: Date.now(), failures: 0, restarts: 0, error: '', output: '', handshake: true }) as any;
 const entries = () => IDS.map(id => ({ id, name: id, config: conf(), enabled: true, addedAt: Date.now() }));
 afterAll(() => { for (const s of Object.values(socks)) s.close(); for (const s of Object.values(targets)) s.stop(true); W.__instances.clear(); __exitTest.scope = ''; __setExitVerifier(); __setPsiphonRegionTester(); restore(); });
 beforeEach(() => {
   hits = {}; for (const id of IDS) answers[id] = 'ok'; answers['wg-home'] = 'opencode-used-up';
   W.__instances.clear(); for (const id of IDS) W.__instances.set(id, instance(id));
-  settings.wireguard = { enabled: true, autoStart: false, mode: 'spread', pinned: '', skip: true, renew: false, spent: {}, configs: entries() };
+  settings.wireguard = { enabled: true, autoStart: false, mode: 'spread', pinned: '', skip: true, spent: {}, configs: entries() };
   settings.routes = settings.routes.filter(r => r.id !== 'wireguard').concat({ id: 'wireguard', name: 'WireGuard', kind: 'proxy', url: 'wireguard://local', enabled: true, models: [], managed: true });
   settings.exhaustedFailover = true; __exitTest.scope = 'opencode';
   __setExitVerifier(async () => 'exhausted');
@@ -106,7 +106,14 @@ AllowedIPs = 0.0.0.0/0\r
   expect(W.parseConfig(text)).toMatchObject({ privateKey: pair.privateKey, addresses: ['10.7.0.2/32'], mtu: 1280, endpoint: 'VPN.Example.com:51820' });
 });
 test('AmneziaWG fields are kept and checked like the client checks them', () => {
-  expect(W.parseConfig(conf(AMNEZIA)).amnezia).toBe(true);
+  const parsed = W.parseConfig(conf(AMNEZIA));
+  expect(parsed.amnezia).toBe(true);
+  expect(parsed.amneziaFields).toEqual(['Jc 5', 'Jmin 50', 'Jmax 1000', 'S1 50', 'S2 60', 'S3 70', 'S4 80', 'H1 1234', 'H2 1235-1300', 'H3 1301', 'H4 1400-1500', 'RandomTrailers true']);
+  const headerKey = keyPair().privateKey;
+  const hidden = W.parseConfig(conf(AMNEZIA + `\nI1 = <b 0xdeadbeef>\nHeaderProtectionKey = ${headerKey}`));
+  expect(hidden.amneziaFields).toContain('I1');
+  expect(hidden.amneziaFields).toContain('HeaderProtectionKey');
+  expect(JSON.stringify(hidden.amneziaFields)).not.toContain(headerKey);
   expect(W.parseConfig(conf('Jc = 5')).amnezia).toBe(true);
   expect(() => W.parseConfig(conf('Jc = 0'))).toThrow('Jc must be between 1 and 128');
   expect(() => W.parseConfig(conf('Jc = 129'))).toThrow('Jc must be between 1 and 128');
@@ -118,8 +125,9 @@ test('AmneziaWG fields are kept and checked like the client checks them', () => 
   expect(() => W.parseConfig(conf(`Jc = 5\nS1 = 5\nS2 = 60\nS3 = 70\nS4 = 80\nHeaderProtectionKey = ${keyPair().privateKey}`))).toThrow('at least 12');
   expect(() => W.parseConfig(conf('Jc = many'))).toThrow('JC must be a whole number');
   expect(() => W.parseConfig(conf('RekeyAfterTime = soon'))).toThrow('must be a number or a range');
-  expect(() => W.parseConfig(conf('RandomTrailers = maybe'))).toThrow('must be on or off');
-  expect(W.parseConfig(conf(AMNEZIA + '\nDisableCookies = yes')).amnezia).toBe(true);
+  expect(() => W.parseConfig(conf('RandomTrailers = maybe'))).toThrow('must be true or false');
+  expect(() => W.parseConfig(conf('RandomTrailers = yes'))).toThrow('must be true or false');
+  expect(W.parseConfig(conf(AMNEZIA + '\nDisableCookies = true')).amnezia).toBe(true);
 });
 test('a file that is not a usable config is refused with the section and key that are wrong', () => {
   expect(() => W.parseConfig('Address = 10.0.0.2/32')).toThrow('no [Interface] section');
@@ -148,6 +156,14 @@ test('a file that is not a usable config is refused with the section and key tha
 test('the wrapper points the client at the uploaded file and gives it the local SOCKS port', () => {
   expect(W.__wrapperText('C:\\Users\\me\\wireguard.conf', 47701)).toBe('WGConfig = C:/Users/me/wireguard.conf\n\n[Socks5]\nBindAddress = 127.0.0.1:47701\n');
 });
+test('the client copy caps the tunnel MTU so large TLS packets fit the path', () => {
+  const out = W.__clientText(conf('MTU = 1280'));
+  expect(out).toContain('MTU = 1200');
+  expect(out).not.toContain('MTU = 1280');
+  expect(W.__clientText(conf('MTU = 900'))).toContain('MTU = 900');
+  expect(W.__clientText(conf())).toContain('MTU = 1200');
+  expect(W.__clientText(conf('MTU = 1280\nListenPort = 51820'))).not.toContain('ListenPort');
+});
 test('import adds every file, always suffixing duplicates, and reports each file it could not use', async () => {
   W.__instances.clear(); settings.wireguard = { ...W.wireguardConfig(), configs: [] };
   const r = await W.wireguardImport([
@@ -167,7 +183,12 @@ test('import adds every file, always suffixing duplicates, and reports each file
   expect(new Set(c.configs.map(x => x.id)).size).toBe(3);
   expect(c.configs.every(x => x.enabled)).toBe(true);
   expect(c.configs[1].config).toContain('Jc = 5');
-  expect(JSON.stringify(W.wireguardStatus())).not.toContain(pair.privateKey);
+  const status = W.wireguardStatus();
+  expect(JSON.stringify(status)).not.toContain(pair.privateKey);
+  expect(status.configs[0]).toMatchObject({ dns: ['1.1.1.1'], mtu: 1420, mtuUsed: 1200, keepalive: '25', allowedIPs: '0.0.0.0/0, ::/0', amnezia: false });
+  expect(status.configs[1].amneziaFields).toContain('Jc 5');
+  expect(status.config).not.toHaveProperty('renew');
+  expect(status.configs[0]).not.toHaveProperty('checking');
   expect((publicSettings() as any).wireguard).toBeUndefined();
   expect(JSON.stringify(publicSettings())).not.toContain(pair.privateKey);
   const again = await W.wireguardImport([{ name: 'home.conf', text: conf() }]);

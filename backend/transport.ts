@@ -640,7 +640,7 @@ async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<Rou
 }
 // Checks an exit's new address with the provider whose limit it had reached, through exactly that exit (Psiphon, Surfshark):
 // OpenCode Free with the same small request as a route test, Kilo with one small chat request to a Kilo model.
-for(const group of exitGroups())group.setChecker(async(region,scope)=>{
+for(const group of exitGroups())group.setChecker?.(async(region,scope)=>{
   const route=group.virtualRoute(region);if(!route)return {result:'unknown',note:`the ${group.unit} stopped`};
   if(scope==='opencode'){const c=await checkChat(route);return c.chat==='ok'?{result:'ok'}:c.chat==='used-up'||c.chat==='refused'?{result:'used-up',until:c.until}:{result:'unknown',note:c.note};}
   const kilo=settings.providers.find(p=>p.kind==='kilo'&&p.enabled);if(scope!=='kilo'||!kilo)return {result:'unknown',note:'Kilo is not enabled'};

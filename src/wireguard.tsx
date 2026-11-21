@@ -1,5 +1,5 @@
 import {useRef,useState} from 'react';
-import {AlertCircle,Check,ClipboardPaste,FileUp,FlaskConical,Info,Loader2,Pencil,Power,RefreshCw,Route as RouteIcon,ShieldCheck,Trash2,X} from 'lucide-react';
+import {AlertCircle,Check,ClipboardPaste,FileUp,FlaskConical,Info,Loader2,Pencil,Power,Route as RouteIcon,ShieldCheck,Trash2,X} from 'lucide-react';
 import {api} from './api';
 import {Badge,Button,Field,Select,Toggle,usePoll} from './ui';
 import {useConfirm} from './confirm';
@@ -8,10 +8,10 @@ import type {Notice} from './panels';
 
 // The WireGuard route (backend/wireguard.ts): every imported .conf file is a WireGuard or AmneziaWG tunnel of its own, run by the bundled
 // wireproxy-awg, and together they are one route that takes turns or stays on one config, with the same options as Psiphon and Surfshark.
-type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;amnezia:boolean;peers:number;
-  state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;since:number;usedUpUntil:number;kiloUntil:number;checking:''|'opencode'|'kilo'|'other';error:string};
+type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
+  state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;since:number;usedUpUntil:number;kiloUntil:number;error:string};
 type WireguardInfo={installed:boolean;problem:string;platform:string;busy:string;lastError:string;running:boolean;live:number;
-  config:{enabled:boolean;autoStart:boolean;mode:'spread'|'single';pinned:string;skip:boolean;renew:boolean};
+  config:{enabled:boolean;autoStart:boolean;mode:'spread'|'single';pinned:string;skip:boolean};
   configs:Config[];spent:number;route:{exists:boolean;enabled:boolean;inUse:boolean}};
 type ImportResult={added:{id:string;name:string;renamedFrom?:string;amnezia:boolean;endpoint:string}[];failed:{name:string;error:string}[];summary:string};
 const stateLabel:Record<Config['state'],[string,string]>={ready:['healthy','Connected'],starting:['neutral','Connecting'],failed:['error','Failed'],stopped:['neutral','Not running']};
@@ -110,14 +110,13 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
     {s.lastError&&!working&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.lastError}</span></div>}
 
     {s.configs.length>0?<div className="psi-rows">{s.configs.map(cfg=>{const pinned=c.mode==='single'&&c.pinned===cfg.id;
-      const [t,l]=cfg.state!=='ready'?stateLabel[cfg.state]:cfg.checking?['neutral',`Checking with ${cfg.checking==='kilo'?'Kilo':'OpenCode'}`]:cfg.usedUpUntil?['cooldown',`Used up until ${utc(cfg.usedUpUntil)}`]:stateLabel[cfg.state];
+      const [t,l]=cfg.state!=='ready'?stateLabel[cfg.state]:cfg.usedUpUntil?['cooldown',`Used up until ${utc(cfg.usedUpUntil)}`]:stateLabel[cfg.state];
       return <div key={cfg.id} className={`psi-row${pinned?' pinned':''}`}>
-        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono">{cfg.endpoint||'No endpoint'}{cfg.amnezia?' · AmneziaWG':''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtu}{cfg.enabled?'':' · off'}</small></div>
-        <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.error||(cfg.state==='ready'&&!cfg.exitIp?'Finding the exit address…':cfg.state==='starting'?'Connecting through WireGuard…':cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
+        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''}{cfg.dns.length?` · DNS ${cfg.dns.join(', ')}`:''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
+        <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.error||(cfg.state==='ready'&&!cfg.exitIp?'Connected; the exit address appears after the first request':cfg.state==='starting'?'Connecting through WireGuard…':cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
         <Badge state={t}>{l}</Badge>
         <div className="psi-actions">
           {c.mode==='single'&&!pinned&&<Button disabled={working||!cfg.enabled||cfg.state!=='ready'} onClick={()=>run('pin-'+cfg.id,'/admin/wireguard/settings',{pinned:cfg.id},`WireGuard stays on ${cfg.name}`)}>Stay on this</Button>}
-          <Button disabled={working||cfg.state==='stopped'||!cfg.enabled} title="Reconnect this config; its server may hand out another exit address" onClick={()=>run('renew-'+cfg.id,'/admin/wireguard/renew',{id:cfg.id},`${cfg.name} is reconnecting`)}>{busy==='renew-'+cfg.id?<Loader2 size={15} className="spin"/>:<RefreshCw size={15}/>}New address</Button>
           <Button disabled={working||cfg.state!=='ready'} title="Send a small OpenCode Free request through exactly this config" onClick={async()=>{const r=await run('test-'+cfg.id,'/admin/routes/test',{id:'wireguard:'+cfg.id});if(r?.summary)notice(r.summary,r.ok?'ok':'error');}}>{busy==='test-'+cfg.id?<Loader2 size={15} className="spin"/>:<FlaskConical size={15}/>}Test</Button>
           <Button disabled={working} title="Rename this config or edit its file" onClick={()=>void openEdit(cfg)}>{busy==='edit-'+cfg.id?<Loader2 size={15} className="spin"/>:<Pencil size={15}/>}Edit</Button>
           <Button disabled={working} onClick={()=>run('toggle-'+cfg.id,'/admin/wireguard/config/toggle',{id:cfg.id,enabled:!cfg.enabled},`${cfg.name} is ${cfg.enabled?'off':'on'}`)}>{cfg.enabled?'Turn off':'Turn on'}</Button>
@@ -134,7 +133,6 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
       {c.mode==='single'&&enabled.length>0&&<div className="psi-pin"><span>Config in use</span><Select aria-label="Config in use" value={c.pinned||enabled[0].id} onChange={v=>void run('pin','/admin/wireguard/settings',{pinned:v},`WireGuard stays on ${nameOf(v)}`)}>{enabled.map(x=><option key={x.id} value={x.id}>{x.name}</option>)}</Select></div>}
 
       <Toggle checked={c.skip} onChange={skip=>void run('skip','/admin/wireguard/settings',{skip},skip?'A used-up exit is skipped':'A used-up exit returns its error')} label="Skip a used-up exit" detail={c.mode==='single'?'With one config, a used-up exit hands the request to your backup exits (Routing policy).':'When OpenCode says an exit has used up its free allowance, the request goes on through the next config.'}/>
-      <Toggle checked={c.renew} onChange={renew=>void run('renew','/admin/wireguard/settings',{renew},renew?'Used-up configs reconnect and are checked first':'Used-up configs keep their connection')} label="Get a new address when one is used up, and check it" detail="When OpenCode Free or Kilo says an exit is used up, that config reconnects. Most providers hand out a fresh exit address on a new connection; a config that always gets the same one keeps being skipped. Polygate sends one small request to that same provider through it, and puts it back in turn for that provider once it answers. At most three reconnects an hour per config."/>
       <Toggle checked={c.autoStart} onChange={autoStart=>void run('auto','/admin/wireguard/settings',{autoStart},autoStart?'WireGuard connects when Polygate starts':'WireGuard waits for Connect')} label="Connect when Polygate starts" detail="Brings the enabled configs up after a restart or reboot. While WireGuard is the route in use it always reconnects, so requests are not left without their route."/>
       <Toggle checked={c.enabled} onChange={enabled=>void run('enabled','/admin/wireguard/settings',{enabled},enabled?'WireGuard is on':'WireGuard is off')} label="WireGuard enabled" detail="Turn it off to stop every config and take the WireGuard route out of use."/>
     </>}

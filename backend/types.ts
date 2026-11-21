@@ -25,10 +25,11 @@ export type PsiphonSettings = { enabled: boolean; autoStart: boolean; regions: s
 export type SurfsharkServer = { id: string; host: string; country: string; countryCode: string; location: string; pubKey: string; load?: number };
 export type SurfsharkSettings = { enabled: boolean; autoStart: boolean; regions: string[]; mode: 'spread' | 'single'; pinned: string; skip: boolean; renew: boolean; privateKey?: string; publicKey?: string; address?: string; servers?: SurfsharkServer[]; updatedAt?: number; spent?: Record<string, number> };
 // WireGuard (backend/wireguard.ts): imported .conf files, each run by the bundled wireproxy-awg (plain WireGuard and AmneziaWG). config is the
-// file as uploaded and stays in the encrypted settings; the dashboard only learns where it connects (endpoint, address, MTU) and whether it
-// carries AmneziaWG fields. The same route options as Psiphon and Surfshark.
+// file as uploaded and stays in the encrypted settings; the dashboard only learns where it connects (endpoint, address, MTU, DNS) and which
+// AmneziaWG fields it carries. A config's exit address is fixed by the file, so there is no new address to fetch: the route options are take
+// turns or stay on one, and skip a used-up exit.
 export type WireguardConfig = { id: string; name: string; config: string; enabled: boolean; addedAt: number };
-export type WireguardSettings = { enabled: boolean; autoStart: boolean; mode: 'spread' | 'single'; pinned: string; skip: boolean; renew: boolean; configs: WireguardConfig[]; spent?: Record<string, number> };
+export type WireguardSettings = { enabled: boolean; autoStart: boolean; mode: 'spread' | 'single'; pinned: string; skip: boolean; configs: WireguardConfig[]; spent?: Record<string, number> };
 export type ModelGrantKind = 'qualified' | 'upstream';
 // Companion metadata preserves each models string's meaning after catalog changes. Legacy slash grants default to qualified IDs.
 export type ApiKey = { id: string; name: string; value: string; enabled: boolean; agent?: boolean; limit: number; rpm?: number; tpm?: number; budget?: number; used?: number; requests?: number; models?: string[]; modelGrantKinds?: Record<string, ModelGrantKind>; expiresAt?: number; lastUsed?: number; created?: number };
