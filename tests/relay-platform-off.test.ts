@@ -18,6 +18,8 @@ const vercelProtected = () => new Response(JSON.stringify({
   error: { code: '401', message: 'Protected deployment' },
   protection: { vercel_auth_callback: 'https://vercel.com/sso-api?url=https%3A%2F%2Frelay.vercel.app' },
 }), { status: 401, headers: { 'content-type': 'application/json' } });
+// The same protection for a request Vercel does not answer as JSON: a login redirect to its SSO page.
+const vercelProtectedRedirect = (status = 302) => new Response(null, { status, headers: { location: 'https://vercel.com/sso-api?url=https%3A%2F%2Frelay.vercel.app' } });
 const chat = () => networkFetch('https://opencode.ai/zen/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }, 'rp-a');
 
 test('the platform pages are recognised: Vercel disabled or deleted, Cloudflare 1027, Netlify usage pause', async () => {
@@ -39,6 +41,13 @@ test('Vercel Deployment Protection is the platform blocking the relay, not the p
   expect(blocked!.until - Date.now()).toBeGreaterThan(50 * 60000);
   // The login page is the other shape the protection takes.
   expect(await relayPlatformOff(new Response('<html><title>Authentication Required</title><a href="https://vercel.com/sso-api?url=x">Log in</a></html>', { status: 401, headers: { 'content-type': 'text/html' } }), 'R')).toBeDefined();
+  // And an SSO redirect when Vercel does not answer the request as JSON.
+  const redirect = await relayPlatformOff(vercelProtectedRedirect(), 'R');
+  expect(redirect?.message).toContain('Deployment Protection');
+  expect(redirect!.until - Date.now()).toBeGreaterThan(50 * 60000);
+  expect(await relayPlatformOff(vercelProtectedRedirect(307), 'R')).toBeDefined();
+  // A redirect passed through by the relay keeps the runtime header: not the platform.
+  expect(await relayPlatformOff(new Response(null, { status: 302, headers: { location: 'https://vercel.com/sso-api?url=x', 'x-relay-runtime': 'vercel-bun' } }), 'R')).toBeUndefined();
   // A provider's own 401 passed through by the relay keeps the relay's runtime header: not the platform.
   expect(await relayPlatformOff(new Response(JSON.stringify({ error: { code: '401', message: 'Protected deployment' } }), { status: 401, headers: { 'x-relay-runtime': 'vercel-bun', 'content-type': 'application/json' } }), 'R')).toBeUndefined();
   expect(await relayPlatformOff(new Response('{"error":{"message":"invalid api key"}}', { status: 401, headers: { 'content-type': 'application/json' } }), 'R')).toBeUndefined();
@@ -62,7 +71,8 @@ test('a chat request through a disabled Vercel relay fails as a route problem wi
   expect(a.status).toContain('Vercel');
 });
 
-test('a chat request through a relay behind Deployment Protection fails as a route problem, so another exit can carry the session', async () => {
+// The gateway's move to the working relay is covered end to end in tests/fallback-skip.test.ts; this level proves the route error it acts on.
+test('a chat request through a relay behind Deployment Protection fails as a route problem the gateway can fail over on', async () => {
   const a = add('rp-a'); add('rp-b'); settings.failover = true;
   reply = () => vercelProtected();
   const err: any = await chat().then(() => undefined, e => e);
@@ -70,6 +80,16 @@ test('a chat request through a relay behind Deployment Protection fails as a rou
   expect(err.message).toContain('Deployment Protection');
   expect(a.cooldownUntil - Date.now()).toBeGreaterThan(5.9 * 3600000);
   expect(a.status).toContain('Deployment Protection');
+});
+
+test('the SSO redirect Vercel sends instead of the 401 is the same route problem, not a redirect failure', async () => {
+  const a = add('rp-a'); add('rp-b'); settings.failover = true;
+  reply = () => vercelProtectedRedirect();
+  const err: any = await chat().then(() => undefined, e => e);
+  expect(err?.type).toBe('route_unavailable'); expect(err.status).toBe(503);
+  expect(err.message).toContain('Deployment Protection');
+  expect(err.message).not.toContain('redirected');
+  expect(a.cooldownUntil - Date.now()).toBeGreaterThan(5.9 * 3600000);
 });
 
 test('with no other exit to stand in, the relay is not rested, but the answer is still the plain message', async () => {

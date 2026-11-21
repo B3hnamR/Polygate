@@ -376,8 +376,16 @@ const relayRejectedKey=async(r:Response)=>/Unauthorized relay request/i.test(awa
 // The bundled relays mark every answer of theirs with x-relay-runtime, so an answer without it, saying one of these, came from the platform.
 // Nothing sent to that relay will get through, so the request moves to another route and the relay rests for a while.
 const nextUtcMidnight=()=>{const d=new Date();d.setUTCHours(24,0,0,0);return d.getTime();};
+const deploymentProtectedOff=(name:string)=>({until:now()+6*3600000,message:`Vercel is keeping this relay's deployment behind Deployment Protection (${name}): Vercel answers its callers with a login page or a 401 instead of running the relay, so nothing reaches the provider. Turn off Deployment Protection for the project on vercel.com, or deploy the relay on a project without it. Requests use the other routes meanwhile.`});
 export async function relayPlatformOff(r:Response,name:string):Promise<{message:string;until:number}|undefined>{
-  if(r.status<400||r.headers.get('x-relay-runtime'))return undefined;
+  if(r.headers.get('x-relay-runtime'))return undefined;
+  // Deployment Protection sends a request it does not answer as JSON to its SSO page instead: the relay never runs either way.
+  if(r.status>=300&&r.status<400){
+    let sso=false;
+    try{const u=new URL(r.headers.get('location')||'');sso=(u.hostname==='vercel.com'||u.hostname==='www.vercel.com')&&u.pathname.replace(/\/+$/,'')==='/sso-api';}catch{/* not a redirect to inspect */}
+    return sso?deploymentProtectedOff(name):undefined;
+  }
+  if(r.status<400)return undefined;
   const header=r.headers.get('x-vercel-error')||'';const text=(await r.clone().text().catch(()=>'')).slice(0,2000);
   const vercel=/^DEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)$/.exec(header)||/\bDEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)\b/.exec(text);
   if(vercel){const code=`DEPLOYMENT_${vercel[1]}`;const gone=vercel[1]==='NOT_FOUND'||vercel[1]==='DELETED';
@@ -392,7 +400,7 @@ export async function relayPlatformOff(r:Response,name:string):Promise<{message:
     let protectedDeployment=false;
     try{const body=JSON.parse(text);const code=body?.error?.code;protectedDeployment=body?.error?.message==='Protected deployment'&&(code===401||code==='401');}
     catch{protectedDeployment=/<title>\s*Authentication Required\s*<\/title>/i.test(text)&&/vercel\.com\/sso-api/i.test(text);}
-    if(protectedDeployment)return {until:now()+6*3600000,message:`Vercel is keeping this relay's deployment behind Deployment Protection (${name}): Vercel answers its callers with a login page or a 401 instead of running the relay, so nothing reaches the provider. Turn off Deployment Protection for the project on vercel.com, or deploy the relay on a project without it. Requests use the other routes meanwhile.`};
+    if(protectedDeployment)return deploymentProtectedOff(name);
   }
   return undefined;
 }
@@ -516,8 +524,16 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
       for(let spin=0;;spin++){
         const r=relayRequest(url,init,route);const avoid=spentList(route.id);if(avoid.length&&bunRelays.has(route.id))(r.init.headers as Headers).set('x-relay-avoid',avoid.join(','));
         // A relay that is known to run Bun is a pool of instances: when one cannot be reached, take another before giving the route up.
-        try{response=await fetch(r.url,r.init);const moved=relayRedirect(response);if(moved){await response.body?.cancel().catch(()=>{});throw moved;}}
-        catch(e){if(callerCancelled(init)||!bunRelays.has(route.id)||isCanary(rid0)||spin>=max||!await rotateRelay(route))throw e;continue;}
+        try{
+          response=await fetch(r.url,r.init);
+          // A platform block rests the route; another instance of the same deployment cannot get past it.
+          const off=await relayPlatformOff(response,route.name);
+          if(off){await response.body?.cancel().catch(()=>{});
+            if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
+            throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
+          const moved=relayRedirect(response);if(moved){await response.body?.cancel().catch(()=>{});throw moved;}
+        }
+        catch(e){if((e as any)?.restUntil||callerCancelled(init)||!bunRelays.has(route.id)||isCanary(rid0)||spin>=max||!await rotateRelay(route))throw e;continue;}
         const egress=response.headers.get('x-relay-egress');// A relay that reports its egress address can be rotated (relays/vercel-bun); the Netlify relay trusts the same handshake but has no instances.
       const bun=!!response.headers.get('x-relay-egress')&&trustedRuntime(response.headers.get('x-relay-runtime'));
         if(egress)liveEgress.set(route.id,egress);if(bun)bunRelays.add(route.id);
@@ -533,10 +549,6 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
         if(ex&&!ex.refused&&spin<max){markSpent(route.id,egress,ex.until);if(await rotateRelay(route)){await response.body?.cancel().catch(()=>{});judged=undefined;continue;}}
         break;
       }
-      const off=await relayPlatformOff(response,route.name);
-      if(off){await response.body?.cancel().catch(()=>{});
-        if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
-        throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
     }
     else if(route.kind==='warp'){const result=await viaWarp(route,url,init,quiet);response=result.response;judged=result.judged;}
     else if(route.kind==='proxy'){
