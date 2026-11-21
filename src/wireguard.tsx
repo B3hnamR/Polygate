@@ -56,7 +56,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   async function saveEdit(){
     if(!editing)return;
     setBusy('save');
-    try{await api('/admin/wireguard/config',{id:editing.id,name:editing.name,text:editing.text},start());notice(`${editing.name.trim()||'WireGuard config'} saved`);setEditing(null);await reload();onChanged();}
+    try{const signal=start();await api('/admin/wireguard/config',{id:editing.id,name:editing.name,text:editing.text},signal);if(signal.aborted)return;notice(`${editing.name.trim()||'WireGuard config'} saved`);setEditing(null);await reload();onChanged();}
     catch(e){if(isCancelled(e)){notice('Save cancelled','ok');return;}notice(String((e as Error)?.message||e),'error');}
     finally{setBusy('');}
   }
@@ -143,7 +143,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
       <form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if(busy!=='save'&&editing.name.trim()&&editing.text.trim())void saveEdit();}}>
         <Field label="Name"><input value={editing.name} onChange={e=>setEditing({...editing,name:e.target.value})} maxLength={60} autoFocus/></Field>
         <Field label="Configuration" hint="Checked with the bundled client before it is saved. A running config reconnects with the new file."><textarea className="mono" rows={16} value={editing.text} onChange={e=>setEditing({...editing,text:e.target.value})} spellCheck={false}/></Field>
-        <div className="dialog-actions"><Button onClick={()=>setEditing(null)}>Cancel</Button><Button variant="primary" type="submit" disabled={busy==='save'||!editing.name.trim()||!editing.text.trim()}>{busy==='save'?<Loader2 size={15} className="spin"/>:<Check size={15}/>}Save config</Button></div>
+        <div className="dialog-actions"><Button onClick={()=>{cancel();setEditing(null);}}>Cancel</Button><Button variant="primary" type="submit" disabled={busy==='save'||!editing.name.trim()||!editing.text.trim()}>{busy==='save'?<Loader2 size={15} className="spin"/>:<Check size={15}/>}Save config</Button></div>
       </form>
     </Dialog>}
   </section>;

@@ -398,6 +398,17 @@ test('a used-up mark written before the exit address was known still skips that 
   const r = await post(); expect(r.status).toBe(200); await r.text();
   expect(hits['wg-home']).toBeUndefined();
 });
+test('migrating an id-keyed used-up mark to the learned address keeps the later expiry', () => {
+  const home = W.__instances.get('wg-home')!;
+  const ip = exits['wg-home'], idUntil = Date.now() + 3600e3, ipUntil = Date.now() + 7200e3;
+  settings.wireguard = { ...W.wireguardConfig(), spent: { [`id:${home.id}`]: idUntil, [ip]: ipUntil } };
+  W.__migrateLimits(home, ip);
+  expect(W.wireguardConfig().spent?.[ip]).toBe(ipUntil);
+  expect(W.wireguardConfig().spent?.[`id:${home.id}`]).toBeUndefined();
+  settings.wireguard = { ...W.wireguardConfig(), spent: { [`id:${home.id}`]: ipUntil, [ip]: idUntil } };
+  W.__migrateLimits(home, ip);
+  expect(W.wireguardConfig().spent?.[ip]).toBe(ipUntil);
+});
 test("a passing Kilo check clears WireGuard's mark for the address", () => {
   const g = exitGroups().find(x => x.id === 'wireguard')!;
   g.kiloLimited('wg-home', Date.now() + 3600e3);

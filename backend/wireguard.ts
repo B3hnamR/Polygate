@@ -18,7 +18,7 @@ import { GatewayError } from './queue';
 import { freePort, traceVia, warpTarget } from './warp';
 import { logEvent } from './logbook';
 import { notify } from './notifications';
-import { detached, isCancelled, cancelledError } from './cancel';
+import { detached, isCancelled, cancelledError, cancellable, requestSignal } from './cancel';
 import { registerExitGroup, type ExitScope } from './exit-group';
 import type { Route, WireguardConfig, WireguardSettings } from './types';
 
@@ -268,7 +268,7 @@ const enabledConfigs = () => wireguardConfig().configs.filter(c => c.enabled);
 // --- instances ---
 type State = 'starting' | 'ready' | 'failed';
 type Instance = { id: string; name: string; gen: string; port: number; proc?: ChildProcess; state: State; exitIp: string; location: string; startedAt: number; readyAt: number;
-  failures: number; restarts: number; opened: number; cooldownUntil: number; lastTraffic: number; probedAt: number; error: string; stopping?: boolean; output: string; handshake: boolean; probing?: boolean };
+  failures: number; probeFailures: number; requestFailed?: boolean; restarts: number; opened: number; cooldownUntil: number; lastTraffic: number; probedAt: number; error: string; stopping?: boolean; paused?: boolean; output: string; handshake: boolean; probing?: boolean };
 const instances = new Map<string, Instance>();
 // The exit group names an exit by its config id; a name still resolves for marks written before that, and for the dashboard.
 const instOf = (key: string) => instances.get(key) || [...instances.values()].find(i => i.name === key);
@@ -351,13 +351,15 @@ async function coreCheck(text: string): Promise<void> {
   try {
     writeConf(id, text, 1);
     await new Promise<void>((resolve, reject) => {
-      const proc = spawn(bin, ['-n', '-c', confOf(id)], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      const request = requestSignal();
+      const signal = cancellable(15000);
+      const proc = spawn(bin, ['-n', '-c', confOf(id)], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], signal });
       let output = ''; const data = (d: Buffer) => { output += d; if (output.length > 20000) output = output.slice(-20000); };
       proc.stdout!.on('data', data); proc.stderr!.on('data', data);
-      const timer = setTimeout(() => { try { proc.kill(); } catch { /* already gone */ } }, 15000); timer.unref?.();
-      proc.once('error', e => { clearTimeout(timer); reject(new GatewayError(`The WireGuard client could not check this configuration: ${e.message}`, 500, 'wireguard_error')); });
+      const cancelled = () => !!request?.aborted || isCancelled();
+      proc.once('error', e => { if (cancelled()) reject(cancelledError()); else reject(new GatewayError(`The WireGuard client could not check this configuration: ${e.message}`, 500, 'wireguard_error')); });
       proc.once('exit', code => {
-        clearTimeout(timer);
+        if (cancelled()) return reject(cancelledError());
         if (code === 0) resolve();
         else reject(new GatewayError(`The WireGuard client rejected this configuration: ${clean(output) || `the check exited with code ${code ?? '?'}`}`, 400, 'wireguard_config'));
       });
@@ -411,7 +413,7 @@ async function startOnce(id: string, fresh: boolean, at: number): Promise<Instan
   if (at !== epoch) throw stopped();
   const c = configOf(id); if (!c || !c.enabled) throw new GatewayError(`The WireGuard config ${old?.name || id} is turned off.`, 400, 'wireguard_config');
   const gen = randomBytes(4).toString('hex');
-  const inst: Instance = { id, name: c.name, gen, port, state: 'starting', exitIp: '', location: '', startedAt: Date.now(), readyAt: 0, failures: 0,
+  const inst: Instance = { id, name: c.name, gen, port, state: 'starting', exitIp: '', location: '', startedAt: Date.now(), readyAt: 0, failures: 0, probeFailures: 0,
     restarts: old?.restarts || 0, opened: old?.opened || 0, cooldownUntil: old?.cooldownUntil || 0, lastTraffic: 0, probedAt: 0, error: '', output: '', handshake: false };
   instances.set(id, inst);
   try {
@@ -440,10 +442,11 @@ function migrateLimits(inst: Instance, ip: string) {
   const idKey = `id:${inst.id}`; const c = wireguardConfig();
   if (c.spent?.[idKey]) {
     const { [idKey]: until, ...spent } = c.spent;
-    save({ spent: { ...spent, ...(spent[ip] ? {} : { [ip]: until }) } });
+    // A mark learned earlier under the address is newer than the id-key one; keep whichever expires later.
+    save({ spent: { ...spent, [ip]: Math.max(until, spent[ip] || 0) } });
   }
   const until = kiloLimits.get(idKey);
-  if (until) { kiloLimits.delete(idKey); if (!kiloLimits.has(ip)) kiloLimits.set(ip, until); }
+  if (until) { kiloLimits.delete(idKey); kiloLimits.set(ip, Math.max(until, kiloLimits.get(ip) || 0)); }
 }
 async function learnExit(inst: Instance, wait = 40000) {
   if (inst.probing) return;
@@ -481,8 +484,12 @@ async function reprobe(inst: Instance) {
   try {
     const egress = await traceVia('127.0.0.1', inst.port, 10000);
     if (instances.get(inst.id) !== inst || inst.stopping || inst.state !== 'ready') return;
-    if (egress?.ip) { inst.failures = 0; inst.exitIp = egress.ip; inst.location = egress.loc || ''; }
-    else wireguardFailed(inst.id);
+    if (egress?.ip) { inst.failures = 0; inst.probeFailures = 0; inst.requestFailed = false; inst.exitIp = egress.ip; inst.location = egress.loc || ''; }
+    else if (++inst.probeFailures >= 5 && inst.requestFailed) {
+      // A probe miss alone is not proof: 1.1.1.1 or this network can be down while provider traffic still passes. Only escalate when a real
+      // request through this exit has also failed since the last success.
+      wireguardFailed(inst.id);
+    }
   } finally { inst.probing = false; }
 }
 // Whether another route can carry requests while this one is down. Mirrors the route breaker (backend/transport.ts): failover must be on,
@@ -503,6 +510,9 @@ function failInstance(inst: Instance, why: string) {
   inst.cooldownUntil = Date.now() + Math.min(300000, 30000 * 2 ** (inst.opened - 1));
   const wait = wireguardLive() === 0 && canStandIn() ? inst.cooldownUntil - Date.now() : 0;
   if (wait > 0) {
+    // A paused config is not serving: stop its client now so it cannot keep holding the SOCKS port and tunnel during the wait. Its later
+    // exit is ignored because `paused` is set, so it cannot schedule a competing restart.
+    inst.paused = true; stopProcess(inst.proc);
     logEvent('warn', 'wireguard', `WireGuard ${inst.name} is paused for ${Math.round(wait / 1000)} s after failing: ${why}`, { config: inst.id, pausedUntil: inst.cooldownUntil });
     restartLater(inst, wait);
   } else {
@@ -511,7 +521,7 @@ function failInstance(inst: Instance, why: string) {
   }
 }
 function onExit(inst: Instance, code: number | null) {
-  if (instances.get(inst.id) !== inst || inst.stopping) return;
+  if (instances.get(inst.id) !== inst || inst.stopping || inst.paused) return;
   inst.state = 'failed'; inst.error = inst.error || inst.output || `The WireGuard client stopped (code ${code ?? '?'})`;
   if (!wireguardConfig().enabled || inst.restarts >= 5) return;
   // The last connected config is not brought back at once while another route can take the requests: that is the moment failover is for.
@@ -558,10 +568,11 @@ export function wireguardClearKilo(key: string, exitIp: string) {
 }
 export function wireguardFailed(key: string) {
   const inst = instOf(key); if (!inst || inst.state !== 'ready') return;
+  inst.requestFailed = true;
   if (++inst.failures < 3) return;
   failInstance(inst, inst.error || 'The tunnel stopped passing requests.');
 }
-export function wireguardOk(key: string) { const inst = instOf(key); if (inst) { inst.failures = 0; inst.lastTraffic = Date.now(); } }
+export function wireguardOk(key: string) { const inst = instOf(key); if (inst) { inst.failures = 0; inst.probeFailures = 0; inst.requestFailed = false; inst.lastTraffic = Date.now(); } }
 
 // --- picking an exit for a request ---
 // Both keys are checked: a mark written before the exit address was known stays by config id until learnExit moves it to the address.
@@ -578,7 +589,7 @@ const candidates = (c: WireguardSettings) => (c.mode === 'single' ? [c.pinned ||
 export function pickWireguard(tried: Set<string> = new Set(), scope: ExitScope = 'other') {
   const c = wireguardConfig(); if (!c.enabled) return null;
   const live = candidates(c).filter(i => !tried.has(i.id) && !tried.has(i.name) && usable(i, scope, c.skip));
-  if (!live.length) return null; const i = c.mode === 'single' ? live[0] : live[rr++ % live.length]; return { region: i.id, port: i.port };
+  if (!live.length) return null; const i = c.mode === 'single' ? live[0] : live[rr++ % live.length]; return { region: i.id, label: i.name, port: i.port };
 }
 export const wireguardSkips = () => wireguardConfig().skip;
 export const wireguardLive = () => [...instances.values()].filter(i => i.state === 'ready').length;
@@ -600,7 +611,7 @@ export function wireguardUnavailable(scope: ExitScope = 'other'): string {
 export function wireguardVirtualRoute(key: string): Route | undefined {
   const i = instOf(key); return i ? { id: `${ROUTE_ID}:${i.id}`, name: `WireGuard ${i.name}`, kind: 'proxy', url: `socks5://127.0.0.1:${i.port}`, enabled: true, models: [] } : undefined;
 }
-export const wireguardRegionsReady = () => [...instances.values()].filter(i => i.state === 'ready').map(i => ({ region: i.id, exitIp: i.exitIp }));
+export const wireguardRegionsReady = () => [...instances.values()].filter(i => i.state === 'ready').map(i => ({ region: i.id, label: i.name, exitIp: i.exitIp }));
 
 // --- the managed route ---
 // An explicit stop hands requests back to the previous route (or Direct, or the first route that is on). Never force a route the person
@@ -805,8 +816,9 @@ function startMonitor() {
     sweepTemps(new Set([...instances.values()].map(i => `${i.id}-${i.gen}`)), Date.now() - 3600000);
     // A ready config with no traffic is asked again now and then: a tunnel can keep its process and listener while its data path dies.
     for (const i of instances.values()) {
-      // A restart count is only a streak: two minutes of real service means the next failure starts the wait over.
-      if (i.state === 'ready' && i.restarts && Date.now() - i.readyAt >= 120000) { i.restarts = 0; i.opened = 0; }
+      // A restart count is only a streak: two minutes of real service means the next failure starts the wait over, including one that came
+      // from a request failure rather than a process exit (`opened` is set by failInstance, which never touches `restarts`).
+      if (i.state === 'ready' && Date.now() - i.readyAt >= 120000) { i.restarts = 0; i.opened = 0; }
       if (i.state === 'ready' && Date.now() - Math.max(i.lastTraffic, i.probedAt, i.readyAt) >= 60000) void reprobe(i);
     }
     const state = wireguardLive() ? 'up' : instances.size ? 'down' : 'off';
@@ -858,3 +870,4 @@ registerExitGroup({ id: ROUTE_ID, label: 'WireGuard', unit: 'config', source: 'w
   clearKilo: wireguardClearKilo, failed: wireguardFailed, ok: wireguardOk, skips: wireguardSkips });
 export const __instances = instances;
 export const __wrapperText = wrapperText;
+export const __migrateLimits = migrateLimits;

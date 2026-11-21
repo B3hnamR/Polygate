@@ -486,18 +486,19 @@ async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
   const rid=routeContext.getStore()?.requestId;const scope=requestScope(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
   // A request refused through a region whose small check passed: OpenCode's limits are not all per address and per day (one model can be
   // limited on an exit where another still answers), so it goes on to another region, at most twice, before the refusal is returned.
-  let refused:Response|undefined;let refusedAt='';let refusals=0;
-  const via=(r:Response,region:string)=>{if(rid&&!isCanary(rid)){exitRegions.set(rid,region);if(exitRegions.size>300)exitRegions.delete(exitRegions.keys().next().value!);}return r;};
+  let refused:Response|undefined;let refusedAt='';let refusedLabel='';let exhaustedLabel='';let refusals=0;
+  const via=(r:Response,region:string,label?:string)=>{if(rid&&!isCanary(rid)){exitRegions.set(rid,label||region);if(exitRegions.size>300)exitRegions.delete(exitRegions.keys().next().value!);}return r;};
   // A refusal goes back as a refusal: a used-up note from an earlier region is dropped, or the gateway would read the next exit's failure as used up.
-  const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt);}return exhausted&&via(exhausted,exhaustedAt);};
+  const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt,refusedLabel);}return exhausted&&via(exhausted,exhaustedAt,exhaustedLabel);};
   // Why the request left the region it was on, said in the log line when it reaches the next one.
   let moved:{from:string;why:string}|undefined;
   const attempts=Math.max(1,Math.min(6,g.live()));
   for(let i=0;i<attempts;i++){
     const pick=g.pick(tried,scope);
     if(!pick){const r=giveUp();if(r)return r;if(last)throw last;throw new GatewayError(g.unavailable(scope),503,'route_unavailable');}
+    const shown=pick.label||pick.region;
     tried.add(pick.region);
-    if(moved&&!isCanary(rid))logEvent('info',g.source,`A request moved from ${g.label} ${moved.from} (${moved.why}) to ${pick.region}`,{from:moved.from,to:pick.region,request:rid});
+    if(moved&&!isCanary(rid))logEvent('info',g.source,`A request moved from ${g.label} ${moved.from} (${moved.why}) to ${shown}`,{from:moved.from,to:pick.region,request:rid});
     moved=undefined;
     try{
       const response=await fetch(url,{...init,proxy:await socksBridge({host:'127.0.0.1',port:pick.port})});
@@ -506,20 +507,21 @@ async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
       if((response.status===502||response.status===504)&&response.headers.get('x-polygate-tunnel-error')==='1'){
         await response.body?.cancel().catch(()=>{});
         g.failed(pick.region);
-        last=new GatewayError(`The ${g.label} ${g.unit} ${pick.region} could not carry the request.`,502,'route_unreachable');
-        moved={from:pick.region,why:'its tunnel did not pass the request'};
+        last=new GatewayError(`The ${g.label} ${g.unit} ${shown} could not carry the request.`,502,'route_unreachable');
+        moved={from:shown,why:'its tunnel did not pass the request'};
         continue;
       }
       if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(g.id+':'+pick.region,false,response,seen,rid);
-        if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
-        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&g.skips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
+        if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region,shown);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;exhaustedLabel=shown;moved={from:shown,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
+        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;refusedLabel=shown;if(++refusals<=2&&g.skips()){moved={from:shown,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
       // Kilo's anonymous limit belongs to the exit's address (backend/kilo.ts): set this region aside for Kilo and try the next one. When every
       // region is limited the last answer goes back, and the gateway rests the whole route for Kilo as it does for any exit.
-      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){g.kiloLimited(pick.region,now()+30*60000);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:"Kilo's free limit for its address"};continue;}}
-      g.ok(pick.region);return via(response,pick.region);
-    }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
+      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){g.kiloLimited(pick.region,now()+30*60000);if(!g.skips())return via(response,pick.region,shown);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:shown,why:"Kilo's free limit for its address"};continue;}}
+      g.ok(pick.region);return via(response,pick.region,shown);
+    }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:shown,why:'it could not connect'};}
   }
   const r=giveUp();if(r)return r;
+  if(last instanceof GatewayError&&last.type==='route_unreachable')throw last;
   if(last)throw new GatewayError(`Could not reach the provider through any ${g.label} ${g.unit}: ${redactError(String((last as any)?.message||last)).slice(0,240)}`,502,'route_unreachable');
   throw new GatewayError(g.unavailable(scope),503,'route_unavailable');
 }
@@ -651,7 +653,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
 // One model is asked (`model`), so a pass says the exit works for that provider, not that every model of it will answer.
 // until: when a check found the exit used up, the end of the wait the provider gave.
 export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string;model?:string;until?:number;regions?:ExitTest[]};
-export type ExitTest={region:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
+export type ExitTest={region:string;label?:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
 export type PsiphonRegionTest=ExitTest;
 function testProvider(route:Route,providerId?:string):Provider|undefined{
   const enabled=settings.providers.filter(p=>p.enabled&&p.kind!=='zai');
@@ -684,19 +686,20 @@ async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<Rou
   if(!route.enabled||!ready.length)throw new GatewayError(g.unavailable(),503,'route_unavailable');
   const scope=providerId?scopeOfKind(settings.providers.find(p=>p.id===providerId)?.kind):'opencode';
   const kilo=scope==='kilo';
-  const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp})=>{
+  const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp,label})=>{
+    const shown=label||region;
     try{const t=await regionTester(g.id+':'+region,providerId);
       if(scope==='opencode'&&t.chat==='used-up')g.spent(region,t.until||nextResetAt());
       else if(scope==='opencode'&&t.chat==='ok')g.clean(region);
       else if(kilo&&t.chat==='limited')g.kiloLimited(region,now()+30*60000);
       else if(kilo&&t.chat==='ok')g.clearKilo?.(region,exitIp);
-      return {region,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
-    catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
+      return {region,label,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
+    catch(e:any){return {region,label,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${shown}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
   }));
   const good=regions.filter(r=>r.ok);const times=regions.map(r=>r.latency).filter((n):n is number=>typeof n==='number').sort((a,b)=>a-b);
   route.latency=times.length?times[Math.floor(times.length/2)]:route.latency;route.status=good.length?'healthy':route.status;if(good.length){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
-  const others=regions.filter(r=>!r.ok).map(r=>`${r.region} ${r.chat==='used-up'?'is used up':r.chat==='limited'?'reached Kilo\'s limit':r.chat==='refused'?'was refused':r.chat==='busy'?'was busy':'did not answer'}`);
-  const summary=`${g.label}: ${good.length} of ${regions.length} ${g.unit}${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
+  const others=regions.filter(r=>!r.ok).map(r=>`${r.label||r.region} ${r.chat==='used-up'?'is used up':r.chat==='limited'?'reached Kilo\'s limit':r.chat==='refused'?'was refused':r.chat==='busy'?'was busy':'did not answer'}`);
+  const summary=`${g.label}: ${good.length} of ${regions.length} ${g.unit}${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.label||r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
   logEvent(good.length?'info':'warn','routes',summary,{route:route.id});
   return {ok:good.length>0,status:good.length?200:503,latency:route.latency,buffered:false,chat:good.length?'ok':regions[0]?.chat||'unknown',summary,provider:kilo?'Kilo Free':undefined,regions};
 }

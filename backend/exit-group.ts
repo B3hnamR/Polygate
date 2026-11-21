@@ -17,7 +17,9 @@ export const scopeOfUrl = (url: string): ExitScope => {
 };
 export const scopeOfKind = (kind?: string): ExitScope => kind === 'free' ? 'opencode' : kind === 'kilo' ? 'kilo' : 'other';
 
-export type ExitPick = { region: string; port: number };
+// `region` is the stable key used for limits, logs and virtual routes; `label` is the name to show when the two differ (WireGuard config ids
+// are opaque, their names are what the user chose). Groups whose key is already a display name leave label out.
+export type ExitPick = { region: string; port: number; label?: string };
 // 'unknown' (the check could not be sent or read) lets real requests decide.
 export type ExitCheck = { result: 'ok' | 'used-up' | 'unknown'; until?: number; note?: string };
 export type ExitChecker = (region: string, scope: ExitScope) => Promise<ExitCheck>;
@@ -31,7 +33,7 @@ export type ExitGroup = {
   live(): number;                        // exits connected
   unavailable(scope?: ExitScope): string;
   virtualRoute(region: string): Route | undefined;
-  regionsReady(): { region: string; exitIp: string }[];
+  regionsReady(): { region: string; exitIp: string; label?: string }[];
   spent(region: string, until: number): void;
   kiloLimited(region: string, until: number): void;
   clean(region: string): void;
