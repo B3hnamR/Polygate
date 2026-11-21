@@ -8,7 +8,7 @@ import type {Notice} from './panels';
 
 // The WireGuard route (backend/wireguard.ts): every imported .conf file is a WireGuard or AmneziaWG tunnel of its own, run by the bundled
 // wireproxy-awg, and together they are one route that takes turns or stays on one config, with the same options as Psiphon and Surfshark.
-type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
+type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];dnsUsed:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
   state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;since:number;usedUpUntil:number;kiloUntil:number;error:string};
 type WireguardInfo={installed:boolean;problem:string;platform:string;busy:string;lastError:string;running:boolean;live:number;
   config:{enabled:boolean;autoStart:boolean;mode:'spread'|'single';pinned:string;skip:boolean};
@@ -75,12 +75,12 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   return <section className="section-block form-section psiphon-panel wireguard-panel">
     {dialog}
     <div className="section-top"><div className="section-title"><ShieldCheck size={19}/><h2>WireGuard</h2></div><Badge state={tone}>{label}</Badge></div>
-    <p className="muted">Send model traffic through your own WireGuard or AmneziaWG configs. Import the <b>.conf</b> files your provider gave you: Polygate runs one client for each file, and together they are the route <b>WireGuard</b>, taking turns or staying on one. The client keeps the tunnel to itself: no network adapter, route or DNS changes on this computer, and only the gateway's own requests use it.</p>
+    <p className="muted">Send model traffic through your own WireGuard or AmneziaWG configs. Import the <b>.conf</b> files your provider gave you: Polygate runs one client for each file, and together they are the route <b>WireGuard</b>, taking turns or staying on one. The client keeps the tunnel to itself: no network adapter or system route or DNS change on this computer, and only the gateway's own requests use it. Provider names are resolved by the tunnel's DNS server, so they never reach your local resolver.</p>
     {!s.installed&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.problem}</span></div>}
 
     <div className={`wg-import${dropping?' dropping':''}`} onDragOver={e=>{if(e.dataTransfer.types.includes('Files')){e.preventDefault();setDropping(true);}}} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))setDropping(false);}} onDrop={e=>{e.preventDefault();setDropping(false);void importFiles(Array.from(e.dataTransfer.files));}}>
       <FileUp size={24}/>
-      <div><strong>Import WireGuard configs</strong><small>Drop one or more .conf files here, or choose them. Each file becomes an exit of its own; duplicate names get -2, -3. AmneziaWG fields are kept exactly as written.</small></div>
+      <div><strong>Import WireGuard configs</strong><small>Drop one or more .conf files here, or choose them. Each file becomes an exit of its own; duplicate names get -2, -3. AmneziaWG fields are kept as written; the running copy caps MTU for a 1280-byte path, drops ListenPort and adds a tunnel DNS server if the file has none.</small></div>
       <div className="token-row">
         <Button disabled={working} onClick={()=>picker.current?.click()}>{busy==='import'?<Loader2 size={15} className="spin"/>:<FileUp size={15}/>}Choose files</Button>
         <Button disabled={working} onClick={()=>setPasting(!pasting)}>{pasting?<X size={15}/>:<ClipboardPaste size={15}/>}{pasting?'Cancel paste':'Paste a config'}</Button>
@@ -112,7 +112,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
     {s.configs.length>0?<div className="psi-rows">{s.configs.map(cfg=>{const pinned=c.mode==='single'&&c.pinned===cfg.id;
       const [t,l]=cfg.state!=='ready'?stateLabel[cfg.state]:cfg.usedUpUntil?['cooldown',`Used up until ${utc(cfg.usedUpUntil)}`]:stateLabel[cfg.state];
       return <div key={cfg.id} className={`psi-row${pinned?' pinned':''}`}>
-        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''}{cfg.dns.length?` · DNS ${cfg.dns.join(', ')}`:''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
+        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''} · DNS {cfg.dnsUsed.join(', ')}{!cfg.dns.length?' (added; the file has none)':''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
         <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.error||(cfg.state==='ready'&&!cfg.exitIp?'Connected; the exit address appears after the first request':cfg.state==='starting'?'Connecting through WireGuard…':cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
         <Badge state={t}>{l}</Badge>
         <div className="psi-actions">

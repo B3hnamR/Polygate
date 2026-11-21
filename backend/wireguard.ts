@@ -1,15 +1,15 @@
 // WireGuard as one route. Each imported .conf file is started by the bundled wireproxy-awg (resources/wireguard, ISC licence), a userspace
-// WireGuard and AmneziaWG client that offers the tunnel as a local SOCKS port: no network adapter, route or DNS change on this computer, and
+// WireGuard and AmneziaWG client that offers the tunnel as a local SOCKS port: no network adapter or system DNS change on this computer, and
 // only the gateway's own requests use it. Together the configs are the route "wireguard", an exit group like Psiphon and Surfshark
 // (backend/exit-group.ts): taking turns or staying on one, used-up exits skipped per provider.
 //
-// The uploaded file is kept as it was written. Polygate writes it beside a small wrapper that points wireproxy-awg at it (WGConfig) and
-// gives it the local SOCKS port, so the [Interface] and [Peer] sections, AmneziaWG fields and MTU included, reach the client untouched. The
-// client copy drops ListenPort: it is a local UDP port, and two configs exported with the same value would otherwise stop each other from
-// binding. Both files are deleted as soon as the tunnel is up (or the start failed), and anything left by an interrupted run is removed when
-// the gateway starts.
+// The uploaded file is kept as it was written in the encrypted settings. Polygate writes a client copy beside a small wrapper that points
+// wireproxy-awg at it (WGConfig) and gives it the local SOCKS port. The client copy keeps the file's addresses, peers, AmneziaWG fields and
+// keepalive; it drops ListenPort (a local UDP port that two configs exported with the same value could not both bind), caps MTU to fit a
+// 1280-byte path including AmneziaWG junk, and adds a tunnel DNS server when the file has none so hostnames never reach the local resolver.
+// Both files are deleted as soon as the tunnel is up (or the start failed).
 import { spawn, type ChildProcess } from 'node:child_process';
-import { accessSync, constants as fsConstants, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -25,9 +25,12 @@ import type { Route, WireguardConfig, WireguardSettings } from './types';
 const isWin = process.platform === 'win32';
 const appDir = process.env.POLYGATE_APP_DIR || process.cwd();
 const dataDir = path.join(stateDir, 'wireguard');
-// A crash or a power cut can leave a client file with keys in the temp folder. No client is running when this module loads, so remove the
-// whole folder; it is recreated before the next start.
-try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* nothing left to clean */ }
+// The config id becomes a directory name under dataDir. A restored backup is otherwise trusted, so reject any id that is not a plain name:
+// without this, an id like "../../etc" would let writeConf/dropConf write keys and recursively delete files outside the state folder.
+const safeId = (id: string) => !!id && id.length <= 128 && /^[A-Za-z0-9_-]+$/.test(id);
+// A crash or a power cut can leave a client file with keys in the temp folder. Only prune directories that are safe, owned names; a second
+// gateway instance sharing this state folder keeps its own short-lived files until its own cleanup runs.
+try { for (const entry of readdirSync(dataDir)) if (safeId(entry) && /^(wg-[0-9a-f]{8}(-[0-9a-f]{8})?|check-[0-9a-f]{8})$/.test(entry)) rmSync(path.join(dataDir, entry), { recursive: true, force: true }); } catch { /* nothing left to clean */ }
 // Each config is its own client on its own port, counted up from here (every port is checked free first; Psiphon starts at 47100,
 // Surfshark at 47400).
 const BASE_PORT = 47700;
@@ -38,7 +41,7 @@ const defaults: WireguardSettings = { enabled: true, autoStart: false, mode: 'sp
 
 // One imported configuration, checked for what the client needs before it reaches the settings: a broken file is refused at import with a
 // reason, not left to fail silently when it is connected.
-export type Parsed = { privateKey: string; addresses: string[]; dns: string[]; mtu: number; endpoint: string; peers: number; amnezia: boolean;
+export type Parsed = { privateKey: string; addresses: string[]; dns: string[]; mtu: number; s4: number; endpoint: string; peers: number; amnezia: boolean;
   amneziaFields: string[]; allowedIPs: string; keepalive: string };
 // The AmneziaWG fields the client reads from [Interface], with the name the page shows. The header key and the packet patterns stay out of the
 // status line: the key is a secret, and the patterns are long and tell nobody anything useful.
@@ -55,8 +58,9 @@ const AMNEZIA_FIELDS: { key: string; label: string; show: boolean }[] = [
   { key: 'randomtrailers', label: 'RandomTrailers', show: true }, { key: 'disablecookies', label: 'DisableCookies', show: true },
 ];
 
-// go-ini strips a comment that starts after whitespace. Keys and sections are case-insensitive in wireproxy-awg (ini.LoadOptions
-// Insensitive), and a repeated key keeps the first value (AllowShadows, then GetKey).
+// The bundled client uses go-ini with Insensitive + AllowShadows. Mirror the parts that decide whether a real provider file imports:
+// case-insensitive sections/keys, `=` or `:` as the delimiter, comments starting at the first #/; (no preceding whitespace needed),
+// surrounding quotes, and a repeated key keeping its first value. A value that the client would accept must not be refused here.
 function sectionsOf(text: string) {
   const out: { name: string; values: Map<string, string> }[] = []; let cur: { name: string; values: Map<string, string> } | undefined;
   for (const raw of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
@@ -65,18 +69,25 @@ function sectionsOf(text: string) {
     const header = /^\[([^\]]*)\]\s*(?:[;#].*)?$/.exec(line);
     if (header) { cur = { name: header[1].trim().toLowerCase(), values: new Map() }; out.push(cur); continue; }
     if (!cur) continue; // root keys, such as wireproxy's own WGConfig
-    const eq = line.indexOf('=');
-    if (eq < 1) continue;
-    const key = line.slice(0, eq).trim().toLowerCase();
-    let value = line.slice(eq + 1).trim();
-    const comment = /(^|[ \t])[;#]/.exec(value);
+    const eq = /[=:]/.exec(line);
+    if (!eq || eq.index < 1) continue;
+    const key = line.slice(0, eq.index).trim().toLowerCase();
+    let value = line.slice(eq.index + 1).trim();
+    const comment = /[;#]/.exec(value);
     if (comment) value = value.slice(0, comment.index).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
     if (!cur.values.has(key)) cur.values.set(key, value);
   }
   return out;
 }
 const key = (value: string) => /^[A-Za-z0-9+/]{43}=$/.test(value) && Buffer.from(value, 'base64').length === 32;
-const uint = (value: string) => /^\d+$/.test(value) && Number(value) <= 0xffffffff ? Number(value) : undefined;
+// go-ini's Key.Int uses strconv.ParseInt(value, 0, 64), so hex, octal, binary and digit separators are all valid.
+const uint = (value: string) => {
+  const v = value.trim().replace(/_/g, '');
+  if (!/^(0x[0-9a-f]+|0o[0-7]+|0b[01]+|\d+)$/i.test(v)) return undefined;
+  const n = /^0x/i.test(v) ? parseInt(v.slice(2), 16) : /^0o/i.test(v) ? parseInt(v.slice(2), 8) : /^0b/i.test(v) ? parseInt(v.slice(2), 2) : Number(v);
+  return Number.isSafeInteger(n) && n >= 0 && n <= 0xffffffff ? n : undefined;
+};
 function range(value: string): { min: number; max: number } | undefined {
   const m = /^(\d+)(?:-(\d+))?$/.exec(value.trim()); if (!m) return undefined;
   const min = uint(m[1]); const max = m[2] === undefined ? min : uint(m[2]);
@@ -103,7 +114,8 @@ function endpoint(value: string): { host: string; port: number } | undefined {
   }
   return /^\d{1,5}$/.test(port) && Number(port) > 0 && Number(port) <= 65535 ? { host, port: Number(port) } : undefined;
 }
-const bool = (value: string) => /^(true|false|1|0|t|f)$/i.test(value.trim());
+// go-ini's Key.Bool accepts Go's full true/false vocabulary, not just the four short forms.
+const bool = (value: string) => ['1', 't', 'true', 'y', 'yes', 'on', '0', 'f', 'false', 'n', 'no', 'off'].includes(value.trim().toLowerCase());
 
 // What wireproxy-awg itself checks in an AmneziaWG [Interface] (awg_config.go), so an import fails here with the same reason the client
 // would give later, and the import report can name the file.
@@ -140,7 +152,7 @@ function checkAmnezia(v: Map<string, string>) {
   for (const name of ['contentpaddingaddition', 'rekeyaftertime', 'rekeytimeout', 'rejectaftertime', 'keepalivetimeout', 'maxhandshakeattempts'])
     if (v.has(name) && !range(v.get(name)!)) throw new GatewayError(`The AmneziaWG setting ${name} must be a number or a range such as 5-10.`, 400, 'wireguard_config');
   for (const name of ['randomtrailers', 'disablecookies'])
-    if (v.has(name) && !bool(v.get(name)!)) throw new GatewayError(`The AmneziaWG setting ${name} must be true or false.`, 400, 'wireguard_config');
+    if (v.has(name) && !bool(v.get(name)!)) throw new GatewayError(`The AmneziaWG setting ${name} must be on or off.`, 400, 'wireguard_config');
 }
 
 // Parses a .conf file into what the page shows and what a tunnel needs. Throws a message naming the section and key; never includes a key's
@@ -201,8 +213,9 @@ export function parseConfig(text: string): Parsed {
   if (!firstEndpoint) throw new GatewayError('No [Peer] has an Endpoint, so there is no server to connect to. Add Endpoint = host:port to the server\'s [Peer] section.', 400, 'wireguard_config');
 
   checkAmnezia(iface);
+  const s4 = uint(iface.get('s4') || '0') || 0;
   const amneziaFields = AMNEZIA_FIELDS.filter(f => iface.has(f.key)).map(f => f.show ? `${f.label} ${iface.get(f.key)}` : f.label);
-  return { privateKey, addresses, dns, mtu, endpoint: firstEndpoint, peers: peers.length, amnezia: amneziaFields.length > 0, amneziaFields, allowedIPs, keepalive };
+  return { privateKey, addresses, dns, mtu, s4, endpoint: firstEndpoint, peers: peers.length, amnezia: amneziaFields.length > 0, amneziaFields, allowedIPs, keepalive };
 }
 
 // --- the bundled client ---
@@ -221,7 +234,7 @@ export const wireguardConfig = (): WireguardSettings => {
   const c: any = { ...defaults, ...settings.wireguard };
   delete c.renew; // a config's address is fixed by its file, so there is no new-address switch
   const ids = new Set<string>(); const names = new Set<string>();
-  c.configs = Array.isArray(c.configs) ? c.configs.filter((x: any) => x && typeof x.id === 'string' && typeof x.config === 'string' && typeof x.name === 'string')
+  c.configs = Array.isArray(c.configs) ? c.configs.filter((x: any) => x && safeId(x.id) && typeof x.config === 'string' && typeof x.name === 'string')
     .filter((x: any) => { if (ids.has(x.id)) return false; ids.add(x.id); return true; })
     .map((x: any) => {
       const base = String(x.name).replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60) || String(x.id).slice(0, 60);
@@ -229,7 +242,7 @@ export const wireguardConfig = (): WireguardSettings => {
       return { id: x.id, name, config: x.config, enabled: x.enabled !== false, addedAt: Number(x.addedAt) || 0 };
     }) : [];
   c.mode = c.mode === 'single' ? 'single' : 'spread';
-  c.pinned = c.configs.some((x: WireguardConfig) => x.id === c.pinned) ? c.pinned : '';
+  c.pinned = c.configs.some((x: WireguardConfig) => x.id === c.pinned && x.enabled) ? c.pinned : '';
   return c as WireguardSettings;
 };
 const save = (patch: Partial<WireguardSettings>) => { settings.wireguard = { ...wireguardConfig(), ...patch }; persist(); };
@@ -239,43 +252,81 @@ const enabledConfigs = () => wireguardConfig().configs.filter(c => c.enabled);
 
 // --- instances ---
 type State = 'starting' | 'ready' | 'failed';
-type Instance = { id: string; name: string; port: number; proc?: ChildProcess; state: State; exitIp: string; location: string; startedAt: number; readyAt: number;
+type Instance = { id: string; name: string; gen: string; port: number; proc?: ChildProcess; state: State; exitIp: string; location: string; startedAt: number; readyAt: number;
   failures: number; restarts: number; error: string; stopping?: boolean; output: string; handshake: boolean; probing?: boolean };
 const instances = new Map<string, Instance>();
 // The exit group names an exit by its config name (a stable id appears nowhere in the dashboard); internal maps stay keyed by id.
 const instOf = (key: string) => instances.get(key) || [...instances.values()].find(i => i.name === key);
 let rr = 0, monitor: ReturnType<typeof setInterval> | undefined, busy = '', lastError = '', lastNotified = '';
-const configDir = (id: string) => path.join(dataDir, id);
+const configDir = (id: string, gen = '') => {
+  if (!safeId(id) || (gen && !safeId(gen))) throw new GatewayError('Invalid WireGuard config id.', 400, 'wireguard_config');
+  const dir = path.join(dataDir, gen ? `${id}-${gen}` : id);
+  if (!dir.startsWith(path.resolve(dataDir) + path.sep)) throw new GatewayError('Invalid WireGuard config id.', 400, 'wireguard_config');
+  return dir;
+};
 const used = () => new Set([...instances.values()].map(i => i.port));
 // What the client prints is kept for an error message, with anything that looks like a key taken out.
-const clean = (s: string) => s.replace(/[A-Za-z0-9+/]{42,}={0,2}/g, '•••').replace(/\s+/g, ' ').trim().slice(-400);
+// Collapse whitespace first: a key wrapped across two lines would otherwise be two short runs that escape the redaction.
+const clean = (s: string) => s.replace(/\s+/g, ' ').trim().replace(/[A-Za-z0-9+/]{42,}={0,2}/g, '•••').slice(-400);
 const wrapperText = (configFile: string, port: number) => ['WGConfig = ' + configFile.replace(/\\/g, '/'), '', '[Socks5]', `BindAddress = 127.0.0.1:${port}`, ''].join('\n');
-// A config's MTU is the tunnel's inner size, and WireGuard adds about 60 bytes outside it: a 1280 config sends 1340-byte packets, which a
-// 1280-byte path drops without a word. Small requests still pass, so the tunnel looks up until a TLS handshake needs the larger packets.
-// 1200 keeps the outer packet under the IPv6 minimum (1280), and a config that asks for less keeps its own value.
+// A config's MTU is the tunnel's inner size. WireGuard adds 16 bytes of transport header, 16 of Poly1305 tag and about 48 of outer IPv6
+// header, so 1200 keeps the outer packet at or under the IPv6 minimum of 1280. AmneziaWG prepends S4 junk bytes to every transport packet,
+// which the cap must also leave room for, or large TLS packets silently vanish on a 1280-byte path.
 const TUNNEL_MTU = 1200;
-const usedMtu = (mtu: number) => Math.min(mtu > 0 ? mtu : 1420, TUNNEL_MTU);
-// ListenPort is a local UDP port, not the tunnel's identity. Providers often export the same value in every file, and two clients cannot bind
-// the same port; the client copy leaves it out and lets the operating system choose. The stored file still has the line, unchanged.
+const DEFAULT_DNS = ['1.1.1.1', '9.9.9.9'];
+const usedMtu = (mtu: number, s4 = 0) => Math.max(68, Math.min(mtu > 0 ? mtu : 1420, TUNNEL_MTU - s4));
+const effectiveDns = (parsed: Parsed | null) => parsed?.dns.length ? parsed.dns : DEFAULT_DNS;
+// The client copy edits only the [Interface] section: it drops ListenPort (a local UDP port that two exported configs cannot both bind),
+// rewrites MTU to the capped value (including AmneziaWG S4), and inserts a DNS server when the file has none so wireproxy-awg never falls
+// back to the host resolver and leaks the provider hostnames. The stored file in the encrypted settings stays exactly as imported.
 const clientText = (text: string) => {
-  const body = text.replace(/^\uFEFF/, '').replace(/^[ \t]*ListenPort[ \t]*=[^\r\n]*(?:\r?\n|$)/gim, '');
-  const mtu = /^[ \t]*MTU[ \t]*=[ \t]*(\d+)/im.exec(body);
-  const value = usedMtu(mtu ? Number(mtu[1]) : 0);
-  return /^[ \t]*MTU[ \t]*=/im.test(body)
-    ? body.replace(/^[ \t]*MTU[ \t]*=[^\r\n]*/gim, `MTU = ${value}`)
-    : body.replace(/^([ \t]*\[Interface\][^\r\n]*(?:\r?\n|$))/im, `$1MTU = ${value}\n`);
+  const source = text.replace(/^\uFEFF/, '');
+  const iface = sectionsOf(source).find(s => s.name === 'interface')?.values;
+  const s4 = uint(iface?.get('s4') || '0') || 0;
+  const mtu = usedMtu(uint(iface?.get('mtu') || '0') || 0, s4);
+  const configuredDns = (iface?.get('dns') || '').split(',').map(s => s.trim()).filter(Boolean);
+  const dnsLine = `DNS = ${(configuredDns.length ? configuredDns : DEFAULT_DNS).join(', ')}`;
+  let inIface = false, sawMtu = false, sawDns = false;
+  const out: string[] = [];
+  for (const line of source.split(/\r?\n/)) {
+    const header = /^[ \t]*\[([^\]]*)\]/.exec(line);
+    if (header) {
+      if (inIface) { if (!sawMtu) out.push(`MTU = ${mtu}`); if (!sawDns) out.push(dnsLine); }
+      inIface = header[1].trim().toLowerCase() === 'interface';
+      sawMtu = false; sawDns = false;
+      out.push(line); continue;
+    }
+    if (inIface) {
+      const setting = /^[ \t]*(MTU|DNS|ListenPort)[ \t]*[=:]/i.exec(line);
+      if (setting) {
+        const name = setting[1].toLowerCase();
+        if (name === 'listenport') continue;
+        if (name === 'mtu') { out.push(`MTU = ${mtu}`); sawMtu = true; continue; }
+        if (name === 'dns') { out.push(dnsLine); sawDns = true; continue; }
+      }
+    }
+    out.push(line);
+  }
+  if (inIface) { if (!sawMtu) out.push(`MTU = ${mtu}`); if (!sawDns) out.push(dnsLine); }
+  return out.join('\n');
 };
 export const __clientText = clientText;
 // The client reads the config, which holds the private key, from files in Polygate's own data folder, readable by this user only, and only
 // while the client starts: they are deleted as soon as the tunnel is up (or the start failed).
-const confOf = (id: string) => path.join(configDir(id), 'wireproxy.conf');
-const clientOf = (id: string) => path.join(configDir(id), 'wireguard.conf');
-const dropConf = (id: string) => { try { rmSync(configDir(id), { recursive: true, force: true }); } catch { /* already gone */ } };
-function writeConf(id: string, text: string, port: number): void {
-  mkdirSync(configDir(id), { recursive: true, mode: 0o700 });
-  const client = clientOf(id); const body = clientText(text);
+const confOf = (id: string, gen = '') => path.join(configDir(id, gen), 'wireproxy.conf');
+const clientOf = (id: string, gen = '') => path.join(configDir(id, gen), 'wireguard.conf');
+// A start gets a generation-specific directory: if the old process outlives exitOf's 5 s wait, its exit handler deletes only its own files,
+// not the new client's config. A failed deletion is logged rather than silently treated as "already gone", so key files do not linger unseen.
+const dropConf = (id: string, gen = '') => {
+  const dir = configDir(id, gen);
+  try { rmSync(dir, { recursive: true, force: true }); }
+  catch (e: any) { console.warn(`[wireguard] could not remove temporary files for ${id}: ${redactError(String(e?.message || e))}`); }
+};
+function writeConf(id: string, text: string, port: number, gen = ''): void {
+  mkdirSync(configDir(id, gen), { recursive: true, mode: 0o700 });
+  const client = clientOf(id, gen); const body = clientText(text);
   writeFileSync(client, body.endsWith('\n') ? body : body + '\n', { mode: 0o600 });
-  writeFileSync(confOf(id), wrapperText(client, port), { mode: 0o600 });
+  writeFileSync(confOf(id, gen), wrapperText(client, port), { mode: 0o600 });
 }
 // The client's own check: the same parser that start uses, without opening a tunnel or a port. A config that fails here would have ended
 // up as a process that exits at once, with a log line instead of a reason on the page.
@@ -305,17 +356,17 @@ async function coreCheck(text: string): Promise<void> {
 async function launch(inst: Instance): Promise<ChildProcess> {
   const bin = findWireproxyAwg(); if (!bin) throw new GatewayError(wireproxyMissing(), 503, 'wireguard_not_installed');
   const c = configOf(inst.id); if (!c) throw new GatewayError(`The WireGuard config ${inst.name} was removed.`, 400, 'wireguard_config');
-  writeConf(inst.id, c.config, inst.port);
-  const proc = spawn(bin, ['-c', confOf(inst.id)], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  writeConf(inst.id, c.config, inst.port, inst.gen);
+  const proc = spawn(bin, ['-c', confOf(inst.id, inst.gen)], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let buf = '';
   const data = (d: Buffer) => { buf += d; if (buf.length > 1e6) buf = buf.slice(-2e5); let n; while ((n = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, n); buf = buf.slice(n + 1); onLine(inst, line); } };
   proc.stdout!.on('data', data); proc.stderr!.on('data', data);
-  await new Promise<void>((resolve, reject) => { proc.once('spawn', () => resolve()); proc.once('error', e => { dropConf(inst.id); reject(new GatewayError(`The WireGuard client could not start: ${e.message}`, 502, 'wireguard_error')); }); });
+  await new Promise<void>((resolve, reject) => { proc.once('spawn', () => resolve()); proc.once('error', e => { dropConf(inst.id, inst.gen); reject(new GatewayError(`The WireGuard client could not start: ${e.message}`, 502, 'wireguard_error')); }); });
   return proc;
 }
 function onLine(inst: Instance, line: string) {
   if (instances.get(inst.id) !== inst) return;
-  if (/Received handshake response/i.test(line)) { if (!inst.handshake) { inst.handshake = true; dropConf(inst.id); void learnExit(inst, true); } }
+  if (/Received handshake response/i.test(line)) { if (!inst.handshake) { inst.handshake = true; dropConf(inst.id, inst.gen); void learnExit(inst, true); } }
   else if (/error|failed|could not|unable|lacks|invalid/i.test(line) && !/DEBUG/.test(line)) inst.output = clean(line);
 }
 
@@ -329,7 +380,13 @@ function startInstance(id: string, fresh = false): Promise<Instance> {
 }
 const stopped = () => new GatewayError('WireGuard was stopped', 409, 'wireguard_stopped');
 function stopProcess(proc?: ChildProcess) { try { proc?.kill(); } catch { /* already gone */ } }
-const exitOf = (proc: ChildProcess) => new Promise<void>(r => { if (proc.exitCode !== null || proc.signalCode) return r(); proc.once('exit', () => r()); setTimeout(r, 5000); });
+// Escalate: a client that ignores the first signal must not keep its SOCKS port and tunnel after Polygate has forgotten it.
+const exitOf = (proc: ChildProcess) => new Promise<void>(r => {
+  if (proc.exitCode !== null || proc.signalCode) return r();
+  let done = false; const finish = () => { if (!done) { done = true; r(); } };
+  proc.once('exit', finish);
+  const t = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* already gone */ } finish(); }, 5000); t.unref?.();
+});
 async function startOnce(id: string, fresh: boolean, at: number): Promise<Instance> {
   const old = instances.get(id);
   if (old) { old.stopping = true; stopProcess(old.proc); if (old.proc) await exitOf(old.proc); }
@@ -338,11 +395,12 @@ async function startOnce(id: string, fresh: boolean, at: number): Promise<Instan
   const port = old?.port && !fresh ? old.port : await freePort(BASE_PORT, avoid);
   if (at !== epoch) throw stopped();
   const c = configOf(id); if (!c || !c.enabled) throw new GatewayError(`The WireGuard config ${old?.name || id} is turned off.`, 400, 'wireguard_config');
-  const inst: Instance = { id, name: c.name, port, state: 'starting', exitIp: '', location: '', startedAt: Date.now(), readyAt: 0, failures: 0, restarts: old?.restarts || 0, error: '', output: '', handshake: false };
+  const gen = randomBytes(4).toString('hex');
+  const inst: Instance = { id, name: c.name, gen, port, state: 'starting', exitIp: '', location: '', startedAt: Date.now(), readyAt: 0, failures: 0, restarts: old?.restarts || 0, error: '', output: '', handshake: false };
   instances.set(id, inst);
   try {
     inst.proc = await launch(inst);
-    const exited = (code: number | null) => { dropConf(id); onExit(inst, code); };
+    const exited = (code: number | null) => { dropConf(id, inst.gen); onExit(inst, code); };
     inst.proc.once('exit', exited);
     // The client can exit between the spawn event and this listener (a config the runtime rejects after the -n check passed);
     // without this, the exit is never handled and the config stays "connecting" until the 45 s timeout.
@@ -354,12 +412,13 @@ async function startOnce(id: string, fresh: boolean, at: number): Promise<Instan
     t.unref?.();
     // No traffic means no handshake: ask through the tunnel at once instead of waiting for the route to use a config that is never ready.
     void learnExit(inst, true);
-  } catch (e: any) { dropConf(id); inst.state = 'failed'; inst.error = redactError(String(e.message || e)); throw e; }
+  } catch (e: any) { dropConf(id, inst.gen); inst.state = 'failed'; inst.error = redactError(String(e.message || e)); throw e; }
   return inst;
 }
 // The client sends nothing, and so never handshakes, until traffic passes through the tunnel. A request through its SOCKS port is what
-// brings the tunnel up, and the address it reports is the exit the providers see. If the probe cannot get through but the client is
-// listening, the config is still usable: real requests decide, and the next probe learns the address.
+// brings the tunnel up, and the address it reports is the exit the providers see. A bare TCP connect is NOT enough to call a config ready:
+// wireproxy opens its SOCKS listener before the WireGuard handshake, so that would hand real requests to a dead tunnel and disarm the
+// handshake watchdog. Only a config whose handshake completed may be marked ready on the strength of its listener.
 function socksListening(port: number): Promise<boolean> {
   return new Promise(resolve => {
     const socket = net.connect({ host: '127.0.0.1', port });
@@ -386,14 +445,14 @@ async function learnExit(inst: Instance, first: boolean, wait = 40000) {
       const wasReady = inst.state === 'ready';
       const changed = egress.ip !== inst.exitIp; inst.exitIp = egress.ip; inst.location = egress.loc || '';
       inst.state = 'ready'; inst.error = ''; inst.failures = 0; inst.restarts = 0; if (!wasReady) inst.readyAt = Date.now();
-      dropConf(inst.id); // the tunnel is up: the files with the key are no longer needed
+      dropConf(inst.id, inst.gen); // the tunnel is up: the files with the key are no longer needed
       const spent = spentUntil(egress.ip);
       if (!wasReady || changed) logEvent('info', 'wireguard', `WireGuard ${inst.name} is connected; exit ${egress.ip}${spent ? ' (used up today)' : ''}`, { config: inst.id, ip: egress.ip });
       return;
     }
-    if (inst.state === 'starting' && await socksListening(inst.port)) {
+    if (inst.state === 'starting' && inst.handshake && await socksListening(inst.port)) {
       inst.state = 'ready'; inst.error = ''; inst.failures = 0; inst.restarts = 0; inst.readyAt = Date.now();
-      dropConf(inst.id);
+      dropConf(inst.id, inst.gen);
       logEvent('info', 'wireguard', `WireGuard ${inst.name} is connected; its exit address is learned from the first request`, { config: inst.id });
       return;
     }
@@ -409,27 +468,33 @@ function onExit(inst: Instance, code: number | null) {
 }
 
 // --- used-up exits (as in backend/psiphon.ts) ---
+// Until the exit probe learns an address, key the allowance by config id: otherwise a used-up exit that is still starting is sent the same
+// request again and again because wireguardSpent returns without recording anything.
 export function spentUntil(ip: string): number { const until = (ip && wireguardConfig().spent?.[ip]) || 0; return until > Date.now() ? until : 0; }
 const kiloLimits = new Map<string, number>();
 export const kiloUntil = (ip: string) => { const until = (ip && kiloLimits.get(ip)) || 0; return until > Date.now() ? until : 0; };
+const limitKey = (i: Instance) => i.exitIp || `id:${i.id}`;
 function pruneSpent() {
   const c = wireguardConfig(); const now = Date.now(); const spent = Object.fromEntries(Object.entries(c.spent || {}).filter(([, until]) => until > now));
   if (Object.keys(spent).length !== Object.keys(c.spent || {}).length) save({ spent });
   for (const [ip, until] of kiloLimits) if (until <= now) kiloLimits.delete(ip);
 }
 export function wireguardSpent(key: string, until: number) {
-  const inst = instOf(key); if (!inst?.exitIp) return;
-  const c = wireguardConfig(); save({ spent: { ...(c.spent || {}), [inst.exitIp]: until } });
-  logEvent('info', 'wireguard', `WireGuard ${inst.name} exit ${inst.exitIp} has used up its OpenCode Free allowance until ${new Date(until).toISOString().slice(0, 16).replace('T', ' ')} UTC`, { config: inst.id, ip: inst.exitIp });
+  const inst = instOf(key); if (!inst) return;
+  const at = limitKey(inst);
+  const c = wireguardConfig(); save({ spent: { ...(c.spent || {}), [at]: until } });
+  logEvent('info', 'wireguard', `WireGuard ${inst.name} exit ${at} has used up its OpenCode Free allowance until ${new Date(until).toISOString().slice(0, 16).replace('T', ' ')} UTC`, { config: inst.id, ip: at });
 }
 export function wireguardKiloLimited(key: string, until: number) {
-  const inst = instOf(key); if (!inst?.exitIp) return;
-  kiloLimits.set(inst.exitIp, until);
-  logEvent('info', 'wireguard', `WireGuard ${inst.name} exit ${inst.exitIp} reached Kilo's free limit for its address; Kilo uses the other configs until ${new Date(until).toISOString().slice(11, 16)} UTC`, { config: inst.id, ip: inst.exitIp });
+  const inst = instOf(key); if (!inst) return;
+  const at = limitKey(inst);
+  kiloLimits.set(at, until);
+  logEvent('info', 'wireguard', `WireGuard ${inst.name} exit ${at} reached Kilo's free limit for its address; Kilo uses the other configs until ${new Date(until).toISOString().slice(11, 16)} UTC`, { config: inst.id, ip: at });
 }
 export function wireguardClean(key: string) {
-  const inst = instOf(key); const c = wireguardConfig(); if (!inst?.exitIp || !c.spent?.[inst.exitIp]) return;
-  const { [inst.exitIp]: _gone, ...spent } = c.spent; save({ spent });
+  const inst = instOf(key); const c = wireguardConfig(); if (!inst) return;
+  const at = limitKey(inst); if (!c.spent?.[at]) return;
+  const { [at]: _gone, ...spent } = c.spent; save({ spent });
 }
 export function wireguardFailed(key: string) { const inst = instOf(key); if (!inst) return; if (++inst.failures >= 3 && inst.state === 'ready') { inst.failures = 0; void startInstance(inst.id, true).catch(() => {}); } }
 export function wireguardOk(key: string) { const inst = instOf(key); if (inst) inst.failures = 0; }
@@ -437,11 +502,12 @@ export function wireguardOk(key: string) { const inst = instOf(key); if (inst) i
 // --- picking an exit for a request ---
 const blocked = (i: Instance, scope: ExitScope, skip: boolean) => {
   if (!skip || scope === 'other') return false;
-  return scope === 'opencode' ? !!spentUntil(i.exitIp) : !!kiloUntil(i.exitIp);
+  return scope === 'opencode' ? !!spentUntil(limitKey(i)) : !!kiloUntil(limitKey(i));
 };
 const usable = (i: Instance, scope: ExitScope, skip: boolean) => i.state === 'ready' && !blocked(i, scope, skip);
 // The configs a request can be sent to, in the order of the settings: the pinned one alone, or every enabled one.
-const candidates = (c: WireguardSettings) => (c.mode === 'single' ? [c.pinned || c.configs.find(x => x.enabled)?.id || ''] : c.configs.filter(x => x.enabled).map(x => x.id)).map(id => instances.get(id)).filter((i): i is Instance => !!i);
+const candidates = (c: WireguardSettings) => (c.mode === 'single' ? [c.pinned || c.configs.find(x => x.enabled)?.id || ''] : c.configs.filter(x => x.enabled).map(x => x.id))
+  .filter(id => c.configs.some(x => x.id === id && x.enabled)).map(id => instances.get(id)).filter((i): i is Instance => !!i);
 export function pickWireguard(tried: Set<string> = new Set(), scope: ExitScope = 'other') {
   const c = wireguardConfig(); if (!c.enabled) return null;
   const live = candidates(c).filter(i => !tried.has(i.id) && !tried.has(i.name) && usable(i, scope, c.skip));
@@ -452,8 +518,8 @@ export const wireguardLive = () => [...instances.values()].filter(i => i.state =
 export const wireguardReady = (scope: ExitScope = 'other') => { const c = wireguardConfig(); return c.enabled ? candidates(c).filter(i => usable(i, scope, c.skip)).length : 0; };
 export function wireguardUnavailable(scope: ExitScope = 'other'): string {
   const c = wireguardConfig();
-  if (!c.configs.some(x => x.enabled)) return 'No WireGuard config is turned on. Add .conf files under Routing → WireGuard.';
   if (!c.enabled) return 'WireGuard is turned off. Turn it on under Routing → WireGuard.';
+  if (!c.configs.some(x => x.enabled)) return 'No WireGuard config is turned on. Add .conf files under Routing → WireGuard.';
   if (!instances.size) return 'WireGuard is not connected. Connect it under Routing → WireGuard.';
   const all = candidates(c); const ready = all.filter(i => i.state === 'ready');
   const limit = scope === 'kilo' ? "Kilo's free limit" : 'its OpenCode Free allowance';
@@ -472,7 +538,14 @@ export const wireguardRegionsReady = () => [...instances.values()].filter(i => i
 // --- the managed route ---
 function fallbackRoute(): string {
   const on = (id?: string) => !!id && id !== ROUTE_ID && settings.routes.some(r => r.id === id && r.enabled);
-  return on(settings.previousRouteId) ? settings.previousRouteId! : on('direct') ? 'direct' : settings.routes.find(r => r.enabled && r.id !== ROUTE_ID)?.id || settings.routeId;
+  if (on(settings.previousRouteId)) return settings.previousRouteId!;
+  if (on('direct')) return 'direct';
+  const any = settings.routes.find(r => r.enabled && r.id !== ROUTE_ID)?.id;
+  if (any) return any;
+  // Never leave the main selection on the route being switched off. If every other route was disabled, bring Direct back as the last resort.
+  const direct = settings.routes.find(r => r.id === 'direct');
+  if (direct) direct.enabled = true;
+  return 'direct';
 }
 function ensureRoute(enabled: boolean) {
   let route = settings.routes.find(r => r.id === ROUTE_ID);
@@ -484,7 +557,7 @@ function ensureRoute(enabled: boolean) {
 // Makes the route match what is running: on while a client runs, off when none does (after a restart, or a restored backup).
 export function reconcileWireguard() {
   const c = wireguardConfig();
-  for (const [id, inst] of [...instances]) if (!c.configs.some(x => x.id === id && x.enabled)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id); }
+  for (const [id, inst] of [...instances]) if (!c.configs.some(x => x.id === id && x.enabled)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
   ensureRoute(instances.size > 0 && c.enabled);
 }
 
@@ -500,13 +573,15 @@ function uniqueName(base: string, taken: Set<string>) {
   for (let n = 2; ; n++) { const suffix = `-${n}`; const candidate = `${base.slice(0, 60 - suffix.length).trimEnd()}${suffix}`; if (!taken.has(candidate.toLowerCase())) return candidate; }
 }
 export type ImportResult = { added: { id: string; name: string; renamedFrom?: string; amnezia: boolean; endpoint: string }[]; failed: { name: string; error: string }[]; summary: string };
-export async function wireguardImport(input: unknown): Promise<ImportResult> {
+export function wireguardImport(input: unknown): Promise<ImportResult> { return serialize(() => doImport(input)); }
+async function doImport(input: unknown): Promise<ImportResult> {
   if (!Array.isArray(input) || !input.length) throw new GatewayError('Choose one or more WireGuard .conf files to import.', 400, 'wireguard_import');
   if (input.length > MAX_IMPORT) throw new GatewayError(`Import at most ${MAX_IMPORT} configs at a time.`, 400, 'wireguard_import');
   const c = wireguardConfig(); const added: ImportResult['added'] = []; const failed: ImportResult['failed'] = [];
   const taken = new Set(c.configs.map(x => x.name.toLowerCase()));
   const configs = [...c.configs];
   for (let i = 0; i < input.length; i++) {
+    if (isCancelled()) throw cancelledError();
     const item: any = input[i];
     const rawName = cleanName(String(item?.name || ''));
     const base = rawName || (input.length > 1 ? `WireGuard ${i + 1}` : 'WireGuard');
@@ -526,10 +601,13 @@ export async function wireguardImport(input: unknown): Promise<ImportResult> {
     }
   }
   if (added.length) {
-    settings.wireguard = { ...c, configs }; persist();
+    if (isCancelled()) throw cancelledError();
+    // Re-read after the awaits: a rename or removal that completed while coreCheck ran must survive the import.
+    const latest = wireguardConfig();
+    settings.wireguard = { ...latest, configs: [...latest.configs, ...configs.slice(c.configs.length)] }; persist();
     logEvent('info', 'wireguard', `Imported ${added.length} WireGuard config${added.length === 1 ? '' : 's'}${added.some(a => a.amnezia) ? ` (${added.filter(a => a.amnezia).length} AmneziaWG)` : ''}${failed.length ? `; ${failed.length} could not be used` : ''}`);
     // A connected group follows its new configs at once.
-    if (instances.size && c.enabled) for (const a of added) await startInstance(a.id).catch(() => {});
+    if (instances.size && latest.enabled) for (const a of added) await startInstance(a.id).catch(() => {});
     reconcileWireguard();
   }
   const summary = added.length
@@ -539,10 +617,18 @@ export async function wireguardImport(input: unknown): Promise<ImportResult> {
 }
 
 // --- actions ---
+// Every settings mutation runs through one queue. Import and coreCheck await up to 15 s per file; without this, a concurrent rename, toggle,
+// remove or spent-exit save could write its own snapshot of settings and silently undo the other change.
+let mutation = Promise.resolve();
+const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+  const run = mutation.then(fn, fn);
+  mutation = run.then(() => undefined, () => undefined);
+  return run;
+};
 const guard = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
   if (busy) throw new GatewayError(`WireGuard is busy (${busy}). Try again in a moment.`, 409, 'wireguard_busy');
   busy = name; lastError = '';
-  try { return await fn(); } catch (e: any) { if (isCancelled()) throw cancelledError(); lastError = redactError(String(e.message || e)); throw e instanceof GatewayError ? e : new GatewayError(lastError, 502, 'wireguard_error'); } finally { busy = ''; }
+  try { return await serialize(fn); } catch (e: any) { if (isCancelled()) throw cancelledError(); lastError = redactError(String(e.message || e)); throw e instanceof GatewayError ? e : new GatewayError(lastError, 502, 'wireguard_error'); } finally { busy = ''; }
 };
 export function wireguardConnect() {
   return guard('connecting', async () => {
@@ -551,7 +637,7 @@ export function wireguardConnect() {
     if (!findWireproxyAwg()) throw new GatewayError(wireproxyMissing(), 503, 'wireguard_not_installed');
     const enabled = c.configs.filter(x => x.enabled);
     if (!enabled.length) throw new GatewayError('Import a WireGuard .conf file first, then connect.', 400);
-    for (const [id, inst] of [...instances]) if (!enabled.some(x => x.id === id)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id); }
+    for (const [id, inst] of [...instances]) if (!enabled.some(x => x.id === id)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
     for (const x of enabled) { const i = instances.get(x.id); if (!i || i.state === 'failed') { if (i) i.restarts = 0; await startInstance(x.id); } }
     ensureRoute(true); startMonitor();
     return wireguardStatus();
@@ -563,7 +649,8 @@ export function wireguardConfigText(id: string): string {
   const c = configOf(id); if (!c) throw new GatewayError('No such WireGuard config', 404);
   return c.config;
 }
-export async function wireguardUpdate(input: { id?: unknown; name?: unknown; text?: unknown }) {
+export function wireguardUpdate(input: { id?: unknown; name?: unknown; text?: unknown }): Promise<any> { return serialize(() => doUpdate(input)); }
+async function doUpdate(input: { id?: unknown; name?: unknown; text?: unknown }) {
   const id = String(input.id || ''); const c = wireguardConfig(); const found = c.configs.find(x => x.id === id);
   if (!found) throw new GatewayError('No such WireGuard config', 404);
   const patch: Partial<WireguardConfig> = {};
@@ -581,7 +668,9 @@ export async function wireguardUpdate(input: { id?: unknown; name?: unknown; tex
     patch.config = text.replace(/^\uFEFF/, '');
   }
   if (!Object.keys(patch).length) throw new GatewayError('Nothing to change.', 400);
-  settings.wireguard = { ...c, configs: c.configs.map(x => x.id === id ? { ...x, ...patch } : x) }; persist();
+  if (isCancelled()) throw cancelledError();
+  const latest = wireguardConfig(); if (!latest.configs.some(x => x.id === id)) throw new GatewayError('No such WireGuard config', 404);
+  settings.wireguard = { ...latest, configs: latest.configs.map(x => x.id === id ? { ...x, ...patch } : x) }; persist();
   const inst = instances.get(id);
   if (inst) {
     if (patch.name) inst.name = patch.name;
@@ -590,29 +679,32 @@ export async function wireguardUpdate(input: { id?: unknown; name?: unknown; tex
   logEvent('info', 'wireguard', `WireGuard ${patch.name || found.name} was ${patch.config !== undefined ? 'updated' : 'renamed'}${patch.config !== undefined && patch.name ? ' and renamed' : ''}`, { config: id });
   return wireguardStatus();
 }
-export async function wireguardToggle(id: string, enabled: boolean) {
+export function wireguardToggle(id: string, enabled: boolean): Promise<any> { return serialize(() => doToggle(id, enabled)); }
+async function doToggle(id: string, enabled: boolean) {
   const c = wireguardConfig(); const found = c.configs.find(x => x.id === id);
   if (!found) throw new GatewayError('No such WireGuard config', 404);
   if (found.enabled === enabled) return wireguardStatus();
   settings.wireguard = { ...c, configs: c.configs.map(x => x.id === id ? { ...x, enabled } : x) }; persist();
   if (!enabled) {
-    const inst = instances.get(id); if (inst) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id); }
+    const inst = instances.get(id); if (inst) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
     if (c.pinned === id) { const next = enabledConfigs()[0]?.id || ''; save({ pinned: next }); }
   } else if (instances.size && c.enabled) await startInstance(id).catch(e => { lastError = redactError(String(e?.message || e)); });
   logEvent('info', 'wireguard', `WireGuard ${found.name} is ${enabled ? 'on' : 'off'}`);
   reconcileWireguard();
   return wireguardStatus();
 }
-export async function wireguardRemove(id: string) {
+export function wireguardRemove(id: string): Promise<any> { return serialize(() => doRemove(id)); }
+async function doRemove(id: string) {
   const c = wireguardConfig(); const found = c.configs.find(x => x.id === id);
   if (!found) throw new GatewayError('No such WireGuard config', 404);
-  const inst = instances.get(id); if (inst) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id); }
+  const inst = instances.get(id); if (inst) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
   settings.wireguard = { ...c, configs: c.configs.filter(x => x.id !== id), ...(c.pinned === id ? { pinned: '' } : {}) }; persist();
   logEvent('info', 'wireguard', `WireGuard ${found.name} was removed`);
   reconcileWireguard();
   return wireguardStatus();
 }
-export async function setWireguardSettings(patch: Partial<WireguardSettings>) {
+export function setWireguardSettings(patch: Partial<WireguardSettings>): Promise<any> { return serialize(() => doSettings(patch)); }
+async function doSettings(patch: Partial<WireguardSettings>) {
   const c = wireguardConfig(); const next: WireguardSettings = { ...c };
   if (patch.enabled !== undefined) next.enabled = !!patch.enabled;
   if (patch.autoStart !== undefined) next.autoStart = !!patch.autoStart;
@@ -628,7 +720,7 @@ export async function setWireguardSettings(patch: Partial<WireguardSettings>) {
   if (!next.enabled) { await stopAll(); ensureRoute(false); }
   // Running clients follow the settings at once: disabled ones stop, re-enabled ones start.
   else if (instances.size) {
-    for (const [id, inst] of [...instances]) if (!next.configs.some(x => x.id === id && x.enabled)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id); }
+    for (const [id, inst] of [...instances]) if (!next.configs.some(x => x.id === id && x.enabled)) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
     for (const x of next.configs) if (x.enabled && !instances.has(x.id)) await startInstance(x.id).catch(() => {});
   }
   reconcileWireguard();
@@ -638,7 +730,7 @@ async function stopAll() {
   epoch++; const live = [...instances.values()]; instances.clear();
   for (const i of live) { i.stopping = true; stopProcess(i.proc); }
   await Promise.all(live.map(i => i.proc ? exitOf(i.proc) : undefined));
-  for (const i of live) dropConf(i.id);
+  for (const i of live) dropConf(i.id, i.gen);
 }
 function startMonitor() {
   if (monitor) return;
@@ -651,6 +743,14 @@ function startMonitor() {
   }, 30000);
   monitor.unref?.();
 }
+// The dashboard polls status every few seconds; re-parsing up to 200 configs each time is wasteful. Cache the parsed summary by config id
+// and text identity, so a restored or edited file is re-parsed once without a separate invalidation hook.
+const parsedCache = new Map<string, { text: string; parsed: Parsed | null }>();
+function cachedParse(id: string, text: string): Parsed | null {
+  const hit = parsedCache.get(id); if (hit && hit.text === text) return hit.parsed;
+  let parsed: Parsed | null = null; try { parsed = parseConfig(text); } catch { /* a restored backup may hold a file that no longer parses */ }
+  parsedCache.set(id, { text, parsed }); return parsed;
+}
 // What the WireGuard section shows. The files themselves never go to the dashboard: only where each one connects, and what it carries.
 export function wireguardStatus() {
   const c = wireguardConfig(); const bin = findWireproxyAwg(); const now = Date.now(); const route = settings.routes.find(r => r.id === ROUTE_ID);
@@ -659,13 +759,13 @@ export function wireguardStatus() {
     busy, lastError, running: instances.size > 0, live: wireguardLive(),
     config: { enabled: c.enabled, autoStart: c.autoStart, mode: c.mode, pinned: c.pinned, skip: c.skip },
     configs: c.configs.map(entry => {
-      const i = instances.get(entry.id); const until = i?.exitIp ? spentUntil(i.exitIp) : 0;
-      let parsed: Parsed | null = null; try { parsed = parseConfig(entry.config); } catch { /* a restored backup may hold a file that no longer parses; the row still shows it */ }
+      const i = instances.get(entry.id); const until = i ? spentUntil(limitKey(i)) : 0;
+      const parsed = cachedParse(entry.id, entry.config);
       return { id: entry.id, name: entry.name, enabled: entry.enabled, addedAt: entry.addedAt,
-        endpoint: parsed?.endpoint || '', address: parsed?.addresses.join(', ') || '', mtu: parsed?.mtu || 0, mtuUsed: parsed ? usedMtu(parsed.mtu) : 0, dns: parsed?.dns || [],
+        endpoint: parsed?.endpoint || '', address: parsed?.addresses.join(', ') || '', mtu: parsed?.mtu || 0, mtuUsed: parsed ? usedMtu(parsed.mtu, parsed.s4) : 0, dns: parsed?.dns || [], dnsUsed: effectiveDns(parsed),
         allowedIPs: parsed?.allowedIPs || '', keepalive: parsed?.keepalive || '', amnezia: !!parsed?.amnezia, amneziaFields: parsed?.amneziaFields || [], peers: parsed?.peers || 0,
         state: i ? i.state : 'stopped', port: i?.port || 0, exitIp: i?.exitIp || '', since: i?.readyAt || 0,
-        usedUpUntil: until, kiloUntil: i?.exitIp ? kiloUntil(i.exitIp) : 0, error: i?.state === 'failed' ? i.error : '' };
+        usedUpUntil: until, kiloUntil: i ? kiloUntil(limitKey(i)) : 0, error: i?.state === 'failed' ? i.error : '' };
     }),
     spent: Object.entries(c.spent || {}).filter(([, until]) => until > now).length,
     route: { exists: !!route, enabled: !!route?.enabled, inUse: settings.routeId === ROUTE_ID },

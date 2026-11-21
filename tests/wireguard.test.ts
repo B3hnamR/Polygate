@@ -125,8 +125,11 @@ test('AmneziaWG fields are kept and checked like the client checks them', () => 
   expect(() => W.parseConfig(conf(`Jc = 5\nS1 = 5\nS2 = 60\nS3 = 70\nS4 = 80\nHeaderProtectionKey = ${keyPair().privateKey}`))).toThrow('at least 12');
   expect(() => W.parseConfig(conf('Jc = many'))).toThrow('JC must be a whole number');
   expect(() => W.parseConfig(conf('RekeyAfterTime = soon'))).toThrow('must be a number or a range');
-  expect(() => W.parseConfig(conf('RandomTrailers = maybe'))).toThrow('must be true or false');
-  expect(() => W.parseConfig(conf('RandomTrailers = yes'))).toThrow('must be true or false');
+  expect(() => W.parseConfig(conf('RandomTrailers = maybe'))).toThrow('must be on or off');
+  // go-ini's Key.Bool accepts yes/no/on/off as well as true/false; the client would accept this file, so import must too.
+  expect(W.parseConfig(conf('RandomTrailers = yes')).amnezia).toBe(true);
+  expect(W.parseConfig(conf('DisableCookies = off')).amnezia).toBe(true);
+  expect(() => W.parseConfig(conf('RandomTrailers = maybe'))).toThrow('must be on or off');
   expect(W.parseConfig(conf(AMNEZIA + '\nDisableCookies = true')).amnezia).toBe(true);
 });
 test('a file that is not a usable config is refused with the section and key that are wrong', () => {
@@ -163,6 +166,45 @@ test('the client copy caps the tunnel MTU so large TLS packets fit the path', ()
   expect(W.__clientText(conf('MTU = 900'))).toContain('MTU = 900');
   expect(W.__clientText(conf())).toContain('MTU = 1200');
   expect(W.__clientText(conf('MTU = 1280\nListenPort = 51820'))).not.toContain('ListenPort');
+  // S4 junk is added to every AmneziaWG transport packet, so the inner MTU has to leave room for it.
+  expect(W.__clientText(conf(AMNEZIA))).toContain('MTU = 1120'); // min(1420, 1200 - S4 80)
+  expect(W.wireguardStatus().configs[0].mtuUsed).toBe(1200);
+});
+test('a config without DNS gets a tunnel resolver in the client copy so DNS cannot leak to the host', () => {
+  const noDns = conf().replace(/^DNS = .*\r?\n/m, '');
+  expect(W.parseConfig(noDns).dns).toEqual([]);
+  const out = W.__clientText(noDns);
+  expect(out).toContain('DNS = 1.1.1.1, 9.9.9.9');
+  settings.wireguard = { ...W.wireguardConfig(), configs: [{ id: 'wg-nodns', name: 'no-dns', config: noDns, enabled: true, addedAt: Date.now() }] };
+  const row = W.wireguardStatus().configs[0];
+  expect(row.dns).toEqual([]);
+  expect(row.dnsUsed).toEqual(['1.1.1.1', '9.9.9.9']);
+});
+test('the parser accepts the forms go-ini accepts: spaced sections, colons, quotes, hex numbers and inline comments', () => {
+  const text = `[ Interface ]
+PrivateKey: "${pair.privateKey}"
+Address = 10.7.0.2/32
+DNS = 1.1.1.1#comment
+Jc = 0x10
+
+[Peer]
+PublicKey = ${pair.publicKey}
+Endpoint = vpn.example.com:51820#comment
+AllowedIPs = 0.0.0.0/0
+`;
+  expect(W.parseConfig(text)).toMatchObject({ mtu: 1420, endpoint: 'vpn.example.com:51820', amnezia: true, amneziaFields: ['Jc 0x10'] });
+  expect(W.__clientText(text)).toContain('MTU = 1200'); // the spaced [ Interface ] header is still edited
+});
+test('a restored config id cannot become a path outside the WireGuard state folder', () => {
+  const before = W.wireguardConfig().configs.length;
+  settings.wireguard = { ...W.wireguardConfig(), configs: [
+    { id: '../../../etc', name: 'bad', config: conf(), enabled: true, addedAt: Date.now() },
+    { id: 'wg-safe01', name: 'good', config: conf(), enabled: true, addedAt: Date.now() },
+  ] } as any;
+  const c = W.wireguardConfig();
+  expect(c.configs.map(x => x.id)).toEqual(['wg-safe01']);
+  expect(c.configs.length).toBeLessThan(before + 2);
+  settings.wireguard = { ...c, configs: entries() } as any;
 });
 test('import adds every file, always suffixing duplicates, and reports each file it could not use', async () => {
   W.__instances.clear(); settings.wireguard = { ...W.wireguardConfig(), configs: [] };

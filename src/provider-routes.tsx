@@ -11,8 +11,11 @@ const takesRelay=(p:Provider)=>p.kind==='free'||p.kind==='kilo';
 const names=(ids:string[],routes:Route[])=>ids.map(id=>routes.find(r=>r.id===id)?.name||'a deleted route');
 
 // A relay marked `only` (the Cloudflare Worker) is refused by OpenCode, so it does not carry OpenCode providers.
-export const ZAI_EXITS='Z.ai keeps one steady address, so it can use Direct or a proxy of your own, not a relay, the proxy pool or WARP.';
-export const steadyExit=(r:Route)=>r.kind==='direct'||(r.kind==='proxy'&&r.id!=='proxy-pool'&&r.id!=='psiphon'&&r.id!=='surfshark'&&!r.poolUrls?.length);
+export const ZAI_EXITS='Z.ai keeps one steady address, so it can use Direct or a proxy of your own, not a relay, the proxy pool or a managed exit such as WARP, Psiphon, Surfshark or WireGuard.';
+// Keep this in step with steadyExit in backend/transport.ts: every exit group (including WireGuard) changes address and is refused there,
+// so offering it here would let the user choose a route every Z.ai request then fails with a 503.
+const MANAGED_EXITS=new Set(['proxy-pool','psiphon','surfshark','wireguard']);
+export const steadyExit=(r:Route)=>r.kind==='direct'||(r.kind==='proxy'&&!MANAGED_EXITS.has(r.id)&&!r.poolUrls?.length);
 export const routeRefusal=(p:Provider,r:Route)=>p.kind==='zai'?(steadyExit(r)?'':ZAI_EXITS):r.only&&r.only!==p.kind&&!(r.only==='kilo'&&p.kind==='openai')?'This relay cannot carry OpenCode':'';
 
 // The line under a provider on the Providers page.
@@ -36,7 +39,7 @@ export function usedByText(r:Route,data:Snapshot){
 // Z.ai's route: one exit from a short list, so a dropdown says all of it.
 export function ZaiRoutePick({p,data,act}:{p:Provider;data:Snapshot;act:Function}){
   const choices=data.settings.routes.filter(r=>steadyExit(r));const now=routesOf(p)?.ids[0]||'direct';
-  return <div className="provider-route zai-route"><span>Route:</span><Select aria-label="Route for Z.ai" value={now} onChange={v=>act('provider','/admin/providers',{...p,routes:v==='direct'?null:{ids:[v]}},v==='direct'?'Z.ai now uses Direct':'Z.ai now uses that proxy')}>{choices.map(r=><option key={r.id} value={r.id}>{r.name}{r.enabled?'':' (off)'}</option>)}</Select><small className="muted">{choices.length>1?'A proxy sees your Z.ai token and prompts.':'Add a proxy of your own on Routing to choose it here.'} Relays, the proxy pool and WARP change address, so they are not offered.</small></div>;
+  return <div className="provider-route zai-route"><span>Route:</span><Select aria-label="Route for Z.ai" value={now} onChange={v=>act('provider','/admin/providers',{...p,routes:v==='direct'?null:{ids:[v]}},v==='direct'?'Z.ai now uses Direct':'Z.ai now uses that proxy')}>{choices.map(r=><option key={r.id} value={r.id}>{r.name}{r.enabled?'':' (off)'}</option>)}</Select><small className="muted">{choices.length>1?'A proxy sees your Z.ai token and prompts.':'Add a proxy of your own on Routing to choose it here.'} Managed exits such as WARP, Psiphon, Surfshark and WireGuard change address, so they are not offered.</small></div>;
 }
 
 export function ProviderRoutesDialog({provider:p,data,onClose,onSave}:{provider:Provider;data:Snapshot;onClose:()=>void;onSave:(routes:ProviderRoutes|null)=>Promise<boolean>}){

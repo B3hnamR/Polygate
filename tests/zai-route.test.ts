@@ -16,6 +16,23 @@ test('only an exit with one steady address counts: Direct or a proxy of your own
   setUp(); const yes = settings.routes.filter(steadyExit).map(r => r.id);
   expect(yes).toEqual(['direct', 'mine']);
   expect(steadyExit(route('list', 'proxy', { poolUrls: ['http://127.0.0.1:1'] }))).toBe(false);
+  expect(steadyExit(route('wireguard', 'proxy', { url: 'wireguard://local' }))).toBe(false);
+  expect(steadyExit(route('psiphon', 'proxy'))).toBe(false);
+  expect(steadyExit(route('surfshark', 'proxy'))).toBe(false);
+});
+
+test('the Z.ai route picker never offers an exit the backend would refuse', async () => {
+  // provider-routes imports the dashboard api module, which reads the browser URL at load time.
+  const g = globalThis as any; const saved = { location: g.location, sessionStorage: g.sessionStorage, history: g.history };
+  g.location = { hash: '', pathname: '/', search: '', href: 'http://localhost/' };
+  g.sessionStorage = { removeItem() {} }; g.history = { replaceState() {} };
+  const { steadyExit: clientSteadyExit, ZAI_EXITS } = await import('../src/provider-routes');
+  g.location = saved.location; g.sessionStorage = saved.sessionStorage; g.history = saved.history;
+  for (const id of ['wireguard', 'psiphon', 'surfshark', 'proxy-pool', 'warp'])
+    expect(clientSteadyExit(route(id, id === 'warp' ? 'warp' : 'proxy'))).toBe(false);
+  expect(clientSteadyExit(route('mine', 'proxy'))).toBe(true);
+  expect(clientSteadyExit(route('direct', 'direct'))).toBe(true);
+  expect(ZAI_EXITS).toContain('WireGuard');
 });
 
 test('without a choice Z.ai uses Direct; with one it uses that proxy and nothing else', () => {
