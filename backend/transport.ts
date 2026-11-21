@@ -386,6 +386,14 @@ export async function relayPlatformOff(r:Response,name:string):Promise<{message:
       :`Vercel has switched off this relay's deployment (${name}, ${code}). This usually means the Vercel account went over its free usage this month, or the project was paused or blocked; see the project on vercel.com. Deploy the relay on another account or platform, or wait for the usage to reset. Requests use the other routes meanwhile.`};}
   if(/error code:?\s*1027\b/i.test(text))return {until:nextUtcMidnight(),message:`Cloudflare has stopped this relay Worker for today (${name}, error 1027): the free plan's daily request limit is used up. It works again after 00:00 UTC. Requests use the other routes meanwhile.`};
   if(/(paused|suspended)[^.]{0,80}usage limit|usage limit[^.]{0,80}(paused|suspended)/i.test(text)&&/netlify/i.test(text+(r.headers.get('server')||'')))return {until:now()+6*3600000,message:`Netlify has paused this relay site (${name}): the account reached its usage limits. See the site on netlify.com, or deploy the relay on another platform. Requests use the other routes meanwhile.`};
+  // Deployment Protection in front of the relay: an API request gets this structured 401 (a browser gets a login redirect instead), so
+  // the relay never runs. No instance or address of it helps until the project is unprotected, and this is not the provider refusing the exit.
+  if(r.status===401){
+    let protectedDeployment=false;
+    try{const body=JSON.parse(text);const code=body?.error?.code;protectedDeployment=body?.error?.message==='Protected deployment'&&(code===401||code==='401');}
+    catch{protectedDeployment=/<title>\s*Authentication Required\s*<\/title>/i.test(text)&&/vercel\.com\/sso-api/i.test(text);}
+    if(protectedDeployment)return {until:now()+6*3600000,message:`Vercel is keeping this relay's deployment behind Deployment Protection (${name}): Vercel answers its callers with a login page or a 401 instead of running the relay, so nothing reaches the provider. Turn off Deployment Protection for the project on vercel.com, or deploy the relay on a project without it. Requests use the other routes meanwhile.`};
+  }
   return undefined;
 }
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}

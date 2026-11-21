@@ -222,6 +222,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(final)break;
           if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}
         }catch(e){
+          // A relay its platform switched off stays off for hours (route_unavailable carries the rest time). Retrying it or stopping
+          // because the retry budget is spent would end the session for a route problem: move straight to another exit, as when one is used up.
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&(e as any).restUntil&&settings.failover!==false&&switches<maxSwitches()&&!controller.signal.aborted){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;keepRoute=true;r=alt;route=r.name;attempts++;continue;}}
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&!controller.signal.aborted){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;continue;}}
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;upstream=undefined;break;}
