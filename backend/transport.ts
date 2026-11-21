@@ -11,7 +11,7 @@ import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanSta
 import { exitGroupOf, exitGroups, exitOfVirtual, scopeOfUrl, scopeOfKind, type ExitGroup } from './exit-group';
 // Loaded here so their exit groups are registered before the first request (backend/exit-group.ts).
 import './psiphon';
-import { clearSurfsharkKiloLimit } from './surfshark';
+import './surfshark';
 import './wireguard';
 import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, noteInconclusive, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
@@ -501,6 +501,15 @@ async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
     moved=undefined;
     try{
       const response=await fetch(url,{...init,proxy:await socksBridge({host:'127.0.0.1',port:pick.port})});
+      // The local bridge marks its own 502/504: the tunnel could not carry the request, so this exit failed. A provider's own 502 passes
+      // through untouched and is delivered as its answer.
+      if((response.status===502||response.status===504)&&response.headers.get('x-polygate-tunnel-error')==='1'){
+        await response.body?.cancel().catch(()=>{});
+        g.failed(pick.region);
+        last=new GatewayError(`The ${g.label} ${g.unit} ${pick.region} could not carry the request.`,502,'route_unreachable');
+        moved={from:pick.region,why:'its tunnel did not pass the request'};
+        continue;
+      }
       if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(g.id+':'+pick.region,false,response,seen,rid);
         if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
         if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&g.skips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
@@ -511,7 +520,8 @@ async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
     }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
   }
   const r=giveUp();if(r)return r;
-  throw last;
+  if(last)throw new GatewayError(`Could not reach the provider through any ${g.label} ${g.unit}: ${redactError(String((last as any)?.message||last)).slice(0,240)}`,502,'route_unreachable');
+  throw new GatewayError(g.unavailable(scope),503,'route_unavailable');
 }
 const isReadOnly=(init:any)=>['GET','HEAD'].includes(String(init?.method||'GET').toUpperCase());
 // Keep gateway failover semantics without treating a provider's allowance as a broken connection.
@@ -679,7 +689,7 @@ async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<Rou
       if(scope==='opencode'&&t.chat==='used-up')g.spent(region,t.until||nextResetAt());
       else if(scope==='opencode'&&t.chat==='ok')g.clean(region);
       else if(kilo&&t.chat==='limited')g.kiloLimited(region,now()+30*60000);
-      else if(kilo&&t.chat==='ok'&&g.id==='surfshark')clearSurfsharkKiloLimit(exitIp);
+      else if(kilo&&t.chat==='ok')g.clearKilo?.(region,exitIp);
       return {region,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
     catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
   }));

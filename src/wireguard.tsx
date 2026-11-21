@@ -1,7 +1,7 @@
 import {useRef,useState} from 'react';
 import {AlertCircle,Check,ClipboardPaste,FileUp,FlaskConical,Info,Loader2,Pencil,Power,Route as RouteIcon,ShieldCheck,Trash2,X} from 'lucide-react';
-import {api} from './api';
-import {Badge,Button,Field,Select,Toggle,usePoll} from './ui';
+import {api,isCancelled} from './api';
+import {Badge,Button,Field,Select,Toggle,usePoll,useCancel} from './ui';
 import {useConfirm} from './confirm';
 import {Dialog} from './mcp';
 import type {Notice} from './panels';
@@ -9,7 +9,7 @@ import type {Notice} from './panels';
 // The WireGuard route (backend/wireguard.ts): every imported .conf file is a WireGuard or AmneziaWG tunnel of its own, run by the bundled
 // wireproxy-awg, and together they are one route that takes turns or stays on one config, with the same options as Psiphon and Surfshark.
 type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];dnsUsed:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
-  state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;since:number;usedUpUntil:number;kiloUntil:number;error:string};
+  state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;location:string;since:number;usedUpUntil:number;kiloUntil:number;error:string};
 type WireguardInfo={installed:boolean;problem:string;platform:string;busy:string;lastError:string;running:boolean;live:number;
   config:{enabled:boolean;autoStart:boolean;mode:'spread'|'single';pinned:string;skip:boolean};
   configs:Config[];spent:number;route:{exists:boolean;enabled:boolean;inUse:boolean}};
@@ -23,7 +23,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   const [busy,setBusy]=useState('');const [dropping,setDropping]=useState(false);const [pasting,setPasting]=useState(false);
   const [pasteName,setPasteName]=useState('');const [pasteText,setPasteText]=useState('');const [report,setReport]=useState<ImportResult|null>(null);
   const [editing,setEditing]=useState<{id:string;name:string;text:string}|null>(null);
-  const picker=useRef<HTMLInputElement>(null);const {confirm,dialog}=useConfirm();
+  const picker=useRef<HTMLInputElement>(null);const {confirm,dialog}=useConfirm();const {start,cancel}=useCancel(false);
   async function run(name:string,path:string,body:unknown={},done=''){
     setBusy(name);
     try{const r:any=await api(path,body);if(done)notice(done);await reload();onChanged();return r;}
@@ -32,8 +32,8 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   }
   async function sendImport(files:{name:string;text:string}[]){
     setBusy('import');setReport(null);
-    try{const r=await api('/admin/wireguard/import',{files}) as ImportResult;setReport(r);notice(r.summary,r.added.length?'ok':'error');await reload();onChanged();return r.added.length>0;}
-    catch(e){notice(String((e as Error)?.message||e),'error');return false;}
+    try{const r=await api('/admin/wireguard/import',{files},start()) as ImportResult;setReport(r);notice(r.summary,r.added.length?'ok':'error');await reload();onChanged();return r.added.length>0;}
+    catch(e){if(isCancelled(e)){notice('Import cancelled','ok');return false;}notice(String((e as Error)?.message||e),'error');return false;}
     finally{setBusy('');}
   }
   async function importFiles(list:File[]){
@@ -56,8 +56,8 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   async function saveEdit(){
     if(!editing)return;
     setBusy('save');
-    try{await api('/admin/wireguard/config',{id:editing.id,name:editing.name,text:editing.text});notice(`${editing.name.trim()||'WireGuard config'} saved`);setEditing(null);await reload();onChanged();}
-    catch(e){notice(String((e as Error)?.message||e),'error');}
+    try{await api('/admin/wireguard/config',{id:editing.id,name:editing.name,text:editing.text},start());notice(`${editing.name.trim()||'WireGuard config'} saved`);setEditing(null);await reload();onChanged();}
+    catch(e){if(isCancelled(e)){notice('Save cancelled','ok');return;}notice(String((e as Error)?.message||e),'error');}
     finally{setBusy('');}
   }
   async function remove(c:Config){
@@ -84,6 +84,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
       <div className="token-row">
         <Button disabled={working} onClick={()=>picker.current?.click()}>{busy==='import'?<Loader2 size={15} className="spin"/>:<FileUp size={15}/>}Choose files</Button>
         <Button disabled={working} onClick={()=>setPasting(!pasting)}>{pasting?<X size={15}/>:<ClipboardPaste size={15}/>}{pasting?'Cancel paste':'Paste a config'}</Button>
+        {busy==='import'&&<Button onClick={cancel}><X size={15}/>Cancel import</Button>}
       </div>
       <input ref={picker} hidden type="file" multiple accept=".conf" aria-label="Choose WireGuard .conf files" onChange={e=>{void importFiles(Array.from(e.target.files||[]));e.target.value='';}}/>
     </div>
@@ -104,7 +105,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
     <div className="button-row">
       <Button variant="primary" disabled={working||!s.installed||!c.enabled||!enabled.length||(s.running&&!down)} onClick={()=>void connect()}>{busy==='connect'?<Loader2 size={15} className="spin"/>:<Power size={15}/>}{connectLabel}</Button>
       <Button disabled={working||!s.running} onClick={()=>run('disconnect','/admin/wireguard/disconnect',{},'WireGuard disconnected')}>Disconnect</Button>
-      {s.route.exists&&s.route.enabled&&!s.route.inUse&&<Button disabled={working} onClick={()=>run('use','/admin/settings',{routeId:'wireguard'},'WireGuard is now the route in use')}><RouteIcon size={15}/>Make it the route in use</Button>}
+      {s.route.exists&&s.route.enabled&&!s.route.inUse&&<Button disabled={working} onClick={()=>run('use','/admin/settings',{routeId:'wireguard',rotate:false},'WireGuard is now the route in use')}><RouteIcon size={15}/>Make it the route in use</Button>}
       {s.route.inUse&&<span className="psi-inuse"><RouteIcon size={15}/>Route in use</span>}
     </div>
     {s.lastError&&!working&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.lastError}</span></div>}
@@ -113,7 +114,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
       const [t,l]=cfg.state!=='ready'?stateLabel[cfg.state]:cfg.usedUpUntil?['cooldown',`Used up until ${utc(cfg.usedUpUntil)}`]:stateLabel[cfg.state];
       return <div key={cfg.id} className={`psi-row${pinned?' pinned':''}`}>
         <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''} · DNS {cfg.dnsUsed.join(', ')}{!cfg.dns.length?' (added; the file has none)':''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
-        <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.error||(cfg.state==='ready'&&!cfg.exitIp?'Connected; the exit address appears after the first request':cfg.state==='starting'?'Connecting through WireGuard…':cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
+        <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.location?`${cfg.location} · `:''}{cfg.error||(cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:cfg.state==='starting'?'Connecting through WireGuard…':'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
         <Badge state={t}>{l}</Badge>
         <div className="psi-actions">
           {c.mode==='single'&&!pinned&&<Button disabled={working||!cfg.enabled||cfg.state!=='ready'} onClick={()=>run('pin-'+cfg.id,'/admin/wireguard/settings',{pinned:cfg.id},`WireGuard stays on ${cfg.name}`)}>Stay on this</Button>}
@@ -138,7 +139,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
     </>}
     <p className="muted fine-print"><Info size={14}/> Runs your own configs with wireproxy-awg 1.0.18 (ISC licence), which supports plain WireGuard and AmneziaWG 1.0–3.1 ({s.platform}). Imported files are kept in the encrypted settings, are part of your backup, and are written to a temporary file only while a config starts. Polygate is not affiliated with the networks these files connect to.{s.spent?` ${s.spent} exit${s.spent>1?'s are':' is'} marked used up today.`:''}</p>
 
-    {editing&&<Dialog title="Edit WireGuard config" icon={<ShieldCheck size={18}/>} onClose={()=>setEditing(null)} busy={busy==='save'} wide>
+    {editing&&<Dialog title="Edit WireGuard config" icon={<ShieldCheck size={18}/>} onClose={()=>{cancel();setEditing(null);}} busy={busy==='save'} wide>
       <form className="dialog-form" autoComplete="off" onSubmit={e=>{e.preventDefault();if(busy!=='save'&&editing.name.trim()&&editing.text.trim())void saveEdit();}}>
         <Field label="Name"><input value={editing.name} onChange={e=>setEditing({...editing,name:e.target.value})} maxLength={60} autoFocus/></Field>
         <Field label="Configuration" hint="Checked with the bundled client before it is saved. A running config reconnects with the new file."><textarea className="mono" rows={16} value={editing.text} onChange={e=>setEditing({...editing,text:e.target.value})} spellCheck={false}/></Field>

@@ -35,6 +35,8 @@ export type ExitGroup = {
   spent(region: string, until: number): void;
   kiloLimited(region: string, until: number): void;
   clean(region: string): void;
+  // A passing Kilo check clears the address's Kilo mark, for groups that keep one (WireGuard, Surfshark).
+  clearKilo?(region: string, exitIp: string): void;
   failed(region: string): void;
   ok(region: string): void;
   skips(): boolean;

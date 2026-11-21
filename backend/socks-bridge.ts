@@ -87,7 +87,8 @@ function ipv6Bytes(address: string) {
 }
 function handle(client: net.Socket, up: SocksUpstream) {
   client.setNoDelay(true); let head = Buffer.alloc(0);
-  const refuse = (status: string) => { try { client.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch { client.destroy(); } };
+  // The marker tells a provider's own 502 apart from one this bridge invented because the tunnel could not carry the request.
+  const refuse = (status: string, tunnel = false) => { try { client.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n${tunnel ? 'x-polygate-tunnel-error: 1\r\n' : ''}\r\n`); } catch { client.destroy(); } };
   const onData = async (chunk: Buffer) => {
     head = Buffer.concat([head, chunk]); const end = head.indexOf('\r\n\r\n');
     if (end < 0) { if (head.length > HEADER_LIMIT) { client.off('data', onData); refuse('431 Request Header Fields Too Large'); } return; }
@@ -109,7 +110,7 @@ function handle(client: net.Socket, up: SocksUpstream) {
       // One request per connection: a kept-alive client connection could otherwise send its next request (to another host) down this tunnel.
       const headers = [...lines.slice(1).filter(l => !/^(proxy-|connection:|keep-alive:)/i.test(l)), 'Connection: close'];
       upstream.write(Buffer.concat([Buffer.from(`${method} ${url.pathname}${url.search} ${version}\r\n${headers.join('\r\n')}\r\n\r\n`, 'latin1'), rest])); link(client, upstream);
-    } catch { refuse('502 Bad Gateway'); }
+    } catch { refuse('502 Bad Gateway', true); }
   };
   client.on('data', onData); client.on('error', () => client.destroy());
 }

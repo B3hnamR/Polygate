@@ -66,8 +66,10 @@ const IDS = ['wg-home', 'wg-work', 'wg-travel'] as const;
 const targets = Object.fromEntries(IDS.map(id => [id, target(id)])) as Record<string, ReturnType<typeof target>>;
 const socks: Record<string, { port: number; close: () => void }> = {}; for (const id of IDS) socks[id] = await socksTo(targets[id].port as number);
 const exits: Record<string, string> = { 'wg-home': '198.51.100.21', 'wg-work': '198.51.100.22', 'wg-travel': '198.51.100.23' };
-const instance = (id: string, state = 'ready') => ({ id, name: id, port: socks[id].port, state, exitIp: exits[id], location: '', startedAt: Date.now(), readyAt: Date.now(), failures: 0, restarts: 0, error: '', output: '', handshake: true }) as any;
+const instance = (id: string, state = 'ready') => ({ id, name: id, port: socks[id].port, state, exitIp: exits[id], location: '', startedAt: Date.now(), readyAt: Date.now(), failures: 0, restarts: 0, opened: 0, cooldownUntil: 0, lastTraffic: 0, probedAt: 0, error: '', output: '', handshake: true }) as any;
 const entries = () => IDS.map(id => ({ id, name: id, config: conf(), enabled: true, addedAt: Date.now() }));
+// A port nothing listens on: the local bridge answers its own marked 502 instead of carrying the request.
+const closedPort = async () => { const s = net.createServer(); await new Promise<void>(r => s.listen(0, '127.0.0.1', () => r())); const port = (s.address() as any).port; await new Promise<void>(r => s.close(() => r())); return port; };
 afterAll(() => { for (const s of Object.values(socks)) s.close(); for (const s of Object.values(targets)) s.stop(true); W.__instances.clear(); __exitTest.scope = ''; __setExitVerifier(); __setPsiphonRegionTester(); restore(); });
 beforeEach(() => {
   hits = {}; for (const id of IDS) answers[id] = 'ok'; answers['wg-home'] = 'opencode-used-up';
@@ -242,11 +244,11 @@ test('import adds every file, always suffixing duplicates, and reports each file
   await expect(W.wireguardImport('nope' as any)).rejects.toThrow('Choose one or more');
 });
 test('imported keys are redacted from any error that quotes the file', () => {
-  const k1 = keyPair(); const k2 = keyPair(); const k3 = keyPair();
+  const k1 = keyPair(); const k2 = keyPair(); const k3 = keyPair(); const k4 = keyPair(); const k5 = keyPair();
   settings.wireguard = { ...W.wireguardConfig(), configs: [{ id: 'wg-x', name: 'x', enabled: true, addedAt: 1,
-    config: conf().replace(/^PrivateKey.*$/m, 'PrivateKey = ' + k1.privateKey) + `PresharedKey = ${k2.privateKey} ; backup key\nHeaderProtectionKey = ${k3.privateKey} # header key\n` }] };
-  const text = redactError(`a ${k1.privateKey} b ${k2.privateKey} c ${k3.privateKey}`);
-  expect(text).toBe('a [redacted] b [redacted] c [redacted]');
+    config: conf().replace(/^PrivateKey.*$/m, 'PrivateKey = ' + k1.privateKey) + `PresharedKey = ${k2.privateKey} ; backup key\nHeaderProtectionKey = ${k3.privateKey} # header key\nPrivateKey: "${k4.privateKey}"\nPresharedKey: '${k5.privateKey}'\n` }] };
+  const text = redactError(`a ${k1.privateKey} b ${k2.privateKey} c ${k3.privateKey} d ${k4.privateKey} e ${k5.privateKey}`);
+  expect(text).toBe('a [redacted] b [redacted] c [redacted] d [redacted] e [redacted]');
 });
 test('requests take turns over the configs; a used-up exit is skipped for OpenCode only, and the request moves on and answers', async () => {
   const seen: number[] = []; for (let i = 0; i < 3; i++) { const r = await post(); seen.push(r.status); await r.text(); }
@@ -273,11 +275,11 @@ test('staying on one config never uses another; each config can be reached on it
   expect(findRoute('wireguard:wg-travel')!.url).toBe(`socks5://127.0.0.1:${socks['wg-travel'].port}`);
   expect(findRoute('wireguard:wg-nowhere')).toBeUndefined();
 });
-test('the route group names a config by its name, and still finds it by id', () => {
+test('the route group names a config by its id, and still finds it by name', () => {
   W.__instances.get('wg-work')!.name = 'Work';
   settings.wireguard = { ...settings.wireguard!, mode: 'single', pinned: 'wg-work', skip: false };
-  expect(W.pickWireguard(new Set(), 'opencode')!.region).toBe('Work');
-  expect(W.pickWireguard(new Set(['Work']), 'opencode')).toBeNull();
+  expect(W.pickWireguard(new Set(), 'opencode')!.region).toBe('wg-work');
+  expect(W.pickWireguard(new Set(['wg-work']), 'opencode')).toBeNull();
   expect(findRoute('wireguard:Work')!.url).toBe(`socks5://127.0.0.1:${socks['wg-work'].port}`);
   expect(findRoute('wireguard:wg-work')!.url).toBe(`socks5://127.0.0.1:${socks['wg-work'].port}`);
 });
@@ -324,6 +326,96 @@ test('turning WireGuard off stops every client and takes the route out of use', 
   expect(st.running).toBe(false);
   expect(st.route.enabled).toBe(false);
   expect(settings.routeId).not.toBe('wireguard');
+});
+test('an explicit stop hands requests back to the previous route and remembers the choice', async () => {
+  const saved = { routes: settings.routes, routeId: settings.routeId, previousRouteId: settings.previousRouteId, managedChoice: settings.managedChoice };
+  try {
+    settings.routes = [
+      { id: 'direct', name: 'Direct', kind: 'direct', url: '', enabled: true, models: [] },
+      { id: 'wireguard', name: 'WireGuard', kind: 'proxy', url: 'wireguard://local', enabled: true, models: [], managed: true },
+    ];
+    settings.routeId = 'wireguard'; settings.previousRouteId = 'direct'; delete settings.managedChoice;
+    await W.wireguardDisconnect();
+    expect(settings.routeId).toBe('direct');
+    expect((settings as any).managedChoice).toBe('wireguard');
+    // The remembered choice puts WireGuard back in use when it connects again.
+    W.__instances.set('wg-home', instance('wg-home'));
+    W.reconcileWireguard();
+    expect(settings.routeId).toBe('wireguard');
+    expect((settings as any).managedChoice).toBeUndefined();
+  } finally { Object.assign(settings, saved); }
+});
+test('with no other route on, stopping WireGuard leaves the selection on it and requests fail closed', async () => {
+  const saved = { routes: settings.routes, routeId: settings.routeId, managedChoice: settings.managedChoice };
+  try {
+    settings.routes = [
+      { id: 'direct', name: 'Direct', kind: 'direct', url: '', enabled: false, models: [] },
+      { id: 'wireguard', name: 'WireGuard', kind: 'proxy', url: 'wireguard://local', enabled: true, models: [], managed: true },
+    ];
+    settings.routeId = 'wireguard'; delete settings.managedChoice;
+    W.__instances.clear();
+    await W.setWireguardSettings({ enabled: false });
+    expect(settings.routeId).toBe('wireguard');
+    expect(W.wireguardStatus().route.enabled).toBe(false);
+    await expect(post()).rejects.toThrow('Network route is disabled or missing');
+  } finally { Object.assign(settings, saved); }
+});
+test('a tunnel that cannot carry the request is marked by the local bridge, and the request moves to another config', async () => {
+  W.__instances.get('wg-home')!.port = await closedPort();
+  const r = await post(); expect(r.status).toBe(200); await r.text();
+  expect(hits['wg-home']).toBeUndefined();
+  expect(W.__instances.get('wg-home')!.failures).toBe(1);
+});
+test('when no tunnel carries the request, it fails as a route error that names WireGuard', async () => {
+  for (const id of IDS) W.__instances.get(id)!.port = await closedPort();
+  await expect(post()).rejects.toMatchObject({ status: 502, type: 'route_unreachable', message: expect.stringContaining('could not carry the request') });
+});
+test('a config paused after repeated failures is not picked until its wait ends', () => {
+  const home = W.__instances.get('wg-home')!;
+  home.cooldownUntil = Date.now() + 60000;
+  for (let i = 0; i < 6; i++) expect(W.pickWireguard(new Set(), 'other')!.region).not.toBe('wg-home');
+  home.cooldownUntil = 0;
+  expect(Array.from({ length: 6 }, () => W.pickWireguard(new Set(), 'other')!.region)).toContain('wg-home');
+});
+test('three failures in a row pause the config out of turn', () => {
+  const saved = { allowDirect: settings.allowDirect, failover: settings.failover };
+  try {
+    settings.allowDirect = true; settings.failover = true;
+    for (const id of ['wg-work', 'wg-travel']) W.__instances.get(id)!.state = 'failed';
+    const home = W.__instances.get('wg-home')!;
+    W.wireguardFailed('wg-home'); W.wireguardFailed('wg-home');
+    expect(home.state).toBe('ready');
+    W.wireguardFailed('wg-home');
+    expect(home.state).toBe('failed');
+    expect(home.cooldownUntil).toBeGreaterThan(Date.now());
+    expect(W.wireguardLive()).toBe(0);
+  } finally { Object.assign(settings, saved); }
+});
+test('a used-up mark written before the exit address was known still skips that config', async () => {
+  const home = W.__instances.get('wg-home')!; home.exitIp = '';
+  settings.wireguard = { ...W.wireguardConfig(), spent: { 'id:wg-home': Date.now() + 3600e3 } };
+  for (let i = 0; i < 6; i++) expect(W.pickWireguard(new Set(), 'opencode')!.region).not.toBe('wg-home');
+  const r = await post(); expect(r.status).toBe(200); await r.text();
+  expect(hits['wg-home']).toBeUndefined();
+});
+test("a passing Kilo check clears WireGuard's mark for the address", () => {
+  const g = exitGroups().find(x => x.id === 'wireguard')!;
+  g.kiloLimited('wg-home', Date.now() + 3600e3);
+  expect(W.kiloUntil(exits['wg-home'])).toBeGreaterThan(0);
+  g.clearKilo!('wg-home', exits['wg-home']);
+  expect(W.kiloUntil(exits['wg-home'])).toBe(0);
+});
+test('a config name never equals another config id', async () => {
+  W.__instances.clear();
+  settings.wireguard = { ...W.wireguardConfig(), configs: W.wireguardConfig().configs.map(x => ({ ...x, name: x.name.replace('wg-', '') })) };
+  const r = await W.wireguardImport([{ name: 'wg-work.conf', text: conf() }]);
+  expect(r.added[0].name).toBe('wg-work-2');
+  expect(r.added[0].renamedFrom).toBe('wg-work');
+  expect(W.wireguardConfig().configs.find(x => x.id === r.added[0].id)!.name).toBe('wg-work-2');
+});
+test('a config that is still starting reports what the client last said', () => {
+  const home = W.__instances.get('wg-home')!; home.state = 'starting'; home.output = 'The handshake did not complete';
+  expect(W.wireguardStatus().configs.find(x => x.id === 'wg-home')!.error).toContain('The handshake did not complete');
 });
 test('a restored setting is cleaned before use: unknown entries, duplicate ids, repeated names, modes and pins are dropped or defaulted', () => {
   settings.wireguard = { configs: [

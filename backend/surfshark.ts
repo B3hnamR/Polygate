@@ -412,7 +412,7 @@ export async function stopSurfshark() { if (monitor) clearInterval(monitor); mon
 // Surfshark is one exit group: the route machinery (backend/transport.ts) reaches it through these.
 registerExitGroup({ id: ROUTE_ID, label: 'Surfshark', unit: 'location', source: 'surfshark', pick: pickSurfshark, ready: surfsharkReady, live: surfsharkLive, unavailable: surfsharkUnavailable,
   virtualRoute: surfsharkVirtualRoute, regionsReady: surfsharkRegionsReady, spent: surfsharkSpent, kiloLimited: surfsharkKiloLimited, clean: surfsharkClean,
-  failed: surfsharkFailed, ok: surfsharkOk, skips: surfsharkSkips, setChecker: setSurfsharkChecker });
+  clearKilo: (_region, exitIp) => clearSurfsharkKiloLimit(exitIp), failed: surfsharkFailed, ok: surfsharkOk, skips: surfsharkSkips, setChecker: setSurfsharkChecker });
 export const __instances = instances;
 export const __parseServers = parseServers;
 export const __configText = configText;
