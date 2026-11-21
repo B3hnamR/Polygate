@@ -14,6 +14,7 @@ import { serverConfig, hostAllowed, clientIp, isHttps, loginGate, ensureAdminPas
 import { startWarp, stopWarp } from './warp';
 import { startPsiphon, stopPsiphon } from './psiphon';
 import { startSurfshark, stopSurfshark } from './surfshark';
+import { startWireguard, stopWireguard } from './wireguard';
 import { startNotifier } from './notifications';
 import { startPoolMaintenance } from './pool';
 import { startExitRecheck } from './transport';
@@ -136,11 +137,12 @@ export async function startGateway(port=Number(process.env.POLYGATE_PORT||4317),
     }
     const old=server;server=next;actual=next.port as number;current={...o,port:actual};setEngineGateway(`http://127.0.0.1:${actual}`);old.stop();return actual;
   };
-  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();stopAgent();await Promise.all([stopWarp(),stopPsiphon(),stopSurfshark(),stopEngine()]);};
+  const close=async()=>{logEvent('info','gateway','Polygate is stopping');stopMcp();flushKeys();server.stop(true);stopHttps();stopBridge();closeSocksBridges();stopAgent();await Promise.all([stopWarp(),stopPsiphon(),stopSurfshark(),stopWireguard(),stopEngine()]);};
   if(process.env.POLYGATE_NO_DISCOVERY!=='1')discover().catch(e=>console.error('[catalog]',redactError(String(e))));
   startWarp().catch(e=>console.error('[warp]',redactError(String(e))));
   startPsiphon().catch(e=>console.error('[psiphon]',redactError(String(e))));
   startSurfshark().catch(e=>console.error('[surfshark]',redactError(String(e))));
+  startWireguard().catch(e=>console.error('[wireguard]',redactError(String(e))));
   setTimeout(()=>{try{pruneOldEngines();}catch(e){console.error('[agent]',redactError(String(e)));}},5000).unref?.();
   syncMcp();
   const stopPool=startPoolMaintenance();

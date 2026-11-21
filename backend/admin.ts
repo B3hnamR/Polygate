@@ -10,6 +10,7 @@ import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit, spr
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
 import { psiphonStatus, psiphonConnect, psiphonDisconnect, psiphonUpdateNodes, renewRegion, setPsiphonSettings, reconcilePsiphon, ROUTE_ID as PSIPHON } from './psiphon';
 import { surfsharkStatus, surfsharkConnect, surfsharkDisconnect, surfsharkUpdateServers, renewSurfshark, setSurfsharkSettings, setSurfsharkKeys, clearSurfsharkKeys, reconcileSurfshark, ROUTE_ID as SURFSHARK } from './surfshark';
+import { wireguardStatus, wireguardConnect, wireguardDisconnect, renewWireguard, setWireguardSettings, wireguardImport, wireguardUpdate, wireguardToggle, wireguardRemove, wireguardConfigText, reconcileWireguard, ROUTE_ID as WIREGUARD } from './wireguard';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
@@ -123,7 +124,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
   if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
-  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();await setPsiphonSettings({}).catch(()=>{});reconcilePsiphon();await setSurfsharkSettings({}).catch(()=>{});reconcileSurfshark();return json(res,200,{ok:true,...out});}
+  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();await setPsiphonSettings({}).catch(()=>{});reconcilePsiphon();await setSurfsharkSettings({}).catch(()=>{});reconcileSurfshark();await setWireguardSettings({}).catch(()=>{});reconcileWireguard();return json(res,200,{ok:true,...out});}
   if(pathname==='/admin/usage'&&method==='GET')return json(res,200,usage(Number(new URL(req.url||'/','http://x').searchParams.get('days'))));
   if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
   if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));
@@ -145,8 +146,8 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
       // Remember where requests went, so making the pool "standby only" can give the route back.
       if(b.routeId==='proxy-pool'&&settings.routeId!=='proxy-pool')next.previousRouteId=settings.routeId;
-      // The same for Psiphon and Surfshark: when one stops, requests go back to where they went before it.
-      if((b.routeId===PSIPHON||b.routeId===SURFSHARK)&&settings.routeId!==b.routeId)next.previousRouteId=settings.routeId;}
+      // The same for Psiphon, Surfshark and WireGuard: when one stops, requests go back to where they went before it.
+      if((b.routeId===PSIPHON||b.routeId===SURFSHARK||b.routeId===WIREGUARD)&&settings.routeId!==b.routeId)next.previousRouteId=settings.routeId;}
     // Everything is validated before anything is applied, so a rejected request never half-applies.
     // Turning cooldowns off also releases models that are cooling down now, so the change takes effect immediately.
     if(next.cooldowns===false)for(const m of models.values())if(m.cooldownUntil||m.state==='cooldown'){m.cooldownUntil=0;m.failCount=0;if(m.state==='cooldown')m.state='unchecked';saveModel(m);}
@@ -236,6 +237,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     // The Psiphon route is on exactly while Psiphon runs: switching it is connecting or disconnecting Psiphon.
     if(route.id===PSIPHON){await (b.enabled?psiphonConnect():psiphonDisconnect());return json(res,200,{ok:true});}
     if(route.id===SURFSHARK){await (b.enabled?surfsharkConnect():surfsharkDisconnect());return json(res,200,{ok:true});}
+    if(route.id===WIREGUARD){await (b.enabled?wireguardConnect():wireguardDisconnect());return json(res,200,{ok:true});}
     route.enabled=b.enabled;if(b.enabled){route.cooldownUntil=0;route.failures=0;route.opened=0;}persist();return json(res,200,{ok:true});
   }
   // A route the breaker paused after failures (a dropped connection) is tried again at once instead of waiting out the pause.
@@ -244,7 +246,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     route.cooldownUntil=0;route.failures=0;route.opened=0;persist();logEvent('info','routes',`${route.name} was resumed by hand`,{route:route.id});return json(res,200,{ok:true});
   }
   // Deleting a route is refused while a provider or the main selection depends on it; the checks are shared with removing a relay from its platform.
-  const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id===PSIPHON)throw new GatewayError('The Psiphon route belongs to Psiphon. Disconnect it, or turn Psiphon off, under Routing → Psiphon.',409);if(id===SURFSHARK)throw new GatewayError('The Surfshark route belongs to Surfshark. Disconnect it, or turn Surfshark off, under Routing → Surfshark.',409);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
+  const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id===PSIPHON)throw new GatewayError('The Psiphon route belongs to Psiphon. Disconnect it, or turn Psiphon off, under Routing → Psiphon.',409);if(id===SURFSHARK)throw new GatewayError('The Surfshark route belongs to Surfshark. Disconnect it, or turn Surfshark off, under Routing → Surfshark.',409);if(id===WIREGUARD)throw new GatewayError('The WireGuard route belongs to WireGuard. Disconnect it, or turn WireGuard off, under Routing → Relays.',409);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
   const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id)};p.routeId=p.routes.ids[0]||'';}persist();};
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);assertRouteDeletable(String(b.id));deleteRoute(String(b.id));return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
@@ -325,6 +327,17 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/surfshark/update'&&method==='POST')return json(res,200,await surfsharkUpdateServers());
   if(pathname==='/admin/surfshark/renew'&&method==='POST'){const b=await readJson(req);return json(res,200,await renewSurfshark(String(b.region||'').toLowerCase()));}
   if(pathname==='/admin/surfshark/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['enabled','autoStart','regions','mode','pinned','skip','renew'])if(k in b)patch[k]=b[k];return json(res,200,await setSurfsharkSettings(patch));}
+  // --- WireGuard (backend/wireguard.ts): imported .conf files, each its own client. The file text stays in the encrypted settings and is never sent back except to its own editor ---
+  if(pathname==='/admin/wireguard/status'&&method==='GET')return json(res,200,wireguardStatus());
+  if(pathname==='/admin/wireguard/import'&&method==='POST'){const b=await readJson(req,16*1024*1024);return json(res,200,await wireguardImport(b.files));}
+  if(pathname==='/admin/wireguard/config'&&method==='POST'){const b=await readJson(req,16*1024*1024);return json(res,200,await wireguardUpdate(b));}
+  if(pathname==='/admin/wireguard/config/text'&&method==='POST'){const b=await readJson(req);return json(res,200,{text:wireguardConfigText(String(b.id||''))});}
+  if(pathname==='/admin/wireguard/config/toggle'&&method==='POST'){const b=await readJson(req);if(typeof b.enabled!=='boolean')throw new GatewayError('Expected a boolean',400);return json(res,200,await wireguardToggle(String(b.id||''),b.enabled));}
+  if(pathname==='/admin/wireguard/config/remove'&&method==='POST'){const b=await readJson(req);return json(res,200,await wireguardRemove(String(b.id||'')));}
+  if(pathname==='/admin/wireguard/connect'&&method==='POST')return json(res,200,await wireguardConnect());
+  if(pathname==='/admin/wireguard/disconnect'&&method==='POST')return json(res,200,await wireguardDisconnect());
+  if(pathname==='/admin/wireguard/renew'&&method==='POST'){const b=await readJson(req);return json(res,200,await renewWireguard(String(b.id||'')));}
+  if(pathname==='/admin/wireguard/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['enabled','autoStart','mode','pinned','skip','renew'])if(k in b)patch[k]=b[k];return json(res,200,await setWireguardSettings(patch));}
   // --- scoped client keys ---
   if(pathname==='/admin/keys'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:createKey(b)});}
   if(pathname==='/admin/keys/update'&&method==='POST'){const b=await readJson(req);return json(res,200,{ok:true,key:updateKey(String(b.id),b)});}

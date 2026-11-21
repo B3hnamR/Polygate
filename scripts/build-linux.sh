@@ -9,6 +9,7 @@ case "$ARCH" in amd64) target=x64;; arm64) target=aarch64;; *) echo 'Usage: buil
 [ "$BUN_VERSION" = 1.4.4 ] || { echo 'Retained runtime notices cover Bun 1.4.4 only; review and update them before changing Bun.' >&2; exit 1; }
 for tool in bun python3; do command -v "$tool" >/dev/null || { echo "build-linux.sh needs $tool on PATH." >&2; exit 1; }; done
 python3 scripts/fetch-wireproxy.py "linux-$ARCH"
+python3 scripts/fetch-wireproxy-awg.py "linux-$ARCH"
 mkdir -p release build
 work=$(mktemp -d "${TMPDIR:-/tmp}/polygate-package.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
@@ -67,6 +68,11 @@ mkdir -p "$pkg/surfshark"
 cp "resources/surfshark/wireproxy-linux-$ARCH" resources/surfshark/LICENSE resources/surfshark/README.md "$pkg/surfshark/"
 grep "wireproxy-linux-$ARCH\|LICENSE" resources/surfshark/sha256.txt > "$pkg/surfshark/sha256.txt"
 chmod 0755 "$pkg/surfshark/wireproxy-linux-$ARCH"
+# Imported WireGuard configs use wireproxy-awg, which also reads AmneziaWG fields (resources/wireguard/README.md).
+mkdir -p "$pkg/wireguard"
+cp "resources/wireguard/wireproxy-awg-linux-$ARCH" resources/wireguard/LICENSE resources/wireguard/README.md "$pkg/wireguard/"
+grep "wireproxy-awg-linux-$ARCH\|LICENSE" resources/wireguard/sha256.txt > "$pkg/wireguard/sha256.txt"
+chmod 0755 "$pkg/wireguard/wireproxy-awg-linux-$ARCH"
 cp install.sh package.json README.md LICENSE THIRD_PARTY_NOTICES.md "$pkg/"
 mkdir -p "$pkg/vendor/bridge" "$pkg/vendor/protocols"
 cp -R vendor/licenses "$pkg/vendor/licenses"

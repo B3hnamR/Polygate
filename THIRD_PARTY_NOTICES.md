@@ -49,6 +49,12 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
+# WireGuard Route Helper: wireproxy-awg
+
+The WireGuard route runs the user's own imported `.conf` files with **wireproxy-awg v1.0.18**, a fork of wireproxy from https://github.com/artem-russkikh/wireproxy-awg/releases/tag/v1.0.18, under the ISC license reproduced above and at `resources/wireguard/LICENSE`. This fork adds AmneziaWG 1.0–3.1 obfuscation alongside plain WireGuard; both use the same `[Interface]` and `[Peer]` sections. The helper runs as a separate process; no wireproxy-awg code is linked into Polygate. The supplied helper files are `wireproxy-awg-windows-amd64.exe`, `wireproxy-awg-linux-amd64` and `wireproxy-awg-linux-arm64`; their hashes are listed in `resources/wireguard/sha256.txt`. See `resources/wireguard/README.md` for their upstream archive provenance.
+
+No WireGuard accounts, configurations or keys are bundled: each user imports their own. Polygate is not affiliated with the networks those configurations connect to.
+
 Adding this ISC notice does not resolve other components' redistribution requirements. In particular, the Psiphon source-repository link above is not verification that complete corresponding source and build materials for the exact shipped binaries have been supplied; that remains to be established. The Bun redistribution gaps below also remain open.
 
 # Bundled Dashboard Fonts

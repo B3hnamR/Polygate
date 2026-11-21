@@ -12,6 +12,7 @@ import { exitGroupOf, exitGroups, exitOfVirtual, scopeOfUrl, scopeOfKind, type E
 // Loaded here so their exit groups are registered before the first request (backend/exit-group.ts).
 import './psiphon';
 import './surfshark';
+import './wireguard';
 import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, noteInconclusive, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
