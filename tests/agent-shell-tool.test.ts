@@ -65,3 +65,37 @@ test('A shell tool that differs anywhere else is still not taken for the real on
     expect(out.appended).toEqual(['shell']);
   }
 });
+
+// 2.3.2 moved `read`'s description into a `description:` array inside
+// `editor.add` and `shell`'s timeout behind a local `timeoutInput` helper. The
+// extractor missed both, so the profile disagreed with the client and the
+// guard rejected the model's `read` call as a placeholder with a 502.
+test('OpenCode 2.3.2 Windows tools pass unchanged with the identity extracted from its release sources', () => {
+  const fixture = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures', 'opencode-2.3.2-source.json'), 'utf8'));
+  const captured: any[] = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures', 'opencode-2.3.2-windows-tools.json'), 'utf8'));
+  const extracted = bridge.identity.extractRecipe(fixture.files);
+  bridge.identity.__setToolProfile(extracted.tools, `captured-${fixture.ref}`);
+  try {
+    const want = (name: string) => captured.find((t: any) => t.function.name === name).function;
+    expect(extracted.tools.read.description).toBe(want('read').description);
+    expect(extracted.tools.read.parameters).toEqual(want('read').parameters);
+    expect(extracted.tools.shell.parameters).toEqual(want('shell').parameters);
+
+    const out = bridge.prepareToolsWithFingerprint(captured, false, null, MODEL);
+    expect(out.appended).toEqual([]);
+    expect([...out.originalToAlias.keys()]).toEqual([]);
+    expect(out.allowedTools.get('read')).toBe('read');
+
+    const guard = bridge.__chatToolGuard(out.allowedTools);
+    const released: any = guard.feed({
+      choices: [{
+        index: 0,
+        delta: { tool_calls: [{ index: 0, id: 'call-2.3.2', type: 'function', function: { name: 'read', arguments: '{"path":"a"}' } }] },
+        finish_reason: 'tool_calls',
+      }],
+    });
+    expect(released.choices[0].delta.tool_calls[0].function.name).toBe('read');
+  } finally {
+    bridge.identity.__reset();
+  }
+});

@@ -1,0 +1,4 @@
+3e59b2c518cf2402f8d858caf977205dfa9277703eddb266a34395c93674bbec  wireproxy-awg-windows-amd64.exe
+98d3dbd96bd43daba80863fac433c528ef2694e7a92f025d26192860a9247e6a  wireproxy-awg-linux-amd64
+752d50de6c6ba9c0b524e531bc95e9971a5998f8b06bd61ea09c17eebe27b670  wireproxy-awg-linux-arm64
+12e05cf70e2876d0cfd1c649e1c0032f82a370b365dcccd7d5a03feee17f2625  LICENSE

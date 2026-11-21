@@ -1138,3 +1138,18 @@ nav.ag-q-tabs{flex-direction:row;align-items:center}.agent-folder-trust>p.subtle
 .ss-keys{border:1px solid var(--line);border-radius:6px;padding:14px 16px;margin:4px 0 18px;background:var(--surface-raised)}.ss-keys .psi-head{margin:0 0 8px}.ss-keys strong{display:inline-flex;align-items:center;gap:6px}
 .ss-saved{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--text-secondary);overflow-wrap:anywhere}.ss-saved>svg{color:var(--green);flex-shrink:0}.ss-key-form>p{margin-bottom:12px}.ss-key-form .form-actions{margin-top:4px}
 .ss-search{margin:6px 0 12px}.ss-locations{max-height:440px;overflow:auto;padding:2px 4px 2px 0;margin-bottom:14px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}.ss-locations span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* WireGuard: the import area and the import report (the rows reuse the Psiphon styles) */
+.wg-import{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:16px 18px;margin:4px 0 16px;border:1px dashed var(--line-strong);border-radius:10px;background:var(--surface-raised);transition:border-color 150ms,background 150ms}
+.wg-import.dropping{border-color:var(--accent);background:var(--accent-soft)}
+.wg-import>svg{color:var(--accent);flex-shrink:0}
+.wg-import>div:not(.token-row){flex:1;min-width:220px}.wg-import strong{display:block;font-size:15px}.wg-import small{font-size:13px;color:var(--muted);max-width:80ch}
+.wg-import .token-row{margin:0;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.wg-paste{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:0 0 16px;background:var(--surface-raised)}
+.wg-paste .field:last-of-type{margin-bottom:8px}
+.wg-report{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:0 0 16px;background:var(--surface-raised);font-size:14px}
+.wg-report>p{margin:0 0 6px}.wg-report ul{list-style:none;margin:0 0 8px;padding:0;display:grid;gap:4px}
+.wg-report li{display:flex;gap:8px;align-items:flex-start;font-size:13.5px;overflow-wrap:anywhere}
+.wg-report li>svg{flex-shrink:0;margin-top:3px;color:var(--green)}
+.wg-report .wg-failed li>svg{color:var(--red)}
+.wg-report small{display:inline;font-size:13px;color:var(--muted)}

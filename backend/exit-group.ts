@@ -1,6 +1,7 @@
 import type { Route } from './types';
-// An exit group is one route made of several exits that Polygate runs itself: Psiphon's regions (backend/psiphon.ts) and Surfshark's
-// locations (backend/surfshark.ts). Each exit is a local SOCKS port with its own outbound address. The route machinery (backend/transport.ts)
+// An exit group is one route made of several exits that Polygate runs itself: Psiphon's regions (backend/psiphon.ts), Surfshark's
+// locations (backend/surfshark.ts) and imported WireGuard configs (backend/wireguard.ts). Each exit is a local SOCKS port with its own
+// outbound address. The route machinery (backend/transport.ts)
 // treats every group the same way: one exit per request, taking turns or staying on one; a used-up exit skipped for that provider only and
 // given a new address that is checked first; a refused request moved on; a route test that checks every exit; the exit named in the log.
 
