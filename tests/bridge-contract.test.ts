@@ -28,7 +28,7 @@ const reconstructedCalls = (text: string) => {
 
 // Exercise the real HTTP handler with in-memory request/response streams. No
 // listener or model is contacted; every upstream call is intercepted below.
-async function request(lane: 'chat' | 'responses', stream: boolean, wire: string | string[], extra: any = {}, options: { gateRetry?: boolean; fullCollision?: boolean; holdOpen?: boolean } = {}) {
+async function request(lane: 'chat' | 'responses', stream: boolean, wire: string | string[], extra: any = {}, options: { gateRetry?: boolean; fullCollision?: boolean; holdOpen?: boolean; upstreamError?: Error } = {}) {
   const payloads: any[] = [];
   let cancelled = false;
   const ensure = spyOn(bridge.identity, 'ensureFresh').mockImplementation(() => ({}));
@@ -45,6 +45,7 @@ async function request(lane: 'chat' | 'responses', stream: boolean, wire: string
   });
   const upstream = spyOn(proxy, 'netFetch').mockImplementation(async (_url: any, init: any) => {
     payloads.push(JSON.parse(init.body));
+    if (options.upstreamError) throw options.upstreamError;
     if (options.gateRetry && payloads.length === 1) return Response.json({ error: { type: 'FreeTierError', message: 'Fixture gate rejection' } }, { status: 403 });
     const pieces = typeof wire === 'string' ? [wire] : wire;
     let i = 0;
@@ -145,6 +146,16 @@ for (const lane of ['chat', 'responses'] as const) for (const stream of [false, 
     expect(r.text).toContain('call-fixture-0');
   });
 }
+
+test('a route that never answered keeps its status and plain message through the bridge', async () => {
+  const failure: any = new Error('Could not reach api.opencode.ai through the relay "Vercel fra1": Connection reset: the network or the relay host closed it. Another relay or exit may work.');
+  failure.status = 502; failure.type = 'route_unreachable';
+  const r = await request('chat', false, '', {}, { upstreamError: failure });
+  expect(r.status).toBe(502);
+  expect(JSON.parse(r.text).error).toMatchObject({ type: 'route_unreachable', code: 502 });
+  expect(r.text).toContain('Connection reset');
+  expect(r.text).not.toContain('Internal server error');
+});
 
 test('chat buffers split names, preserves parallel call IDs and does not alias twice', async () => {
   const wire = sse(chunk({ tool_calls: [call('read_', '{"value":', 0), call('read_client', '{"value":"other"}', 1)] })) +

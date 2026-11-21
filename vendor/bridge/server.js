@@ -3200,6 +3200,16 @@ function handleRequest(req, res) {
           }
           return res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);
         }
+        // Polygate's network layer throws GatewayError with a status and a type when a route never answered. Keep that status and the
+        // plain message instead of turning it into a raw 500, and leave the route's own log to record the stack trace.
+        if (Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599 && typeof err.type === "string") {
+          const payload = JSON.stringify({ error: { type: err.type, message: err.message || "The route did not answer", code: err.status } });
+          if (!res.headersSent) {
+            res.writeHead(err.status, { "Content-Type": "application/json" });
+            return res.end(payload);
+          }
+          return res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);
+        }
         if (timedOut) {
           if (!res.headersSent) {
             res.writeHead(504, { "Content-Type": "application/json" });

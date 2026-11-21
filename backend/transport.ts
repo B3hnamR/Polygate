@@ -358,6 +358,23 @@ export function plainRouteError(raw:string,kind?:string):string{
   if(/certificate|CERT_|self.signed|SSL|TLS handshake|unable to verify/i.test(t))return 'Secure connection failed: the certificate or handshake was rejected';
   return t.replace(/^(Type|Syntax)?Error:\s*/i,'').slice(0,160);
 }
+// A connection that never produced an answer is not the provider refusing the request. Name the route, the plain cause, and what can be
+// tried next; the raw exception stays in the route log, where a stack trace is useful and the client never sees it.
+export function networkFailure(route: Route, raw: unknown, target: URL): GatewayError {
+  const said = plainRouteError(redactError(String((raw as any)?.message || raw)), route.kind);
+  const where = route.kind === 'relay' ? `the relay "${route.name}"` : `the route "${route.name}"`;
+  let next = 'Another route may work; if every route fails, test or change the route on the Routing page.';
+  if (/Name not found/i.test(said)) next = route.kind === 'relay'
+    ? 'Its deployment may have been deleted or renamed. Update or remove it on the Relays page, or choose another route.'
+    : 'If the address is right, this network\'s DNS may be blocking it; another route may work.';
+  else if (/Connection reset/i.test(said)) next = route.kind === 'relay'
+    ? 'The relay host or this network closed the connection. Another relay or exit may work; if every route fails, this network may be blocking the site.'
+    : 'Another exit or route may work; if every route fails, this network may be blocking the site.';
+  else if (/Connection refused/i.test(said)) next = 'Update the relay or route, or choose another one.';
+  else if (/No answer in time/i.test(said)) next = 'The network did not answer in time. Another exit or route may work; if it keeps happening, check this network.';
+  else if (/Secure connection failed/i.test(said)) next = 'The certificate or TLS handshake was rejected. Another exit may work; if every exit fails, check the relay or the network.';
+  return new GatewayError(`Could not reach ${target.host} through ${where}: ${said}. ${next}`, 502, 'route_unreachable');
+}
 const canStandIn=(route:Route)=>settings.failover!==false&&settings.routes.some(r=>r.id!==route.id&&r.enabled&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true||settings.spreadDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
 export function routeFailed(route:Route,reason:string,immediate=false){
   const raw=redactError(reason);route.status=plainRouteError(raw,route.kind);route.failures=(route.failures||0)+1;
@@ -578,13 +595,15 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   }catch(e){
     finishAttempt(attempt,undefined,e);
     if(e instanceof WarpFreeUnavailable)throw e;
+    if(callerCancelled(init))throw e;
+    const wrapped=e instanceof GatewayError?e:networkFailure(route,e,local);
     // Background reads (model lists, version and identity checks) carry no one's request, and a slow one times out now and then: they never
     // put an exit to rest. Only requests that send something (chat) count toward the breaker.
-    if(quiet||callerCancelled(init)||isCanary(routeContext.getStore()?.requestId)||route.id.startsWith('pool:')||!!exitOfVirtual(route.id)||isReadOnly(init))throw e;
+    if(quiet||isCanary(routeContext.getStore()?.requestId)||route.id.startsWith('pool:')||!!exitOfVirtual(route.id)||isReadOnly(init))throw wrapped;
     routeFailed(route,e instanceof GatewayError?e.message:String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');
     // A relay its platform switched off rests until it may be back, not the breaker's few minutes, when another exit can stand in.
     const restUntil=Number((e as any)?.restUntil)||0;if(restUntil&&route.cooldownUntil&&route.cooldownUntil>now()){route.cooldownUntil=Math.max(route.cooldownUntil,restUntil);persist();}
-    throw e;
+    throw wrapped;
   }
 }
 // What a route test sends, and how its answer is read, depends on the provider chosen in the dialog. OpenCode Free keeps its own check (the model list
@@ -675,5 +694,5 @@ async function testRouteOnce(id:string,providerId?:string):Promise<RouteTest>{
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
     return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat==='ok'&&check.unfinished?'incomplete':check.chat,summary,provider:'OpenCode Free',model:check.model,...(check.until?{until:check.until}:{})});
   }catch(e){if(isCancelled())throw cancelledError(); // a cancelled test leaves the route as it was
-    const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
+    const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError&&e.type!=='route_unreachable'?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }
