@@ -102,7 +102,7 @@ test('a chat request through a relay behind Deployment Protection fails as a rou
   const err: any = await chat().then(() => undefined, e => e);
   expect(err?.type).toBe('route_unavailable'); expect(err.status).toBe(503);
   expect(err.message).toContain('Deployment Protection');
-  expect(a.cooldownUntil - Date.now()).toBeGreaterThan(5.9 * 3600000);
+  expect((a.cooldownUntil || 0) - Date.now()).toBeGreaterThan(5.9 * 3600000);
   expect(a.status).toContain('Deployment Protection');
 });
 
@@ -113,7 +113,7 @@ test('the SSO redirect Vercel sends instead of the 401 is the same route problem
   expect(err?.type).toBe('route_unavailable'); expect(err.status).toBe(503);
   expect(err.message).toContain('Deployment Protection');
   expect(err.message).not.toContain('redirected');
-  expect(a.cooldownUntil - Date.now()).toBeGreaterThan(5.9 * 3600000);
+  expect((a.cooldownUntil || 0) - Date.now()).toBeGreaterThan(5.9 * 3600000);
 });
 
 test('with no other exit to stand in, the relay is not rested, but the answer is still the plain message', async () => {

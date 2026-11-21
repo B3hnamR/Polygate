@@ -1312,7 +1312,6 @@ function writeCachedCatalog(json) {
   }
 }
 
-const SOURCE_CACHE_VERSION = 1;
 function readCachedSource(expectedRef = null) {
   try {
     const file = getSourceCacheFile();
