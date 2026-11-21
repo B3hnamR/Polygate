@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { randomBytes, createCipheriv, createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, openSync, writeSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { Settings, Model, LogRow, Provider, McpServer } from './types';
@@ -15,8 +15,17 @@ const master = readFileSync(masterPath);
 // Written to a temporary file, flushed, then renamed over the old one: a crash leaves the old file or the new one, never half of one.
 export function writeFileAtomic(file: string, data: string | Buffer, mode = 0o600) {
   const tmp = file + '.tmp'; const fd = openSync(tmp, 'w', mode);
-  try { writeSync(fd, typeof data === 'string' ? Buffer.from(data) : data); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, file);
+  try { writeAll(fd, typeof data === 'string' ? Buffer.from(data) : data); fsyncSync(fd); }
+  catch (e) { closeSync(fd); try { unlinkSync(tmp); } catch { /* already gone */ } throw e; }
+  closeSync(fd); renameSync(tmp, file);
+}
+// writeSync may write fewer bytes than asked without an error; a file renamed over the old one must be complete.
+export function writeAll(fd: number, bytes: Buffer, write: (fd: number, b: Buffer, offset: number, length: number) => number = writeSync) {
+  for (let offset = 0; offset < bytes.length;) {
+    const n = write(fd, bytes, offset, bytes.length - offset);
+    if (!Number.isInteger(n) || n <= 0) throw new Error('The file could not be written completely (the disk may be full).');
+    offset += n;
+  }
 }
 export const deriveKey = (label: string) => createHmac('sha256', master).update(label).digest();
 const configPath = path.join(stateDir, 'settings.vault');
@@ -59,21 +68,25 @@ function load(): Settings {
   } catch (e: any) {
     // The vault key and the vault no longer belong together (one was replaced or deleted) or the file is damaged. Starting with a clear message and a
     // copy kept aside is better than failing on every launch with a raw crypto error.
+    // Inspection (the command line, a health check) never moves the files it was asked to look at, and never runs on defaults it could
+    // later save over the vault: it stops with the reason instead. Only the gateway itself sets the file aside and starts fresh.
+    if (process.env.POLYGATE_READ_ONLY_STATE === '1') throw new Error(`Polygate could not open its saved settings (${e?.message || e}). Nothing was changed. Start Polygate itself to set the file aside, or put the original vault.key back.`);
     const kept = configPath + '.unreadable-' + Date.now();
-    try { renameSync(configPath, kept); } catch { /* it stays where it is */ }
-    console.error(`[settings] Polygate could not open its saved settings (${e?.message || e}). The file was kept as ${kept}. Starting with default settings; if vault.key was replaced, put the original back and restore that file.`);
+    let moved = false, why = ''; try { renameSync(configPath, kept); moved = true; } catch (m: any) { why = m?.code || m?.message || String(m); }
+    // Starting on defaults would save them over the path at once, and then the only copy of the old settings would be gone: stop instead.
+    if (!moved) throw new Error(`Polygate could not open its saved settings (${e?.message || e}) and could not set the file aside (${why}), so it did not start and changed nothing. Close anything that holds ${configPath} open, or move it away yourself, then start Polygate again.`);
+    console.error(`[settings] Polygate could not open its saved settings (${e?.message || e}). ${moved ? `The file was kept as ${kept}.` : `The file could not be set aside and was left at ${configPath}.`} Starting with default settings; if vault.key was replaced, put the original back and restore that file.`);
     return initialSettings();
   }
 }
 export let settings = load();
-export function persist() {
+export function persist() { writeVault(settings); }
+// Writes the given settings as the vault: complete, flushed to disk, then renamed over the old one, so a crash, a power cut or a full disk
+// leaves either the old or the new vault, never a truncated one. Used for a candidate (a restore) before it replaces the running settings.
+export function writeVault(value: Settings) {
   const iv = randomBytes(12); const c = createCipheriv('aes-256-gcm', master, iv);
-  const body = Buffer.concat([c.update(JSON.stringify(settings)), c.final()]);
-  // Written to a temporary file, flushed to disk, then renamed over the old one: a crash or power cut leaves either the old or the new
-  // vault, never a truncated one that fails decryption at the next start.
-  const tmp = configPath + '.tmp'; const fd = openSync(tmp, 'w', 0o600);
-  try { writeSync(fd, Buffer.concat([iv, c.getAuthTag(), body])); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, configPath);
+  const body = Buffer.concat([c.update(JSON.stringify(value)), c.final()]);
+  writeFileAtomic(configPath, Buffer.concat([iv, c.getAuthTag(), body]), 0o600);
 }
 if(process.env.POLYGATE_READ_ONLY_STATE!=='1')persist();
 export function equal(a: string, b: string) { const x = Buffer.from(a); const y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
@@ -94,6 +107,21 @@ if (!(db.query('SELECT 1 FROM usage_daily LIMIT 1').get())) db.exec('INSERT INTO
 // the week the request log keeps. A new table is filled from the requests that are still in the log.
 db.exec('CREATE TABLE IF NOT EXISTS usage_keys_daily (day INTEGER NOT NULL, key TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0, ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, key));');
 if (!(db.query('SELECT 1 FROM usage_keys_daily LIMIT 1').get())) db.exec("INSERT INTO usage_keys_daily (day,key,requests,errors,input,output,ms) SELECT time/86400000, COALESCE(keyId,''), COUNT(*), SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END), COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(ms),0) FROM requests GROUP BY time/86400000, COALESCE(keyId,'')");
+export function migrateHourly(database: Database, now = Date.now()) {
+  if ((database.query('PRAGMA user_version').get() as { user_version: number }).user_version >= 1) return;
+  database.transaction(() => {
+    database.exec('CREATE TABLE IF NOT EXISTS usage_hourly (hour INTEGER PRIMARY KEY, requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0, ms INTEGER NOT NULL DEFAULT 0)');
+    // Pre-rollup installs have only detail; early rollup installs may already count requests lost to pruning.
+    // Never add the two overlapping histories or shrink a counter to match a truncated log.
+    database.query(`INSERT INTO usage_hourly (hour,requests,errors,input,output,ms)
+      SELECT time/3600000, COUNT(*), SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END), COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(ms),0)
+      FROM requests WHERE time>=? GROUP BY time/3600000
+      ON CONFLICT(hour) DO UPDATE SET requests=excluded.requests, errors=excluded.errors, input=excluded.input, output=excluded.output, ms=excluded.ms
+      WHERE excluded.requests > usage_hourly.requests`).run((Math.floor(now / 3600000) - 72) * 3600000);
+    database.exec('PRAGMA user_version=1');
+  }).immediate();
+}
+migrateHourly(db);
 // How each route did, per day: what the relay results table on the Relays page reads. outcome is ok, refused, used_up, redirected or failed. Kept 90 days.
 db.exec('CREATE TABLE IF NOT EXISTS route_outcomes (day INTEGER NOT NULL, route TEXT NOT NULL, outcome TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, route, outcome));');
 let lastOutcomePrune = 0;
@@ -114,9 +142,16 @@ export function removeModels(providerId: string) { for (const [id, m] of models)
 let lastPrune = 0;
 export function record(row: LogRow) {
   db.query('INSERT INTO requests (id,time,model,provider,protocol,route,status,ms,input,output,error,keyId,fault,detail,session) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,row.time,row.model,row.provider,row.protocol,row.route,row.status,row.ms,row.input,row.output,row.error.slice(0,800),row.keyId,row.fault?1:0,row.detail??null,row.session||null);
-  db.query('INSERT INTO usage_daily (day,model,route,requests,errors,input,output,ms) VALUES (?,?,?,1,?,?,?,?) ON CONFLICT(day,model,route) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 86400000), row.model, row.route || '', row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
+  const day = Math.floor(row.time / 86400000);
+  const daily = db.query('INSERT INTO usage_daily (day,model,route,requests,errors,input,output,ms) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(day,model,route) DO UPDATE SET requests=requests+excluded.requests, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms');
+  // The request counts once, on the model and route that gave the final answer; its tokens go to the attempts that used them.
+  const spent = row.spent?.length ? row.spent : [{ model: row.model, route: row.route, input: row.input || 0, output: row.output || 0 }];
+  daily.run(day, row.model, row.route || '', 1, row.status >= 400 ? 1 : 0, 0, 0, row.ms || 0);
+  for (const part of spent) if (part.input || part.output) daily.run(day, part.model, part.route || '', 0, 0, part.input || 0, part.output || 0, 0);
+  // Hourly totals for "last 24 hours": kept apart from the detailed log, whose row limit would otherwise undercount a busy gateway.
+  db.query('INSERT INTO usage_hourly (hour,requests,errors,input,output,ms) VALUES (?,1,?,?,?,?) ON CONFLICT(hour) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 3600000), row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
   db.query('INSERT INTO usage_keys_daily (day,key,requests,errors,input,output,ms) VALUES (?,?,1,?,?,?,?) ON CONFLICT(day,key) DO UPDATE SET requests=requests+1, errors=errors+excluded.errors, input=input+excluded.input, output=output+excluded.output, ms=ms+excluded.ms').run(Math.floor(row.time / 86400000), row.keyId || '', row.status >= 400 ? 1 : 0, row.input || 0, row.output || 0, row.ms || 0);
-  if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM usage_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM usage_keys_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
+  if (Date.now() - lastPrune > 60000) { lastPrune = Date.now(); db.query('DELETE FROM usage_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM usage_keys_daily WHERE day < ?').run(Math.floor(Date.now() / 86400000) - 400); db.query('DELETE FROM usage_hourly WHERE hour < ?').run(Math.floor(Date.now() / 3600000) - 72); db.query('DELETE FROM requests WHERE time < ?').run(Date.now() - 7 * 86400000);
     // A busy gateway can log far more than a week's worth in a day: the newest 100000 rows are the most that are kept.
     db.query('DELETE FROM requests WHERE time <= (SELECT time FROM requests ORDER BY time DESC LIMIT 1 OFFSET 100000)').run();
     // Failures keep their shape record for the whole retention window; successes only the latest 50, as a baseline to compare with.

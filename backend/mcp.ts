@@ -31,7 +31,10 @@ const allowed = (key: ApiKey | undefined, keys?: string[]) => !key || !keys?.len
 // The route for a remote server: its own, else Direct. Relays only forward OpenCode and Kilo, so they cannot carry MCP traffic.
 // Direct unless the user switched it off; then the selected route, or the first other one that can carry MCP traffic.
 export const mcpDefaultRoute = () => settings.routes.find(r => r.id === 'direct')?.enabled !== false ? 'direct' : (settings.routes.find(r => r.id === settings.routeId && r.enabled && r.kind !== 'relay') || settings.routes.find(r => r.enabled && r.kind !== 'relay'))?.id || 'direct';
-const routeOf = (s: McpServer) => s.routeId && settings.routes.some(r => r.id === s.routeId && r.enabled && r.kind !== 'relay') ? s.routeId : mcpDefaultRoute();
+// A server sent through a route the user chose stays on it: switched off or removed, its requests are refused (the card says why) instead
+// of leaving another way. Direct, the default, follows mcpDefaultRoute when it is switched off.
+const routeOf = (s: McpServer) => s.routeId && s.routeId !== 'direct' ? s.routeId : mcpDefaultRoute();
+export const __mcpRouteOf = routeOf;
 const plain = (e: any) => redactError(String(e?.message || e)).replace(/^Error: /, '');
 
 // ------------------------------------------------------------------------------------------------------------------- transports
@@ -62,7 +65,10 @@ class HttpChannel implements Channel {
   async open() { new URL(this.s.url || ''); }
   private headers() { return { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(this.s.headers || {}), ...(this.session ? { 'mcp-session-id': this.session } : {}), ...(this.protocolVersion ? { 'mcp-protocol-version': this.protocolVersion } : {}) }; }
   async send(m: Msg, signal?: AbortSignal) {
-    const r = await networkFetch(this.s.url!, { method: 'POST', headers: this.headers(), body: JSON.stringify(m), signal: signal ? AbortSignal.any([signal, this.abort.signal]) : this.abort.signal }, routeOf(this.s));
+    // Every send has a deadline (a notification has none of its own) and stops when the channel closes. The initialization alone is left to
+    // finish after a close: the session it starts has no name yet, so it can only be ended once its answer names it (below).
+    const deadline = signal || AbortSignal.timeout(30000);
+    const r = await networkFetch(this.s.url!, { method: 'POST', headers: this.headers(), body: JSON.stringify(m), signal: m.method === 'initialize' ? deadline : AbortSignal.any([deadline, this.abort.signal]) }, routeOf(this.s));
     const sid = r.headers.get('mcp-session-id');
     // The channel was closed while this request was on its way (the initialization of a server switched off meanwhile): the session it just started is
     // closed at once, and nothing is kept.
@@ -83,9 +89,9 @@ class HttpChannel implements Channel {
     const text = await r.text(); if (text.trim()) each(JSON.parse(text), x => this.onMessage?.(x));
   }
   private endSession(sid: string) { if (this.s.url) void networkFetch(this.s.url, { method: 'DELETE', headers: { ...this.headers(), 'mcp-session-id': sid }, signal: AbortSignal.timeout(5000) }, routeOf(this.s)).then(r => r.body?.cancel()).catch(() => {}); }
-  // With a session, it is ended on the server and everything in flight is cancelled with it. Without one the initialization is still on its way: it is left
-  // to finish (it is short and has its own time limit) and `send` ends the session it starts, because a session that has not been named cannot be ended.
-  close() { this.closed = true; const sid = this.session; this.session = ''; if (sid) { this.endSession(sid); this.abort.abort(); } }
+  // Everything in flight is cancelled, and a named session is ended on the server. An initialization still on its way is left to finish (it is
+  // short and has its own time limit) and `send` ends the session it starts, because a session that has not been named cannot be ended.
+  close() { this.closed = true; const sid = this.session; this.session = ''; if (sid) this.endSession(sid); this.abort.abort(); }
 }
 // The older HTTP+SSE transport (MCP 2024-11-05): one long event stream for answers, messages POSTed to the address it announces.
 class SseChannel implements Channel {
@@ -491,6 +497,13 @@ function secrets(input: unknown, saved: Record<string, string> | undefined, kind
   }
   return Object.keys(out).length ? out : undefined;
 }
+// The keys an editor chose. A key deleted since the editor opened is refused, not dropped: dropping the only one would leave an empty list,
+// which means every key, and turn a restriction into open access.
+export function knownKeys(list: unknown[]) {
+  const ids = list.map(String), stale = ids.filter(id => !settings.keys.some(k => k.id === id));
+  if (stale.length) throw new GatewayError('A client key chosen here was deleted since this editor opened. Reopen it and choose the keys again.', 409, 'stale_keys');
+  return ids;
+}
 export function cleanServer(input: any, saved: McpServer | undefined, local: boolean): McpServer {
   if (!input || typeof input !== 'object') throw new GatewayError('Server details are missing', 400);
   const cfg = mcpConfig(); const transport = (input.transport === undefined ? saved?.transport : input.transport) as McpServer['transport'];
@@ -500,7 +513,7 @@ export function cleanServer(input: any, saved: McpServer | undefined, local: boo
   if (!NAME.test(name)) throw new GatewayError('Name: 1–24 lowercase letters, digits or dashes, starting with a letter. Tool names start with it.', 400);
   if (name === 'polygate') throw new GatewayError('The name "polygate" is used by Polygate\'s own tools', 400);
   if (cfg.servers.some(s => s.name === name && s.id !== saved?.id)) throw new GatewayError(`Another server is already named "${name}"`, 400);
-  const keys = Array.isArray(input.keys) ? input.keys.map(String).filter((id: string) => settings.keys.some(k => k.id === id)) : saved?.keys;
+  const keys = Array.isArray(input.keys) ? knownKeys(input.keys) : saved?.keys;
   const disabledTools = Array.isArray(input.disabledTools) ? strings(input.disabledTools, 500) : saved?.disabledTools;
   const timeoutSec = input.timeoutSec === undefined ? saved?.timeoutSec : Math.max(5, Math.min(600, Math.floor(Number(input.timeoutSec) || 60)));
   const base: McpServer = { id: saved?.id || randomUUID(), name, title: String(input.title ?? saved?.title ?? '').trim().slice(0, 80) || undefined, enabled: input.enabled === undefined ? saved?.enabled ?? true : !!input.enabled, transport, keys: keys?.length ? keys : undefined, disabledTools: disabledTools?.length ? disabledTools : undefined, timeoutSec, created: saved?.created || Date.now() };

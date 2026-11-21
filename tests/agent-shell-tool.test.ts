@@ -17,6 +17,32 @@ const names = (tools: any[]) => tools.map(t => t.function?.name ?? t.name);
 const shellOf = (tools: any[]) => tools.find(t => (t.function?.name ?? t.name) === 'shell');
 const withShellDescription = (description: string) => real.map(t => t.function?.name === 'shell' ? { ...t, function: { ...t.function, description } } : t);
 
+test('2.3.2 registration arrays and timeout helpers preserve the client tool contract', () => {
+  const files = {
+    'tool:read': `export const name = "read"
+      const LocationInput = Schema.Struct({path: Schema.String, offset: PageInput.fields.offset})
+      export const Input = LocationInput
+      editor.add({ name, description: ["Read a file or directory.", ...(codeMode ? ["Code mode: attach the result."] : ["Each line is prefixed as <line>: <content>."]), "Use offset for larger files."].join(" "), input: Input })`,
+    'ref:read-filesystem': 'export const PageInput = Schema.Struct({offset: Schema.optionalKey(Schema.Int)})',
+    'tool:shell': 'export const name = "shell"\nexport const description = "Execute a shell command and return its output."\nexport const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000\nconst timeoutInput = (foreground: number) => Schema.optionalKey(NonNegativeInt).annotate({description: `Optional timeout in milliseconds (default ${foreground}).`})\nexport const Input = Schema.Struct({ command: Schema.String, timeout: timeoutInput(DEFAULT_TIMEOUT_MS) })',
+  };
+  const defs = bridge.identity.extractRecipe(files).tools;
+  const expected = [
+    { name: 'read', description: 'Read a file or directory. Each line is prefixed as <line>: <content>. Use offset for larger files.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer' } }, required: ['path'], additionalProperties: false } },
+    { name: 'shell', description: 'Execute a shell command and return its output.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout: { type: 'integer', minimum: 0, description: 'Optional timeout in milliseconds (default 120000).' } }, required: ['command'], additionalProperties: false } },
+  ];
+  bridge.identity.__setToolProfile(defs, '2.3.2-regression');
+  try {
+    const out = bridge.prepareToolsWithFingerprint(expected.map(fn => ({ type: 'function', function: fn })), false, null, MODEL);
+    for (const fn of expected) {
+      expect(defs[fn.name].description).toBe(fn.description);
+      expect(defs[fn.name].parameters).toEqual(fn.parameters);
+      expect(out.allowedTools.get(fn.name)).toBe(fn.name);
+      expect(out.originalToAlias.has(fn.name)).toBe(false);
+    }
+  } finally { bridge.identity.__reset(); }
+});
+
 test('OpenCode 2.2.5 Windows tools pass unchanged with the identity extracted from its release sources', () => {
   const captured = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures', 'opencode-2.2.5-windows-tools.json'), 'utf8'));
   bridge.identity.__setToolProfile(captured.fingerprint, 'captured-2.2.5-source');

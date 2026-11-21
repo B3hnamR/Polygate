@@ -123,15 +123,21 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   const streaming=()=>{clearTimeout(timer);armIdle();ceiling||=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),3600000);};
   const cancel=()=>{if(!res.writableEnded)controller.abort(new GatewayError('Client disconnected',499,'client_closed_request'));};res.on('close',cancel);
   let release:(()=>void)|undefined;let used=candidates[0];let route='';const start=Date.now();let status=500;let message='';let input=0,output=0;
-  let accountingStarted=false,complete=false,streamFailed=false,pipeFinished=false;let pipeController:AbortController|undefined;let outputChars=0;let reportedInput=0,reportedOutput=0;let finalUsage:{input:number;output:number}|undefined;
+  let complete=false,streamFailed=false,pipeFinished=false;let pipeController:AbortController|undefined;let outputChars=0;let reportedInput=0,reportedOutput=0;let finalUsage:{input:number;output:number}|undefined;
   const estimatedInput=Math.ceil(JSON.stringify(body).length/4);
-  let attemptInput=estimatedInput;
-  let reservation:ReturnType<typeof reserveTokens>|undefined;let settledInput=0,settledOutput=0;
-  const settleAttempt=()=>{
+  let reservation:(ReturnType<typeof reserveTokens>&{input:number;model:string;route:string})|undefined;let settledInput=0,settledOutput=0;const usedBy:{model:string;route:string;input:number;output:number}[]=[];
+  const startAttempt=(m:Model,route:string,input:number,amount:number)=>{
+    reservation={...reserveTokens(k,amount),input,model:m.id,route};
+    outputChars=reportedInput=reportedOutput=0;finalUsage=undefined;complete=false;
+  };
+  const counter=(v:unknown)=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0?v:undefined;
+  const settleAttempt=(refusal?:any)=>{
     if(!reservation)return;
-    const a=complete&&finalUsage?finalUsage.input:Math.max(reportedInput,accountingStarted?attemptInput:0);
-    const b=complete&&finalUsage?finalUsage.output:Math.max(reportedOutput,Math.ceil(outputChars/4));
-    reservation.settle(Math.min(Number.MAX_SAFE_INTEGER,a+b));reservation=undefined;settledInput+=a;settledOutput+=b;accountingStarted=false;
+    const a=counter(refusal?.prompt_tokens)??counter(refusal?.input_tokens)??(complete&&finalUsage?finalUsage.input:Math.max(reportedInput,reservation.input));
+    const b=counter(refusal?.completion_tokens)??counter(refusal?.output_tokens)??(complete&&finalUsage?finalUsage.output:Math.max(reportedOutput,Math.ceil(outputChars/4)));
+    reservation.settle(Math.min(Number.MAX_SAFE_INTEGER,a+b));settledInput+=a;settledOutput+=b;
+    if(a||b)usedBy.push({model:reservation.model,route:reservation.route,input:a,output:b});
+    reservation=undefined;
   };
   // keepRoute: the next attempt goes through the exit just switched to, not a fresh pick (which could be the refusing one again).
   // region: the Psiphon region the last answer came through, shown in the log line.
@@ -153,11 +159,15 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       // A model listed (or found) to take no images gets the conversation with each image replaced by a short note.
       if(needs.images&&m.images===false){const w=withoutImages(chat);if(w.count){chat=w.chat;imagesDropped=true;}}
       used=m;const p=settings.providers.find(p=>p.id===m.providerId&&p.enabled);if(!p)continue;
+      // A token-limited key cannot use every provider (one without an enforceable output bound). That candidate is passed over before anything
+      // is sent, so a later compatible one still answers; the reason is kept in case none does.
+      if((k.budget||k.tpm)&&m!==candidates[candidates.length-1]){try{outputAllowance(p,m,chat);}catch(e){if(e instanceof GatewayError&&e.status===400){status=e.status;message=e.message;fault=false;hops.push(m.id);continue;}throw e;}}
       // A provider whose chosen routes cannot take the request right now is skipped like one that failed, so the next provider is still tried.
       let r:ReturnType<typeof routeForProvider>;
       try{r=routeForProvider(p,m.id);route=r.name;}catch(e){if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;fault=false;continue;}throw e;}
       // Rotating through a proxy pool needs more tries than a single-route retry budget.
-      let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
+       let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
+       const partialKiloGroups=new Set<string>();
       for(let attempt=0;attempt<=attempts;attempt++){
         if(attempt>0&&!canSwitch())break;
         if(attempt>0&&providerPicksAgain(p)&&!keepRoute){r=routeForProvider(p,m.id);route=r.name;}keepRoute=false;
@@ -170,36 +180,42 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // Revalidation and reservation are synchronous, immediately before each upstream dispatch.
           // Every failed dispatch is settled before a retry, so fallback cannot reset its allowance.
           k=authenticate(req,false);if(!modelAllowed(k,m.id))throw new GatewayError('This API key is not allowed to use that model',403,'permission_error');
-          reservation=reserveTokens(k,k.budget||k.tpm?estimatedInput+outputAllowance(p,m,chat):0);
-          const tracked=!!(k.budget||k.tpm)&&['openai','kilo','zai'].includes(p.kind);
-          accountingStarted=!tracked;attemptInput=estimatedInput;outputChars=0;reportedInput=0;reportedOutput=0;finalUsage=undefined;complete=false;
+          const tracked=p.kind==='zai'||(!!(k.budget||k.tpm)&&['openai','kilo'].includes(p.kind));
+          // Validate output before adapter preflight. Z.ai can only estimate input after translation.
+          const allowance=k.budget||k.tpm?outputAllowance(p,m,chat):0;
+          startAttempt(m,route,tracked?0:estimatedInput,allowance?allowance+(p.kind==='zai'?0:estimatedInput):0);
           upstream=await providerChat(p,m,chat,controller.signal,r.id,sessionFor(k.id,chat.messages,req.headers),requestId,tracked?{
-            before(payload){
+            before(payload,input=estimatedInput,routeName=r.name){
               settleAttempt();
               if(controller.signal.aborted)throw controller.signal.reason;
               k=authenticate(req,false);if(!settings.enabled)throw new GatewayError('Gateway is paused. Resume it in Polygate.',503,'gateway_paused');
               if(!modelAllowed(k,m.id))throw new GatewayError('This API key is not allowed to use that model',403,'permission_error');
               // The first hold covered preflight without consumption. Each generation owns a hold;
               // a failed internal generation is debited before the next callback can reserve.
-              attemptInput=estimatedInput;
-              reservation=reserveTokens(k,k.budget||k.tpm?attemptInput+outputAllowance(p,m,payload):0);
-              accountingStarted=true;outputChars=0;reportedInput=0;reportedOutput=0;finalUsage=undefined;complete=false;
+              route=routeName;
+              startAttempt(m,routeName,input,k.budget||k.tpm?input+outputAllowance(p,m,payload):0);
             },
-            failed(usage:any){for(const [field,target] of [['prompt_tokens','input'],['input_tokens','input'],['completion_tokens','output'],['output_tokens','output']] as const){const value=usage?.[field];if(Number.isSafeInteger(value)&&value>=0){if(target==='input')reportedInput=Math.max(reportedInput,value);else reportedOutput=Math.max(reportedOutput,value);}}}
+            failed:settleAttempt
           }:undefined);status=upstream.status;region=exitGroupOf(r.id)?takeExitRegion(requestId)||'':'';
           if(upstream.ok){retained=true;break;}
-          fault=true;message=(await upstream.text()).slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
+          fault=true;const refusal=await upstream.text();message=refusal.slice(0,4000);const after=upstream.headers.get('retry-after');retryAfter=after||'';const parsed=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
+          if(reservation){let usage;try{usage=JSON.parse(refusal)?.usage;}catch{}settleAttempt(usage);}
           // The model refused the images: it is marked as taking none, and the same request goes again with each image replaced by a note, so the
           // conversation keeps working (an agent session otherwise sends the picture with every later message and fails each time).
           if(!imagesDropped&&needs.images&&refusesImages(status,message)){const w=withoutImages(chat);if(w.count){m.images=false;saveModel(m);chat=w.chat;imagesDropped=true;fault=false;
             logEvent('info','requests',`${m.id} does not accept images; sent again with ${w.count} image${w.count===1?'':'s'} replaced by a note`,{model:m.id,requestId});attempts++;continue;}}
-          try{const usage=JSON.parse(message)?.usage;if(Number.isSafeInteger(usage?.prompt_tokens)&&usage.prompt_tokens>=0)reportedInput=Math.max(reportedInput,usage.prompt_tokens);if(Number.isSafeInteger(usage?.completion_tokens)&&usage.completion_tokens>=0)reportedOutput=Math.max(reportedOutput,usage.completion_tokens);}catch{}
           // Kilo's anonymous limit covers every Kilo model at once: they all rest together and the rest of this request skips them.
           // The limit belongs to the exit's address, not to the model: that exit is set aside for Kilo and the request moves on to another one.
           // Only when no exit is left do the Kilo models rest, so requests are not sent into the same limit again and again.
-          if(p.kind==='kilo'&&isAddressLimit(status,message)){fault=false;kiloLimitRoute(r,Date.now()+KILO_LIMIT_PAUSE_MS);
+          if(p.kind==='kilo'&&isAddressLimit(status,message)){fault=false;
+            // The group bounds attempts per request. Its last 429 is not proof that every eligible address is limited.
+            const group=exitGroupOf(r.id);
+            const hasLocations=!!(group?.skips()&&group.ready('kilo')>0);
+            if(hasLocations)partialKiloGroups.add(r.id);else kiloLimitRoute(r,Date.now()+KILO_LIMIT_PAUSE_MS);
             const alt=switches<maxSwitches()&&canSwitch()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
-            if(alt){switches++;notify('Switched network exit',`Kilo's free limit was reached through ${r.name}; Kilo requests moved to ${alt.name}.`,'info','kilo-switched|'+alt.id,600000);r=alt;route=r.name;attempts++;continue;}
+            if(alt){switches++;notify('Switched network exit',`Kilo's free limit was reached through ${r.name}; Kilo requests moved to ${alt.name}.`,'info','kilo-switched|'+alt.id,600000);r=alt;route=r.name;keepRoute=true;attempts++;continue;}
+            // A backup may have refused too, while a previously tried group still has locations left.
+            if([...partialKiloGroups].some(id=>(exitGroupOf(id)?.ready('kilo')||0)>0)){limited.add(p.id);break;}
             const until=pauseKilo(p.id,message);limited.add(p.id);retryAfter=String(Math.ceil(KILO_LIMIT_PAUSE_MS/1000));
             const plain=`Kilo's free tier limits anonymous use per network address and has stopped answering from ${switches?'every exit Polygate could try':'this one'}. Polygate rests all Kilo models until ${resetTime(until)} and then tries again. Kilo says a free account continues service: save its API key in the Kilo provider.`;
             notify('Kilo free limit reached',plain,'warning','kilo-limit',3600000);message=plain;break;}
@@ -226,19 +242,19 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // A chain moves past a model that refuses it (blocked, or no longer offered) to the next step; the last step's refusal is the answer.
           if(blocked){if(chain&&m!==candidates[candidates.length-1]&&!controller.signal.aborted)break;throw new GatewayError(message,status,'upstream_error');}
           if(final)break;
-          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}
+          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}
         }catch(e){
           // A relay its platform switched off stays off for hours (route_unavailable carries the rest time). Retrying it or stopping
           // because the retry budget is spent would end the session for a route problem: move straight to another exit, as when one is used up.
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&(e as any).restUntil&&settings.failover!==false&&switches<maxSwitches()&&canSwitch()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;keepRoute=true;r=alt;route=r.name;attempts++;continue;}}
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
-          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&canSwitch()){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;continue;}}
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;upstream=undefined;break;}
           // A connection that never reached the provider is retried like any other transient failure, but its plain message is kept: the
           // client should read the route, the cause and the next step, never a raw ECONNRESET or ENOTFOUND.
-          if(e instanceof GatewayError&&e.type==='route_unreachable'&&!controller.signal.aborted){fault=true;if(attempt<attempts&&canSwitch()){if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}continue;}status=e.status;message=e.message;upstream=undefined;break;}
+          if(e instanceof GatewayError&&e.type==='route_unreachable'&&!controller.signal.aborted){fault=true;if(attempt<attempts&&canSwitch()){if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}continue;}status=e.status;message=e.message;upstream=undefined;break;}
           if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts||!canSwitch()){status=502;message=redactError(String(e));upstream=undefined;break;}
-          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r);if(alt){r=alt;route=r.name;}}}
+          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}}
         finally{if(!retained)settleAttempt();}
       }
       if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);
@@ -265,6 +281,8 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
     // The answer is complete at [DONE], or when every choice that started has finished: with n > 1 one choice finishing is not the end.
     // `asked` is the number of answers requested (n): with fewer finished, a stream that ends without [DONE] is cut short.
     const asked=Math.max(1,Math.floor(Number(askedChat.n))||1);
+    const answerType=upstream.headers.get('content-type')||'';
+    if(!/text\/event-stream/i.test(answerType)&&/json/i.test(answerType))upstream=await jsonAsStream(upstream);
     let ended=false;let done=false;let firstAt=0;const writing=new Set<number>();const finished=new Set<number>();
     const observer=observeSse(raw=>{
       if(raw==='[DONE]'){done=true;ended=true;return;}
@@ -276,9 +294,9 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(validA)reportedInput=Math.max(reportedInput,Math.ceil(a));if(validB)reportedOutput=Math.max(reportedOutput,Math.ceil(b));
           finalUsage=ended&&validA&&validB?{input:Math.ceil(a),output:Math.ceil(b)}:undefined;
         }if(d.error){status=502;fault=true;message=d.error.message||'Upstream stream error';}}catch{}
-      // This ceiling is based on the source accounting estimator, not an exact cross-provider
+      // This ceiling uses the dispatch's input estimate, not an exact cross-provider
       // tokenizer. Provider-reported usage can arrive after consumption; retain it even on abort.
-      if((k.budget||k.tpm)&&reservation&&Math.max(estimatedInput,reportedInput)+Math.max(Math.ceil(outputChars/4),reportedOutput)>reservation.amount){const error=new GatewayError('Upstream exceeded the reserved token allowance; the request was stopped. Increase the explicit output allowance or the key limit.',429,'insufficient_quota');controller.abort(error);throw error;}
+      if((k.budget||k.tpm)&&reservation&&Math.max(reservation.input,reportedInput)+Math.max(Math.ceil(outputChars/4),reportedOutput)>reservation.amount){const error=new GatewayError('Upstream exceeded the reserved token allowance; the request was stopped. Increase the explicit output allowance or the key limit.',429,'insufficient_quota');controller.abort(error);throw error;}
     },()=>{firstAt=Date.now();streaming();},()=>{if(firstAt)armIdle();});
     // pipeTo rather than pipeThrough: an abort in the middle of the stream rejects the pipe, and that is handled here instead of surfacing as an unhandled rejection.
     pipeController=new AbortController();
@@ -318,7 +336,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
       const ro=settings.routes.find(x=>x.name===route);const failed=(fault||!!exhausted)&&status>=400;
       detail=JSON.stringify({v:1,model:used.id,protocol,status,route:{name:route,id:ro?.id||'',kind:ro?.kind||'',...(region?{region}:{})},cooldownsEnabled:settings.cooldowns===true,client:clientShape,upstreamMessage:upstreamMessage||undefined,attempts:takeAttempts(requestId),egress:failed&&ro&&ro.kind!=='warp'?await egressInfo(ro.id,networkFetch):undefined,exhausted:exhausted?{until:exhausted.until,seconds:exhausted.seconds}:undefined});
     }catch{/* diagnostics never affect the request */}}
-    const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail,
+    const ms=Date.now()-start;record({id:requestId,time:Date.now(),model:used.id,provider:used.providerId,protocol,route,status,ms,input,output,error:message,keyId:k.id,fault:fault&&tried,detail,spent:usedBy,
       // The agent engine names its session in each request; kept for the agent's key only (per-session usage on the Agent page).
       session:k.agent?String(req.headers['x-opencode-session-id']||req.headers['x-session-id']||'').slice(0,80)||undefined:undefined});
     logEvent(status<400||status===499?'info':status>=500?'error':'warn','requests',`${status} ${chain?chain.name+' → ':''}${used.id}${route?` via ${route}${region?' '+region:''}`:''} · ${ms<1000?ms+' ms':(ms/1000).toFixed(1)+' s'}${hops.length?` · skipped ${hops.join(', ')}`:''}${status===499?' · cancelled by the client':status>=400&&message?` · ${message.slice(0,300)}`:''}`,{requestId,protocol,model:used.id,provider:used.providerId,route,status,...(chain?{chain:chain.name,skipped:hops.length?hops:undefined}:{}),durationMs:ms,inputTokens:input,outputTokens:output,key:k.name||k.id,stream:!!body.stream,...(status>=400?{error:message,upstream:upstreamMessage&&upstreamMessage!==message?upstreamMessage:undefined}:{})});}
@@ -344,6 +362,27 @@ export function readiness(){
 }
 // One small real request to a model. slots: how many checks may run at once (a run over a provider's own server uses a few).
 export const probeModel=(id:string)=>probeResult(id).then(r=>r.model);
+// One rule for "the answer is complete", shared by inference and model checks: every choice reported how it finished.
+export const finishedAnswer=(data:any)=>!!data&&Array.isArray(data.choices)&&data.choices.length>0&&data.choices.every((c:any)=>!!c?.finish_reason);
+// A provider may answer a streamed request with one plain JSON completion. It is checked as JSON (complete when every choice finished) and
+// passed on as the equivalent stream, so the SSE path that follows sees the same answer and its finish.
+export async function jsonAsStream(r:Response):Promise<Response>{
+  const data:any=await r.json().catch(()=>null);
+  if(!data||!Array.isArray(data.choices)||!data.choices.length)throw new GatewayError('Upstream answered with JSON that is not a chat completion',502,'upstream_error');
+  const head={id:data.id||'chatcmpl-'+crypto.randomUUID(),object:'chat.completion.chunk',created:data.created||Math.floor(Date.now()/1000),model:data.model};
+  const frames:any[]=[];
+  for(const c of data.choices){
+    const index=Number.isInteger(c?.index)?c.index:0,m=c?.message||{},delta:any={role:'assistant'};
+    if(typeof m.content==='string')delta.content=m.content;
+    for(const k of ['reasoning_content','reasoning'])if(typeof m[k]==='string')delta[k]=m[k];
+    if(Array.isArray(m.tool_calls))delta.tool_calls=m.tool_calls.map((t:any,i:number)=>({index:i,id:t?.id,type:t?.type||'function',function:{name:t?.function?.name,arguments:t?.function?.arguments??''}}));
+    frames.push({...head,choices:[{index,delta,finish_reason:null}]});
+    if(c?.finish_reason)frames.push({...head,choices:[{index,delta:{},finish_reason:c.finish_reason}]});
+  }
+  if(data.usage)frames.push({...head,choices:[],usage:data.usage});
+  const text=frames.map(f=>`data: ${JSON.stringify(f)}\n\n`).join('')+(finishedAnswer(data)?'data: [DONE]\n\n':'');
+  return new Response(text,{status:r.status,headers:{'content-type':'text/event-stream'}});
+}
 // One sentence for the person who pressed Check: what the model answered and what Polygate made of it.
 export function probeSummary(m:Model,status:number){
   if(status<400)return `${m.name} answered.`;
@@ -360,10 +399,11 @@ export async function probeResult(id:string,slots=1):Promise<{model:Model;status
   try{
     release=await queue.acquire('availability-probe',slots,c.signal);
     const r=await providerChat(p,m,{messages:[{role:'user',content:'Reply with OK.'}],max_tokens:16,stream:true},c.signal,route.id,'probe-'+crypto.randomUUID());
-    let error='';if(r.ok)await collect(r);else error=await r.text();
+    // The same test inference applies: a 200 whose answer ended before every choice finished is not a working model.
+    let error='',status=r.status;if(r.ok){if(!finishedAnswer(await collect(r))){status=502;error='The answer ended before it finished';}}else error=await r.text();
     const after=r.headers.get('retry-after');const wait=after?(Number(after)*1000||Date.parse(after)-Date.now()):0;
-    classifyModel(m,r.status,error,Date.now()-start,r.ok||!Number.isFinite(wait)?0:Math.max(0,Math.min(wait,86400000)));
-    return {model:m,status:r.status,...(!r.ok&&r.headers.get(LIMIT_SCOPE)==='model'?{scope:'model' as const}:{})};
+    classifyModel(m,status,error,Date.now()-start,r.ok||!Number.isFinite(wait)?0:Math.max(0,Math.min(wait,86400000)));
+    return {model:m,status,...(!r.ok&&r.headers.get(LIMIT_SCOPE)==='model'?{scope:'model' as const}:{})};
   }catch(e){
     // A full queue or cancelled wait says nothing about the model; only failures after admission are its verdict.
     if(cancel?.aborted)throw cancel.reason;

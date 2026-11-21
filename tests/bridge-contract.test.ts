@@ -188,6 +188,20 @@ test('chat buffers split names, preserves parallel call IDs and does not alias t
   }
 });
 
+test('chat accepts null function names on continuation fragments', async () => {
+  const wire = sse(chunk({ tool_calls: [call('read', '{"value":', 0)] })) +
+    sse(chunk({ tool_calls: [{ index: 0, function: { name: null, arguments: '"fixture"}' } }] })) +
+    sse(chunk({}, 'tool_calls')) + sse('[DONE]');
+  for (const stream of [false, true]) {
+    const r = await request('chat', stream, wire, { tools: [{ type: 'function', function: { name: 'read', ...bridge.identity.DEFAULT_TOOLS.read } }] });
+    expect(r.status).toBe(200);
+    expect(r.text).not.toContain('upstream_tool_error');
+    const calls = stream ? reconstructedCalls(r.text) : JSON.parse(r.text).choices[0].message.tool_calls;
+    expect(calls[0].function?.name || calls[0].name).toBe('read');
+    expect(calls[0].function?.arguments || calls[0].arguments).toBe('{"value":"fixture"}');
+  }
+});
+
 test('chat forwards a completed name that extends an offered prefix', async () => {
   const wire = sse(chunk({ tool_calls: [call('lookup', '{"value":"private"}')] })) +
     sse(chunk({ tool_calls: [{ index: 0, function: { name: '_unoffered' } }] })) + sse(chunk({}, 'tool_calls'));
@@ -279,6 +293,28 @@ test('no-tools and none eligibility remain empty after a full-shape retry', asyn
   }
 });
 
+test('Responses sends the forced tool under its wire name and restores the client name', async () => {
+  const extra = { tools: [tool('read'), tool('lookup')], tool_choice: { type: 'function', function: { name: 'read' } } };
+  for (const stream of [false, true]) {
+    const r = await request('responses', stream, responseCall('read_client'), extra);
+    expect(r.payloads[0].tool_choice).toEqual({ type: 'function', name: 'read_client' });
+    expect(r.status).toBe(200);
+    expect(r.text).not.toContain('read_client');
+    const name = stream ? reconstructedCalls(r.text)[0].name : JSON.parse(r.text).choices[0].message.tool_calls[0].function.name;
+    expect(name).toBe('read');
+  }
+});
+
+test('Responses sends none or required rather than silently requesting automatic selection', async () => {
+  for (const choice of ['none', { type: 'none' }, 'required']) {
+    const required = choice === 'required';
+    const wire = required ? responseCall('lookup') : sse({ type: 'response.completed', response: { status: 'completed' } });
+    const r = await request('responses', false, wire, { tools: [tool('lookup')], tool_choice: choice });
+    expect(r.payloads[0].tool_choice).toBe(required ? 'required' : 'none');
+    expect(r.status).toBe(200);
+  }
+});
+
 test('Chat rejects repeated executable calls and fresh data after a terminal event', async () => {
   const finishedCall = sse(chunk({ tool_calls: [call('lookup', '{}')] }, 'tool_calls'));
   for (const stream of [false, true]) for (const wire of [
@@ -298,6 +334,25 @@ test('Chat rejects repeated executable calls and fresh data after a terminal eve
       expect(r.status).toBe(502);
       expect(JSON.parse(r.text).error.type).toBe('upstream_stream_error');
       expect(r.text).not.toContain('{}{}');
+    }
+  }
+});
+
+test('a finished Chat choice can have an empty trailer without losing the answer or usage', async () => {
+  const usage = { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 };
+  for (const delta of [{}, { content: null }, { content: '' }]) for (const stream of [false, true]) {
+    const wire = sse(chunk({ content: 'OK' }, 'stop')) + sse({ ...chunk(delta), usage }) + sse('[DONE]');
+    const r = await request('chat', stream, wire);
+    expect(r.status).toBe(200);
+    expect(r.text).not.toContain('upstream_stream_error');
+    if (stream) {
+      const frames = events(r.text);
+      expect(frames.flatMap(f => f.choices || []).map(c => c.delta?.content || '').join('')).toBe('OK');
+      expect(frames.find(f => f.usage)?.usage.total_tokens).toBe(4);
+    } else {
+      const answer = JSON.parse(r.text);
+      expect(answer.choices[0].message.content).toBe('OK');
+      expect(answer.usage.total_tokens).toBe(4);
     }
   }
 });
@@ -404,4 +459,31 @@ test('Responses emits exactly one ID when call_id arrives at done, completed, or
     expect(r.text).not.toContain('error');
     expect(reconstructedCalls(r.text)).toEqual([{ id: arrival === 'never' ? '1' : 'call-late', name: 'lookup', arguments: '{"value":"fixture"}', idParts: 1 }]);
   }
+});
+
+// Recorded from OpenCode Free on 2026-11-21 (Direct): DeepSeek sends "tool_calls": null on every chunk of a plain answer, and Nemotron repeats
+// its finished choice as {"role":"assistant","content":""} beside the final usage. Both broke 0.6.6 (502 "tool call not permitted", and
+// "choice data after its terminal event"); 0.6.5 passed them on.
+test('OpenCode Free plain answers pass: null tool_calls on every chunk, and the finished choice repeated with its role beside the usage', () => {
+  const deepseek = bridge.__chatToolGuard(new Map());
+  const ds = (delta: any, finish: string | null = null) => ({ id: 'c', object: 'chat.completion.chunk', model: 'deepseek-v4.1-flash-free', choices: [{ index: 0, finish_reason: finish, logprobs: null, delta }], usage: null });
+  expect(deepseek.feed(ds({ role: 'assistant', content: '', reasoning_content: null, tool_calls: null }))).not.toBeNull();
+  const answer = deepseek.feed(ds({ role: null, content: 'OK', reasoning_content: null, tool_calls: null }, 'stop'));
+  expect(answer.choices[0].delta.content).toBe('OK'); expect('tool_calls' in answer.choices[0].delta).toBe(false);
+  expect(deepseek.feed({ id: 'c', choices: [], usage: { prompt_tokens: 905, completion_tokens: 3 } }).usage.completion_tokens).toBe(3);
+
+  const nemotron = bridge.__chatToolGuard(new Map());
+  const nm = (delta: any, finish: string | null = null, usage?: any) => ({ id: 'g', choices: [{ index: 0, finish_reason: finish, delta }], ...(usage ? { usage } : {}) });
+  nemotron.feed(nm({ role: 'assistant', content: 'OK' }));
+  nemotron.feed(nm({ role: 'assistant', content: '', reasoning: null }, 'stop'));
+  const last = nemotron.feed(nm({ role: 'assistant', content: '' }, 'stop', { prompt_tokens: 982, completion_tokens: 21 }));
+  expect(last.choices).toEqual([]); expect(last.usage.completion_tokens).toBe(21); // the empty repeat is dropped, the usage kept
+  // Something new after the finish is still refused.
+  const strict = bridge.__chatToolGuard(new Map());
+  strict.feed(nm({ content: 'OK' }, 'stop'));
+  expect(() => strict.feed(nm({ role: 'assistant', content: 'more text' }))).toThrow('terminal event');
+  // A real tool call is still checked against the offered tools; an empty list is no call.
+  const tools = bridge.__chatToolGuard(new Map([['read_file', 'read_file']]));
+  expect(tools.feed(nm({ tool_calls: [] })).choices.length).toBe(1);
+  expect(() => bridge.__chatToolGuard(new Map()).feed(nm({ tool_calls: [{ index: 0, function: { name: 'rm_rf', arguments: '{}' } }] }))).toThrow();
 });

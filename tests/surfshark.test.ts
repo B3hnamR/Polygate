@@ -137,9 +137,36 @@ test('Test on the Surfshark route checks every connected location through its ow
   expect(S.spentUntil(exits['de-fra'])).toBeGreaterThan(Date.now());
   __setPsiphonRegionTester();
 });
+test('a successful Surfshark route test clears only the tested provider limit', async () => {
+  const until = Date.now() + 3600000;
+  S.surfsharkSpent('de-fra', until);
+  S.surfsharkKiloLimited('de-fra', until);
+  __setPsiphonRegionTester(async () => ({ ok: true, status: 200, buffered: false, chat: 'ok', summary: 'ok', latency: 50 }));
+  try {
+    await testRoute('surfshark', 'kilo');
+    expect(S.spentUntil(exits['de-fra'])).toBe(until);
+    expect(S.kiloUntil(exits['de-fra'])).toBe(0);
+    S.surfsharkKiloLimited('de-fra', until);
+    await testRoute('surfshark');
+    expect(S.spentUntil(exits['de-fra'])).toBe(0);
+    expect(S.kiloUntil(exits['de-fra'])).toBe(until);
+  } finally { S.clearSurfsharkKiloLimit(exits['de-fra']); __setPsiphonRegionTester(); }
+});
 test('nothing connected: requests fail with a reason that names Surfshark', async () => {
   S.__instances.clear();
   await expect(post()).rejects.toThrow(/Surfshark is not connected/);
+});
+test('explicit pool selection supersedes a remembered Surfshark choice; standby alone does not', async () => {
+  const { setPoolRole } = await import('../backend/pool');
+  const saved = { routeId: settings.routeId, previousRouteId: settings.previousRouteId, managedChoice: settings.managedChoice, routes: settings.routes };
+  try {
+    settings.routes = [...settings.routes.filter(r => r.id !== 'proxy-pool'), { id: 'proxy-pool', name: 'Pool', kind: 'proxy', url: 'pool://verified', enabled: true, models: [] }];
+    settings.routeId = 'direct'; settings.managedChoice = 'surfshark';
+    setPoolRole(false); expect(settings.managedChoice).toBe('surfshark');
+    setPoolRole(true); S.reconcileSurfshark();
+    expect(settings.routeId).toBe('proxy-pool'); expect(settings.managedChoice).toBeUndefined();
+    expect(settings.previousRouteId).toBe('direct');
+  } finally { Object.assign(settings, saved); }
 });
 test('settings: locations are checked and kept in lower case, and there is no limit on how many', async () => {
   S.__instances.clear();
@@ -154,4 +181,18 @@ test('Connect says what is missing: the key pair, the server list, a location', 
   await expect(S.surfsharkConnect()).rejects.toThrow(S.findWireproxy() ? 'key pair' : 'WireGuard client');
   settings.surfshark = { ...settings.surfshark!, privateKey: pair.privateKey, servers: [] };
   if (S.findWireproxy()) await expect(S.surfsharkConnect()).rejects.toThrow('Update servers');
+});
+
+test('a location Surfshark no longer lists leaves your chosen locations when the servers are updated, so Connect is not blocked by it', async () => {
+  const k = keyPair().publicKey;
+  settings.surfshark = { ...settings.surfshark!, regions: ['de-fra', 'za-jnb'], pinned: 'za-jnb', mode: 'single' };
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify([
+    { connectionName: 'de-fra.prod.surfshark.com', pubKey: k, country: 'Germany', countryCode: 'DE', location: 'Frankfurt' },
+    { connectionName: 'nl-ams.prod.surfshark.com', pubKey: k, country: 'Netherlands', countryCode: 'NL', location: 'Amsterdam' },
+  ]), { headers: { 'content-type': 'application/json' } })) as any;
+  try { await S.surfsharkUpdateServers(); } finally { globalThis.fetch = real; }
+  expect(settings.surfshark!.regions).toEqual(['de-fra']);
+  expect(settings.surfshark!.pinned).toBe('de-fra');
+  expect(settings.surfshark!.servers!.map(s => s.id).sort()).toEqual(['de-fra', 'nl-ams']);
 });

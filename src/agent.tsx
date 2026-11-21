@@ -61,12 +61,16 @@ export function AgentApp({onBack}:{onBack:()=>void}){
       autoStarted.current=true;void act('/admin/agent/engine/start','start');
     }
   },[engine,busy,act]);
-  const choose=(id:string)=>{setOpen(id);store('polygate-agent-open',id);if(fresh?.info.id!==id)setFresh(null);};
+  // The open session as last seen. One failed or partial list poll must not unmount it (and its unsent draft): it stays until the user
+  // navigates away, deletes it, or its own view confirms it is gone.
+  const lastInfo=useRef<SessionInfo|undefined>(undefined);
+  const choose=(id:string)=>{setOpen(id);store('polygate-agent-open',id);if(fresh?.info.id!==id)setFresh(null);if(lastInfo.current?.id!==id)lastInfo.current=undefined;};
   // A new session, empty or (with +) in one folder; seq starts a fresh screen even when the same folder is asked for again.
   const [start,setStart]=useState<{folder?:string|null;seq:number}>({seq:0});
   const newSession=(folder?:string|null)=>{choose('');setStart(x=>({folder,seq:x.seq+1}));};
   const sessions=list?.sessions||[];
-  const info=sessions.find(s=>s.id===open)||(fresh?.info.id===open?fresh.info:undefined);
+  const listed=sessions.find(s=>s.id===open);if(listed)lastInfo.current=listed;
+  const info=listed||(fresh?.info.id===open?fresh.info:undefined)||(open&&lastInfo.current?.id===open?lastInfo.current:undefined);
   // Sessions grouped by their folder, the folder with the newest session first (the list comes newest first). Sessions started with
   // "No folder" (each in its own empty folder under the scratch folder) share one group.
   const scratch=folderList?.scratch||'';
@@ -82,7 +86,7 @@ export function AgentApp({onBack}:{onBack:()=>void}){
   const main=!engine?<div className="ag-center">{engineError?<div className="pg-error">{engineError}</div>:<p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Checking the agent engine…</p>}</div>
     :!running?<div className="ag-center"><div className="ag-column">{busy==='start'||['starting','restarting'].includes(engine.state)?<p className="subtle ag-loading" role="status"><Loader2 className="spin" size={15}/> Starting the agent engine…</p>:<div className="ag-card"><EngineCard engine={engine} busy={busy} act={act}/></div>}</div></div>
     :!list&&!listError&&open&&!info?<div className="ag-center"><p className="subtle ag-loading"><Loader2 className="spin" size={15}/> Loading sessions…</p></div>
-    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} scratch={scratch} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{choose('');reloadList();}}/>
+    :info?<SessionView key={info.id} start={info} opening={fresh?.info.id===info.id?fresh.opening:undefined} scratch={scratch} models={models} onResync={resync} onChanged={reloadList} onDeleted={()=>{lastInfo.current=undefined;choose('');reloadList();}}/>
     :<NewSession key={start.seq} startFolder={start.folder} models={models} folders={folderList?.folders||[]} reloadFolders={reloadFolders} onResync={resync} onCreated={(s,opening)=>{setFresh({info:s,opening});setOpen(s.id);store('polygate-agent-open',s.id);reloadList();reloadFolders();}}/>;
   return <div className="ag-app" style={agentFontVars(font) as CSSProperties}>
     <aside className="ag-side" aria-label="Agent sessions">
@@ -475,6 +479,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   const [info,setInfo]=useState<SessionInfo>(start);const [items,setItems]=useState<Item[]>([]);const [pending,setPending]=useState<Approval[]>([]);
   const [paused,setPaused]=useState('');const [busy,setBusy]=useState(false);const [usage,setUsage]=useState<SessionInfo['tokens']>(start.tokens);
   const [error,setError]=useState(opening?.error||'');const [notice,setNotice]=useState(opening?.notice||'');const [live,setLive]=useState<'connecting'|'syncing'|'recovering'|'live'|'lost'>('connecting');const [requests,setRequests]=useState<RouteUsage|null>(null);
+  const [changesWarning,setChangesWarning]=useState('');
   const [text,setText]=useState(opening?.draft||'');const [files,setFiles]=useState<AgentFile[]>(opening?.files||[]);const [skills,setSkills]=useState<SkillPick[]>(opening?.skills||[]);const [sending,setSending]=useState(false);
   const draftRevision=useRef({text:0,files:0,skills:0});
   const editText=(value:string|((current:string)=>string))=>{draftRevision.current.text++;setText(value);};
@@ -513,15 +518,21 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
     const sync=async()=>{
       if(closed)return;if(syncing){again=true;return;}repair.begin();syncing=true;setLive('syncing');
       const request=consistency.begin();
-      try{const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),api('/admin/agent/session/changes?id='+encodeURIComponent(id))]);if(closed)return;
-        const snapshot=[...withChanges(fromHistory(s.messages),changes.turns||[]),...fromInbox(s.inbox||[])];
+      try{
+        // Pending file recording can prevent loading change cards, but not the conversation itself.
+        const [s,changes]=await Promise.all([api('/admin/agent/session?id='+encodeURIComponent(id)),
+          api('/admin/agent/session/changes?id='+encodeURIComponent(id)).then(c=>({turns:c.turns||[],warning:''}),
+            e=>({turns:[],warning:`Recorded file changes are unavailable.${e?.message?' '+e.message:''}`}))]);
+        if(closed)return;
+        const snapshot=[...withChanges(fromHistory(s.messages),changes.turns),...fromInbox(s.inbox||[])];
         const replay=consistency.install(request,snapshot,s.reconnect);if(!replay){again=connected;return;}
+        setChangesWarning(changes.warning);
         setInfo(s.session);setItems(snapshot);setRequests(s.usage||null);setPending(s.pending||[]);setPaused(s.paused||'');setBusy(!!s.busy);setUsage(s.session.tokens);
         engineConnected=!!s.reconnect.connected;setLive(!connected||!engineConnected?'lost':replay.refresh||s.busy?'recovering':'live');
         for(const e of replay.events)handle(e);
         // A disconnected engine stream cannot be repaired by polling history. Its reconnect event resumes reconciliation.
         repair.complete(replay.refresh&&s.reconnect.connected);
-      }catch(e:any){if(!closed){setError(e.message);setLive(connected&&engineConnected?'recovering':'lost');if(connected&&engineConnected)repair.failed();else repair.complete(false);}}
+      }catch(e:any){if(!closed&&e?.status===404){deleted.current();return;}if(!closed){setError(e.message);setLive(connected&&engineConnected?'recovering':'lost');if(connected&&engineConnected)repair.failed();else repair.complete(false);}}
       finally{syncing=false;if(again&&!closed){again=false;void sync();}}
     };
     resync.current=()=>repair.request(true);
@@ -571,7 +582,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
   const answer=async(p:Approval,decision:'once'|'session'|'project'|'deny')=>{
     if(decision==='project'&&!await confirm(<>Save this exact {p.action} request for this working folder? It will be allowed in future sessions without asking. It does not match broader command prefixes. Remove it under Project rules.</>,{title:'Save project rule',confirm:'Save and allow',icon:<ShieldCheck size={18}/>}))return;
     setPending(list=>list.filter(x=>x.id!==p.id));
-    try{await api('/admin/agent/session/approve',{id,request:p.id,decision});}catch(e:any){setError(e.message);resync.current();}
+    try{const r=await api('/admin/agent/session/approve',{id,request:p.id,decision});if(r?.warning)setError(r.warning);}catch(e:any){setError(e.message);resync.current();}
   };
   const shown=useMemo(()=>blocks(transcript),[transcript]);const todos=useMemo(()=>latestTodos(transcript),[transcript]);
   // A queued message taken back, or sent now as steering; the screen follows at once, the engine confirms with its own event.
@@ -609,6 +620,7 @@ function SessionView({start,opening,scratch,models:modelData,onResync,onChanged,
       <AgentForms id={id}/>
       {paused&&<div className="agent-paused" role="status"><TriangleAlert size={17}/><div><strong>Paused.</strong> {plainError(paused)} Send a message to try again, or pick another model below.</div></div>}
       {notice&&!error&&<div className="agent-notice" role="status">{notice}</div>}
+      {changesWarning&&<p className="agent-warn" role="status"><TriangleAlert size={15}/>{changesWarning}</p>}
       {error&&<div className="pg-error agent-error">{error}</div>}
       {queued.length>0&&<QueuedMessages queued={queued} busy={busy} onSteer={k=>unqueue(k,'steer')} onRemove={k=>unqueue(k,'cancel')}/>}
       <Composer value={text} onChange={editText} files={files} onFiles={editFiles} skills={skills} onSkills={editSkills} folder={folder} onSend={()=>send('steer')} onQueue={()=>send('queue')} canSend={!untrusted} sending={sending} busy={busy} onStop={stop}

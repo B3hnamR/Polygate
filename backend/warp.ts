@@ -124,11 +124,15 @@ function stopProcess(proc?: ChildProcess) { try { proc?.kill(); } catch { /* alr
 // --- SOCKS probing ---
 function socksAlive(host: string, port: number, timeoutMs = 2500): Promise<boolean> {
   return new Promise(resolve => {
-    const socket = net.connect({ host, port }); let settled = false;
-    const finish = (ok: boolean) => { if (settled) return; settled = true; socket.destroy(); resolve(ok); };
+    const socket = net.connect({ host, port }); let settled = false; let reply = Buffer.alloc(0);
+    // An overall deadline as well as the idle one, and a clean close (EOF) before the two-byte answer counts as a failure, never as a wait.
+    const deadline = setTimeout(() => finish(false), timeoutMs);
+    const finish = (ok: boolean) => { if (settled) return; settled = true; clearTimeout(deadline); socket.destroy(); resolve(ok); };
     socket.setTimeout(timeoutMs, () => finish(false)); socket.once('error', () => finish(false));
+    socket.once('end', () => finish(false)); socket.once('close', () => finish(false));
     socket.once('connect', () => socket.write(Buffer.from([0x05, 0x01, 0x00])));
-    socket.once('data', d => finish(d.length >= 2 && d[0] === 0x05 && d[1] === 0x00));
+    // The answer may arrive split across reads.
+    socket.on('data', (d: Buffer) => { reply = Buffer.concat([reply, d]); if (reply.length >= 2) finish(reply[0] === 0x05 && reply[1] === 0x00); });
   });
 }
 // A real request through the tunnel is the only readiness signal that matters. Port-open is not enough: usque opens its SOCKS

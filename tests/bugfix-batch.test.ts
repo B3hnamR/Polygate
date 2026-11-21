@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 // State folder and POLYGATE_NO_DISCOVERY come from tests/setup.ts.
@@ -64,15 +64,34 @@ test('SOCKS bridges are capped, so thousands of proxies cannot open thousands of
   closeSocksBridges(); expect(bridgeCount()).toBe(0);
 });
 
-test('settings that cannot be opened are kept aside and the app starts with defaults, with a clear message', () => {
+// An unreadable vault: the gateway sets it aside and starts on defaults; inspection changes nothing; and when it cannot be set aside, nothing
+// starts and the file is left exactly as it was (starting on defaults would save them over the only copy).
+const unreadableVault = (script: string, extra: Record<string, string> = {}) => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'polygate-vault-'));
-  try {
-    writeFileSync(path.join(dir, 'vault.key'), Buffer.alloc(32, 7)); writeFileSync(path.join(dir, 'settings.vault'), Buffer.alloc(120, 1));
-    const run = Bun.spawnSync([process.execPath, '-e', "const m = await import('./backend/state.ts'); console.log('providers:' + m.settings.providers.length);"], { cwd: path.resolve(import.meta.dir, '..'), env: { ...process.env, POLYGATE_STATE: dir, POLYGATE_READ_ONLY_STATE: '1' } });
-    expect(run.exitCode).toBe(0); expect(run.stdout.toString()).toContain('providers:');
-    expect(run.stderr.toString()).toContain('could not open its saved settings');
-    expect(readdirSync(dir).some(f => f.startsWith('settings.vault.unreadable-'))).toBe(true);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  writeFileSync(path.join(dir, 'vault.key'), Buffer.alloc(32, 7)); writeFileSync(path.join(dir, 'settings.vault'), Buffer.alloc(120, 1));
+  const env: Record<string, string | undefined> = { ...process.env, POLYGATE_STATE: dir, ...extra }; if (!('POLYGATE_READ_ONLY_STATE' in extra)) delete env.POLYGATE_READ_ONLY_STATE;
+  const run = Bun.spawnSync([process.execPath, '-e', script], { cwd: path.resolve(import.meta.dir, '..'), env: env as any });
+  const vault = path.join(dir, 'settings.vault'); const original = existsSync(vault) && readFileSync(vault).equals(Buffer.alloc(120, 1));
+  const files = readdirSync(dir); rmSync(dir, { recursive: true, force: true });
+  return { run, original, files };
+};
+const START = "const m = await import('./backend/state.ts'); console.log('providers:' + m.settings.providers.length);";
+test('settings that cannot be opened are kept aside and the gateway starts with defaults, with a clear message', () => {
+  const { run, files } = unreadableVault(START);
+  expect(run.exitCode).toBe(0); expect(run.stdout.toString()).toContain('providers:');
+  expect(run.stderr.toString()).toContain('could not open its saved settings');
+  expect(files.some(f => f.startsWith('settings.vault.unreadable-'))).toBe(true);
+});
+test('inspecting unreadable settings stops with the reason and changes nothing', () => {
+  const { run, original, files } = unreadableVault(START, { POLYGATE_READ_ONLY_STATE: '1' });
+  expect(run.exitCode).not.toBe(0); expect(run.stderr.toString()).toContain('Nothing was changed');
+  expect(original).toBe(true); expect(files.some(f => f.startsWith('settings.vault.unreadable-'))).toBe(false);
+});
+test('when unreadable settings cannot be set aside, nothing starts and the only copy is left exactly as it was', () => {
+  const { run, original, files } = unreadableVault("const fs = require('node:fs'); fs.renameSync = () => { throw Object.assign(new Error('locked'), { code: 'EBUSY' }); }; " + START);
+  expect(run.exitCode).not.toBe(0); expect(run.stdout.toString()).not.toContain('providers:');
+  expect(run.stderr.toString()).toContain('could not set the file aside (EBUSY)');
+  expect(original).toBe(true); expect(files.some(f => f.startsWith('settings.vault.unreadable-'))).toBe(false);
 });
 
 test('an atomic write leaves the whole new file and no temporary file behind', () => {

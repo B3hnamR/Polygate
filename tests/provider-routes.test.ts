@@ -122,3 +122,15 @@ test('a route that is the only one chosen for a provider cannot be switched off 
   expect(del.status).toBe(200);
   expect(settings.providers.find(p => p.id === 'two')!.routes!.ids).toEqual(['prs-a']);
 });
+
+test("a provider's only route, paused, cannot be deleted: \"send nothing\" must not turn into \"follow the main route\"", async () => {
+  proxy('prs-p'); proxy('prs-q'); settings.routeId = 'direct';
+  settings.providers.push(own({ ids: ['prs-p'], paused: ['prs-p'] }), { ...own({ ids: ['prs-p', 'prs-q'], paused: ['prs-p'] }), id: 'two-paused', name: 'Two paused' });
+  const del = await call('/admin/routes/delete', { id: 'prs-p' });
+  expect(del.status).toBe(409); expect(del.body.error.message).toContain('Own server');
+  expect(settings.providers.find(p => p.id === 'own')!.routes).toMatchObject({ ids: ['prs-p'], paused: ['prs-p'] });
+  // With another usable route on the list, the paused one can go, and it leaves the paused list too.
+  settings.providers = settings.providers.filter(p => p.id !== 'own');
+  expect((await call('/admin/routes/delete', { id: 'prs-p' })).status).toBe(200);
+  expect(settings.providers.find(p => p.id === 'two-paused')!.routes).toMatchObject({ ids: ['prs-q'], paused: [] });
+});

@@ -11,13 +11,13 @@ type Library={instructions:string;skills:LibrarySkill[];revision:string;builtin:
 // visit to the other; `part` says which one is showing (none: nothing is drawn, the edits are kept).
 export function AgentLibrarySettings({busy,part}:{busy:boolean;part:'prompt'|'skills'|null}){
   const [data,setData]=useState<Library|null>(null),[instructions,setInstructions]=useState(''),[skills,setSkills]=useState<LibrarySkill[]>([]),[open,setOpen]=useState<string>(''),[error,setError]=useState(''),[saving,setSaving]=useState(false),[saved,setSaved]=useState(false);
-  const [query,setQuery]=useState(''),[dropping,setDropping]=useState(false);
+  const [query,setQuery]=useState(''),[dropping,setDropping]=useState(false),[pendingImports,setPendingImports]=useState(0);
   const picker=useRef<HTMLInputElement>(null);const {confirm,dialog}=useConfirm();
   const edits=useRef({instructions:0,skills:0}),operation=useRef(0),locked=useRef(false),lifetime=useRef(0);
   const editInstructions=(value:string)=>{edits.current.instructions++;setInstructions(value);setSaved(false);};
   const editSkills=(change:(list:LibrarySkill[])=>LibrarySkill[])=>{edits.current.skills++;setSkills(change);setSaved(false);};
   const load=async(discard=false)=>{
-    if(locked.current)return;locked.current=true;const request=++operation.current,revision={...edits.current};setSaving(true);setSaved(false);
+    if(locked.current||pendingImports)return;locked.current=true;const request=++operation.current,revision={...edits.current};setSaving(true);setSaved(false);
     try{
       if(discard&&!await confirm('Discard unsaved changes to the system prompt and skills?',{title:'Discard changes',confirm:'Discard'}))return;
       if(request!==operation.current)return;setError('');const l:Library=await api('/admin/agent/library');if(request!==operation.current)return;
@@ -47,25 +47,35 @@ export function AgentLibrarySettings({busy,part}:{busy:boolean;part:'prompt'|'sk
   const discard=()=>load(true);
   const update=(id:string,patch:Partial<LibrarySkill>)=>editSkills(list=>list.map(s=>s.id===id?{...s,...patch}:s));
   const add=(skill:Omit<LibrarySkill,'id'>)=>{const id='new-'+crypto.randomUUID();editSkills(list=>[...list,{id,...skill}]);setOpen(id);setQuery('');};
-  const importFiles=async(files:File[])=>{const owner=lifetime.current;setError('');for(const f of files){if(!/\.(md|markdown|txt)$/i.test(f.name)){setError(`${f.name} is not a Markdown file.`);continue;}if(f.size>32000){setError(`${f.name} is larger than 32,000 bytes.`);continue;}try{const text=await f.text();if(owner!==lifetime.current)return;add(parseSkillFile(text,f.name));}catch(e:any){if(owner!==lifetime.current)return;setError(e?.message||`Could not read ${f.name}.`);}}};
+  const importFiles=async(files:File[])=>{
+    if(!data||locked.current||!files.length)return;
+    // A reload replaces the skill list; wait for accepted imports to finish before allowing one.
+    const owner=lifetime.current;setPendingImports(n=>n+1);setError('');
+    try{for(const f of files){
+      if(!/\.(md|markdown|txt)$/i.test(f.name)){setError(`${f.name} is not a Markdown file.`);continue;}
+      if(f.size>32000){setError(`${f.name} is larger than 32,000 bytes.`);continue;}
+      try{const text=await f.text();if(owner!==lifetime.current)return;add(parseSkillFile(text,f.name));}
+      catch(e:any){if(owner!==lifetime.current)return;setError(e?.message||`Could not read ${f.name}.`);}
+    }}finally{if(owner===lifetime.current)setPendingImports(n=>n-1);}
+  };
   if(!part)return <>{dialog}</>;
   const words=query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const matches=(s:{name:string;description:string})=>words.every(w=>`${s.name} ${s.description}`.toLowerCase().includes(w));
   const list=skills.filter(s=>s.id===open||matches(s));const builtin=(data?.builtin||[]).filter(matches);
-  const saveBar=dirty&&<div className="ag-savebar" role="status"><span>Unsaved changes to the system prompt and skills</span><Button disabled={saving} onClick={discard}>Discard</Button><Button variant="primary" disabled={busy||saving} onClick={save}>{saving?'Saving…':'Save'}</Button></div>;
+  const saveBar=dirty&&<div className="ag-savebar" role="status"><span>Unsaved changes to the system prompt and skills</span><Button disabled={saving||pendingImports>0} onClick={discard}>Discard</Button><Button variant="primary" disabled={busy||saving} onClick={save}>{saving?'Saving…':'Save'}</Button></div>;
   return <div className="ag-library">
     {part==='prompt'&&<>
       <p className="ag-settings-lead">Applied before every message in every working folder, ahead of a folder’s own instructions from its Project tab. Changes apply from the next message you send.</p>
       {!data&&!error&&<p className="subtle">Loading…</p>}
       {data&&<textarea dir="auto" className="ag-prompt" aria-label="Agent system prompt" rows={12} value={instructions} placeholder="How the agent should work for you: language, style, rules it should always follow" onChange={e=>editInstructions(e.target.value)}/>}
     </>}
-    {part==='skills'&&<div className={`ag-skills${dropping?' dropping':''}`} onDragOver={e=>{if(e.dataTransfer.types.includes('Files')){e.preventDefault();setDropping(true);}}} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))setDropping(false);}} onDrop={e=>{e.preventDefault();setDropping(false);void importFiles(Array.from(e.dataTransfer.files));}}>
+    {part==='skills'&&<div className={`ag-skills${dropping&&data&&!saving?' dropping':''}`} onDragOver={e=>{if(e.dataTransfer.types.includes('Files')){e.preventDefault();const allowed=!!data&&!locked.current;e.dataTransfer.dropEffect=allowed?'copy':'none';setDropping(allowed);}}} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))setDropping(false);}} onDrop={e=>{e.preventDefault();setDropping(false);void importFiles(Array.from(e.dataTransfer.files));}}>
       <p className="ag-settings-lead">A skill teaches the agent one kind of task. Use one in a message by typing <kbd>/</kbd> or pressing the <BookOpen size={13} className="ag-inline-icon" aria-label="skills"/> button beside the message box. With <strong>Auto</strong> on, the agent also loads it by itself when a task matches its description. Drop SKILL.md files here to import them.</p>
       <div className="ag-skill-tools">
         <label className="ag-settings-search"><Search size={14}/><input type="search" aria-label="Search skills" placeholder="Search skills" value={query} onChange={e=>setQuery(e.target.value)}/></label>
         <Button variant="primary" disabled={!data||skills.length>=50} onClick={()=>add({name:'',description:'',text:'',auto:true})}><Plus size={13}/>New skill</Button>
-        <Button disabled={!data||skills.length>=50} onClick={()=>picker.current?.click()}><FileUp size={13}/>Import</Button>
-        <input ref={picker} className="ag-file-input" type="file" accept=".md,text/markdown,text/plain" multiple tabIndex={-1} aria-label="Choose SKILL.md files" onChange={e=>{void importFiles(Array.from(e.target.files||[]));e.target.value='';}}/>
+        <Button disabled={!data||saving||skills.length>=50} onClick={()=>picker.current?.click()}><FileUp size={13}/>Import</Button>
+        <input ref={picker} className="ag-file-input" type="file" disabled={!data||saving} accept=".md,text/markdown,text/plain" multiple tabIndex={-1} aria-label="Choose SKILL.md files" onChange={e=>{void importFiles(Array.from(e.target.files||[]));e.target.value='';}}/>
       </div>
       {!data&&!error&&<p className="subtle">Loading…</p>}
       {data&&<>
@@ -92,7 +102,7 @@ export function AgentLibrarySettings({busy,part}:{busy:boolean;part:'prompt'|'sk
         </>}
       </>}
     </div>}
-    {data&&!dirty&&<div className="button-row ag-library-foot">{saved&&<span className="green" role="status"><Check size={13}/> Saved</span>}<Button disabled={saving} onClick={()=>load()}><RefreshCw size={13}/>Reload</Button></div>}
+    {data&&!dirty&&<div className="button-row ag-library-foot">{saved&&<span className="green" role="status"><Check size={13}/> Saved</span>}<Button disabled={saving||pendingImports>0} onClick={()=>load()}><RefreshCw size={13}/>Reload</Button></div>}
     {error&&<p className="pg-error" role="alert">{error}</p>}
     {saveBar}{dialog}
   </div>;

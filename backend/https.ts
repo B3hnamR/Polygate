@@ -36,7 +36,13 @@ function restorePemPair(id: string, before: { cert: string | null; key: string |
 function readTls(cfg: HttpsSettings): (Tls & { cert509: X509Certificate }) | undefined {
   const id = cfg.mode === 'custom' ? 'custom' : cfg.mode; if (cfg.mode === 'off') return undefined;
   const cf = certPath(id), kf = keyPath(id); if (!existsSync(cf) || !existsSync(kf)) return undefined;
-  try { const cert = readFileSync(cf, 'utf8'); return { cert, key: readFileSync(kf, 'utf8'), cert509: new X509Certificate(cert) }; } catch { return undefined; }
+  // The certificate and key must parse and belong together: a damaged or mismatched key would select TLS and then fail to bind, instead of
+  // falling back to loopback-only recovery.
+  try {
+    const cert = readFileSync(cf, 'utf8'), key = readFileSync(kf, 'utf8'), cert509 = new X509Certificate(cert);
+    if (!cert509.checkPrivateKey(createPrivateKey(key))) return undefined;
+    return { cert, key, cert509 };
+  } catch { return undefined; }
 }
 const expiryOf = (c: X509Certificate) => Date.parse(c.validTo);
 // --- environment checks ---

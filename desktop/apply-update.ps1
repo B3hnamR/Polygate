@@ -15,8 +15,12 @@ function Get-UpdateHash([string]$File) {
 # gone counts as closed; only one that is still running after the wait is a failure.
 function Wait-ForOldApp([int]$ProcessId, [int]$TimeoutSeconds) {
   if ($ProcessId -le 0) { return }
-  Wait-Process -Id $ProcessId -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
-  if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { throw 'The old app did not close in time.' }
+  try { $oldApp = [Diagnostics.Process]::GetProcessById($ProcessId) }
+  catch [ArgumentException] { return } # Already gone before the lookup.
+  try {
+    # Use the wait result, not a second PID lookup that could find a different process.
+    if (!$oldApp.WaitForExit($TimeoutSeconds * 1000)) { throw 'The old app did not close in time.' }
+  } finally { $oldApp.Dispose() }
 }
 try {
   $configFile = [IO.Path]::GetFullPath($ConfigPath)
@@ -41,7 +45,8 @@ try {
   Wait-ForOldApp $config.parentPid 45
   $suffix = [guid]::NewGuid().ToString('N')
   $incoming = Join-Path $targetDir ('.polygate-incoming-' + $suffix + '.exe')
-  $backup = Join-Path $targetDir ('.polygate-backup-' + $suffix + '.exe')
+  # File.Replace can preserve timestamps from the old executable. Record when the backup was allocated, independently of file metadata.
+  $backup = Join-Path $targetDir ('.polygate-backup-' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + '-' + $suffix + '.exe')
   # Both resolved paths stay beside the exact portable executable selected by the main process.
   if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($incoming)) -ne $targetDir -or [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($backup)) -ne $targetDir) { throw 'Invalid replacement paths.' }
   Copy-Item -LiteralPath $staged -Destination $incoming
@@ -61,8 +66,20 @@ try {
   }
   [IO.File]::WriteAllText($config.resultPath, (@{ ok=$true; version=$config.version; path=$final } | ConvertTo-Json -Compress))
   # The update is already in place; a launch that fails must not roll it back.
-  if (!$NoLaunch) { try { Remove-Item Env:POLYGATE_RELOCATED -ErrorAction SilentlyContinue; Start-Process -FilePath $final -WorkingDirectory $targetDir } catch { [Console]::Error.WriteLine('The update was installed but the app could not be started: ' + $_.Exception.Message) } }
-  Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+  # The previous executable is kept until the new version confirms that its gateway and dashboard are up (it writes update-started.json
+  # beside the result file). Only the helper that made this backup removes it on confirmation.
+  $confirmed = $false
+  if (!$NoLaunch) {
+    $ack = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($config.resultPath))) 'update-started.json'
+    [IO.File]::Delete($ack) # Absence is fine, but a stale acknowledgement that cannot be cleared is not.
+    try { Remove-Item Env:POLYGATE_RELOCATED -ErrorAction SilentlyContinue; Start-Process -FilePath $final -WorkingDirectory $targetDir } catch { [Console]::Error.WriteLine('The update was installed but the app could not be started: ' + $_.Exception.Message) }
+    for ($wait = 0; $wait -lt 360 -and !$confirmed; $wait++) {
+      Start-Sleep -Milliseconds 500
+      try { $started = Get-Content -LiteralPath $ack -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json; if ($started.version -eq $config.version -and $started.exe -and ([IO.Path]::GetFullPath([string]$started.exe) -eq [IO.Path]::GetFullPath($final))) { $confirmed = $true } } catch {}
+    }
+    if (!$confirmed) { [Console]::Error.WriteLine('The new version did not confirm that it started. The previous executable is kept at ' + $backup) }
+  }
+  if ($confirmed) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
   foreach ($file in @($staged, $configFile, (Join-Path $stageDir 'ready'), (Join-Path $stageDir 'launcher-error.log'), $PSCommandPath)) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
   Remove-Item -LiteralPath $stageDir -ErrorAction SilentlyContinue
 } catch {

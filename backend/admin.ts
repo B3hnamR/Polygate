@@ -31,7 +31,7 @@ import { checkForUpdates } from './updates';
 import * as agentEngine from './agent-engine';
 import { agentApi, pruneAgentBackups } from './agent';
 import { queryEvents, exportEvents, clearEvents, parseLogQuery, logEvent } from './logbook';
-import { mcpConfig, mcpState, serverStatus, cleanServer, parseImport, slug, testServer, saveServers, settle, reconnect, callTool, canManageLocal, syncMcp } from './mcp';
+import { mcpConfig, mcpState, serverStatus, cleanServer, knownKeys, parseImport, slug, testServer, saveServers, settle, reconnect, callTool, canManageLocal, syncMcp } from './mcp';
 // The MCP page: hub settings, servers, their tools, connection tests and trying a tool.
 async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
   const method=req.method;const cfg=mcpConfig();const local=canManageLocal(req);
@@ -40,8 +40,10 @@ async function mcpAdmin(req:IncomingMessage,res:ServerResponse,pathname:string){
   if(method!=='POST')throw new GatewayError('Endpoint not found',404);
   const b=await readJson(req);
   if(pathname==='/admin/mcp/settings'){
+    // Stale keys are refused before anything changes, so switching the tools on cannot go through with a widened key list.
+    const keys=Array.isArray(b.builtinKeys)?knownKeys(b.builtinKeys):undefined;
     if(b.enabled!==undefined)cfg.enabled=!!b.enabled;if(b.builtin!==undefined)cfg.builtin=!!b.builtin;
-    if(Array.isArray(b.builtinKeys)){const keys=b.builtinKeys.map(String).filter((id:string)=>settings.keys.some(k=>k.id===id));cfg.builtinKeys=keys.length?keys:undefined;}
+    if(keys)cfg.builtinKeys=keys.length?keys:undefined;
     persist();syncMcp();return json(res,200,mcpState(req));
   }
   if(pathname==='/admin/mcp/servers'){
@@ -102,7 +104,9 @@ function chosenRoutes(b: any, old?: Provider): ProviderRoutes | undefined {
   return { ids, spread: raw.spread === true, backups: (b.kind === 'free' || b.kind === 'kilo') && raw.backups === true, ...(paused.length ? { paused } : {}) };
 }
 // Providers for which this route is the last enabled one in their list: switching it off or deleting it would leave them nowhere to go.
-const soleRouteOf = (routeId: string) => settings.providers.filter(p => { const set = providerRoutes(p); return !!set && set.ids.includes(routeId) && !set.ids.some(id => id !== routeId && settings.routes.some(r => r.id === id && r.enabled)); });
+// Read from the provider's own list, paused routes included: a paused route is still the provider's choice ("send nothing for now"), and
+// deleting the last one would otherwise leave no list at all, which means "follow the main route".
+const soleRouteOf = (routeId: string) => settings.providers.filter(p => { const ids = p.routes?.ids?.length ? p.routes.ids : p.routeId ? [p.routeId] : []; const paused = p.routes?.paused || []; return ids.includes(routeId) && !ids.some(id => id !== routeId && !paused.includes(id) && settings.routes.some(r => r.id === id && r.enabled)); });
 // The text before the slash in every model of a provider ("test1/gpt-4"). The user picks it; without one it comes from the provider's name.
 const PREFIX_RESERVED = new Set(['opencode', 'kilo', 'zai', 'free', 'auto', 'chain']);
 function providerPrefix(b: any): string {
@@ -124,7 +128,15 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/metrics'&&method==='GET')return json(res,200,metrics());
   // Settings backup: one passphrase-protected file that can be restored on any computer (see backup.ts). The file is sent to the dashboard to be saved; nothing is written on disk here.
   if(pathname==='/admin/backup/export'&&method==='POST'){const b=await readJson(req);requirePassword(req,b.password);const out=createBackup(b.passphrase);logEvent('info','backup',`Settings backup exported (${out.providers} providers, ${out.routes} routes, ${out.keys} keys)`);return json(res,200,out);}
-  if(pathname==='/admin/backup/restore'&&method==='POST'){const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);syncMcp();await setPsiphonSettings({}).catch(()=>{});reconcilePsiphon();await setSurfsharkSettings({}).catch(()=>{});reconcileSurfshark();await wireguardDisconnect().catch(()=>{});await setWireguardSettings({}).catch(()=>{});reconcileWireguard();return json(res,200,{ok:true,...out});}
+  if(pathname==='/admin/backup/restore'&&method==='POST'){
+    const b=await readJson(req,16*1024*1024);requirePassword(req,b.password);const out=restoreBackup(b.content,b.passphrase,canManageLocal(req));
+    // A backup carries route flags, not running tunnels. Correct both before yielding to requests or starting any dependent service.
+    reconcilePsiphon();reconcileSurfshark();
+    logEvent('warn','backup',`Settings restored from a backup (${out.providers} providers, ${out.routes} routes, ${out.keys} keys); the previous settings were kept as ${out.kept}`);
+    syncMcp();await setPsiphonSettings({}).catch(()=>{});await setSurfsharkSettings({}).catch(()=>{});
+    // WireGuard keeps key files on disk and launches a client per config, so stop every old tunnel before adopting the restored ids.
+    await wireguardDisconnect().catch(()=>{});await setWireguardSettings({}).catch(()=>{});reconcileWireguard();
+    return json(res,200,{ok:true,...out});}
   if(pathname==='/admin/usage'&&method==='GET')return json(res,200,usage(Number(new URL(req.url||'/','http://x').searchParams.get('days'))));
   if(pathname==='/admin/mcp'||pathname.startsWith('/admin/mcp/'))return mcpAdmin(req,res,pathname);
   if(pathname==='/admin/events'&&method==='GET')return json(res,200,queryEvents(parseLogQuery(new URL(req.url||'/','http://x').searchParams)));
@@ -143,7 +155,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     for(const key of ['enabled','fallback','rotate','autoProbe','failover','allowDirect','cooldowns','trimTools','exhaustedFailover','relayRecheck','catalogDirect','spreadDirect','agentBackups'] as const)if(key in b){if(typeof b[key]!=='boolean')throw new GatewayError('Expected a boolean',400);next[key]=b[key];}
     for(const [key,lo,hi] of [['maxConcurrent',0,64],['maxQueue',0,512],['timeoutMs',1000,600000],['retries',0,2],['refreshMinutes',5,1440],['warpProxyPort',1024,65535],['queueWaitMs',0,120000],['relayRotations',0,10]] as const)if(key in b)(next as any)[key]=bounded(b[key],lo,hi);
     if(b.strategy){if(!['single','round_robin','random','fastest'].includes(b.strategy))throw new GatewayError('Unknown selection strategy',400);next.strategy=b.strategy;}
-    if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;
+    if(b.routeId!==undefined){if(!settings.routes.some(r=>r.id===b.routeId&&r.enabled))throw new GatewayError('Select an enabled route',400);next.routeId=b.routeId;next.managedChoice=undefined;
       // Remember where requests went, so making the pool "standby only" can give the route back.
       if(b.routeId==='proxy-pool'&&settings.routeId!=='proxy-pool')next.previousRouteId=settings.routeId;
       // The same for Psiphon, Surfshark and WireGuard: when one stops, requests go back to where they went before it.
@@ -247,7 +259,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   }
   // Deleting a route is refused while a provider or the main selection depends on it; the checks are shared with removing a relay from its platform.
   const assertRouteDeletable=(id:string)=>{const route=settings.routes.find(r=>r.id===id);if(id===PSIPHON)throw new GatewayError('The Psiphon route belongs to Psiphon. Disconnect it, or turn Psiphon off, under Routing → Psiphon.',409);if(id===SURFSHARK)throw new GatewayError('The Surfshark route belongs to Surfshark. Disconnect it, or turn Surfshark off, under Routing → Surfshark.',409);if(id===WIREGUARD)throw new GatewayError('The WireGuard route belongs to WireGuard. Disconnect it, or turn WireGuard off, under Routing → WireGuard.',409);if(id==='direct'||id===settings.routeId)throw new GatewayError('Select another route before deleting this one',409);{const only=soleRouteOf(id);if(only.length)throw new GatewayError(`Select another route before deleting this one: it is the only route chosen for ${only.map(p=>p.name).join(', ')}.`,409);}if(route?.managed&&route.id==='warp')throw new GatewayError('The WARP route is managed by Polygate. Disable WARP in its panel instead.',409);};
-  const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id)};p.routeId=p.routes.ids[0]||'';}persist();};
+  const deleteRoute=(id:string)=>{settings.routes=settings.routes.filter(r=>r.id!==id);for(const p of settings.providers)if(p.routes?.ids.includes(id)){p.routes={...p.routes,ids:p.routes.ids.filter(i=>i!==id),...(p.routes.paused?{paused:p.routes.paused.filter(i=>i!==id)}:{})};p.routeId=p.routes.ids[0]||'';}persist();};
   if(pathname==='/admin/routes/delete'&&method==='POST'){const b=await readJson(req);assertRouteDeletable(String(b.id));deleteRoute(String(b.id));return json(res,200,{ok:true});}
   if(pathname==='/admin/routes/test'&&method==='POST'){const b=await readJson(req);return json(res,200,await testRoute(b.id,b.providerId?String(b.providerId):undefined));}
   // Platform tokens: a token the user chose to remember (b.useSaved) is read from the encrypted settings here and never sent to the dashboard.
@@ -256,6 +268,9 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   const platformOf=(raw:unknown)=>{if(raw!=='vercel'&&raw!=='netlify'&&raw!=='cloudflare')throw new GatewayError('Choose Vercel, Netlify or Cloudflare',400);return raw;};
   const deployToken=(b:any)=>{if(b.useSaved!==true)return String(b.token||'');const platform=platformOf(b.platform);const saved=settings.deployTokens?.[platform];if(!saved)throw new GatewayError(`No ${labels[platform]} token is saved. Paste a token to continue.`,400);return saved;};
   const deployAccount=(b:any)=>String(b.accountId||'').trim()||(b.useSaved===true?settings.deployAccounts?.cloudflare||'':'');
+  // An existing relay is changed only in the account it was deployed to. The remembered account (or one typed now) may belong to another
+  // Cloudflare account, where a Worker of the same name would be updated or removed instead.
+  const relayAccount=(b:any,d:{account?:string})=>{const asked=String(b.accountId||'').trim().toLowerCase();if(d.account){if(asked&&asked!==d.account.toLowerCase())throw new GatewayError(`This relay was deployed to Cloudflare account ${d.account}. Use a token for that account; nothing was changed.`,409,'wrong_account');return d.account;}return deployAccount(b)||'';};
   const remember=(platform:'vercel'|'netlify'|'cloudflare',token:string,account?:string)=>{settings.deployTokens={...settings.deployTokens,[platform]:token.trim()};if(platform==='cloudflare'&&account)settings.deployAccounts={...settings.deployAccounts,cloudflare:account.trim().toLowerCase()};};
   // What a deployed relay is called on its platform: stored when Polygate deployed it, or read from the route's name ("Vercel relay fra1 (polygate-relay-fra1-a2d9)") for relays deployed by earlier versions.
   const deployedOf=(route:Route):Deployed|undefined=>{
@@ -281,7 +296,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     const b=await readJson(req);const route=relayRoute(b.id);const d=deployedOf(route);
     if(!d)throw new GatewayError('Polygate did not deploy this relay, so it cannot update it. Deploy a new one instead.',400);
     if(!route.token)throw new GatewayError('This relay has no access token saved, so it cannot be updated',400);
-    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account||'';
+    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=relayAccount(body,d);
     const r=await deployRelay({platform:d.platform,token,name:d.name,region:d.region,runtime:d.runtime,teamId:d.team,accountId:accountId||undefined,update:{access:route.token,siteId:d.siteId}});
     route.url=r.url;if(r.buffered)route.buffered=true;else delete route.buffered;route.deployed={...d,name:r.name,...(r.siteId?{siteId:r.siteId}:{}),...(r.account?{account:r.account}:{})};if(r.reachable)route.status='healthy';
     if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,r.account);persist();
@@ -293,7 +308,7 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
     const b=await readJson(req);const route=relayRoute(b.id);const d=deployedOf(route);
     if(!d)throw new GatewayError('Polygate did not deploy this relay, so there is nothing for it to remove on a platform. Delete the route instead.',400);
     assertRouteDeletable(route.id);
-    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=deployAccount(body)||d.account;
+    const body={...b,platform:d.platform};const token=deployToken(body);const accountId=relayAccount(body,d)||undefined;
     await removeFromPlatform({platform:d.platform,token,name:d.name,siteId:d.siteId,accountId,teamId:d.team});
     if(b.remember===true&&b.useSaved!==true)remember(d.platform,token,accountId);
     deleteRoute(route.id);logEvent('info','relays',`${route.name} removed from ${labels[d.platform]} and from Polygate`);

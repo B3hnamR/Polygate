@@ -31,7 +31,10 @@ import {folderKey,foldersOverlap} from './agent-paths';
 const MAX_RETRIES = 3;
 type Mode = keyof typeof ENGINE_MODES;
 type Pending = { id: string; action: string; resources: string[]; note: string; input?: unknown };
-type Session = { id: string; folder: string; parent?:string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; toolNames: Map<string, string>; toolFiles:Map<string,Set<string>>; turns?: Turn[]; backup?: Backup; completions: PendingCompletion[]; pendingError?: string; pendingDirty?: boolean; executionEpoch: number; recording?: Promise<void>; recovering?: Promise<'committed'|'rolledback'|undefined>; undoing?: boolean; sending?: boolean; mode?: Mode; fullEngine?: string; unsafeTurn?:'busy'|'delegated'; turnMessage?:string };
+type Session = { id: string; folder: string; parent?:string; allowed: Set<string>; pending: Map<string, Pending>; retries: number; paused?: string; busy?: boolean; stepFiles: Set<string>; toolNames: Map<string, string>; toolFiles:Map<string,Set<string>>; turns?: Turn[]; backup?: Backup; completions: PendingCompletion[]; pendingError?: string; pendingDirty?: boolean; executionEpoch: number; recording?: Promise<void>; recovering?: Promise<'committed'|'rolledback'|undefined>; undoing?: boolean; sending?: boolean; mode?: Mode; fullEngine?: string; unsafeTurn?:Unsafe; turnMessage?:string; toolBefore?: Map<string, Map<string, string | null | undefined>>; agentHashes?: Map<string, string | null | undefined> };
+// Why a turn's files cannot be told apart from other writers: queued messages, delegated work, a dropped event stream, or edits made outside the agent.
+type Unsafe = 'busy' | 'delegated' | 'gap' | 'foreign';
+const UNSAFE: Unsafe[] = ['busy', 'delegated', 'gap', 'foreign'];
 const sessions = new Map<string, Session>();
 const listeners = new Map<string, Set<ServerResponse>>();
 const eventEpoch = randomUUID();
@@ -142,7 +145,12 @@ function watchFolder(folder: string) {
       const state = streamStates.get(folder);
       if (state?.connected) {
         state.connected = false;
-        for (const s of sessions.values()) if (sameFolder(s.folder, folder)) { s.executionEpoch++; publish(s.id, { type: 'agent.stream', data: { sessionID: s.id, ...state } }); }
+        for (const s of sessions.values()) if (sameFolder(s.folder, folder)) {
+          s.executionEpoch++;
+          // Events lost while the stream was down may have named changed files: a turn in progress can no longer list all of them.
+          if (s.busy || s.backup || s.turnMessage) { s.unsafeTurn = s.unsafeTurn || 'gap'; try { persistPending(s); } catch { /* reported when the turn is recorded */ } }
+          publish(s.id, { type: 'agent.stream', data: { sessionID: s.id, ...state } });
+        }
       }
       if (!abort.signal.aborted) await Bun.sleep(500);
     }
@@ -236,9 +244,12 @@ function onEvent(e: any, folder: string) {
     if (Array.isArray(input.edits)) for (const edit of input.edits) add(edit?.path ?? edit?.filePath);
     const patch = input.patchText ?? input.patch;
     if (typeof patch === 'string') for (const match of patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)\r?$/gm)) add(match[1].trim());
+    // What each target held as the tool started. Compared at success, it shows an edit made outside the agent just before this write.
+    const pre = new Map<string, string | null | undefined>(); for (const file of targets) pre.set(file, hashNow(s.folder, file));
+    (s.toolBefore ||= new Map()).set(d.id, pre);
   }
-  if(e.type==='session.tool.success')for(const file of s.toolFiles.get(d.id)||[])s.stepFiles.add(file);
-  if(/^session\.tool\.(success|failed)$/.test(e.type))s.toolFiles.delete(d.id);
+  if(e.type==='session.tool.success'){const pre=s.toolBefore?.get(d.id);for(const file of s.toolFiles.get(d.id)||[]){s.stepFiles.add(file);noteAgentWrite(s,file,pre?.get(file));}}
+  if(/^session\.tool\.(success|failed)$/.test(e.type)){s.toolFiles.delete(d.id);s.toolBefore?.delete(d.id);}
   // Nested Code Mode leaf calls retain their own success/failure and inputs in final metadata.
   if(/^session\.tool\.(progress|success|failed)$/.test(e.type)&&Array.isArray(d.metadata?.toolCalls))for(const call of d.metadata.toolCalls){
     if(/^(?:tools\.)?subagent$/.test(call.tool||''))s.unsafeTurn='delegated';
@@ -255,6 +266,7 @@ function onEvent(e: any, folder: string) {
     s.pending.clear();
     s.toolNames.clear();
     s.toolFiles.clear();
+    s.toolBefore?.clear();
     try { captureTurnCompletion(s); }
     catch (err: any) { logEvent('warn', 'agent', `The completed turn could not be saved for recovery: ${err?.message || err}`); }
     void recordTurn(s).catch(err => logEvent('warn', 'agent', `Turn recording is pending; reconnect to retry: ${err?.message || err}`));
@@ -271,6 +283,18 @@ function onEvent(e: any, folder: string) {
   }
 }
 
+// Called when a file tool reports success. The bytes on disk at the end of a turn are not necessarily the bytes the agent wrote: an editor can
+// save the same file in between. `pre` is what the file held as the tool started; it should equal the agent's own previous write this turn,
+// or the pre-turn backup. When it equals neither (and is not already the tool's result), someone else changed the file, and the turn is
+// marked so Undo refuses it instead of reverting the user's edit along with the agent's.
+function noteAgentWrite(s: Session, file: string, pre: string | null | undefined) {
+  const key = fileKey(file), hashes = (s.agentHashes ||= new Map()), post = hashNow(s.folder, file);
+  const saved = beforeFile(s.backup, file);
+  const expected = hashes.has(key) ? hashes.get(key) : saved === undefined ? undefined : saved?.hash ?? null;
+  if (pre !== undefined && expected !== undefined && post !== undefined && pre !== expected && pre !== post) s.unsafeTurn = s.unsafeTurn || 'foreign';
+  hashes.set(key, post);
+}
+
 function expireFull(s: Session) {
   s.fullEngine = undefined; s.mode = 'ask'; s.allowed.clear();
   engine('POST', `/api/session/${enc(s.id)}/agent`, { agent: ENGINE_MODES.ask.agent }).catch(err => logEvent('warn', 'agent', `Full access expired; resetting the engine agent failed: ${err?.message || err}`));
@@ -283,7 +307,7 @@ function expireFull(s: Session) {
 // files before writing. Engine snapshots are not used because their Git index can normalize working-tree content.
 type FileChange = { file: string; status: string; additions: number; deletions: number; patch: string; after?: string | null; hashOnly?: true; before?: FileBackup };
 // noBackup: no backup was taken before the turn, because folder backups were off or the message was queued while the agent was working.
-type Turn = { message: string; at: number; files: FileChange[]; noBackup?: 'off' | 'busy' | 'delegated'; completionID?: string };
+type Turn = { message: string; at: number; files: FileChange[]; noBackup?: 'off' | Unsafe; completionID?: string };
 type PendingCompletion = { id: string; at: number; message?: string; files: FileChange[]; noBackup?: Turn['noBackup'] };
 type PendingTurns = { version: 1; backup?: Backup; turnMessage?: string; unsafeTurn?: Session['unsafeTurn']; completions: PendingCompletion[] };
 // Only live, uninterrupted capture boundaries may use the engine's latest context/diff.
@@ -298,9 +322,9 @@ function decodePending(value: any): PendingTurns {
   if (value && value.version === undefined && validBackup(value)) return { version: 1, backup: value, completions: [] };
   if (!value || value.version !== 1 || value.backup !== undefined && !validBackup(value.backup) ||
       value.turnMessage !== undefined && typeof value.turnMessage !== 'string' ||
-      value.unsafeTurn !== undefined && !['busy', 'delegated'].includes(value.unsafeTurn) ||
+      value.unsafeTurn !== undefined && !UNSAFE.includes(value.unsafeTurn) ||
       !Array.isArray(value.completions) || !value.completions.every((c: any) => c && typeof c.id === 'string' && c.id && Number.isFinite(c.at) &&
-        (c.message === undefined || typeof c.message === 'string') && (c.noBackup === undefined || ['off', 'busy', 'delegated'].includes(c.noBackup)) &&
+        (c.message === undefined || typeof c.message === 'string') && (c.noBackup === undefined || c.noBackup === 'off' || UNSAFE.includes(c.noBackup)) &&
         Array.isArray(c.files) && c.files.every((f: any) => f && typeof f.file === 'string' && typeof f.status === 'string' && typeof f.patch === 'string' && Number.isFinite(f.additions) && Number.isFinite(f.deletions) &&
           (f.hashOnly === undefined || f.hashOnly === true) && (f.after === undefined || f.after === null || typeof f.after === 'string' && /^[a-f0-9]{64}$/.test(f.after)) &&
           (f.before === undefined || f.before === null || savedFile(f.before))))) throw new Error('Invalid pending turn record.');
@@ -341,7 +365,9 @@ function recoverUndo(s:Session, ownsUndo=false):Promise<'committed'|'rolledback'
   // Never overwrite an edit made after the interrupted transaction.
   for(const [file]of desired){const hash=hashOf(s.folder,file);if(hash!==(new Map(journal.target).get(file)?.hash??null)&&hash!==(new Map(journal.rollback).get(file)?.hash??null))throw new GatewayError('A file changed during interrupted Undo recovery. Nothing was overwritten. Resolve the saved Undo transaction before continuing.',409,'agent_undo_recovery');}
   let uncertain=false;
-  for(const [file,bytes]of desired){try{restoreFile(s.folder,file,bytes);}catch{uncertain=true;}}
+  // Checked again per file right before it is replaced, so an edit saved during recovery is not overwritten.
+  const targets=new Map(journal.target),rollbacks=new Map(journal.rollback);
+  for(const [file,saved]of desired){try{if(!restoreUndoFile(s.folder,file,saved,(committed?rollbacks:targets).get(file)!))uncertain=true;}catch{uncertain=true;}}
   if(!committed&&info.revert){try{await engine('DELETE',`/api/session/${enc(s.id)}/revert`);}catch{uncertain=true;}}
   for(const [file,bytes]of desired){try{if(!matchesBackup(s.folder,file,bytes))uncertain=true;}catch{uncertain=true;}}
   if(uncertain)throw new GatewayError('Undo recovery could not restore and verify every file or cancel staged history. Recovery information is saved; resolve the saved Undo transaction before continuing.',409,'agent_undo_recovery');
@@ -393,7 +419,10 @@ function loadTurns(s: Session): Turn[] {
   return s.turns;
 }
 function saveTurns(s: Session, turns = loadTurns(s)) { mkdirSync(path.dirname(turnsFile(s.id)), { recursive: true }); writeFileAtomic(turnsFile(s.id), JSON.stringify(turns)); s.turns = turns; }
-const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch { return null; } };
+// null only for a verified missing file; any other read failure throws, so it can never be taken for "absent".
+const hashOf = (folder: string, rel: string) => { try { return createHash('sha256').update(readFileSync(path.join(folder, rel))).digest('hex'); } catch (err: any) { if (err?.code === 'ENOENT') return null; throw err; } };
+// For live event tracking: undefined when the file cannot be read now (nothing can be concluded from it).
+const hashNow = (folder: string, rel: string) => { try { return hashOf(folder, rel); } catch { return undefined; } };
 function matchesBackup(folder: string, file: string, saved: FileBackup) {
   const full = filePath(folder, file);
   try {
@@ -401,8 +430,15 @@ function matchesBackup(folder: string, file: string, saved: FileBackup) {
     return saved !== null && stat.isFile() && (stat.mode & 0o777) === saved.mode && createHash('sha256').update(readFileSync(full)).digest('hex') === saved.hash;
   } catch (err: any) { if (err.code === 'ENOENT') return saved === null; throw err; }
 }
+function restoreUndoFile(folder: string, file: string, desired: FileBackup, other: FileBackup) {
+  if (matchesBackup(folder, file, desired)) return true;
+  const hash = hashOf(folder, file);
+  if (hash !== (desired?.hash ?? null) && hash !== (other?.hash ?? null)) return false;
+  restoreFile(folder, file, desired);
+  return true;
+}
 // undoable: every file the turn changed has an exact copy from before it; when not, `why` says so in plain words.
-const NO_BACKUP = { off: 'Folder backups were off when this turn ran, so it cannot be undone from Polygate.', busy: 'This execution includes queued or steering messages without separate backup boundaries, so it cannot be safely undone from Polygate.', delegated:'This task includes delegated work with separate child history. Changes are shown, but combined parent/child Undo is unavailable.' };
+const NO_BACKUP: Record<'off' | Unsafe, string> = { off: 'Folder backups were off when this turn ran, so it cannot be undone from Polygate.', busy: 'This execution includes queued or steering messages without separate backup boundaries, so it cannot be safely undone from Polygate.', delegated:'This task includes delegated work with separate child history. Changes are shown, but combined parent/child Undo is unavailable.', gap: 'The connection to the agent engine dropped while this turn ran, so Polygate may have missed some of the files it changed. It cannot be undone from Polygate.', foreign: 'A file this turn changed was also edited outside the agent while it worked (or between two runs of the same message), so Undo cannot tell your edits from the agent’s. It cannot be undone from Polygate.' };
 function publicTurn(t: Turn) {
   const why = t.noBackup ? NO_BACKUP[t.noBackup] : t.files.some(f => f.after === undefined) ? 'Some post-turn files could not be captured exactly, so this turn cannot be undone from Polygate.' : t.files.some(f => f.before === undefined || f.hashOnly) ? 'Some of these files were not in the backup (the folder is bigger than one backup covers, or the file is left out of backups), so this turn cannot be undone from Polygate.' : '';
   return { message: t.message, at: t.at, undoable: !why, ...(why ? { why } : {}), files: t.files.map(({ after, before, hashOnly, ...f }) => f) };
@@ -434,8 +470,12 @@ function captureTurnCompletion(s: Session) {
     } catch { /* An unavailable post-image is not a deletion and cannot authorize Undo. */ }
     return { file, status: before === null ? 'added' : before !== undefined && after === null ? 'deleted' : 'modified', additions: 0, deletions: 0, patch: '', before, after, ...(hashOnly ? { hashOnly: true as const } : {}) };
   });
+  // A file that no longer holds the agent's last write was saved by someone else after it: its post-turn bytes mix both.
+  const written = s.agentHashes;
+  const foreign = !!written && files.some(f => { const key = fileKey(f.file); return written.has(key) && written.get(key) !== undefined && f.after !== undefined && f.after !== written.get(key); });
+  s.agentHashes = undefined;
   if (files.length) {
-    const completion: PendingCompletion = { id: randomUUID(), at: Date.now(), message: s.turnMessage, files, noBackup };
+    const completion: PendingCompletion = { id: randomUUID(), at: Date.now(), message: s.turnMessage, files, noBackup: noBackup || (foreign ? 'foreign' : undefined) };
     completionEpochs.set(completion, s.executionEpoch);
     s.completions.push(completion);
   }
@@ -462,6 +502,9 @@ function recordTurn(s: Session): Promise<void> {
           }
         }
         const known = turns.find(t => t.message === completion.message);
+        // A second run of the same message: a file it starts from must be the one the first run left. When it is not, the file was edited
+        // between the two runs, and merging both into one turn would undo that edit too.
+        const between = !!known && completion.files.some(f => { const old = known.files.find(x => fileKey(x.file) === fileKey(f.file)); if (!old || old.after === undefined || f.before === undefined || old.before === undefined) return false; const start = f.before?.hash ?? null; return start !== (old.before?.hash ?? null) && old.after !== start; });
         let files = [...(known?.files.filter(f => !completion.files.some(n => fileKey(n.file) === fileKey(f.file))) || []), ...completion.files.map(f => {
           const old = known?.files.find(x => fileKey(x.file) === fileKey(f.file));
           const before = old ? old.before : f.before;
@@ -483,7 +526,7 @@ function recordTurn(s: Session): Promise<void> {
           return metadata ? { ...f, additions: Number(metadata.additions) || 0, deletions: Number(metadata.deletions) || 0, patch: String(metadata.patch || '').slice(0, 200000) } : f;
         });
         if (completion.message && (files.length || known)) {
-          turn = { message: completion.message, at: completion.at, files, noBackup: known?.noBackup || completion.noBackup, completionID: completion.id };
+          turn = { message: completion.message, at: completion.at, files, noBackup: known?.noBackup || completion.noBackup || (between ? 'foreign' : undefined), completionID: completion.id };
           saveTurns(s, known ? turns.map(t => t === known ? turn! : t) : [...turns, turn]);
         }
       }
@@ -509,7 +552,8 @@ async function undoTurn(s: Session, message: string) {
   const unbacked = turns.slice(from).find(t => t.noBackup);
   if (unbacked) throw new GatewayError(`${NO_BACKUP[unbacked.noBackup!]}${unbacked.message !== message ? ' (A later turn, which undo would have to go back through.)' : ''}${unbacked.noBackup === 'off' ? ' Switch on folder backups in Agent settings to be able to undo later turns.' : ''}`, 409, 'agent_undo_unavailable');
   const files = [...new Map(turns.slice(from).flatMap(t => t.files.map(f => [fileKey(f.file), f.file] as const))).values()];
-  const rollback = new Map(files.map(file => { const full = filePath(s.folder, file); return [file, existsSync(full) ? { hash: saveBytes(readFileSync(full)), mode: statSync(full).mode & 0o777 } : null] as const; }));
+  // Only a verified missing file counts as absent; a file that cannot be read stops Undo before anything is written.
+  const rollback = new Map(files.map(file => { const full = filePath(s.folder, file); let stat; try { stat = statSync(full); } catch (err: any) { if (err?.code === 'ENOENT') return [file, null] as const; throw err; } return [file, { hash: saveBytes(readFileSync(full)), mode: stat.mode & 0o777 }] as const; }));
   const target = new Map<string, FileBackup>(), conflicts: { file: string; reason: string }[] = [];
   let merged = 0;
   for (const file of files) {
@@ -543,7 +587,11 @@ async function undoTurn(s: Session, message: string) {
     journal.phase='restoring';saveJournal();
     try {
       // Enrol before restore: replacement may succeed even when its final chmod fails.
-      for (const file of files) { written.push(file); restoreFile(s.folder, file, target.get(file)!, restore.get(file)); }
+      // Each file is checked again right before it is replaced: an editor may have saved it after the check above.
+      for (const file of files) {
+        if (hashOf(s.folder, file) !== (rollback.get(file)?.hash ?? null)) throw new GatewayError('A file changed while Undo was restoring. The files restored so far were put back.', 409, 'agent_undo_conflict');
+        written.push(file); restoreFile(s.folder, file, target.get(file)!, restore.get(file));
+      }
       for (const file of files) if (!matchesBackup(s.folder, file, target.get(file)!)) throw new Error('The restored file failed verification.');
       journal.phase='committing';saveJournal();
       await engine('POST', `/api/session/${enc(s.id)}/revert/commit`);
@@ -556,7 +604,8 @@ async function undoTurn(s: Session, message: string) {
   } catch (err) {
     if(journal.phase!=='committing'){
       let uncertain=false;
-      for(const file of [...written].reverse()){try{restoreFile(s.folder,file,rollback.get(file)!);}catch{uncertain=true;}}
+      // Put back only files that still hold what Undo wrote (or their original bytes); a newer edit is never overwritten, and the journal is kept.
+      for(const file of [...written].reverse()){try{if(!restoreUndoFile(s.folder,file,rollback.get(file)!,target.get(file)!))uncertain=true;}catch{uncertain=true;}}
       try{await engine('DELETE', `/api/session/${enc(s.id)}/revert`);}catch{uncertain=true;}
       for(const file of written){try{if(!matchesBackup(s.folder,file,rollback.get(file)!))uncertain=true;}catch{uncertain=true;}}
       if(!uncertain){try{unlinkSync(journalFile(s.id));}catch{uncertain=true;}}
@@ -791,10 +840,12 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
   // One folder's sessions, or (no folder) every session in every folder the agent has worked in, newest first.
   if (pathname === '/admin/agent/sessions' && method === 'GET') {
     const one = url.searchParams.get('folder');
-    const lists = await Promise.all((one ? [checkFolder(one)] : knownFolders()).map(folder => engine('GET', `/api/session${q(folder)}`).catch(() => [])));
+    // A folder whose list cannot be read is reported, never turned into an empty list: the page would take its sessions for deleted.
+    let failed = 0;
+    const lists = await Promise.all((one ? [checkFolder(one)] : knownFolders()).map(folder => one ? engine('GET', `/api/session${q(folder)}`) : engine('GET', `/api/session${q(folder)}`).catch(() => { failed++; return []; })));
     const seen = new Set<string>();
     const all = lists.flatMap(list => Array.isArray(list) ? list : []).filter((s: any) => s?.id && !seen.has(s.id) && seen.add(s.id));
-    return json(res, 200, { sessions: all.filter((s:any)=>!s.parentID).map(summary).sort((a, b) => (b.created || 0) - (a.created || 0)) });
+    return json(res, 200, { sessions: all.filter((s:any)=>!s.parentID).map(summary).sort((a, b) => (b.created || 0) - (a.created || 0)), ...(failed ? { failed } : {}) });
   }
   if (pathname === '/admin/agent/session/delete' && method === 'POST') {
     const s = await known((await readJson(req)).id);
@@ -925,10 +976,12 @@ export async function agentApi(req: IncomingMessage, res: ServerResponse, pathna
     if (p.action.startsWith('polygate_shared_') && ['session', 'project'].includes(decision)) throw new GatewayError('MCP tool calls can be allowed once or denied. Use Full access explicitly if you want automatic calls.', 400);
     if (decision !== 'deny') requireTrust(s.folder);
     if (s.mode === 'plan' && (['shell', 'edit', 'subagent'].includes(p.action) || p.action.startsWith('polygate_shared_')) && decision !== 'deny') throw new GatewayError('Leave Plan mode before approving changes, commands or MCP calls.', 409, 'agent_plan');
-    if (decision === 'project') saveProjectRule(s.folder, p.action, p.resources, 'allow');
     if (decision === 'deny') { await reply(s.id, p.id, 'reject', typeof b.message === 'string' ? b.message.slice(0, 2000) : undefined); s.pending.delete(p.id); return json(res, 200, { ok: true }); }
     await reply(s.id, p.id, 'once');
     s.pending.delete(p.id);
+    // The rule is saved only after the engine took this approval, so a failed answer never leaves a permanent allow rule behind. The two
+    // outcomes are reported apart: the request was approved even when its rule could not be saved.
+    if (decision === 'project') { try { saveProjectRule(s.folder, p.action, p.resources, 'allow'); } catch (err: any) { return json(res, 200, { ok: true, ruleSaved: false, warning: `Approved this time, but the project rule could not be saved: ${err?.message || err}` }); } }
     if (decision === 'session') {
       // Allowed again in this session without asking, for exactly this action and target; other requests of the same kind waiting now go too.
       const key = keyOf(p.action, p.resources); s.allowed.add(key);

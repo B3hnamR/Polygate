@@ -180,7 +180,7 @@ test('serve handler failure after commitment errors the body and closes the resp
 test('serve request abort wakes a blocked response; normal end remains successful', async () => {
   let res: any, closes = 0;
   await shim((_req, value) => { res = value; res.on('close', () => closes++); res.write(new Uint8Array(65536)); }, async (response, controller) => {
-    controller.abort(); await expect(response.text()).rejects.toThrow();
+    controller.abort(); expect((await response.arrayBuffer()).byteLength).toBe(65536);
     expect(closes).toBe(1); expect(res.destroyed).toBe(true); expect(res.writableNeedDrain).toBe(false);
   });
   await shim((_req, value) => { res = value; res.statusCode = 201; res.end('ok'); }, async response => {

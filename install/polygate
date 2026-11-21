@@ -145,9 +145,22 @@ cmd_uninstall() {
   local purge=0 yes=0 a
   for a in "$@"; do case "$a" in --yes) yes=1 ;; --purge) purge=1 ;; esac; done
   [ "$yes" = 1 ] || { echo 'Use: polygate uninstall --yes [--purge]. Your data is kept unless --purge is given. (Or run "polygate" for the menu.)'; return 2; }
-  systemctl disable --now polygate 2>/dev/null; rm -f /etc/systemd/system/polygate.service; systemctl daemon-reload
-  # Fixed installation paths only; user data stays by default. Firewall rules are never touched (the installer never adds any).
-  rm -f /usr/local/bin/polygate; rm -rf -- /opt/polygate
+  systemctl disable --now polygate 2>/dev/null
+  # Nothing is removed while the service still runs: its files would go from under it.
+  if systemctl is-active --quiet polygate 2>/dev/null; then echo 'Polygate did not stop, so nothing was removed. Stop it (systemctl stop polygate) and try again.' >&2; return 1; fi
+  rm -f /etc/systemd/system/polygate.service; systemctl daemon-reload
+  # Only what the installer created is removed: its release folders (named <timestamp>-<pid>), the current link and its staging links. Anything else
+  # someone put in /opt/polygate stays, and so does the folder then. User data stays by default. Firewall rules are never touched.
+  rm -f /usr/local/bin/polygate
+  rm -f -- /opt/polygate/current /opt/polygate/.current-new /opt/polygate/.current-old
+  local d
+  for d in /opt/polygate/releases/*; do
+    [ ! -L "$d" ] && [ -d "$d" ] || continue
+    [[ "${d##*/}" =~ ^[0-9]{14}-[0-9]+$ ]] && [ -f "$d/release.json" ] || continue
+    rm -rf -- "$d"
+  done
+  rmdir /opt/polygate/releases 2>/dev/null; rmdir /opt/polygate 2>/dev/null
+  if [ -d /opt/polygate ]; then echo 'Some files in /opt/polygate were not created by Polygate and were left in place.'; fi
   if [ "$purge" = 1 ]; then
     rm -rf -- /var/lib/polygate /etc/polygate /var/log/polygate-install.log
     if [ "$(getent passwd polygate | cut -d: -f6)" = /var/lib/polygate ]; then userdel polygate 2>/dev/null || true; fi

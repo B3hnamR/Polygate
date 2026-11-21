@@ -1195,10 +1195,31 @@ function extractToolFromSource(source, fallbackName) {
   if (!description || description.length < 20) {
     const addBlock0 = source.match(/editor\.add\(\{([\s\S]*?)\binput\s*:/);
     if (addBlock0) {
+      const block = addBlock0[1];
+      const start = /\bdescription\s*:\s*(?=\[)/.exec(block);
+      const at = start ? start.index + start[0].length : -1;
+      const array = at >= 0 && readBalanced(block, at);
+      const join = array && /^\s*\.join\(\s*(["'])(.*?)\1\s*\)/.exec(block.slice(at + array.length));
+      if (join) {
+        const parts = [];
+        for (const part of splitTopLevel(array.slice(1, -1))) {
+          const literal = readStringLiteral(part);
+          if (literal !== null) parts.push(interpolateTemplate(literal, vars));
+          else {
+            // The default (non-code-mode) client sends the second array. A colon inside a quoted description is not a branch delimiter.
+            const spread = /^\.\.\.\(\s*codeMode\s*\?\s*/.exec(part);
+            const first = spread && readBalanced(part, spread[0].length);
+            const second = first && part.slice(spread[0].length + first.length).match(/^\s*:\s*\[([\s\S]*)\]\s*\)$/);
+            if (!second) { parts.length = 0; break; }
+            for (const item of splitTopLevel(second[1])) { const text = readStringLiteral(item); if (text !== null) parts.push(interpolateTemplate(text, vars)); }
+          }
+        }
+        if (parts.length) description = parts.join(unescapeLiteral(join[2]));
+      }
       const descMatch0 = addBlock0[1].match(
         /description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)/
       );
-      if (descMatch0) {
+      if (!description && descMatch0) {
         description =
           descMatch0[1] !== undefined
             ? unescapeLiteral(descMatch0[1])
@@ -1291,6 +1312,7 @@ function writeCachedCatalog(json) {
   }
 }
 
+const SOURCE_CACHE_VERSION = 1;
 function readCachedSource(expectedRef = null) {
   try {
     const file = getSourceCacheFile();
@@ -1301,8 +1323,7 @@ function readCachedSource(expectedRef = null) {
     if (
       parsed &&
       typeof parsed === "object" &&
-      parsed.cacheVersion === SOURCE_CACHE_VERSION &&
-      typeof parsed.ref === "string" &&
+      parsed.cacheVersion === SOURCE_CACHE_VERSION && typeof parsed.ref === "string" &&
       parsed.extracted &&
       typeof parsed.extracted === "object"
     ) {
@@ -2116,6 +2137,7 @@ async function refresh({ force = false, recheck = false } = {}) {
         // `../read-filesystem.ts`. Fetch the local modules each plugin imports so
         // the field's real optionality/type can be resolved instead of guessed.
         const refFiles = new Map();
+        let referencesComplete = true;
         for (const [key, source] of Object.entries(fetchedFiles)) {
           if (!key.startsWith("tool:") || typeof source !== "string") continue;
           // Relative imports: `../read-filesystem.js` → packages/core/src/read-filesystem.ts
@@ -2142,6 +2164,7 @@ async function refresh({ force = false, recheck = false } = {}) {
           );
           for (const item of refSettled) {
             if (item.status === "fulfilled") fetchedFiles[item.value[0]] = item.value[1];
+            else referencesComplete = false;
           }
         }
 
@@ -2166,7 +2189,7 @@ async function refresh({ force = false, recheck = false } = {}) {
             })
           );
           for (const item of txtSettled) {
-            if (item.status !== "fulfilled") continue;
+            if (item.status !== "fulfilled") { referencesComplete = false; continue; }
             const [t, text] = item.value;
             const src = fetchedFiles[t.key];
             if (typeof src !== "string") continue;
@@ -2186,7 +2209,7 @@ async function refresh({ force = false, recheck = false } = {}) {
             (k) => typeof fetchedFiles[k] === "string" && fetchedFiles[k].length > 0
           );
           const allSettledOk = settled.every((item) => item.status === "fulfilled");
-          if (allCoreFetched && allSettledOk) {
+          if (allCoreFetched && allSettledOk && referencesComplete) {
             lastSyncedSource = { ref, extracted, fetchRef: global.fetch };
             if (extracted.tools && Object.keys(extracted.tools).length > 0) {
               writeCachedSource(ref, extracted, latest);

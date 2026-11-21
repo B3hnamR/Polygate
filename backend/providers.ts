@@ -88,21 +88,23 @@ export async function discover(){
   })().finally(()=>{discovery=undefined;});return discovery;
 }
 // The route a provider's model list is read through: the one its chat would use, or the first in its list when none can be used right now.
-const catalogRoute=(p:Provider)=>{try{return routeForProvider(p,'').id;}catch{return providerRoutes(p)?.ids[0]||settings.routeId;}};
+// Every route of the provider paused is the user's choice: then nothing is sent at all, not even a model list through the global route.
+const catalogRoute=(p:Provider)=>{try{return routeForProvider(p,'',true).id;}catch(e){const set=providerRoutes(p);if(set&&!set.ids.length)throw e;return set?.ids[0]||settings.routeId;}};
 // Optional inference-only accounting. before() is synchronous and may reject dispatch; failed()
 // preserves usage from a consumed refusal before the adapter changes/retries its payload.
-export type GenerationAccounting={before:(chat:any)=>void;failed:(usage?:unknown)=>void};
+// Adapters that translate the prompt can supply its input estimate and the route selected for this dispatch.
+export type GenerationAccounting={before:(chat:any,inputTokens?:number,routeName?:string)=>void;failed:(usage?:unknown)=>void};
 export async function providerChat(p:Provider,model:Model,body:any,signal:AbortSignal,routeId:string,session:string,requestId='',accounting?:GenerationAccounting):Promise<Response>{
   if(p.kind==='free'){
     if(!bridgeUrl||!bridgeSecret)throw new GatewayError('The internal Free bridge is not running',503,'provider_unavailable');
     return fetch(bridgeUrl+'/v1/chat/completions',{method:'POST',redirect:'error',headers:{'content-type':'application/json','x-polygate-bridge':bridgeSecret,'x-polygate-route':routeId,'x-session-id':session,...(requestId?{'x-polygate-request':requestId}:{})},body:JSON.stringify({...body,model:model.upstreamId,stream:true}),signal});
   }
-  if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined},()=>realOpenCode(p,model,body,signal,routeId));
-  if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined},()=>kiloChat(p,model,body,signal,routeId,accounting));
+  if(p.kind==='opencode')return routeContext.run({routeId,requestId:requestId||undefined,providerKind:p.kind},()=>realOpenCode(p,model,body,signal,routeId));
+  if(p.kind==='kilo')return routeContext.run({routeId,requestId:requestId||undefined,providerKind:p.kind},()=>kiloChat(p,model,body,signal,routeId,accounting));
   // Z.ai chooses its own exit (zai.ts): Direct or the one proxy set for it, whatever the route's failover would pick.
   if(p.kind==='zai')return zaiChat(p,model,body,signal,accounting);
   const send=(b:any)=>{accounting?.before(b);return networkFetch(p.baseUrl.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{'content-type':'application/json',...(p.apiKey?{authorization:`Bearer ${p.apiKey}`}:{})},body:JSON.stringify({...b,model:model.upstreamId,stream:true}),signal},routeId);};
-  return routeContext.run({routeId,requestId:requestId||undefined},()=>withOutputLimit(model,body,send,accounting));
+  return routeContext.run({routeId,requestId:requestId||undefined,providerKind:p.kind},()=>withOutputLimit(model,body,send,accounting));
 }
 const OUTPUT_KEYS=['max_tokens','max_completion_tokens','max_output_tokens'];
 // The output limit a refusal names ("at most 16384 completion tokens", "maximum is 8192"), or 0.
@@ -126,6 +128,8 @@ export async function withOutputLimit(m:Model,body:any,send:(b:any)=>Promise<Res
   if(retry.ok){m.output=next;saveModel(m);logEvent('info','models',`${m.id} refused ${requested} output tokens; it was asked again with ${next}, and Polygate keeps that limit for it`,{model:m.id});}
   return retry;
 }
+// Usage as the provider reported it: a counter it left out stays out, so accounting never mistakes "not reported" for a reported zero.
+export const reported=(u:Record<string,unknown>)=>{const out=Object.fromEntries(Object.entries(u).filter(([,v])=>typeof v==='number'&&Number.isFinite(v)&&v>=0));return Object.keys(out).length?out:undefined;};
 async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,routeId:string){
   const slash=m.upstreamId.indexOf('/');if(slash<0)throw new GatewayError('OpenCode server models must be provider/model IDs',400);
   const base=p.baseUrl.replace(/\/$/,'');const headers={'content-type':'application/json',...(p.apiKey?{authorization:`Basic ${Buffer.from('opencode:'+p.apiKey).toString('base64')}`}:{})};
@@ -134,7 +138,7 @@ async function realOpenCode(p:Provider,m:Model,body:any,signal:AbortSignal,route
     const payload={model:{providerID:m.upstreamId.slice(0,slash),modelID:m.upstreamId.slice(slash+1)},tools:{},parts:[{type:'text',text:body.messages.map((x:any)=>`${x.role}: ${typeof x.content==='string'?x.content:JSON.stringify(x.content)}`).join('\n\n')}]};
     const reply=await networkFetch(sessionUrl+'/message',{method:'POST',headers,body:JSON.stringify(payload),signal},routeId);if(!reply.ok)return reply;const data:any=await reply.json();
     const text=(data.parts||[]).filter((x:any)=>x.type==='text').map((x:any)=>x.text).join('');
-    const chunks=[{id:'chatcmpl-'+crypto.randomUUID(),choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]},{choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:data.info?.tokens?.input||0,completion_tokens:data.info?.tokens?.output||0}}];
+    const chunks=[{id:'chatcmpl-'+crypto.randomUUID(),choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]},{choices:[{index:0,delta:{},finish_reason:'stop'}],usage:reported({prompt_tokens:data.info?.tokens?.input,completion_tokens:data.info?.tokens?.output})}];
     return new Response(chunks.map(x=>`data: ${JSON.stringify(x)}\n\n`).join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
   }finally{
     // Every request owns a throwaway session on the user's server; remove it without delaying or failing the reply.

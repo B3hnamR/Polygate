@@ -5,6 +5,8 @@ RUN npm ci --ignore-scripts
 COPY index.html vite.config.ts tsconfig.json ./
 COPY src ./src
 COPY public ./public
+# Browser-safe modules the dashboard shares with the gateway (tests/docker-context.test.ts checks this list).
+COPY backend/agent-attachments.ts backend/plain-error.ts ./backend/
 RUN npm run build:ui
 
 FROM oven/bun:1.4.4 AS gateway

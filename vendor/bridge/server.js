@@ -1048,6 +1048,14 @@ function parseStreamData(raw) {
   }
 }
 
+// A delta that adds nothing: OpenCode Free repeats the finished choice beside the final usage as {"role":"assistant","content":""}, and
+// some models send every field on every chunk ("tool_calls": null, "reasoning_content": null). The role and empty values are not new data.
+const EMPTY_VALUE = (value) => value == null || value === "" || (Array.isArray(value) && value.length === 0);
+function emptyDelta(delta) {
+  return delta == null || (typeof delta === "object" && !Array.isArray(delta) &&
+    Object.entries(delta).every(([key, value]) => key === "role" || EMPTY_VALUE(value)));
+}
+
 // Hold chat calls until their complete names are known. Valid name prefixes and
 // injected fingerprint names must never expose unintended commands downstream.
 function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128, strict = false) {
@@ -1075,10 +1083,15 @@ function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128, 
       if (!Array.isArray(chunk?.choices)) return chunk;
       chunk.choices = chunk.choices.filter((choice) => {
         const delta = choice.delta;
-        if (delta?.function_call || choice.message?.function_call || choice.message?.tool_calls) throw toolContractError();
+        // "tool_calls": null (and an empty list) means no tool call in this chunk, as in a plain answer.
+        if (delta && typeof delta === "object" && (delta.tool_calls === null || (Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0))) delete delta.tool_calls;
+        if (delta && typeof delta === "object" && delta.function_call === null) delete delta.function_call;
+        if (delta?.function_call || choice.message?.function_call || choice.message?.tool_calls?.length) throw toolContractError();
         const index = choice.index ?? 0;
         if (done || closed.has(index)) {
-          if (choice.finish_reason && !choice.message && Object.keys(delta || {}).length === 0 && closed.has(index)) return false;
+          // Providers repeat the finished choice in the final usage chunk (OpenCode Free does, with its role and an empty content).
+          // Drop the empty repeat, not the enclosing chunk's accounting; anything new after the finish is still refused.
+          if (closed.has(index) && choice.message == null && emptyDelta(delta)) return false;
           throw streamContractError("Upstream sent choice data after its terminal event");
         }
         const incoming = delta?.tool_calls;
@@ -1088,7 +1101,11 @@ function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128, 
           if (incoming.length) pending.set(index, calls);
           for (const tc of incoming) {
             if (!tc || (tc.type && tc.type !== "function")) throw toolContractError();
-            if ((tc.function?.name !== undefined && typeof tc.function.name !== "string") ||
+            // OpenAI-compatible streams commonly send the function name only in
+            // the first fragment and use null on later argument fragments.
+            // Null means "omitted here", not a malformed tool name; the
+            // assembled name is still checked against the offered tools below.
+            if ((tc.function?.name != null && typeof tc.function.name !== "string") ||
                 (tc.function?.arguments !== undefined && typeof tc.function.arguments !== "string")) throw toolContractError();
             const i = tc.index ?? 0;
             if (!calls.has(i) && ++callCount > maxCalls) throw streamContractError("Upstream exceeded the buffered tool-call count limit");
@@ -1447,7 +1464,9 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
       stream: true,
       max_output_tokens: maxTokens,
       tools,
-      tool_choice: "auto",
+      tool_choice: !allowedTools.size ? "none" : forcedTool
+        ? { type: "function", name: originalToAlias.get(forcedTool) || forcedTool }
+        : body.tool_choice === "required" ? "required" : "auto",
     };
     const instructions = extractSystemInstructions(
       body.messages,

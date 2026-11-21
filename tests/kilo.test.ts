@@ -146,6 +146,36 @@ test('a Kilo provider with its own list moves to the next exit in that list',asy
     expect(sent).toHaveLength(1);
   }finally{proxy.stop(true);settings.routes=settings.routes.filter(x=>x.id!=='kx-proxy2');delete settings.providers[0].routes;addressLimited=false;__resetKiloLimits();}
 });
+test('six Surfshark address limits do not pause the route or models while a seventh location is eligible',async()=>{
+  await seedKilo();
+  const S=await import('../backend/surfshark');const {__exitTest}=await import('../backend/exit-group');
+  const {kiloLimited}=await import('../backend/transport');
+  const regions=Array.from({length:7},(_,i)=>`fixture-${i}`);
+  const route={id:'surfshark',name:'Surfshark',kind:'proxy' as const,url:'surfshark://local',enabled:true,models:[]};
+  const config=settings.surfshark,scope=__exitTest.scope,originalFetch=globalThis.fetch;
+  const upstream=settings.providers[0].baseUrl+'/chat/completions';let calls=0;
+  try{
+    settings.surfshark={enabled:true,autoStart:false,regions,mode:'spread',pinned:'',skip:true,renew:false};
+    for(const [i,region] of regions.entries())S.__instances.set(region,{region,port:48000+i,state:'ready',exitIp:`192.0.2.${i+1}`,location:region,startedAt:0,readyAt:0,failures:0,restarts:0,error:'',renewedAt:[],output:'',handshake:true});
+    settings.routes.push(route);settings.providers[0].routeId=route.id;__exitTest.scope='kilo';
+    globalThis.fetch=Object.assign(async(input:Parameters<typeof fetch>[0],init?:Parameters<typeof fetch>[1])=>{
+      if(String(input)!==upstream)return originalFetch(input,init);
+      calls++;return calls===7?sse('last location'):Response.json({error:{code:'PROMOTION_MODEL_LIMIT_REACHED'}},{status:429});
+    },originalFetch);
+    const capped=await chat('kilo/kilo-auto/free');expect(capped.status).toBe(429);expect(capped.headers.get('retry-after')).not.toBe('1800');await capped.text();
+    expect(calls).toBe(6);expect(S.surfsharkReady('kilo')).toBe(1);expect(kiloLimited(route)).toBe(false);
+    expect([...models.values()].filter(m=>m.providerId==='kilo').some(m=>m.state==='cooldown')).toBe(false);
+    const next=await chat('kilo/vendor/big:free');expect(next.status).toBe(200);expect(await next.text()).toContain('last location');expect(calls).toBe(7);
+    // If the remaining address is actually limited too, the ordinary all-exits pause still applies.
+    const last=await chat('kilo/vendor/big:free');expect(last.status).toBe(429);expect(last.headers.get('retry-after')).toBe('1800');await last.text();
+    expect(calls).toBe(8);expect(S.surfsharkReady('kilo')).toBe(0);expect(kiloLimited(route)).toBe(true);
+    expect([...models.values()].filter(m=>m.providerId==='kilo'&&m.state!=='unavailable').every(m=>m.state==='cooldown')).toBe(true);
+  }finally{
+    globalThis.fetch=originalFetch;__exitTest.scope=scope;settings.surfshark=config;
+    for(const region of regions){const i=S.__instances.get(region);if(i)S.clearSurfsharkKiloLimit(i.exitIp);S.__instances.delete(region);}
+    settings.routes=settings.routes.filter(r=>r!==route);settings.providers[0].routeId='direct';__resetKiloLimits();
+  }
+});
 test('Kilo models are checked in the background only when the user chooses it for Kilo',async()=>{
    await seedKilo();
   const {autoCheckMinutes}=await import('../backend/model-checks');

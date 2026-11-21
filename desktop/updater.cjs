@@ -55,12 +55,19 @@ function portableTarget(file, packaged, platform = process.platform) {
   return packaged && platform === 'win32' && typeof file === 'string' && path.win32.isAbsolute(file) && file.toLowerCase().endsWith('.exe') ? path.resolve(file) : '';
 }
 // Staging folders (a downloaded installer each) left by an update that was interrupted are removed after a day; the one in use is always newer.
+const STAGED_FILES = new Set(['update.exe', 'apply-update.ps1', 'update.json', 'launcher-error.log', 'ready']);
 function removeStaleStaging(tempDir) {
   try {
     for (const name of fs.readdirSync(tempDir)) {
-      if (!name.startsWith('polygate-update-')) continue;
+      // Only a real folder with the exact name mkdtemp gave it (never a file or a link), holding nothing but the files an update stages there.
+      if (!/^polygate-update-[A-Za-z0-9]{6}$/.test(name)) continue;
       const folder = path.join(tempDir, name);
-      try { if (Date.now() - fs.statSync(folder).mtimeMs > 86400000) fs.rmSync(folder, { recursive: true, force: true }); } catch { /* in use or locked: leave it */ }
+      try {
+        const stat = fs.lstatSync(folder);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || Date.now() - stat.mtimeMs <= 86400000) continue;
+        if (!fs.readdirSync(folder).every(file => STAGED_FILES.has(file))) continue;
+        fs.rmSync(folder, { recursive: true, force: true });
+      } catch { /* in use or locked: leave it */ }
     }
   } catch { /* temp folder unreadable: nothing to clean */ }
 }

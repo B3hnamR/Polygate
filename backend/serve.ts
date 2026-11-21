@@ -39,9 +39,18 @@ export function serve(handler: NodeHandler, port: number, hostname = '127.0.0.1'
           if (ctl) { try { if (data?.byteLength) ctl.enqueue(data); ctl.close(); } catch { /* client already gone */ } } else respond((data?.byteLength ? data : null) as BodyInit | null);
           queueMicrotask(() => { res.emit('finish'); close(); cb?.(); }); return res;
         };
-        res.destroy = (error?: Error) => { if (res.destroyed) return res; if (ctl) { try { ctl.error(error ?? new Error('Response destroyed')); } catch { /* already closed */ } } else respond(null); ended = true; try { if (error && res.listenerCount('error')) res.emit('error', error); } finally { close(); } return res; };
+        const destroy = (error?: Error, clientLeft = false) => {
+          if (res.destroyed) return res;
+          ended = true;
+          if (ctl) {
+            try { if (clientLeft) ctl.close(); else ctl.error(error ?? new Error('Response destroyed')); } catch { /* already closed */ }
+          } else respond(null);
+          try { if (error && res.listenerCount('error')) res.emit('error', error); } finally { close(); }
+          return res;
+        };
+        res.destroy = (error?: Error) => destroy(error);
         res.cork = res.uncork = res.setTimeout = () => res;
-        const abort = () => { res.destroy(); req.destroy(); };
+        const abort = () => { destroy(undefined, true); req.destroy(); };
         request.signal.addEventListener('abort', abort, { once: true });
         if (request.signal.aborted) abort();
         Promise.resolve().then(() => { if (!closed) return handler(req, res); }).catch(error => {

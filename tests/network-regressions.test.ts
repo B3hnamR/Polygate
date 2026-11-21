@@ -176,7 +176,10 @@ function warpHarness(register?: (signal: AbortSignal) => Promise<any>) {
     connect() { const socket: any = new EventEmitter(); socket.destroy = () => {}; socket.setTimeout = () => {}; socket.write = () => queueMicrotask(() => socket.emit('data', Buffer.from([5, 0]))); queueMicrotask(() => socket.emit('connect')); return socket; },
   };
   const warp = isolated('../backend/warp.ts', {
-    ...base(settings), net: fakeNet, setTimeout(callback: () => void, ms: number) { timers.push({ callback, ms }); return timer(); }, accessSync() {}, statSync: () => ({ isFile: () => true }), fsConstants: { X_OK: 1 },
+    ...base(settings), net: fakeNet,
+    setTimeout(callback: () => void, ms: number) { const handle = { callback, ms, ...timer() }; timers.push(handle); return handle; },
+    clearTimeout(handle: (typeof timers)[number]) { const i = timers.indexOf(handle); if (i !== -1) timers.splice(i, 1); },
+    accessSync() {}, statSync: () => ({ isFile: () => true }), fsConstants: { X_OK: 1 },
     chmodSync() {}, rmSync() {}, readdirSync: () => [], readFileSync: () => register ? '{}' : JSON.stringify({ private_key: 'x', access_token: 'x', endpoint_pub_key: 'x' }),
     promisify: () => (_: any, __: any, opts: any) => register ? register(opts.signal) : Promise.resolve({}), execFile() {},
     spawn() { spawned++; return proc; }, socksBridge: async () => 'http://fake-bridge', socksConnect() {},

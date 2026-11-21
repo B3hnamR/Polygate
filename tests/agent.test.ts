@@ -867,3 +867,71 @@ test("a session the engine named with a tag from its prompt, or with nothing, sh
   expect(sessionTitle('بررسی پروژه')).toBe('بررسی پروژه');
   expect(sessionTitle('a < b and c > d')).toBe('a < b and c > d');
 });
+
+// A turn's post-turn bytes are not necessarily the agent's: an editor can save the same file while it works. Undo must refuse such a turn
+// instead of restoring the whole pre-turn file and wiping the user's save.
+test('a save outside the agent after its write makes the turn non-undoable, and Undo leaves the save in place', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  try {
+    put('tools/foreign-after.txt', 'line 1\nline 20\n');
+    await admin('/admin/agent/session/prompt', { id: a, text: 'edit line 1' });
+    await emit('session.tool.input.started', { sessionID: a, id: 'fa', name: 'edit' });
+    await emit('session.tool.called', { sessionID: a, id: 'fa', input: { path: 'tools/foreign-after.txt' } });
+    await until(() => ui.events.some(e => e.type === 'session.tool.called' && e.data?.id === 'fa'));
+    put('tools/foreign-after.txt', 'AGENT\nline 20\n');
+    await emit('session.tool.success', { sessionID: a, id: 'fa', content: [{ type: 'text', text: 'done' }] });
+    await until(() => ui.events.some(e => e.type === 'session.tool.success' && e.data?.id === 'fa'));
+    put('tools/foreign-after.txt', 'AGENT\nUSER\n');
+    await emit('session.execution.succeeded', { sessionID: a });
+    await until(() => ui.events.some(e => e.type === 'agent.changes'));
+    const turns = (await admin('/admin/agent/session/changes?id=' + a)).body.turns;
+    expect(turns.at(-1).undoable).toBe(false); expect(turns.at(-1).why).toContain('outside the agent');
+    expect((await admin('/admin/agent/session/undo', { id: a, message: turns.at(-1).message })).status).toBe(409);
+    expect(readFileSync(inFolder('tools/foreign-after.txt'), 'utf8')).toBe('AGENT\nUSER\n');
+  } finally { ui.stop(); }
+});
+
+test('a save outside the agent before its write is detected too, while a write the event arrives after is not mistaken for one', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  try {
+    put('tools/foreign-before.txt', 'original\n'); put('tools/late-event.txt', 'original\n');
+    await admin('/admin/agent/session/prompt', { id: a, text: 'edit both' });
+    // The agent already wrote late-event.txt when its tool.called event is processed: not someone else's edit.
+    put('tools/late-event.txt', 'agent\n');
+    await emit('session.tool.input.started', { sessionID: a, id: 'late', name: 'write' });
+    await emit('session.tool.called', { sessionID: a, id: 'late', input: { path: 'tools/late-event.txt' } });
+    await emit('session.tool.success', { sessionID: a, id: 'late', content: [{ type: 'text', text: 'done' }] });
+    put('tools/foreign-before.txt', 'user\n');
+    await emit('session.tool.input.started', { sessionID: a, id: 'fb', name: 'edit' });
+    await emit('session.tool.called', { sessionID: a, id: 'fb', input: { path: 'tools/foreign-before.txt' } });
+    await until(() => ui.events.some(e => e.type === 'session.tool.called' && e.data?.id === 'fb'));
+    put('tools/foreign-before.txt', 'user\nagent\n');
+    await emit('session.tool.success', { sessionID: a, id: 'fb', content: [{ type: 'text', text: 'done' }] });
+    await emit('session.execution.succeeded', { sessionID: a });
+    await until(() => ui.events.some(e => e.type === 'agent.changes'));
+    const turn = (await admin('/admin/agent/session/changes?id=' + a)).body.turns.at(-1);
+    expect(turn.undoable).toBe(false); expect(turn.why).toContain('outside the agent');
+  } finally { ui.stop(); }
+});
+
+test('agent writes alone keep the turn undoable', async () => {
+  const a = await create('accept-edits'); const ui = listen(a); await ui.ready();
+  try {
+    put('tools/agent-only.txt', 'original\n');
+    await admin('/admin/agent/session/prompt', { id: a, text: 'edit twice' });
+    for (const [id, text] of [['one', 'first\n'], ['two', 'second\n']]) {
+      await emit('session.tool.input.started', { sessionID: a, id, name: 'edit' });
+      await emit('session.tool.called', { sessionID: a, id, input: { path: 'tools/agent-only.txt' } });
+      await until(() => ui.events.some(e => e.type === 'session.tool.called' && e.data?.id === id));
+      put('tools/agent-only.txt', text);
+      await emit('session.tool.success', { sessionID: a, id, content: [{ type: 'text', text: 'done' }] });
+      await until(() => ui.events.some(e => e.type === 'session.tool.success' && e.data?.id === id));
+    }
+    await emit('session.execution.succeeded', { sessionID: a });
+    await until(() => ui.events.some(e => e.type === 'agent.changes'));
+    const turn = (await admin('/admin/agent/session/changes?id=' + a)).body.turns.at(-1);
+    expect(turn.undoable).toBe(true);
+    expect((await admin('/admin/agent/session/undo', { id: a, message: turn.message })).status).toBe(200);
+    expect(readFileSync(inFolder('tools/agent-only.txt'), 'utf8')).toBe('original\n');
+  } finally { ui.stop(); }
+});
