@@ -56,10 +56,11 @@ function socksTo(targetPort: number) {
   });
   return new Promise<{ port: number; close: () => void }>(r => server.listen(0, '127.0.0.1', () => r({ port: (server.address() as any).port, close: () => server.close() })));
 }
-type Answer = 'ok' | 'opencode-used-up' | 'kilo-limit';
+type Answer = 'ok' | 'opencode-used-up' | 'opencode-rate-limit' | 'kilo-limit';
 const answers: Record<string, Answer> = {}; let hits: Record<string, number> = {};
 const target = (name: string) => Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => { hits[name] = (hits[name] || 0) + 1; const a = answers[name];
   if (a === 'opencode-used-up') return new Response(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached' } }), { status: 429, headers: { 'retry-after': '3600', 'content-type': 'application/json' } });
+  if (a === 'opencode-rate-limit') return new Response(JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Free usage limit reached' } }), { status: 429, headers: { 'retry-after': '600', 'content-type': 'application/json' } });
   if (a === 'kilo-limit') return new Response(JSON.stringify({ error: { code: 'PROMOTION_MODEL_LIMIT_REACHED', message: 'limit' } }), { status: 429, headers: { 'content-type': 'application/json' } });
   return new Response('{"ok":true}', { headers: { 'content-type': 'application/json' } }); } });
 const IDS = ['wg-home', 'wg-work', 'wg-travel'] as const;
@@ -257,6 +258,15 @@ test('requests take turns over the configs; a used-up exit is skipped for OpenCo
   expect(W.spentUntil(exits['wg-home'])).toBeGreaterThan(Date.now());
   for (let i = 0; i < 6; i++) expect(W.pickWireguard(new Set(), 'opencode')!.region).not.toBe('wg-home');
   expect(Array.from({ length: 6 }, () => W.pickWireguard(new Set(), 'kilo')!.region)).toContain('wg-home');
+});
+test('a short OpenCode 429 is a rate limit, so the config is not marked used up', async () => {
+  // Stay on one config so this test does not advance the shared round-robin counter used by later tests.
+  settings.wireguard = { ...settings.wireguard!, mode: 'single', pinned: 'wg-home' };
+  answers['wg-home'] = 'opencode-rate-limit';
+  const r = await post(); await r.text();
+  expect(W.spentUntil(exits['wg-home'])).toBe(0);
+  expect(W.wireguardConfig().spent?.[exits['wg-home']]).toBeUndefined();
+  expect(W.pickWireguard(new Set(), 'opencode')!.region).toBe('wg-home');
 });
 test('the config a request answered through is kept for its log line', async () => {
   answers['wg-home'] = 'ok';
