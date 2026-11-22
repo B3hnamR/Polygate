@@ -10,7 +10,7 @@ import { testRoute, describeRoutes, backupChain, providerRoutes, steadyExit, spr
 import { warpStatus, warpConnect, warpDisconnect, warpInstall, warpRotate, setWarpSettings, checkHelperPath } from './warp';
 import { psiphonStatus, psiphonConnect, psiphonDisconnect, psiphonUpdateNodes, renewRegion, setPsiphonSettings, reconcilePsiphon, ROUTE_ID as PSIPHON } from './psiphon';
 import { surfsharkStatus, surfsharkConnect, surfsharkDisconnect, surfsharkUpdateServers, renewSurfshark, setSurfsharkSettings, setSurfsharkKeys, clearSurfsharkKeys, reconcileSurfshark, ROUTE_ID as SURFSHARK } from './surfshark';
-import { wireguardStatus, wireguardConnect, wireguardDisconnect, setWireguardSettings, wireguardImport, wireguardUpdate, wireguardToggle, wireguardRemove, wireguardConfigText, reconcileWireguard, ROUTE_ID as WIREGUARD } from './wireguard';
+import { wireguardStatus, wireguardConnect, wireguardDisconnect, setWireguardSettings, wireguardImport, wireguardUpdate, wireguardToggle, wireguardRemove, wireguardRemoveMany, wireguardRemoveAll, wireguardRemoveDuplicates, wireguardRemoveUsedUp, wireguardConfigText, reconcileWireguard, ROUTE_ID as WIREGUARD } from './wireguard';
 import { poolStatus, testPool, stopPoolTest, poolConfig, poolEntries, attachPool, setPoolRole, apiUrl } from './pool';
 import { createKey, updateKey } from './keys';
 import { KILO_ID, KILO_BASE } from './kilo';
@@ -348,7 +348,9 @@ export async function admin(req:IncomingMessage,res:ServerResponse,pathname:stri
   if(pathname==='/admin/wireguard/config'&&method==='POST'){const b=await readJson(req,16*1024*1024);return json(res,200,await wireguardUpdate(b));}
   if(pathname==='/admin/wireguard/config/text'&&method==='POST'){const b=await readJson(req);return json(res,200,{text:wireguardConfigText(String(b.id||''))});}
   if(pathname==='/admin/wireguard/config/toggle'&&method==='POST'){const b=await readJson(req);if(typeof b.enabled!=='boolean')throw new GatewayError('Expected a boolean',400);return json(res,200,await wireguardToggle(String(b.id||''),b.enabled));}
-  if(pathname==='/admin/wireguard/config/remove'&&method==='POST'){const b=await readJson(req);return json(res,200,await wireguardRemove(String(b.id||'')));}
+  if(pathname==='/admin/wireguard/config/remove'&&method==='POST'){const b=await readJson(req);if(b.all===true)return json(res,200,await wireguardRemoveAll());if(Array.isArray(b.ids))return json(res,200,await wireguardRemoveMany(b.ids));return json(res,200,await wireguardRemove(String(b.id||'')));}
+  if(pathname==='/admin/wireguard/config/remove-duplicates'&&method==='POST')return json(res,200,await wireguardRemoveDuplicates());
+  if(pathname==='/admin/wireguard/config/remove-used-up'&&method==='POST')return json(res,200,await wireguardRemoveUsedUp());
   if(pathname==='/admin/wireguard/connect'&&method==='POST')return json(res,200,await wireguardConnect());
   if(pathname==='/admin/wireguard/disconnect'&&method==='POST')return json(res,200,await wireguardDisconnect());
   if(pathname==='/admin/wireguard/settings'&&method==='POST'){const b=await readJson(req);const patch:any={};for(const k of ['enabled','autoStart','mode','pinned','skip'])if(k in b)patch[k]=b[k];return json(res,200,await setWireguardSettings(patch));}

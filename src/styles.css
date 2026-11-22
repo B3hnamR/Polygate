@@ -1153,3 +1153,21 @@ nav.ag-q-tabs{flex-direction:row;align-items:center}.agent-folder-trust>p.subtle
 .wg-report li>svg{flex-shrink:0;margin-top:3px;color:var(--green)}
 .wg-report .wg-failed li>svg{color:var(--red)}
 .wg-report small{display:inline;font-size:13px;color:var(--muted)}
+/* WireGuard bulk actions: the row gains a select column, and the toolbar filters and acts on the selection. */
+.wireguard-panel .psi-row{grid-template-columns:auto minmax(120px,1fr) minmax(150px,1.2fr) auto auto}
+.wireguard-panel .psi-check{display:flex;align-items:center}
+.wireguard-panel .psi-check input{width:17px;height:17px;margin:0;padding:0;accent-color:var(--accent)}
+.wireguard-panel .psi-row.picked{border-color:var(--accent-line);background:var(--accent-soft)}
+.wg-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;row-gap:10px;margin:0 0 12px;padding:0 0 12px;border-bottom:1px solid var(--line)}
+.wg-toolbar .search{flex:1 1 240px}
+.wg-select-all{display:flex;align-items:center;gap:7px;font-size:14px;color:var(--text-secondary);white-space:nowrap}
+.wg-select-all input{width:16px;height:16px;margin:0;padding:0;accent-color:var(--accent)}
+.wg-same{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
+.wg-same svg{flex:none}
+@media(max-width:760px){.wireguard-panel .psi-row{grid-template-columns:auto minmax(0,1fr) auto;row-gap:8px}
+  .wireguard-panel .psi-check{grid-column:1;grid-row:1}
+  .wireguard-panel .psi-name{grid-column:2;grid-row:1}
+  .wireguard-panel .psi-row>.badge{grid-column:3;grid-row:1;justify-self:end}
+  .wireguard-panel .psi-exit{grid-column:1/-1;grid-row:2;flex-direction:row;flex-wrap:wrap;align-items:baseline;column-gap:8px}
+  .wireguard-panel .psi-actions{grid-column:1/-1;grid-row:3;justify-content:flex-start}
+  .wg-toolbar .search{flex:1 1 100%;max-width:none}}

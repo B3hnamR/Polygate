@@ -456,3 +456,76 @@ test('a restored setting is cleaned before use: unknown entries, duplicate ids, 
   expect(c.mode).toBe('spread');
   expect(c.pinned).toBe('');
 });
+test('bulk removal stops the selected clients, keeps the rest, and clears a pinned selection', async () => {
+  settings.wireguard = { ...W.wireguardConfig(), mode: 'single', pinned: 'wg-home' };
+  const st = await W.wireguardRemoveMany(['wg-home', 'wg-work', 'wg-nope']);
+  const c = W.wireguardConfig();
+  expect(c.configs.map(x => x.id)).toEqual(['wg-travel']);
+  expect(c.pinned).toBe('');
+  expect([...W.__instances.keys()]).toEqual(['wg-travel']);
+  expect(JSON.stringify(st)).not.toContain(pair.privateKey);
+});
+test('removing every config turns the route off and keeps the WireGuard settings', async () => {
+  const saved = { routes: settings.routes, routeId: settings.routeId, previousRouteId: settings.previousRouteId, managedChoice: settings.managedChoice };
+  try {
+    settings.routes = [
+      { id: 'direct', name: 'Direct', kind: 'direct', url: '', enabled: true, models: [] },
+      { id: 'wireguard', name: 'WireGuard', kind: 'proxy', url: 'wireguard://local', enabled: true, models: [], managed: true },
+    ];
+    settings.routeId = 'wireguard';
+    settings.wireguard = { ...W.wireguardConfig(), enabled: true, autoStart: true, mode: 'single', skip: false };
+    const st = await W.wireguardRemoveAll();
+    const c = W.wireguardConfig();
+    expect(c.configs).toEqual([]);
+    expect(c).toMatchObject({ enabled: true, autoStart: true, mode: 'single', skip: false });
+    expect(st.route.enabled).toBe(false);
+    expect(settings.routeId).toBe('direct');
+    expect(W.__instances.size).toBe(0);
+  } finally { Object.assign(settings, saved); }
+});
+test('identical files are marked from the kept copy, and duplicate removal keeps the pinned config', async () => {
+  const bomCrlf = '\uFEFF' + conf().replace(/\n/g, '\r\n') + '\r\n';
+  settings.wireguard = { ...W.wireguardConfig(), mode: 'single', pinned: 'wg-work', configs: [
+    { id: 'wg-home', name: 'wg-home', config: conf(), enabled: true, addedAt: 1 },
+    { id: 'wg-work', name: 'wg-work', config: bomCrlf, enabled: true, addedAt: 2 },
+    { id: 'wg-travel', name: 'wg-travel', config: conf(), enabled: true, addedAt: 3 },
+    { id: 'wg-extra', name: 'wg-extra', config: conf(AMNEZIA), enabled: true, addedAt: 4 },
+  ] };
+  const rows = W.wireguardStatus().configs;
+  const row = (id: string) => rows.find(x => x.id === id)!;
+  expect(row('wg-home').sameAs).toBe('wg-work');
+  expect(row('wg-travel').sameAs).toBe('wg-work');
+  expect(row('wg-work').sameAs).toBeUndefined();
+  expect(row('wg-extra').sameAs).toBeUndefined();
+  await W.wireguardRemoveDuplicates();
+  const c = W.wireguardConfig();
+  expect(c.configs.map(x => x.id)).toEqual(['wg-work', 'wg-extra']);
+  expect(c.pinned).toBe('wg-work');
+  expect([...W.__instances.keys()]).toEqual(['wg-work']);
+});
+test('duplicate removal keeps an enabled copy when the first copy is off', async () => {
+  settings.wireguard = { ...W.wireguardConfig(), configs: [
+    { id: 'wg-home', name: 'wg-home', config: conf(), enabled: false, addedAt: 1 },
+    { id: 'wg-work', name: 'wg-work', config: conf(), enabled: true, addedAt: 2 },
+  ] };
+  await W.wireguardRemoveDuplicates();
+  expect(W.wireguardConfig().configs.map(x => x.id)).toEqual(['wg-work']);
+});
+test('used-up removal deletes only connected configs whose exit is marked used up now', async () => {
+  settings.wireguard = { ...W.wireguardConfig(), spent: { [exits['wg-home']]: Date.now() + 3600e3, [exits['wg-travel']]: Date.now() + 3600e3 } };
+  W.__instances.delete('wg-travel');
+  const st = await W.wireguardRemoveUsedUp();
+  const c = W.wireguardConfig();
+  expect(c.configs.map(x => x.id)).toEqual(['wg-work', 'wg-travel']);
+  expect(st.configs.find((x: any) => x.id === 'wg-travel')!.usedUpUntil).toBe(0);
+  expect(c.spent?.[exits['wg-home']]).toBeGreaterThan(Date.now());
+  expect([...W.__instances.keys()]).toEqual(['wg-work']);
+  const again = await W.wireguardRemoveUsedUp();
+  expect(again.configs.map((x: any) => x.id)).toEqual(['wg-work', 'wg-travel']);
+});
+test('bulk removal refuses a missing selection or more ids than an import can add', async () => {
+  await expect(W.wireguardRemoveMany([])).rejects.toThrow('Say which WireGuard configs to remove.');
+  await expect(W.wireguardRemoveMany('nope' as any)).rejects.toThrow('Say which WireGuard configs to remove.');
+  await expect(W.wireguardRemoveMany(Array.from({ length: 201 }, (_, i) => `wg-${i}`))).rejects.toThrow('Remove at most 200 configs at a time.');
+  await expect(W.wireguardRemoveMany(['wg-nope'])).rejects.toMatchObject({ status: 404, message: 'Those WireGuard configs are no longer there. Reload the page and try again.' });
+});

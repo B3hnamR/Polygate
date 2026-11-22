@@ -12,7 +12,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants as fsConstants, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { settings, persist, stateDir, redactError } from './state';
 import { GatewayError } from './queue';
 import { freePort, traceVia, warpTarget } from './warp';
@@ -48,6 +48,7 @@ sweepTemps(new Set(), Infinity);
 const BASE_PORT = 47700;
 export const ROUTE_ID = 'wireguard';
 const MAX_IMPORT = 200;
+const MAX_BULK = MAX_IMPORT;
 const MAX_TEXT = 256 * 1024;
 const defaults: WireguardSettings = { enabled: true, autoStart: false, mode: 'spread', pinned: '', skip: true, configs: [] };
 
@@ -770,15 +771,72 @@ async function doToggle(id: string, enabled: boolean) {
   reconcileWireguard(!wireguardConfig().configs.some(x => x.enabled));
   return wireguardStatus();
 }
+// Every removal goes through here: the stop, the key files, the pinned choice, the log line and the route must not drift apart between
+// one config, a selection, all of them, identical copies and used-up exits.
+function removeIds(c: WireguardSettings, ids: Set<string>, reason = '') {
+  const gone = c.configs.filter(x => ids.has(x.id));
+  for (const x of gone) {
+    const inst = instances.get(x.id);
+    if (!inst) continue;
+    inst.stopping = true;
+    stopProcess(inst.proc);
+    instances.delete(x.id);
+    dropConf(x.id, inst.gen);
+  }
+  const next: WireguardSettings = { ...c, configs: c.configs.filter(x => !ids.has(x.id)) };
+  if (next.pinned && ids.has(next.pinned)) next.pinned = '';
+  settings.wireguard = next;
+  persist();
+  logEvent('info', 'wireguard', gone.length === 1
+    ? `WireGuard ${gone[0].name} was removed`
+    : `Removed ${gone.length} WireGuard configs${reason ? ` (${reason})` : ''}`);
+  reconcileWireguard(!wireguardConfig().configs.some(x => x.enabled));
+  return wireguardStatus();
+}
 export function wireguardRemove(id: string): Promise<any> { return serialize(() => doRemove(id)); }
 async function doRemove(id: string) {
   const c = wireguardConfig(); const found = c.configs.find(x => x.id === id);
   if (!found) throw new GatewayError('No such WireGuard config', 404);
-  const inst = instances.get(id); if (inst) { inst.stopping = true; stopProcess(inst.proc); instances.delete(id); dropConf(id, inst.gen); }
-  settings.wireguard = { ...c, configs: c.configs.filter(x => x.id !== id), ...(c.pinned === id ? { pinned: '' } : {}) }; persist();
-  logEvent('info', 'wireguard', `WireGuard ${found.name} was removed`);
-  reconcileWireguard(!wireguardConfig().configs.some(x => x.enabled));
-  return wireguardStatus();
+  return removeIds(c, new Set([id]));
+}
+function bulkIds(input: unknown): Set<string> {
+  if (!Array.isArray(input)) throw new GatewayError('Say which WireGuard configs to remove.', 400, 'wireguard_config');
+  if (input.length > MAX_BULK) throw new GatewayError(`Remove at most ${MAX_BULK} configs at a time.`, 400, 'wireguard_config');
+  const ids = new Set(input.map(x => String(x || '')).filter(Boolean));
+  if (!ids.size) throw new GatewayError('Say which WireGuard configs to remove.', 400, 'wireguard_config');
+  return ids;
+}
+export function wireguardRemoveMany(input: unknown): Promise<any> { return serialize(() => doRemoveMany(input)); }
+async function doRemoveMany(input: unknown) {
+  const ids = bulkIds(input);
+  const c = wireguardConfig(); const found = c.configs.filter(x => ids.has(x.id));
+  if (!found.length) throw new GatewayError('Those WireGuard configs are no longer there. Reload the page and try again.', 404);
+  return removeIds(c, new Set(found.map(x => x.id)));
+}
+export function wireguardRemoveAll(): Promise<any> { return serialize(doRemoveAll); }
+async function doRemoveAll() {
+  const c = wireguardConfig();
+  if (!c.configs.length) return wireguardStatus();
+  return removeIds(c, new Set(c.configs.map(x => x.id)), 'all');
+}
+export function wireguardRemoveDuplicates(): Promise<any> { return serialize(doRemoveDuplicates); }
+async function doRemoveDuplicates() {
+  const c = wireguardConfig();
+  const copies = new Set(identicalGroups(c).flatMap(g => g.copies.map(x => x.id)));
+  if (!copies.size) return wireguardStatus();
+  return removeIds(c, copies, 'identical files');
+}
+export function wireguardRemoveUsedUp(): Promise<any> { return serialize(doRemoveUsedUp); }
+async function doRemoveUsedUp() {
+  const c = wireguardConfig(); const ids = new Set<string>();
+  for (const x of c.configs) {
+    const inst = instances.get(x.id);
+    if (!inst) continue;
+    const keys = inst.exitIp ? [inst.exitIp, `id:${x.id}`] : [`id:${x.id}`];
+    if (keys.some(k => (c.spent?.[k] || 0) > Date.now())) ids.add(x.id);
+  }
+  if (!ids.size) return wireguardStatus();
+  return removeIds(c, ids, 'used up');
 }
 export function setWireguardSettings(patch: Partial<WireguardSettings>): Promise<any> { return serialize(() => doSettings(patch)); }
 async function doSettings(patch: Partial<WireguardSettings>) {
@@ -835,17 +893,37 @@ function cachedParse(id: string, text: string): Parsed | null {
   let parsed: Parsed | null = null; try { parsed = parseConfig(text); } catch { /* a restored backup may hold a file that no longer parses */ }
   parsedCache.set(id, { text, parsed }); return parsed;
 }
+// A conservative fingerprint: a file saved with a BOM or CRLF line endings is the same file as one without. Cached by config id and text,
+// like the parsed summary, so the dashboard poll does not hash every file on each request.
+const fingerprints = new Map<string, { text: string; hash: string }>();
+function fingerprint(id: string, text: string): string {
+  const hit = fingerprints.get(id); if (hit && hit.text === text) return hit.hash;
+  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').split('\n').map(line => line.trimEnd()).join('\n').trim();
+  const hash = createHash('sha256').update(normalized).digest('base64url');
+  fingerprints.set(id, { text, hash }); return hash;
+}
+// Configs that hold the same file, with the copy that stays: the pinned one, else the first enabled one, else the first.
+function identicalGroups(c: WireguardSettings) {
+  const groups = new Map<string, WireguardConfig[]>();
+  for (const x of c.configs) { const h = fingerprint(x.id, x.config); groups.set(h, [...(groups.get(h) || []), x]); }
+  return [...groups.values()].filter(g => g.length >= 2).map(g => {
+    const keeper = g.find(x => x.id === c.pinned) || g.find(x => x.enabled) || g[0];
+    return { keeper, copies: g.filter(x => x.id !== keeper.id) };
+  });
+}
 // What the WireGuard section shows. The files themselves never go to the dashboard: only where each one connects, and what it carries.
 export function wireguardStatus() {
   const c = wireguardConfig(); const bin = findWireproxyAwg(); const now = Date.now(); const route = settings.routes.find(r => r.id === ROUTE_ID);
+  const copies = new Map<string, string>();
+  for (const g of identicalGroups(c)) for (const x of g.copies) copies.set(x.id, g.keeper.id);
   return {
     installed: !!bin, problem: bin ? '' : wireproxyMissing(), platform: `${process.platform}-${process.arch}`,
     busy, lastError, running: instances.size > 0, live: wireguardLive(),
     config: { enabled: c.enabled, autoStart: c.autoStart, mode: c.mode, pinned: c.pinned, skip: c.skip },
     configs: c.configs.map(entry => {
       const i = instances.get(entry.id); const until = i ? spentUntil(limitKey(i)) : 0;
-      const parsed = cachedParse(entry.id, entry.config);
-      return { id: entry.id, name: entry.name, enabled: entry.enabled, addedAt: entry.addedAt,
+      const parsed = cachedParse(entry.id, entry.config); const sameAs = copies.get(entry.id);
+      return { id: entry.id, name: entry.name, enabled: entry.enabled, addedAt: entry.addedAt, ...(sameAs ? { sameAs } : {}),
         endpoint: parsed?.endpoint || '', address: parsed?.addresses.join(', ') || '', mtu: parsed?.mtu || 0, mtuUsed: parsed ? usedMtu(parsed.mtu, parsed.s4) : 0, dns: parsed?.dns || [], dnsUsed: effectiveDns(parsed),
         allowedIPs: parsed?.allowedIPs || '', keepalive: parsed?.keepalive || '', amnezia: !!parsed?.amnezia, amneziaFields: parsed?.amneziaFields || [], peers: parsed?.peers || 0,
         state: i ? i.state : 'stopped', port: i?.port || 0, exitIp: i?.exitIp || '', location: i?.location || '', since: i?.readyAt || 0,

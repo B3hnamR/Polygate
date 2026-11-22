@@ -1,5 +1,5 @@
-import {useRef,useState} from 'react';
-import {AlertCircle,Check,ClipboardPaste,FileUp,FlaskConical,Info,Loader2,Pencil,Power,Route as RouteIcon,ShieldCheck,Trash2,X} from 'lucide-react';
+import {useEffect,useRef,useState} from 'react';
+import {AlertCircle,Check,ClipboardPaste,CopyMinus,FileUp,FlaskConical,Info,Loader2,Pencil,Power,Route as RouteIcon,Search,ShieldCheck,Trash2,X} from 'lucide-react';
 import {api,isCancelled} from './api';
 import {Badge,Button,Field,Select,Toggle,usePoll,useCancel} from './ui';
 import {useConfirm} from './confirm';
@@ -8,7 +8,7 @@ import type {Notice} from './panels';
 
 // The WireGuard route (backend/wireguard.ts): every imported .conf file is a WireGuard or AmneziaWG tunnel of its own, run by the bundled
 // wireproxy-awg, and together they are one route that takes turns or stays on one config, with the same options as Psiphon and Surfshark.
-type Config={id:string;name:string;enabled:boolean;addedAt:number;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];dnsUsed:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
+type Config={id:string;name:string;enabled:boolean;addedAt:number;sameAs?:string;endpoint:string;address:string;mtu:number;mtuUsed:number;dns:string[];dnsUsed:string[];allowedIPs:string;keepalive:string;amnezia:boolean;amneziaFields:string[];peers:number;
   state:'stopped'|'starting'|'ready'|'failed';port:number;exitIp:string;location:string;since:number;usedUpUntil:number;kiloUntil:number;error:string};
 type WireguardInfo={installed:boolean;problem:string;platform:string;busy:string;lastError:string;running:boolean;live:number;
   config:{enabled:boolean;autoStart:boolean;mode:'spread'|'single';pinned:string;skip:boolean};
@@ -24,6 +24,11 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   const [pasteName,setPasteName]=useState('');const [pasteText,setPasteText]=useState('');const [report,setReport]=useState<ImportResult|null>(null);
   const [editing,setEditing]=useState<{id:string;name:string;text:string}|null>(null);
   const picker=useRef<HTMLInputElement>(null);const {confirm,dialog}=useConfirm();const {start,cancel}=useCancel(false);
+  const [picked,setPicked]=useState<Set<string>>(new Set());const [query,setQuery]=useState('');
+  const idKey=(s?.configs||[]).map(x=>x.id).join(',');
+  // A selection only ever names rows that are still there; a filter change clears it, so a bulk action never touches a hidden row.
+  useEffect(()=>setPicked(prev=>{const live=new Set(idKey?idKey.split(','):[]);const next=new Set([...prev].filter(id=>live.has(id)));return next.size===prev.size?prev:next;}),[idKey]);
+  useEffect(()=>setPicked(new Set()),[query]);
   async function run(name:string,path:string,body:unknown={},done=''){
     setBusy(name);
     try{const r:any=await api(path,body);if(done)notice(done);await reload();onChanged();return r;}
@@ -65,13 +70,42 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
   }
   if(!s)return <section className="section-block form-section psiphon-panel"><div className="section-top"><div className="section-title"><ShieldCheck size={19}/><h2>WireGuard</h2></div></div>
     {error?<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{error}</span><Button onClick={()=>void reload()}>Try again</Button></div>:<div className="loading"><Loader2 className="spin"/> Checking WireGuard…</div>}</section>;
-  const c=s.config;const working=!!busy||!!s.busy;const enabled=s.configs.filter(x=>x.enabled);
+  const c=s.config;const working=!!busy||!!s.busy;const enabled=s.configs.filter(x=>x.enabled);const configs=s.configs;
   const down=enabled.filter(x=>x.state==='stopped'||x.state==='failed').length;
   const starting=enabled.filter(x=>x.state==='starting').length;
   const [tone,label]=!s.installed?['neutral','Not available']:!c.enabled?['neutral','Off']:s.live?['healthy',`${s.live} of ${enabled.length} connected`]:starting?['cooldown','Connecting']:s.running?['error','Not connected']:['neutral','Not running'];
   const connectLabel=!s.running?'Connect':down?`Restart ${down} stopped config${down>1?'s':''}`:s.live<enabled.length?'Connecting':'Connected';
   const nameOf=(id:string)=>s.configs.find(x=>x.id===id)?.name||id;
   const connect=()=>run('connect','/admin/wireguard/connect',{},'WireGuard is connecting');
+  const q=query.trim().toLowerCase();
+  const shown=s.configs.filter(x=>!q||[x.name,x.endpoint,x.address].some(v=>v.toLowerCase().includes(q)));
+  const usedUp=s.configs.filter(x=>x.usedUpUntil>0);
+  const copies=s.configs.filter(x=>x.sameAs);
+  const allShown=shown.length>0&&shown.every(x=>picked.has(x.id));
+  const toggle=(id:string)=>setPicked(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+  async function removePicked(){
+    const list=configs.filter(x=>picked.has(x.id));const n=list.length;if(!n)return;
+    const ok=await confirm(n===1
+      ?<>Delete <strong>{list[0].name}</strong>? Its .conf file is removed with it, and requests can no longer go through it.</>
+      :<>Delete <strong>{n} selected configs</strong>? Their .conf files are removed with them, and requests can no longer go through them.</>,
+      {title:n===1?'Delete WireGuard config':'Delete WireGuard configs',confirm:n===1?'Delete config':'Delete configs'});
+    if(ok&&await run('remove-picked','/admin/wireguard/config/remove',{ids:[...picked]},`${n} config${n===1?'':'s'} removed`))setPicked(new Set());
+  }
+  async function removeUsedUp(){
+    const n=usedUp.length;if(!n)return;
+    if(await confirm(<>Remove <strong>{n} used-up config{n===1?'':'s'}</strong>? {n===1?'Its .conf file is deleted and its tunnel stops.':'Their .conf files are deleted and their tunnels stop.'} The used-up marks stay, so an exit imported again is still marked used up.</>,{title:'Remove used-up configs',confirm:'Remove configs'})
+      &&await run('remove-used-up','/admin/wireguard/config/remove-used-up',{},`${n} used-up config${n===1?'':'s'} removed`))setPicked(new Set());
+  }
+  async function removeIdentical(){
+    const n=copies.length;if(!n)return;
+    if(await confirm(<>Remove <strong>{n} identical cop{n===1?'y':'ies'}</strong>? One file from each set stays; {n===1?'the copy is deleted with its .conf file, and its tunnel stops.':'the rest are deleted with their .conf files, and their tunnels stop.'}</>,{title:'Remove identical files',confirm:'Remove copies'})
+      &&await run('remove-identical','/admin/wireguard/config/remove-duplicates',{},`${n} identical file${n===1?'':'s'} removed`))setPicked(new Set());
+  }
+  async function removeAll(){
+    const n=configs.length;if(n<1)return;
+    if(await confirm(<>Remove all <strong>{n} config{n===1?'':'s'}</strong>? Every .conf file is deleted, every tunnel stops, and the WireGuard route is turned off. Requests move to your previous route, or fail if there is none. Your mode, skip and auto-start settings stay.</>,{title:'Remove all WireGuard configs',confirm:'Remove all'})
+      &&await run('remove-all','/admin/wireguard/config/remove',{all:true},`All ${n} WireGuard config${n===1?'':'s'} removed`))setPicked(new Set());
+  }
   return <section className="section-block form-section psiphon-panel wireguard-panel">
     {dialog}
     <div className="section-top"><div className="section-title"><ShieldCheck size={19}/><h2>WireGuard</h2></div><Badge state={tone}>{label}</Badge></div>
@@ -110,10 +144,23 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
     </div>
     {s.lastError&&!working&&<div className="error-banner" role="alert"><AlertCircle size={16}/><span>{s.lastError}</span></div>}
 
-    {s.configs.length>0?<div className="psi-rows">{s.configs.map(cfg=>{const pinned=c.mode==='single'&&c.pinned===cfg.id;
+    {s.configs.length>0&&<div className="wg-toolbar">
+      <div className="search"><Search size={16}/><input aria-label="Filter WireGuard configs" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter by name, endpoint or address…"/></div>
+      <label className="wg-select-all"><input type="checkbox" aria-label="Select every config shown" checked={allShown} disabled={working||!shown.length} onChange={e=>setPicked(prev=>{const n=new Set(prev);for(const x of shown)e.target.checked?n.add(x.id):n.delete(x.id);return n;})}/><span>{shown.length===s.configs.length?'Select all':'Select all shown'}</span></label>
+      <span className="subtle">{picked.size?`${picked.size} selected`:shown.length===s.configs.length?`${s.configs.length} config${s.configs.length===1?'':'s'}`:`${shown.length} of ${s.configs.length}`}</span>
+      <span className="toolbar-spacer"/>
+      <Button disabled={working||!picked.size} onClick={()=>void removePicked()}><Trash2 size={15}/>Remove selected ({picked.size})</Button>
+      <Button disabled={working||!usedUp.length} title="Removes the connected configs whose exit is marked used up right now, including ones hidden by the filter" onClick={()=>void removeUsedUp()}><Trash2 size={15}/>Remove used-up ({usedUp.length})</Button>
+      <Button disabled={working||!copies.length} title="Removes copies whose file is identical after BOM and CRLF normalization; one copy from each set stays" onClick={()=>void removeIdentical()}><CopyMinus size={15}/>Remove identical ({copies.length})</Button>
+      {s.configs.length>1&&<Button disabled={working} onClick={()=>void removeAll()}>Remove all</Button>}
+    </div>}
+
+    {shown.length?<div className="psi-rows">{shown.map(cfg=>{const pinned=c.mode==='single'&&c.pinned===cfg.id;
       const [t,l]=cfg.state!=='ready'?stateLabel[cfg.state]:cfg.usedUpUntil?['cooldown',`Used up until ${utc(cfg.usedUpUntil)}`]:stateLabel[cfg.state];
-      return <div key={cfg.id} className={`psi-row${pinned?' pinned':''}`}>
-        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small><small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''} · DNS {cfg.dnsUsed.join(', ')}{!cfg.dns.length?' (added; the file has none)':''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
+      const same=cfg.sameAs?s.configs.find(x=>x.id===cfg.sameAs):undefined;
+      return <div key={cfg.id} className={`psi-row${pinned?' pinned':''}${picked.has(cfg.id)?' picked':''}`}>
+        <label className="psi-check"><input type="checkbox" aria-label={`Select ${cfg.name}`} checked={picked.has(cfg.id)} disabled={working} onChange={()=>toggle(cfg.id)}/></label>
+        <div className="psi-name"><strong>{cfg.name}{pinned?' · the one in use':''}</strong><small className="mono" title={cfg.allowedIPs?`AllowedIPs ${cfg.allowedIPs}`:undefined}>{cfg.endpoint||'No endpoint'}{cfg.peers>1?` · ${cfg.peers} peers`:''}{cfg.amnezia?` · AmneziaWG${cfg.amneziaFields.length?`: ${cfg.amneziaFields.join(', ')}`:''}`:''}</small>{same&&<small className="wg-same"><CopyMinus size={13}/>Same file as {same.name}</small>}<small>{cfg.address||'No address'} · MTU {cfg.mtuUsed||cfg.mtu}{cfg.mtuUsed&&cfg.mtuUsed!==cfg.mtu?` (config says ${cfg.mtu})`:''} · DNS {cfg.dnsUsed.join(', ')}{!cfg.dns.length?' (added; the file has none)':''}{cfg.keepalive?` · keepalive ${cfg.keepalive}`:''}{cfg.enabled?'':' · off'}</small></div>
         <div className="psi-exit"><span className="mono">{cfg.exitIp||'-'}</span><small>{cfg.location?`${cfg.location} · `:''}{cfg.error||(cfg.state==='ready'?`Connected ${cfg.since?'since '+new Date(cfg.since).toLocaleTimeString():''}`:cfg.state==='starting'?'Connecting through WireGuard…':'')}{cfg.kiloUntil?<> · Kilo limit until {utc(cfg.kiloUntil)}</>:null}</small></div>
         <Badge state={t}>{l}</Badge>
         <div className="psi-actions">
@@ -124,6 +171,7 @@ export function WireguardPanel({notice,onChanged}:{notice:Notice;onChanged:()=>v
           <button className="icon-button danger" aria-label={'Delete WireGuard config '+cfg.name} disabled={working} onClick={()=>void remove(cfg)}><Trash2 size={15}/></button>
         </div>
       </div>;})}</div>
+      :s.configs.length?<p className="subtle">No config matches that filter. <Button onClick={()=>setQuery('')}>Clear</Button></p>
       :<p className="subtle">No config imported yet. Drop a .conf file above, or paste one.</p>}
 
     {s.configs.length>0&&<>
