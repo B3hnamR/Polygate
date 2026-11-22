@@ -110,6 +110,11 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
   // The agent on OpenCode Free: only while the bridge presents the engine's own OpenCode version, so its tools are not swapped (agent-engine.ts).
   // 403, not 409: the engine retries a 409 for over a minute (like a 429 or a 5xx) before showing the reason.
   if(k.agent&&candidates.some(m=>settings.providers.find(p=>p.id===m.providerId)?.kind==='free')){const why=freeIdentityProblem(presentedOpenCodeVersion());if(why)throw new GatewayError(why,403,'agent_engine_outdated');}
+  // The deadline is a whole-request budget. Do not start another exit when too little of it is left: the request would be aborted
+  // mid-flight and the real refusal from the last exit would be reported as a bare 504.
+  const deadlineAt=Date.now()+settings.timeoutMs;
+  const switchReserve=()=>Math.min(8000,Math.max(400,settings.timeoutMs/5));
+  const canSwitch=()=>!controller.signal.aborted&&Date.now()+switchReserve()<deadlineAt;
   const timer=setTimeout(()=>controller.abort(new GatewayError('Gateway request deadline exceeded',504,'timeout')),settings.timeoutMs);
   // The deadline covers the wait for the first byte. Once an answer is streaming, only silence counts, so a long answer that is still arriving is
   // not cut off; a stream that never stops is ended after an hour.
@@ -164,6 +169,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
        let attempts=settings.retries;if(r.id==='proxy-pool')attempts=Math.max(attempts,settings.pool?.retries??3);
        const partialKiloGroups=new Set<string>();
       for(let attempt=0;attempt<=attempts;attempt++){
+        if(attempt>0&&!canSwitch())break;
         if(attempt>0&&providerPicksAgain(p)&&!keepRoute){r=routeForProvider(p,m.id);route=r.name;}keepRoute=false;
         tried=true;exitsTried.add(r.id);t0=Date.now();retryAfter=''; // a wait asked for by an earlier failed attempt does not belong to this one
         // A tool list OpenCode refused earlier goes out already trimmed; never for the agent, whose model must see every tool it may call.
@@ -206,7 +212,7 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
             const group=exitGroupOf(r.id);
             const hasLocations=!!(group?.skips()&&group.ready('kilo')>0);
             if(hasLocations)partialKiloGroups.add(r.id);else kiloLimitRoute(r,Date.now()+KILO_LIMIT_PAUSE_MS);
-            const alt=switches<maxSwitches()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
+            const alt=switches<maxSwitches()&&canSwitch()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
             if(alt){switches++;notify('Switched network exit',`Kilo's free limit was reached through ${r.name}; Kilo requests moved to ${alt.name}.`,'info','kilo-switched|'+alt.id,600000);r=alt;route=r.name;keepRoute=true;attempts++;continue;}
             // A backup may have refused too, while a previously tried group still has locations left.
             if([...partialKiloGroups].some(id=>(exitGroupOf(id)?.ready('kilo')||0)>0)){limited.add(p.id);break;}
@@ -219,13 +225,13 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           if(refused&&settings.trimTools!==false&&!k.agent&&!trimmed.length){const t=coreOnly(chat);if(t){learnTrim(p.id,chat);trimmedFor=p.id;trimmed=t.dropped;trimRetried=true;chat=t.chat;confirmedClean=false;attempts++;continue;}}
           // Still refused: OpenCode can limit one model on an exit where a small check with another still answers, so the request tries
           // another exit before the refusal goes back. Nothing is marked: the exit stays in turn for every other request.
-          if(refused&&switches<maxSwitches()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;logEvent('info','routes',`${r.name} refused this request though a small check passed; trying it through ${alt.name}`,{route:r.id,to:alt.id,model:m.id});r=alt;route=r.name;keepRoute=true;attempts++;continue;}}
+          if(refused&&switches<maxSwitches()&&canSwitch()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;logEvent('info','routes',`${r.name} refused this request though a small check passed; trying it through ${alt.name}`,{route:r.id,to:alt.id,model:m.id});r=alt;route=r.name;keepRoute=true;attempts++;continue;}}
           const retryMs=!refused&&!inconclusive&&Number.isFinite(parsed)?Math.max(0,Math.min(parsed,86400000)):0;
           // The daily Free allowance follows the exit address, not the model: move to a clean exit, and never pause the model for it.
           const ex=takeExhaustion(requestId)||(refused||inconclusive?undefined:exhaustionOf(status,after,message));
           if(ex){
             exhausted=ex;notify(ex.refused?'Network exit refused':'Network exit used up',ex.refused?`${r.name} was refused by the Free tier; it is skipped until ${resetTime(ex.until)}.`:`${r.name} has used its daily Free allowance (resets ${resetTime(ex.until)}).`,'warning','exhausted|'+r.id,3600000);
-            const alt=switches<maxSwitches()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
+            const alt=switches<maxSwitches()&&canSwitch()?exhaustedRouteAfter(p,r,[...exitsTried]):undefined;
             if(alt){switches++;notify('Switched network exit',`Requests moved from ${r.name} to ${alt.name}.`,'info','switched|'+alt.id,600000);r=alt;route=r.name;attempts++;exhausted=undefined;continue;}
             break;
           }
@@ -236,13 +242,19 @@ export async function inference(req:IncomingMessage,res:ServerResponse,protocol:
           // A chain moves past a model that refuses it (blocked, or no longer offered) to the next step; the last step's refusal is the answer.
           if(blocked){if(chain&&m!==candidates[candidates.length-1]&&!controller.signal.aborted)break;throw new GatewayError(message,status,'upstream_error');}
           if(final)break;
-          if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}
+          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}
         }catch(e){
+          // A relay its platform switched off stays off for hours (route_unavailable carries the rest time). Retrying it or stopping
+          // because the retry budget is spent would end the session for a route problem: move straight to another exit, as when one is used up.
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&(e as any).restUntil&&settings.failover!==false&&switches<maxSwitches()&&canSwitch()){const alt=exhaustedRouteAfter(p,r,[...exitsTried]);if(alt){switches++;keepRoute=true;r=alt;route=r.name;attempts++;continue;}}
           // A route that is switched off or not connected is skipped like a failed connection when failover is on.
-          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&!controller.signal.aborted){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;continue;}}
+          if(e instanceof GatewayError&&e.type==='route_unavailable'&&settings.failover!==false&&providerSwitches(p)&&attempt<attempts&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;continue;}}
           if(e instanceof GatewayError&&e.type==='route_unavailable'&&!controller.signal.aborted&&m!==candidates[candidates.length-1]){status=e.status;message=e.message;upstream=undefined;break;}
-          if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts){status=502;message=redactError(String(e));upstream=undefined;break;}
-          if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}}
+          // A connection that never reached the provider is retried like any other transient failure, but its plain message is kept: the
+          // client should read the route, the cause and the next step, never a raw ECONNRESET or ENOTFOUND.
+          if(e instanceof GatewayError&&e.type==='route_unreachable'&&!controller.signal.aborted){fault=true;if(attempt<attempts&&canSwitch()){if(settings.failover!==false&&providerSwitches(p)){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}continue;}status=e.status;message=e.message;upstream=undefined;break;}
+          if(e instanceof GatewayError||controller.signal.aborted)throw e;if(attempt===attempts||!canSwitch()){status=502;message=redactError(String(e));upstream=undefined;break;}
+          if(settings.failover!==false&&providerSwitches(p)&&canSwitch()){const alt=routeAfter(p,r,[...exitsTried]);if(alt){r=alt;route=r.name;}}}
         finally{if(!retained)settleAttempt();}
       }
       if(!upstream?.ok&&chain)hops.push(`${m.id} (${status})`);

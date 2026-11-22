@@ -631,6 +631,11 @@ test('Exit-used-up detection needs both the daily Retry-After and the Free limit
   expect(exhaustionOf(429,'30','Too many requests')).toBeUndefined();
   expect(exhaustionOf(503,'7200','Free usage limit reached')).toBeUndefined();
   expect(exhaustionOf(429,'999999','FreeUsageLimitError')?.seconds).toBe(86400);
+  // A short countdown is a rate limit, not a spent daily allowance: it stays truthy so the request still moves on, but is a refusal with the
+  // real wait, never a "used up until" mark on the exit.
+  expect(exhaustionOf(429,'600','Free usage limit reached')).toMatchObject({ refused: true, seconds: 600 });
+  expect(exhaustionOf(429,'1800','FreeUsageLimitError')).toMatchObject({ refused: true, seconds: 1800 });
+  expect(exhaustionOf(429,'3600','Free usage limit reached')?.refused).toBeUndefined();
   expect(parseRetryAfter(new Date(Date.now()+60000).toUTCString())).toBeGreaterThan(50);
 });
 test('Client disconnect cancels the wait and is not charged to the model',async()=>{await scoped([remoteProvider()],async()=>{

@@ -136,6 +136,22 @@
         "to": "surfshark/sha256.txt"
       },
       {
+        "from": "resources/wireguard/wireproxy-awg-windows-amd64.exe",
+        "to": "wireguard/wireproxy-awg-windows-amd64.exe"
+      },
+      {
+        "from": "resources/wireguard/LICENSE",
+        "to": "wireguard/LICENSE"
+      },
+      {
+        "from": "resources/wireguard/README.md",
+        "to": "wireguard/README.md"
+      },
+      {
+        "from": "resources/wireguard/sha256.txt",
+        "to": "wireguard/sha256.txt"
+      },
+      {
         "from": "THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
       },

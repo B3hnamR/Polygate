@@ -1,8 +1,10 @@
 import type { Route } from './types';
-// An exit group is one route made of several exits that Polygate runs itself: Psiphon's regions (backend/psiphon.ts) and Surfshark's
-// locations (backend/surfshark.ts). Each exit is a local SOCKS port with its own outbound address. The route machinery (backend/transport.ts)
-// treats every group the same way: one exit per request, taking turns or staying on one; a used-up exit skipped for that provider only and
-// given a new address that is checked first; a refused request moved on; a route test that checks every exit; the exit named in the log.
+// An exit group is one route made of several exits that Polygate runs itself: Psiphon's regions (backend/psiphon.ts), Surfshark's
+// locations (backend/surfshark.ts) and imported WireGuard configs (backend/wireguard.ts). Each exit is a local SOCKS port with its own
+// outbound address. The route machinery (backend/transport.ts)
+// treats every group the same way: one exit per request, taking turns or staying on one; a used-up exit skipped for that provider only and,
+// where the provider can hand one out, given a new address that is checked first; a refused request moved on; a route test that checks every
+// exit; the exit named in the log. A WireGuard config keeps the address in its file, so it never asks for a new one.
 
 // Which limits a request is subject to: OpenCode Free's daily allowance and Kilo's per-address limit belong to different services, so an exit
 // used up for one is still good for the other, and for every other provider.
@@ -15,7 +17,9 @@ export const scopeOfUrl = (url: string): ExitScope => {
 };
 export const scopeOfKind = (kind?: string): ExitScope => kind === 'free' ? 'opencode' : kind === 'kilo' ? 'kilo' : 'other';
 
-export type ExitPick = { region: string; port: number };
+// `region` is the stable key used for limits, logs and virtual routes; `label` is the name to show when the two differ (WireGuard config ids
+// are opaque, their names are what the user chose). Groups whose key is already a display name leave label out.
+export type ExitPick = { region: string; port: number; label?: string };
 // 'unknown' (the check could not be sent or read) lets real requests decide.
 export type ExitCheck = { result: 'ok' | 'used-up' | 'unknown'; until?: number; note?: string };
 export type ExitChecker = (region: string, scope: ExitScope) => Promise<ExitCheck>;
@@ -29,14 +33,16 @@ export type ExitGroup = {
   live(): number;                        // exits connected
   unavailable(scope?: ExitScope): string;
   virtualRoute(region: string): Route | undefined;
-  regionsReady(): { region: string; exitIp: string }[];
+  regionsReady(): { region: string; exitIp: string; label?: string }[];
   spent(region: string, until: number): void;
   kiloLimited(region: string, until: number): void;
   clean(region: string): void;
+  // A passing Kilo check clears the address's Kilo mark, for groups that keep one (WireGuard, Surfshark).
+  clearKilo?(region: string, exitIp: string): void;
   failed(region: string): void;
   ok(region: string): void;
   skips(): boolean;
-  setChecker(fn?: ExitChecker): void;
+  setChecker?(fn?: ExitChecker): void;
 };
 const groups = new Map<string, ExitGroup>();
 export function registerExitGroup(g: ExitGroup) { groups.set(g.id, g); }

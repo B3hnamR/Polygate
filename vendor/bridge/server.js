@@ -1058,7 +1058,7 @@ function emptyDelta(delta) {
 
 // Hold chat calls until their complete names are known. Valid name prefixes and
 // injected fingerprint names must never expose unintended commands downstream.
-function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128) {
+function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128, strict = false) {
   const pending = new Map();
   const open = new Set();
   const closed = new Set();
@@ -1069,8 +1069,8 @@ function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128) 
     const calls = pending.get(index);
     if (!calls) return [];
     const out = [...calls.values()].map((call) => {
-      if (!allowedTools.has(call.function.name)) throw toolContractError();
-      return { ...call, function: { ...call.function, name: allowedTools.get(call.function.name) } };
+      if (strict && !allowedTools.has(call.function.name)) throw toolContractError();
+      return { ...call, function: { ...call.function, name: allowedTools.get(call.function.name) || call.function.name } };
     });
     pending.delete(index);
     return out;
@@ -1117,7 +1117,7 @@ function chatToolGuard(allowedTools, maxBytes = MAX_BODY_BYTES, maxCalls = 128) 
               call.id = tc.id;
             }
             if (tc.function?.name) call.function.name += tc.function.name;
-            if (call.function.name && ![...allowedTools.keys()].some(name => name.startsWith(call.function.name))) throw toolContractError();
+            if (strict && call.function.name && ![...allowedTools.keys()].some(name => name.startsWith(call.function.name))) throw toolContractError();
             if (tc.function?.arguments) call.function.arguments += tc.function.arguments;
             calls.set(i, call);
           }
@@ -1453,6 +1453,10 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   if (body.tool_choice === "none" || body.tool_choice?.type === "none") allowedTools.clear();
   const forcedTool = body.tool_choice?.function?.name || body.tool_choice?.name;
   if (forcedTool) for (const [wire, client] of allowedTools) if (client !== forcedTool) allowedTools.delete(wire);
+  // A client that constrained tools (none / no tools / one forced tool) has a strict contract. A normal auto request does not: OpenCode
+  // handles a name outside the offered list itself (it aliases bash to shell and returns a recoverable error for unknown names), so an
+  // unoffered name from the model must be forwarded, not turned into a fatal 502 for the whole stream.
+  const strict = allowedTools.size === 0 || Boolean(forcedTool);
   if (useResponses) {
     const upstreamBody = {
       model: targetModel,
@@ -1474,7 +1478,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
     if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
     if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
-    return { upstreamBody, aliasToOriginal, allowedTools };
+    return { upstreamBody, aliasToOriginal, allowedTools, strict };
   }
 
   // Field names and order match the CLI's own request: `max_completion_tokens`
@@ -1515,7 +1519,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
   }
 
-  return { upstreamBody, aliasToOriginal, allowedTools };
+  return { upstreamBody, aliasToOriginal, allowedTools, strict };
 }
 
 /**
@@ -2279,7 +2283,7 @@ function handleRequest(req, res) {
 
       let reader = null;
       try {
-        let { upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(body, targetModel, useResponses);
+        let { upstreamBody, aliasToOriginal, allowedTools, strict } = buildUpstreamPayload(body, targetModel, useResponses);
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
@@ -2309,7 +2313,7 @@ function handleRequest(req, res) {
           ) {
             useResponses = !useResponses;
             markProtocolSupport(targetModel, useResponses);
-            ({ upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(body, targetModel, useResponses));
+            ({ upstreamBody, aliasToOriginal, allowedTools, strict } = buildUpstreamPayload(body, targetModel, useResponses));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
@@ -2561,7 +2565,7 @@ function handleRequest(req, res) {
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
             );
-            ({ upstreamBody, aliasToOriginal, allowedTools } = buildUpstreamPayload(
+            ({ upstreamBody, aliasToOriginal, allowedTools, strict } = buildUpstreamPayload(
               body,
               targetModel,
               useResponses,
@@ -2736,7 +2740,7 @@ function handleRequest(req, res) {
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();
         const decoder = new TextDecoder();
-        const chatTools = chatToolGuard(allowedTools);
+        const chatTools = chatToolGuard(allowedTools, undefined, undefined, strict);
         const responseTools = { output_index: new Map(), item_id: new Map(), call_id: new Map() };
         const checkResponseTools = (ev) => {
           const bind = (selectors, name, added = false) => {
@@ -2748,7 +2752,7 @@ function handleRequest(req, res) {
               if (record) throw toolContractError();
               record = { name };
             }
-            if (!record || (name !== undefined && (record.name !== name || !allowedTools.has(name)))) throw toolContractError();
+            if (!record || (name !== undefined && (record.name !== name || (strict && !allowedTools.has(name))))) throw toolContractError();
             for (const [kind, value] of supplied) {
               const key = String(value);
               if (record[kind] !== undefined && record[kind] !== key) throw toolContractError();
@@ -2759,7 +2763,7 @@ function handleRequest(req, res) {
           };
           let record;
           if (ev.item?.type === "function_call") {
-            if (!allowedTools.has(ev.item.name)) throw toolContractError();
+            if (strict && !allowedTools.has(ev.item.name)) throw toolContractError();
             if (ev.item_id !== undefined && ev.item.id !== undefined && ev.item_id !== ev.item.id) throw toolContractError();
             if (ev.call_id !== undefined && ev.item.call_id !== undefined && ev.call_id !== ev.item.call_id) throw toolContractError();
             record = bind({ output_index: ev.output_index, item_id: ev.item.id ?? ev.item_id, call_id: ev.item.call_id ?? ev.call_id }, ev.item.name, ev.type === "response.output_item.added");
@@ -2768,7 +2772,7 @@ function handleRequest(req, res) {
             record = bind({ output_index: ev.output_index, item_id: ev.item_id, call_id: ev.call_id }, ev.name);
           }
           for (const [index, item] of (ev.response?.output || []).entries()) if (item?.type === "function_call") {
-            if (!allowedTools.has(item.name)) throw toolContractError();
+            if (strict && !allowedTools.has(item.name)) throw toolContractError();
             bind({ output_index: index, item_id: item.id, call_id: item.call_id }, item.name);
           }
           return record;
@@ -2880,7 +2884,7 @@ function handleRequest(req, res) {
                     toolIdx = nextToolIndex++;
                     toolIndexMap.set(key, toolIdx);
                   }
-                  const restoredName = allowedTools.get(ev.item.name);
+                  const restoredName = allowedTools.get(ev.item.name) || ev.item.name;
                   // Chat IDs are concatenated by stream consumers. Do not emit
                   // the item ID as a provisional ID when call_id may arrive later.
                   toolRecord.sentId = toolRecord.call_id;
@@ -3090,7 +3094,7 @@ function handleRequest(req, res) {
                   id: ev.item.call_id || ev.item.id || `call_${toolCalls.length}`,
                   type: "function",
                   function: {
-                    name: allowedTools.get(ev.item.name),
+                    name: allowedTools.get(ev.item.name) || ev.item.name,
                     arguments: "",
                   },
                 };
@@ -3215,6 +3219,16 @@ function handleRequest(req, res) {
           const payload = JSON.stringify({ error: { type: err.type, message: err.message, code: 502 } });
           if (!res.headersSent) {
             res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(payload);
+          }
+          return res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);
+        }
+        // Polygate's network layer throws GatewayError with a status and a type when a route never answered. Keep that status and the
+        // plain message instead of turning it into a raw 500, and leave the route's own log to record the stack trace.
+        if (Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599 && typeof err.type === "string") {
+          const payload = JSON.stringify({ error: { type: err.type, message: err.message || "The route did not answer", code: err.status } });
+          if (!res.headersSent) {
+            res.writeHead(err.status, { "Content-Type": "application/json" });
             return res.end(payload);
           }
           return res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);

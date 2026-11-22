@@ -40,6 +40,16 @@ export function explainError(c: ErrorContext): Explained | undefined {
     return { code: 'relay_unauthorized', extra: { route: c.route, upstream: { status: c.status, ...up } },
       message: `The relay "${c.route || 'relay'}" rejected the access token Polygate sent (HTTP 401), so nothing can pass through it. The token saved here does not match the one set on the relay. Open the Relays page and correct its token, or deploy the relay again.` };
   }
+  // A request that ran out of time is not a refusal: say what stopped it and where the limit is changed. A stream that began and then
+  // went silent is the same deadline on a different stage, so it gets its own sentence rather than "no answer arrived".
+  if (c.status === 504 && c.type === 'timeout') {
+    const stalled = /stopped sending data/i.test(c.message);
+    const tried = c.switches ? ` Polygate tried ${c.switches} other network exit${c.switches > 1 ? 's' : ''} first.` : '';
+    return { code: stalled ? 'stream_stalled' : 'gateway_timeout', extra: { route: c.route, ...(c.switches ? { exits_tried: c.switches } : {}) },
+      message: stalled
+        ? `The answer started but then stopped arriving, so Polygate ended the request.${tried} The route or the provider may be unstable; try again, choose another route on the Routing page, or raise "Deadline" under Gateway limits in Settings.`
+        : `No answer arrived before the gateway's request deadline, so the request was stopped.${tried} The route or the provider may be slow; try again, choose another route on the Routing page, or raise "Deadline" under Gateway limits in Settings.` };
+  }
   if (c.status === 403 || c.status === 401) {
     return { code: 'exit_refused', extra: { route: c.route, upstream: { status: c.status, ...up } },
       message: `The provider refused this connection (HTTP ${c.status}) from the network exit "${c.route || 'direct'}". The exit address may be blocked; try another route or proxy. ${up.text ? 'Provider said: ' + up.text.slice(0, 200) : ''}`.trim() };

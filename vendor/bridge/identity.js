@@ -128,6 +128,11 @@ function getSourceCacheFile() {
   const dir = getCatalogCacheDir();
   return dir ? require("path").join(dir, "source-recipe.json") : null;
 }
+// Bumped when extraction changes the profile it produces. A cache written by an
+// older extractor describes the same release with a different profile, which
+// sends the bridge down the alias/placeholder path for tools the client
+// actually provides.
+const SOURCE_CACHE_VERSION = 1;
 const BOOT_FETCH = global.fetch;
 const CATALOG_CACHE_DIR = getCatalogCacheDir();
 const CATALOG_CACHE_FILE = getCatalogCacheFile();
@@ -667,33 +672,62 @@ function readStringLiteral(raw) {
   return unescapeLiteral(text);
 }
 
-function readArrowExpression(source, start) {
-  let i = start;
-  while (/\s/.test(source[i] || '')) i++;
-  const begin = i;
-  let depth = 0, quote = null;
+/** The expression a local arrow helper returns, from just after its `=>`. */
+function readArrowBody(source, at) {
+  let i = at;
+  while (i < source.length && /\s/.test(source[i])) i++;
+  if (source[i] === "{") return null;
+  const start = i;
+  let depth = 0;
+  let quote = null;
   for (; i < source.length; i++) {
     const ch = source[i];
-    if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = null; continue; }
-    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
-    if ('([{'.includes(ch)) depth++;
-    else if (')]}'.includes(ch)) depth--;
-    else if (ch === '\n' && depth === 0 && /^\s*(?:export\s+)?(?:const|let|var|function|class|type|interface)\b/.test(source.slice(i + 1))) return source.slice(begin, i).trim();
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    else if (depth === 0 && ch === "\n") {
+      const rest = source.slice(i + 1);
+      if (/^\s*(?:export\s+)?(?:const|let|var|function|class|type|interface)\b/.test(rest)) {
+        return source.slice(start, i).trim();
+      }
+    }
   }
-  return source.slice(begin).trim();
+  return source.slice(start).trim();
 }
 
+/**
+ * Expand a local arrow helper that returns a schema expression into that
+ * expression, binding its arguments for `${...}` interpolation
+ * (`timeoutInput(120000)`).
+ */
 function expandSchemaHelper(name, argsText, source, vars) {
-  const corpus = typeof schemaCorpus === 'string' ? schemaCorpus : source;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = corpus.match(new RegExp(`const\\s+${escaped}\\s*=\\s*\\(([^)]*)\\)\\s*=>`));
-  if (!match) return null;
-  const body = readArrowExpression(corpus, match.index + match[0].length);
-  if (!body || body.startsWith('{')) return null;
-  const names = splitTopLevel(match[1]).map(part => (part.match(/^([A-Za-z_$][\w$]*)/) || [])[1]).filter(Boolean);
-  const args = splitTopLevel(argsText), bound = { ...(vars || {}) };
-  names.forEach((name, i) => { const arg = (args[i] || '').trim(); const value = /^\d[\d_]*$/.test(arg) ? Number(arg.replace(/_/g, '')) : bound[arg]; if (value !== undefined) bound[name] = value; });
-  return { body, vars: bound };
+  const corpus = typeof schemaCorpus === "string" ? schemaCorpus : source;
+  const bindings = vars || {};
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const arrow = corpus.match(new RegExp(`const\\s+${escaped}\\s*=\\s*\\(([^)]*)\\)\\s*=>`, "s"));
+  if (!arrow) return null;
+  const body = readArrowBody(corpus, arrow.index + arrow[0].length);
+  if (!body) return null;
+
+  const names = splitTopLevel(arrow[1])
+    .map((part) => (part.match(/^([A-Za-z_$][\w$]*)/) || [])[1])
+    .filter(Boolean);
+  const args = splitTopLevel(argsText);
+  const bound = { ...bindings };
+  for (let i = 0; i < names.length && i < args.length; i++) {
+    const arg = args[i].trim();
+    const value = /^\d[\d_]*$/.test(arg) ? Number(arg.replace(/_/g, "")) : bindings[arg];
+    if (value !== undefined) bound[names[i]] = value;
+  }
+  return { expr: body, vars: bound };
 }
 
 /**
@@ -705,9 +739,15 @@ function parseFieldSchema(expr, source, vars = schemaVars, depth = 0) {
   let required = true;
   let schema = {};
 
+  // A local helper can build the schema (`shell`'s
+  // `timeout: timeoutInput(DEFAULT_TIMEOUT_MS)`). Inline what it returns so its
+  // modifiers and annotations are read like an inline schema.
   if (depth < 3) {
-    const helper = expr.trim().match(/^([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)$/);
-    if (helper) { const expanded = expandSchemaHelper(helper[1], helper[2], source, vars); if (expanded) return parseFieldSchema(expanded.body, source, expanded.vars, depth + 1); }
+    const call = expr.trim().match(/^([A-Za-z_$][\w$]*)\s*\(([\s\S]*)\)$/);
+    if (call) {
+      const inline = expandSchemaHelper(call[1], call[2], source, vars);
+      if (inline) return parseFieldSchema(inline.expr, source, inline.vars, depth + 1);
+    }
   }
 
   // Unwrap modifiers, outermost first.
@@ -995,6 +1035,71 @@ function structFields(structName, corpus) {
 }
 
 /**
+ * The `?`/`:` that separates a conditional's branches at nesting depth 0.
+ * Strings and nested ternaries are skipped so an array element containing
+ * either cannot end the search early.
+ */
+function ternaryColonAt(text, questionAt) {
+  let depth = 0;
+  let quote = null;
+  let nested = 0;
+  for (let i = questionAt + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    else if (depth === 0 && ch === "?") nested++;
+    else if (depth === 0 && ch === ":") {
+      if (nested === 0) return i;
+      nested--;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Evaluate a `description: [...]` body. A conditional spread is a config
+ * branch (code mode): the false branch is what the default client sends.
+ */
+function descriptionParts(body, vars) {
+  const parts = [];
+  for (const part of splitTopLevel(body)) {
+    const literal = readStringLiteral(part);
+    if (literal !== null) {
+      parts.push(interpolateTemplate(literal, vars));
+      continue;
+    }
+    if (!part.startsWith("...")) continue;
+    let expr = part.slice(3).trim();
+    if (expr.startsWith("(")) {
+      const group = readBalanced(expr, 0);
+      if (group === expr) expr = expr.slice(1, -1).trim();
+    }
+    const question = expr.indexOf("?");
+    if (question < 0) continue;
+    const colon = ternaryColonAt(expr, question);
+    if (colon < 0) continue;
+    const branch = expr.slice(colon + 1).trim();
+    if (branch.startsWith("[")) {
+      const array = readBalanced(branch, 0);
+      if (array) parts.push(...descriptionParts(array.slice(1, -1), vars));
+      continue;
+    }
+    const branchLiteral = readStringLiteral(branch);
+    if (branchLiteral !== null) parts.push(interpolateTemplate(branchLiteral, vars));
+  }
+  return parts;
+}
+
+/**
  * Extract a single tool's wire definition (`description` + JSON Schema `parameters`)
  * directly from its TypeScript plugin source (`read.ts` or `shell.ts`).
  */
@@ -1028,7 +1133,7 @@ function extractToolFromSource(source, fallbackName) {
   // 1. Tool description. Three upstream forms:
   //    (a) array literal (optionally inside an arrow fn) joined with " " or "\n"
   //    (b) exported template/string literal
-  //    (c) a `description` key inside `editor.add({ ... })`
+  //    (c) a `description` key (string or `description:` array) inside `editor.add({ ... })`
   let description = null;
   const builderMatch = source.match(
     /const\s+description\s*=\s*(?:\([^)]*\)\s*=>\s*)?\[([\s\S]*?)\]\.join\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/m
@@ -1062,6 +1167,29 @@ function extractToolFromSource(source, fallbackName) {
       const sq = source.match(/export\s+const\s+description\s*=\s*'((?:[^'\\]|\\.)*)'/m);
       if (dq) description = unescapeLiteral(dq[1]);
       else if (sq) description = interpolateTemplate(unescapeLiteral(sq[1]), vars);
+    }
+  }
+  if (!description) {
+    // `description: [...]` inside the registration block. `read.ts` builds its
+    // text from a code-mode conditional, so the array is the only place the
+    // default (flags-off) description lives. The array is read from the
+    // registration up to its `input:` rather than by balancing the whole
+    // `editor.add({...})`: the execute closure contains comments and regexes
+    // that brace counting cannot follow.
+    const addBlock = source.match(/(?:editor|draft)\.add\(\{([\s\S]*?)\binput\s*:/);
+    const body = addBlock ? addBlock[1] : null;
+    const descAt = body ? body.search(/description\s*:\s*\[/) : -1;
+    if (descAt >= 0) {
+      const arrayAt = body.indexOf("[", descAt);
+      const array = readBalanced(body, arrayAt);
+      if (array) {
+        const join = body
+          .slice(arrayAt + array.length)
+          .match(/^\s*\.join\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*\)/s);
+        const joiner = join ? unescapeLiteral(join[1] !== undefined ? join[1] : join[2]) : " ";
+        const parts = descriptionParts(array.slice(1, -1), vars);
+        if (parts.length > 0) description = parts.join(joiner);
+      }
     }
   }
   if (!description || description.length < 20) {
@@ -1184,7 +1312,6 @@ function writeCachedCatalog(json) {
   }
 }
 
-const SOURCE_CACHE_VERSION = 1;
 function readCachedSource(expectedRef = null) {
   try {
     const file = getSourceCacheFile();

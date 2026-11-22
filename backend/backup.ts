@@ -41,6 +41,13 @@ export function openBackup(raw: unknown, rawPassphrase: unknown): Settings {
   // Object.assign below must never invoke the prototype setter: local-program checks run on this plain parsed object.
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.hasOwn(parsed, '__proto__') || arrays.some(k => !Array.isArray(parsed[k]))) throw new GatewayError('The backup does not hold usable settings', 400);
   if (parsed.routes.some((r: any) => !r || typeof r.id !== 'string' || typeof r.kind !== 'string') || parsed.providers.some((p: any) => !p || typeof p.id !== 'string') || parsed.keys.some((k: any) => !k || typeof k.id !== 'string' || typeof k.value !== 'string')) throw new GatewayError('The backup does not hold usable settings', 400);
+  // A WireGuard config id becomes a directory name under the state folder when its tunnel starts. A restored backup must not be able to put
+  // "..", a separator or an absolute path there: writeConf/dropConf would otherwise write keys and recursively delete files outside state.
+  if (parsed.wireguard !== undefined) {
+    const wg = parsed.wireguard;
+    if (!wg || typeof wg !== 'object' || Array.isArray(wg) || !Array.isArray(wg.configs) || wg.configs.some((c: any) => !c || !/^[A-Za-z0-9_-]{1,128}$/.test(String(c.id ?? '')) || typeof c.config !== 'string' || typeof c.name !== 'string'))
+      throw new GatewayError('The backup does not hold usable WireGuard settings', 400);
+  }
   const next = withBuiltIns({ ...initialSettings(), ...parsed });
   if (!next.routes.some(r => r.id === 'direct')) next.routes.unshift(initialSettings().routes[0]);
   return next;

@@ -26,9 +26,10 @@ export function socksConnect(up: SocksUpstream, host: string, port: number, time
     const timer = setTimeout(() => fail(new Error(`SOCKS5 ${up.host}:${up.port} timed out after ${timeoutMs}ms`)), timeoutMs);
     const sendConnect = () => {
       state = 'connect'; const kind = net.isIP(host);
+      const length = Buffer.byteLength(host); if (length > 255) return fail(new Error(`SOCKS5 destination name is too long (${length} bytes)`));
       const address = kind === 4 ? Buffer.concat([Buffer.from([0x01]), Buffer.from(host.split('.').map(Number))])
         : kind === 6 ? Buffer.concat([Buffer.from([0x04]), ipv6Bytes(host)])
-        : Buffer.concat([Buffer.from([0x03, Buffer.byteLength(host)]), Buffer.from(host)]);
+        : Buffer.concat([Buffer.from([0x03, length]), Buffer.from(host)]);
       socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00]), address, Buffer.from([(port >> 8) & 0xff, port & 0xff])]));
     };
     socket.once('connect', () => socket.write(up.username ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00])));
@@ -42,9 +43,11 @@ export function socksConnect(up: SocksUpstream, host: string, port: number, time
         return fail(new Error(`SOCKS5 server refused every authentication method (${method})`));
       }
       if (state === 'auth') {
-        if (buffer.length < 2) return; if (buffer[1] !== 0x00) return fail(new Error('SOCKS5 username/password rejected')); buffer = buffer.subarray(2); return sendConnect();
+        if (buffer.length < 2) return; if (buffer[0] !== 0x01) return fail(new Error('Not a SOCKS5 username/password reply'));
+        if (buffer[1] !== 0x00) return fail(new Error('SOCKS5 username/password rejected')); buffer = buffer.subarray(2); return sendConnect();
       }
       if (buffer.length < 4) return;
+      if (buffer[0] !== 0x05 || buffer[2] !== 0x00) return fail(new Error('Malformed SOCKS5 connect reply'));
       if (buffer[1] !== 0x00) return fail(new Error(`SOCKS5 connect to ${host}:${port} failed: ${socksReply[buffer[1]] || 'code ' + buffer[1]}`));
       const atyp = buffer[3]; const length = atyp === 0x01 ? 10 : atyp === 0x04 ? 22 : atyp === 0x03 ? (buffer.length > 4 ? 7 + buffer[4] : 99) : 0;
       if (!length) return fail(new Error('SOCKS5 reply has an unknown address type')); if (buffer.length < length) return;
@@ -84,7 +87,8 @@ function ipv6Bytes(address: string) {
 }
 function handle(client: net.Socket, up: SocksUpstream) {
   client.setNoDelay(true); let head = Buffer.alloc(0);
-  const refuse = (status: string) => { try { client.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch { client.destroy(); } };
+  // The marker tells a provider's own 502 apart from one this bridge invented because the tunnel could not carry the request.
+  const refuse = (status: string, tunnel = false) => { try { client.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n${tunnel ? 'x-polygate-tunnel-error: 1\r\n' : ''}\r\n`); } catch { client.destroy(); } };
   const onData = async (chunk: Buffer) => {
     head = Buffer.concat([head, chunk]); const end = head.indexOf('\r\n\r\n');
     if (end < 0) { if (head.length > HEADER_LIMIT) { client.off('data', onData); refuse('431 Request Header Fields Too Large'); } return; }
@@ -106,7 +110,7 @@ function handle(client: net.Socket, up: SocksUpstream) {
       // One request per connection: a kept-alive client connection could otherwise send its next request (to another host) down this tunnel.
       const headers = [...lines.slice(1).filter(l => !/^(proxy-|connection:|keep-alive:)/i.test(l)), 'Connection: close'];
       upstream.write(Buffer.concat([Buffer.from(`${method} ${url.pathname}${url.search} ${version}\r\n${headers.join('\r\n')}\r\n\r\n`, 'latin1'), rest])); link(client, upstream);
-    } catch { refuse('502 Bad Gateway'); }
+    } catch { refuse('502 Bad Gateway', true); }
   };
   client.on('data', onData); client.on('error', () => client.destroy());
 }

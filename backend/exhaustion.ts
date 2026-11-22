@@ -4,6 +4,10 @@
 // `refused` marks a short-lived exhaustion recorded for a relay whose outbound TLS client cannot be confirmed to be Bun's.
 export type Exhaustion = { until: number; seconds: number; refused?: boolean };
 const DAY = 86400;
+// A countdown under an hour is a rate limit, not the provider's daily allowance. Treating it as a used-up exit labels every exit the
+// limit touched with "Used up until ...", so one short throttle rests a whole group. Keep the real wait but mark it as a refusal:
+// the exit is skipped briefly, rechecked, and never recorded as a spent daily quota.
+const SHORT_LIMIT_SECONDS = 3600;
 // Retry-After is either a number of seconds or an HTTP date.
 export function parseRetryAfter(value: string | null | undefined): number {
   if (!value) return 0; const n = Number(value); if (Number.isFinite(n)) return Math.max(0, n);
@@ -13,6 +17,7 @@ export const FREE_LIMIT_TEXT = /FreeUsageLimit|Free usage limit/i;
 export function exhaustionOf(status: number, retryAfter: string | null | undefined, text: string): Exhaustion | undefined {
   if (status !== 429 || !FREE_LIMIT_TEXT.test(text)) return;
   const seconds = parseRetryAfter(retryAfter); if (seconds <= 0) return;
+  if (seconds < SHORT_LIMIT_SECONDS) return refusedExhaustion(Math.max(1, Math.ceil(seconds / 60)));
   const capped = Math.min(seconds, DAY); return { until: Date.now() + capped * 1000, seconds: capped };
 }
 // Bound both bytes and time: an error body can be a stalled or unbounded stream.

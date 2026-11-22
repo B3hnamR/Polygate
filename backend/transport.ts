@@ -11,7 +11,8 @@ import { pickPoolProxy, poolReport, virtualPoolRoute, poolExhausted, hasCleanSta
 import { exitGroupOf, exitGroups, exitOfVirtual, scopeOfUrl, scopeOfKind, type ExitGroup } from './exit-group';
 // Loaded here so their exit groups are registered before the first request (backend/exit-group.ts).
 import './psiphon';
-import { clearSurfsharkKiloLimit } from './surfshark';
+import './surfshark';
+import './wireguard';
 import { detectExhaustion, suspectExhaustion, FREE_LIMIT_TEXT, noteExhaustion, noteRefused, noteInconclusive, takeExhaustion, isCanary, newCanaryId, refusedExhaustion, nextResetAt, resetTime, type Exhaustion } from './exhaustion';
 import { beginAttempt, finishAttempt } from './diagnostics';
 import { logEvent } from './logbook';
@@ -366,6 +367,23 @@ export function plainRouteError(raw:string,kind?:string):string{
   if(/certificate|CERT_|self.signed|SSL|TLS handshake|unable to verify/i.test(t))return 'Secure connection failed: the certificate or handshake was rejected';
   return t.replace(/^(Type|Syntax)?Error:\s*/i,'').slice(0,160);
 }
+// A connection that never produced an answer is not the provider refusing the request. Name the route, the plain cause, and what can be
+// tried next; the raw exception stays in the route log, where a stack trace is useful and the client never sees it.
+export function networkFailure(route: Route, raw: unknown, target: URL): GatewayError {
+  const said = plainRouteError(redactError(String((raw as any)?.message || raw)), route.kind);
+  const where = route.kind === 'relay' ? `the relay "${route.name}"` : `the route "${route.name}"`;
+  let next = 'Another route may work; if every route fails, test or change the route on the Routing page.';
+  if (/Name not found/i.test(said)) next = route.kind === 'relay'
+    ? 'Its deployment may have been deleted or renamed. Update or remove it on the Relays page, or choose another route.'
+    : 'If the address is right, this network\'s DNS may be blocking it; another route may work.';
+  else if (/Connection reset/i.test(said)) next = route.kind === 'relay'
+    ? 'The relay host or this network closed the connection. Another relay or exit may work; if every route fails, this network may be blocking the site.'
+    : 'Another exit or route may work; if every route fails, this network may be blocking the site.';
+  else if (/Connection refused/i.test(said)) next = 'Update the relay or route, or choose another one.';
+  else if (/No answer in time/i.test(said)) next = 'The network did not answer in time. Another exit or route may work; if it keeps happening, check this network.';
+  else if (/Secure connection failed/i.test(said)) next = 'The certificate or TLS handshake was rejected. Another exit may work; if every exit fails, check the relay or the network.';
+  return new GatewayError(`Could not reach ${target.host} through ${where}: ${said}. ${next}`, 502, 'route_unreachable');
+}
 const canStandIn=(route:Route)=>settings.failover!==false&&settings.routes.some(r=>r.id!==route.id&&r.enabled&&!coolingDown(r)&&(r.kind!=='direct'||settings.allowDirect===true||settings.spreadDirect===true)&&(r.kind!=='warp'||!!warpTarget()));
 export function routeFailed(route:Route,reason:string,immediate=false){
   const raw=redactError(reason);route.status=plainRouteError(raw,route.kind);route.failures=(route.failures||0)+1;
@@ -385,8 +403,16 @@ const relayRejectedKey=async(r:Response)=>/Unauthorized relay request/i.test(awa
 // The bundled relays mark every answer of theirs with x-relay-runtime, so an answer without it, saying one of these, came from the platform.
 // Nothing sent to that relay will get through, so the request moves to another route and the relay rests for a while.
 const nextUtcMidnight=()=>{const d=new Date();d.setUTCHours(24,0,0,0);return d.getTime();};
+const deploymentProtectedOff=(name:string)=>({until:now()+6*3600000,message:`Vercel is keeping this relay's deployment behind Deployment Protection (${name}): Vercel answers its callers with a login page or a 401 instead of running the relay, so nothing reaches the provider. Turn off Deployment Protection for the project on vercel.com, or deploy the relay on a project without it. Requests use the other routes meanwhile.`});
 export async function relayPlatformOff(r:Response,name:string):Promise<{message:string;until:number}|undefined>{
-  if(r.status<400||r.headers.get('x-relay-runtime'))return undefined;
+  if(r.headers.get('x-relay-runtime'))return undefined;
+  // Deployment Protection sends a request it does not answer as JSON to its SSO page instead: the relay never runs either way.
+  if(r.status>=300&&r.status<400){
+    let sso=false;
+    try{const u=new URL(r.headers.get('location')||'');sso=(u.hostname==='vercel.com'||u.hostname==='www.vercel.com')&&u.pathname.replace(/\/+$/,'')==='/sso-api';}catch{/* not a redirect to inspect */}
+    return sso?deploymentProtectedOff(name):undefined;
+  }
+  if(r.status<400)return undefined;
   const header=r.headers.get('x-vercel-error')||'';const text=(await r.clone().text().catch(()=>'')).slice(0,2000);
   const vercel=/^DEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)$/.exec(header)||/\bDEPLOYMENT_(DISABLED|PAUSED|BLOCKED|NOT_FOUND|DELETED)\b/.exec(text);
   if(vercel){const code=`DEPLOYMENT_${vercel[1]}`;const gone=vercel[1]==='NOT_FOUND'||vercel[1]==='DELETED';
@@ -395,6 +421,14 @@ export async function relayPlatformOff(r:Response,name:string):Promise<{message:
       :`Vercel has switched off this relay's deployment (${name}, ${code}). This usually means the Vercel account went over its free usage this month, or the project was paused or blocked; see the project on vercel.com. Deploy the relay on another account or platform, or wait for the usage to reset. Requests use the other routes meanwhile.`};}
   if(/error code:?\s*1027\b/i.test(text))return {until:nextUtcMidnight(),message:`Cloudflare has stopped this relay Worker for today (${name}, error 1027): the free plan's daily request limit is used up. It works again after 00:00 UTC. Requests use the other routes meanwhile.`};
   if(/(paused|suspended)[^.]{0,80}usage limit|usage limit[^.]{0,80}(paused|suspended)/i.test(text)&&/netlify/i.test(text+(r.headers.get('server')||'')))return {until:now()+6*3600000,message:`Netlify has paused this relay site (${name}): the account reached its usage limits. See the site on netlify.com, or deploy the relay on another platform. Requests use the other routes meanwhile.`};
+  // Deployment Protection in front of the relay: an API request gets this structured 401 (a browser gets a login redirect instead), so
+  // the relay never runs. No instance or address of it helps until the project is unprotected, and this is not the provider refusing the exit.
+  if(r.status===401){
+    let protectedDeployment=false;
+    try{const body=JSON.parse(text);const code=body?.error?.code;protectedDeployment=body?.error?.message==='Protected deployment'&&(code===401||code==='401');}
+    catch{protectedDeployment=/<title>\s*Authentication Required\s*<\/title>/i.test(text)&&/vercel\.com\/sso-api/i.test(text);}
+    if(protectedDeployment)return deploymentProtectedOff(name);
+  }
   return undefined;
 }
 export function routeSucceeded(route:Route,ms:number){route.latency=ms;route.status='healthy';route.failures=0;route.opened=0;route.cooldownUntil=0;}
@@ -452,32 +486,44 @@ async function viaGroup(g:ExitGroup,url:string,init:any):Promise<Response>{
   const rid=routeContext.getStore()?.requestId;const scope=requestScope(url);const tried=new Set<string>();let last:unknown;let exhausted:Response|undefined;let exhaustedAt='';
   // A request refused through a region whose small check passed: OpenCode's limits are not all per address and per day (one model can be
   // limited on an exit where another still answers), so it goes on to another region, at most twice, before the refusal is returned.
-  let refused:Response|undefined;let refusedAt='';let refusals=0;
-  const via=(r:Response,region:string)=>{if(rid&&!isCanary(rid)){exitRegions.set(rid,region);if(exitRegions.size>300)exitRegions.delete(exitRegions.keys().next().value!);}return r;};
+  let refused:Response|undefined;let refusedAt='';let refusedLabel='';let exhaustedLabel='';let refusals=0;
+  const via=(r:Response,region:string,label?:string)=>{if(rid&&!isCanary(rid)){exitRegions.set(rid,label||region);if(exitRegions.size>300)exitRegions.delete(exitRegions.keys().next().value!);}return r;};
   // A refusal goes back as a refusal: a used-up note from an earlier region is dropped, or the gateway would read the next exit's failure as used up.
-  const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt);}return exhausted&&via(exhausted,exhaustedAt);};
+  const giveUp=()=>{if(refused){exhausted?.body?.cancel().catch(()=>{});takeExhaustion(rid);noteRefused(rid);return via(refused,refusedAt,refusedLabel);}return exhausted&&via(exhausted,exhaustedAt,exhaustedLabel);};
   // Why the request left the region it was on, said in the log line when it reaches the next one.
   let moved:{from:string;why:string}|undefined;
   const attempts=Math.max(1,Math.min(6,g.live()));
   for(let i=0;i<attempts;i++){
     const pick=g.pick(tried,scope);
     if(!pick){const r=giveUp();if(r)return r;if(last)throw last;throw new GatewayError(g.unavailable(scope),503,'route_unavailable');}
+    const shown=pick.label||pick.region;
     tried.add(pick.region);
-    if(moved&&!isCanary(rid))logEvent('info',g.source,`A request moved from ${g.label} ${moved.from} (${moved.why}) to ${pick.region}`,{from:moved.from,to:pick.region,request:rid});
+    if(moved&&!isCanary(rid))logEvent('info',g.source,`A request moved from ${g.label} ${moved.from} (${moved.why}) to ${shown}`,{from:moved.from,to:pick.region,request:rid});
     moved=undefined;
     try{
       const response=await fetch(url,{...init,proxy:await socksBridge({host:'127.0.0.1',port:pick.port})});
+      // The local bridge marks its own 502/504: the tunnel could not carry the request, so this exit failed. A provider's own 502 passes
+      // through untouched and is delivered as its answer.
+      if((response.status===502||response.status===504)&&response.headers.get('x-polygate-tunnel-error')==='1'){
+        await response.body?.cancel().catch(()=>{});
+        g.failed(pick.region);
+        last=new GatewayError(`The ${g.label} ${g.unit} ${shown} could not carry the request.`,502,'route_unreachable');
+        moved={from:shown,why:'its tunnel did not pass the request'};
+        continue;
+      }
       if(response.status===429&&!isCanary(rid)&&scope==='opencode'){const seen=await detectExhaustion(response);if(seen){const ex=await judgeExhaustion(g.id+':'+pick.region,false,response,seen,rid);
-        if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
-        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;if(++refusals<=2&&g.skips()){moved={from:pick.region,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
+        if(ex){if(!ex.refused)g.spent(pick.region,ex.until);noteExhaustion(rid,ex);if(!g.skips())return via(response,pick.region,shown);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;exhaustedLabel=shown;moved={from:shown,why:ex.refused?'refused by OpenCode Free':'its exit is used up for OpenCode Free'};continue;}
+        if(ex===undefined){refused?.body?.cancel().catch(()=>{});refused=response;refusedAt=pick.region;refusedLabel=shown;if(++refusals<=2&&g.skips()){moved={from:shown,why:'OpenCode Free refused the request though a small check passed'};continue;}return giveUp()!;}noteInconclusive(rid);}}
       // Kilo's anonymous limit belongs to the exit's address (backend/kilo.ts): set this region aside for Kilo and try the next one. When every
       // region is limited the last answer goes back, and the gateway rests the whole route for Kilo as it does for any exit.
-      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){g.kiloLimited(pick.region,now()+30*60000);if(!g.skips())return via(response,pick.region);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:pick.region,why:"Kilo's free limit for its address"};continue;}}
-      g.ok(pick.region);return via(response,pick.region);
-    }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:pick.region,why:'it could not connect'};}
+      if(response.status===429&&scope==='kilo'){const text=await response.clone().text().catch(()=>'');if(/PROMOTION_MODEL_LIMIT_REACHED/.test(text)){g.kiloLimited(pick.region,now()+30*60000);if(!g.skips())return via(response,pick.region,shown);exhausted?.body?.cancel().catch(()=>{});exhausted=response;exhaustedAt=pick.region;moved={from:shown,why:"Kilo's free limit for its address"};continue;}}
+      g.ok(pick.region);return via(response,pick.region,shown);
+    }catch(e){if(callerCancelled(init))throw e;g.failed(pick.region);last=e;moved={from:shown,why:'it could not connect'};}
   }
   const r=giveUp();if(r)return r;
-  throw last;
+  if(last instanceof GatewayError&&last.type==='route_unreachable')throw last;
+  if(last)throw new GatewayError(`Could not reach the provider through any ${g.label} ${g.unit}: ${redactError(String((last as any)?.message||last)).slice(0,240)}`,502,'route_unreachable');
+  throw new GatewayError(g.unavailable(scope),503,'route_unavailable');
 }
 const isReadOnly=(init:any)=>['GET','HEAD'].includes(String(init?.method||'GET').toUpperCase());
 // Keep gateway failover semantics without treating a provider's allowance as a broken connection.
@@ -537,8 +583,16 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
       for(let spin=0;;spin++){
         const r=relayRequest(url,init,route);const avoid=spentList(route.id);if(avoid.length&&bunRelays.has(route.id))(r.init.headers as Headers).set('x-relay-avoid',avoid.join(','));
         // A relay that is known to run Bun is a pool of instances: when one cannot be reached, take another before giving the route up.
-        try{response=await fetch(r.url,r.init);const moved=relayRedirect(response);if(moved){await response.body?.cancel().catch(()=>{});throw moved;}}
-        catch(e){if(callerCancelled(init)||!bunRelays.has(route.id)||isCanary(rid0)||spin>=max||!await rotateRelay(route))throw e;continue;}
+        try{
+          response=await fetch(r.url,r.init);
+          // A platform block rests the route; another instance of the same deployment cannot get past it.
+          const off=await relayPlatformOff(response,route.name);
+          if(off){await response.body?.cancel().catch(()=>{});
+            if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
+            throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
+          const moved=relayRedirect(response);if(moved){await response.body?.cancel().catch(()=>{});throw moved;}
+        }
+        catch(e){if((e as any)?.restUntil||callerCancelled(init)||!bunRelays.has(route.id)||isCanary(rid0)||spin>=max||!await rotateRelay(route))throw e;continue;}
         const egress=response.headers.get('x-relay-egress');// A relay that reports its egress address can be rotated (relays/vercel-bun); the Netlify relay trusts the same handshake but has no instances.
       const bun=!!response.headers.get('x-relay-egress')&&trustedRuntime(response.headers.get('x-relay-runtime'));
         if(egress)liveEgress.set(route.id,egress);if(bun)bunRelays.add(route.id);
@@ -554,10 +608,6 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
         if(ex&&!ex.refused&&spin<max){markSpent(route.id,egress,ex.until);if(await rotateRelay(route)){await response.body?.cancel().catch(()=>{});judged=undefined;continue;}}
         break;
       }
-      const off=await relayPlatformOff(response,route.name);
-      if(off){await response.body?.cancel().catch(()=>{});
-        if(!quiet&&!isReadOnly(init)&&!isCanary(rid0))logEvent('warn','routes',off.message,{route:route.id,kind:route.kind,status:response.status});
-        throw Object.assign(new GatewayError(off.message,503,'route_unavailable'),{restUntil:off.until});}
     }
     else if(route.kind==='warp'){const result=await viaWarp(route,url,init,quiet);response=result.response;judged=result.judged;}
     else if(route.kind==='proxy'){
@@ -586,13 +636,15 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
   }catch(e){
     finishAttempt(attempt,undefined,e);
     if(e instanceof WarpFreeUnavailable)throw e;
+    if(callerCancelled(init))throw e;
+    const wrapped=e instanceof GatewayError?e:networkFailure(route,e,local);
     // Background reads (model lists, version and identity checks) carry no one's request, and a slow one times out now and then: they never
     // put an exit to rest. Only requests that send something (chat) count toward the breaker.
-    if(quiet||callerCancelled(init)||isCanary(routeContext.getStore()?.requestId)||route.id.startsWith('pool:')||!!exitOfVirtual(route.id)||isReadOnly(init))throw e;
+    if(quiet||isCanary(routeContext.getStore()?.requestId)||route.id.startsWith('pool:')||!!exitOfVirtual(route.id)||isReadOnly(init))throw wrapped;
     routeFailed(route,e instanceof GatewayError?e.message:String(e),e instanceof GatewayError&&e.type==='route_unavailable'&&route.kind!=='proxy');
     // A relay its platform switched off rests until it may be back, not the breaker's few minutes, when another exit can stand in.
     const restUntil=Number((e as any)?.restUntil)||0;if(restUntil&&route.cooldownUntil&&route.cooldownUntil>now()){route.cooldownUntil=Math.max(route.cooldownUntil,restUntil);persist();}
-    throw e;
+    throw wrapped;
   }
 }
 // What a route test sends, and how its answer is read, depends on the provider chosen in the dialog. OpenCode Free keeps its own check (the model list
@@ -601,7 +653,7 @@ export async function networkFetch(raw: string|URL|Request, init: any = {}, expl
 // One model is asked (`model`), so a pass says the exit works for that provider, not that every model of it will answer.
 // until: when a check found the exit used up, the end of the wait the provider gave.
 export type RouteTest={ok:boolean;status:number;latency?:number;buffered:boolean;chat:string;summary:string;provider?:string;model?:string;until?:number;regions?:ExitTest[]};
-export type ExitTest={region:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
+export type ExitTest={region:string;label?:string;exitIp:string;ok:boolean;chat:string;latency?:number;summary:string};
 export type PsiphonRegionTest=ExitTest;
 function testProvider(route:Route,providerId?:string):Provider|undefined{
   const enabled=settings.providers.filter(p=>p.enabled&&p.kind!=='zai');
@@ -634,25 +686,26 @@ async function testGroup(g:ExitGroup,route:Route,providerId?:string):Promise<Rou
   if(!route.enabled||!ready.length)throw new GatewayError(g.unavailable(),503,'route_unavailable');
   const scope=providerId?scopeOfKind(settings.providers.find(p=>p.id===providerId)?.kind):'opencode';
   const kilo=scope==='kilo';
-  const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp})=>{
+  const regions:ExitTest[]=await Promise.all(ready.map(async({region,exitIp,label})=>{
+    const shown=label||region;
     try{const t=await regionTester(g.id+':'+region,providerId);
       if(scope==='opencode'&&t.chat==='used-up')g.spent(region,t.until||nextResetAt());
       else if(scope==='opencode'&&t.chat==='ok')g.clean(region);
       else if(kilo&&t.chat==='limited')g.kiloLimited(region,now()+30*60000);
-      else if(kilo&&t.chat==='ok'&&g.id==='surfshark')clearSurfsharkKiloLimit(exitIp);
-      return {region,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
-    catch(e:any){return {region,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${region}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
+      else if(kilo&&t.chat==='ok')g.clearKilo?.(region,exitIp);
+      return {region,label,exitIp,ok:t.chat==='ok',chat:t.chat,latency:t.latency,summary:t.summary};}
+    catch(e:any){return {region,label,exitIp,ok:false,chat:'unknown',summary:`${g.label} ${shown}: ${redactError(String(e?.message||e)).slice(0,160)}`};}
   }));
   const good=regions.filter(r=>r.ok);const times=regions.map(r=>r.latency).filter((n):n is number=>typeof n==='number').sort((a,b)=>a-b);
   route.latency=times.length?times[Math.floor(times.length/2)]:route.latency;route.status=good.length?'healthy':route.status;if(good.length){route.failures=0;route.opened=0;route.cooldownUntil=0;}persist();
-  const others=regions.filter(r=>!r.ok).map(r=>`${r.region} ${r.chat==='used-up'?'is used up':r.chat==='limited'?'reached Kilo\'s limit':r.chat==='refused'?'was refused':r.chat==='busy'?'was busy':'did not answer'}`);
-  const summary=`${g.label}: ${good.length} of ${regions.length} ${g.unit}${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
+  const others=regions.filter(r=>!r.ok).map(r=>`${r.label||r.region} ${r.chat==='used-up'?'is used up':r.chat==='limited'?'reached Kilo\'s limit':r.chat==='refused'?'was refused':r.chat==='busy'?'was busy':'did not answer'}`);
+  const summary=`${g.label}: ${good.length} of ${regions.length} ${g.unit}${regions.length>1?'s':''} answered${good.length?` (${good.map(r=>r.label||r.region).join(', ')})`:''}${others.length?`; ${others.join(', ')}`:''}.`;
   logEvent(good.length?'info':'warn','routes',summary,{route:route.id});
   return {ok:good.length>0,status:good.length?200:503,latency:route.latency,buffered:false,chat:good.length?'ok':regions[0]?.chat||'unknown',summary,provider:kilo?'Kilo Free':undefined,regions};
 }
 // Checks an exit's new address with the provider whose limit it had reached, through exactly that exit (Psiphon, Surfshark):
 // OpenCode Free with the same small request as a route test, Kilo with one small chat request to a Kilo model.
-for(const group of exitGroups())group.setChecker(async(region,scope)=>{
+for(const group of exitGroups())group.setChecker?.(async(region,scope)=>{
   const route=group.virtualRoute(region);if(!route)return {result:'unknown',note:`the ${group.unit} stopped`};
   if(scope==='opencode'){const c=await checkChat(route);return c.chat==='ok'?{result:'ok'}:c.chat==='used-up'||c.chat==='refused'?{result:'used-up',until:c.until}:{result:'unknown',note:c.note};}
   const kilo=settings.providers.find(p=>p.kind==='kilo'&&p.enabled);if(scope!=='kilo'||!kilo)return {result:'unknown',note:'Kilo is not enabled'};
@@ -687,5 +740,5 @@ async function testRouteOnce(id:string,providerId?:string):Promise<RouteTest>{
       :`${route.name}: connected, but a chat request could not be checked${check.note?' ('+check.note+')':''}.`;
     return tested(route,{ok:r!.ok,status:r!.status,latency:route.latency,buffered:!!route.buffered,chat:check.chat==='ok'&&check.unfinished?'incomplete':check.chat,summary,provider:'OpenCode Free',model:check.model,...(check.until?{until:check.until}:{})});
   }catch(e){if(isCancelled())throw cancelledError(); // a cancelled test leaves the route as it was
-    const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
+    const raw=redactError(String((e as Error)?.message||e));route.status='unreachable';if(route.kind==='relay')tallyRoute(route.id,/redirected \(HTTP \d+\)/i.test(raw)?'redirected':'failed');persist();const said=plainRouteError(raw,route.kind);logEvent('warn','routes',`Tested ${route.name}: could not connect (${said})`,{route:route.id,error:raw});throw e instanceof GatewayError&&e.type!=='route_unreachable'?e:new GatewayError('Could not connect through this route: '+said+'.',502,'route_unreachable');}
 }

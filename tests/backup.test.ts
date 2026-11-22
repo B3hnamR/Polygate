@@ -32,6 +32,20 @@ test('a backup holds the settings, is unreadable without the passphrase and leav
   settings.routes = settings.routes.filter(r => r.id !== 'r-bk');
 });
 
+test('a backup with a path-traversal WireGuard config id is refused', () => {
+  const passphrase = 'a long passphrase';
+  const file = JSON.parse(createBackup(passphrase).content);
+  const key = scryptSync(passphrase, Buffer.from(file.kdf.salt, 'base64'), 32, { N: file.kdf.N, r: file.kdf.r, p: file.kdf.p, maxmem: 128 * 1024 * 1024 });
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(file.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(file.tag, 'base64'));
+  const data = JSON.parse(Buffer.concat([decipher.update(Buffer.from(file.data, 'base64')), decipher.final()]).toString());
+  data.wireguard = { enabled: true, configs: [{ id: '../../../etc', name: 'bad', config: '[Interface]', enabled: true }] };
+  const cipher = createCipheriv('aes-256-gcm', key, Buffer.from(file.iv, 'base64'));
+  const body = Buffer.concat([cipher.update(JSON.stringify(data)), cipher.final()]);
+  file.data = body.toString('base64'); file.tag = cipher.getAuthTag().toString('base64');
+  expect(() => openBackup(JSON.stringify(file), passphrase)).toThrow('WireGuard settings');
+});
+
 test('restoring replaces the settings, keeps the current dashboard password and keeps a copy of what was there', async () => {
   settings.admin = { password: { salt: 'KEEP-SALT', hash: 'KEEP-HASH' }, epoch: 1 };
   settings.routes = [...settings.routes, { id: 'r-was', name: 'Relay that was backed up', kind: 'relay', url: 'https://was.example.com', token: 'was-token-123456', enabled: true, models: [] } as any];

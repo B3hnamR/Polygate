@@ -55,8 +55,8 @@ beforeEach(() => {
 });
 const post = () => networkFetch('http://127.0.0.9/v1/chat', { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } }, 'surfshark');
 
-test('Psiphon and Surfshark are both exit groups', () => {
-  expect(exitGroups().map(g => g.id).sort()).toEqual(['psiphon', 'surfshark']);
+test('Psiphon, Surfshark and WireGuard are exit groups', () => {
+  expect(exitGroups().map(g => g.id).sort()).toEqual(['psiphon', 'surfshark', 'wireguard']);
 });
 test('a key pair is checked before it is saved: the public key must belong to the private key', async () => {
   settings.surfshark = { ...settings.surfshark!, privateKey: undefined, publicKey: undefined };

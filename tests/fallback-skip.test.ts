@@ -46,3 +46,24 @@ test('when nothing else can answer after an exit was used up, the used-up messag
   settings.providers = [prov('pa', 'A', 'limit')] as any; model('pa/a1', 'pa', 1);
   const r = await ask(); expect(r.status).toBe(429); expect(r.body.error.code).toBe('egress_exhausted');
 });
+test('a relay its platform keeps behind Deployment Protection moves this request to another exit instead of refusing the model', async () => {
+  // Both relays answer here; the blocked one answers as Vercel does before the relay runs, the other as the provider would.
+  const relays = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(req) {
+    if (new URL(req.url).pathname === '/protected') return new Response(JSON.stringify({ error: { code: '401', message: 'Protected deployment' } }), { status: 401, headers: { 'content-type': 'application/json' } });
+    return new Response(sse({ choices: [{ index: 0, delta: { content: 'through the other relay' }, finish_reason: null }] }) + sse({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const blocked: any = { id: 'r-protected', name: 'Vercel relay lhr1', kind: 'relay', url: `http://127.0.0.1:${relays.port}/protected`, enabled: true, models: [] };
+  const working: any = { id: 'r-relay-up', name: 'Vercel relay fra1', kind: 'relay', url: `http://127.0.0.1:${relays.port}/working`, enabled: true, models: [] };
+  try {
+    settings.routes.push(blocked, working);
+    // A public provider address, so its calls take the relays; the relays answer above instead of forwarding.
+    settings.providers = [prov('pr', 'Relay', 'r', { baseUrl: 'https://provider.example/v1', routes: { ids: [blocked.id, working.id] } })] as any; model('pr/r1', 'pr', 1);
+    const r = await ask();
+    expect(r.status).toBe(200); expect(r.model).toBe('pr/r1'); expect(r.body.choices[0].message.content).toBe('through the other relay');
+    expect(blocked.cooldownUntil - Date.now()).toBeGreaterThan(5.9 * 3600000);
+    expect(blocked.status).toContain('Deployment Protection');
+  } finally {
+    relays.stop(true);
+    for (const id of [blocked.id, working.id]) { const i = settings.routes.findIndex(x => x.id === id); if (i >= 0) settings.routes.splice(i, 1); }
+  }
+});

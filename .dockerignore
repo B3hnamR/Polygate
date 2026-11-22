@@ -20,3 +20,4 @@ dist
 **/.vercel
 # Never send locally provisioned helper binaries to the build context.
 resources/surfshark/wireproxy-*
+resources/wireguard/wireproxy-*
